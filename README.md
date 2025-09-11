@@ -92,6 +92,7 @@ project_root/
 ├── core/
 │   ├── __init__.py
 │   ├── password.py                      # Password management and validation
+|   ├── profiles.py                      # Profiles management and validation
 │   └── database.py                      # SQLite interface with encryption
 ├── managers/
 │   ├── __init__.py

@@ -1,6 +1,3 @@
-"""
-Dark mode styled widgets - provides consistent theming across the application
-"""
 from PySide6.QtWidgets import QMainWindow, QPushButton, QLineEdit
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont

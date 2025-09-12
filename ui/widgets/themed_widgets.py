@@ -175,3 +175,14 @@ class ColoredLineEdit(QLineEdit):
     def reset_border_color(self):
         """Reset border to default color"""
         self.set_border_color(self.default_color)
+        
+# MARK: Labels
+class ThemedLabel(QLabel):
+    def __init__(self, text="", parent=None):
+        super().__init__(text, parent)
+        self.setStyleSheet("""
+            QLabel {
+                color: #ffffff;
+                background-color: transparent;
+            }
+        """)

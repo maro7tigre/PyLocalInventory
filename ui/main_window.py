@@ -27,7 +27,8 @@ class MainWindow(ThemedMainWindow):
         
         # Core managers
         self.profile = ProfileManager()
-        self.password = PasswordManager()
+        self.password = PasswordManager(self.profile)
+
         
         # UI setup
         self.setup_menu()
@@ -48,11 +49,6 @@ class MainWindow(ThemedMainWindow):
         backups_action.triggered.connect(self.open_backups_dialog)
         menubar.addAction(backups_action)
         
-        # Password menu action
-        password_action = QAction("Password", self)
-        password_action.triggered.connect(self.open_password_dialog)
-        menubar.addAction(password_action)
-        
         # Log out menu action
         logout_action = QAction("Log Out", self)
         logout_action.triggered.connect(self.logout)
@@ -60,21 +56,21 @@ class MainWindow(ThemedMainWindow):
     
     def setup_main_widget(self):
         """Initialize main widget container"""
-        self.main_widget = QWidget()
+        self.main_widget = QWidget() #TODO: figure out how to clean before adding to
         self.setCentralWidget(self.main_widget)
         self.main_layout = QVBoxLayout(self.main_widget)
     
-    def refresh_app(self):
+    def refresh_app(self): 
         """Reset and rebuild main widget based on current state"""
-        # Clear existing layout
+        # Clear existing layout #TODO: is this actually the right way to  do it ???
         for i in reversed(range(self.main_layout.count())):
             child = self.main_layout.itemAt(i).widget()
             if child:
                 child.setParent(None)
         
-        if not self.profile.valid:
+        if not self.profile.validate():
             self.setup_profile_selection()
-        elif not self.password.valid:
+        elif not self.password.validate():
             self.setup_password_entry()
         else:
             self.setup_main_tabs()
@@ -138,13 +134,19 @@ class MainWindow(ThemedMainWindow):
         tab_widget.addTab(LogTab(), "Log")
         
         self.main_layout.addWidget(tab_widget)
+        
+        
+        
     
     def validate_password(self):
         """Validate entered password"""
         password = self.password_input.text()
         if not self.password.validate(password):
             self.password_input.set_border_color("#f44336")  # Red border for incorrect password
-    
+        else:
+            self.password.set_password(password)
+            self.refresh_app()
+            
     def reset_password_border(self):
         """Reset password input border to default when text changes"""
         self.password_input.reset_border_color()
@@ -159,11 +161,9 @@ class MainWindow(ThemedMainWindow):
         dialog = BackupsDialog(self)
         dialog.exec()
     
-    def open_password_dialog(self):
-        """Open encryption password dialog"""
-        dialog = EncryptionDialog(self)
-        dialog.exec()
-    
     def logout(self):
         """Log out current user"""
         self.password.logout()
+        self.profile.logout()
+        
+        self.refresh_app()

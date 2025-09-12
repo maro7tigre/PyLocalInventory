@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QMainWindow, QPushButton, QLineEdit
+from PySide6.QtWidgets import QMainWindow, QPushButton, QLineEdit, QLabel
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 

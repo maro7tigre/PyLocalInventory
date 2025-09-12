@@ -15,7 +15,9 @@ class PasswordManager:
     
     def validate(self, password = None):
         """Validate provided password and return True/False"""
-        return self.decrypt_data(self.profile.encrypted_phrase, password) == self.validation_phrase
+        if self.profile.validate():
+            return self.decrypt_data(self.profile.selected_profile.encrypted_phrase, password) == self.validation_phrase
+        return False
     
     def logout(self):
         """Clear current session and reset authentication state"""

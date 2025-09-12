@@ -12,7 +12,7 @@ class ProfileManager:
             profile= self.selected_profile
         #TODO: implement actual validation logic
             
-        return True
+        return False
     
     def logout(self):
         """Clear current profile and reset state"""

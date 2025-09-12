@@ -8,16 +8,10 @@ Reusable widget components for PyLocalInventory.
 from .themed_widgets import *
 
 # Import simple utility widgets  
-from .simple_widgets import ClickableLabel, PlaceholderPixmap
-
-# Import custom complex widgets
-from .custom_widgets import InfoCard, StatusBadge, ActionToolbar, LabeledInput
+from .simple_widgets import *
 
 # Import selectable widgets (our new "lego pieces")
-from .selectable_widgets import (
-    SelectableItem, SquareSelectableItem, HorizontalSelectableItem,
-    SelectableGrid, SelectableList
-)
+from .selectable_widgets import *
 
 __all__ = [
     # Themed widgets (buttons, inputs, etc.)
@@ -27,12 +21,6 @@ __all__ = [
     'ThemedCheckBox', 'ThemedRadioButton', 'ThemedListWidget',
     
     # Simple widgets
-    'ClickableLabel', 'PlaceholderPixmap',
     
-    # Custom widgets
-    'InfoCard', 'StatusBadge', 'ActionToolbar', 'LabeledInput',
-    
-    # Selectable widgets (the new lego pieces)
-    'SelectableItem', 'SquareSelectableItem', 'HorizontalSelectableItem',
-    'SelectableGrid', 'SelectableList'
+    # Selectable widgets
 ]

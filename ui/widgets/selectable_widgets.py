@@ -1,6 +1,7 @@
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QLabel, QMenu
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QAction
+from .preview_widget import PreviewWidget
 
 
 class ClickableWidget(QWidget):
@@ -139,3 +140,49 @@ class ClickableWidget(QWidget):
     
     def on_delete(self):
         pass
+    
+class CardWidget(ClickableWidget):
+    def __init__(self, label_text, size=120, category="individual", parent=None):
+        self.card_size = size
+        self.label_text = label_text
+        self.category = category
+        super().__init__(parent)
+        
+    def setup_ui(self):
+        """Setup card layout with preview and label"""
+        self.setFixedSize(self.card_size, self.card_size)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(8, 8, 8, 8)
+        layout.setSpacing(4)
+        
+        # Preview widget (75% of card size)
+        preview_size = int(self.card_size * 0.75)
+        self.preview = PreviewWidget(preview_size, self.category)
+        layout.addWidget(self.preview, alignment=Qt.AlignCenter)
+        
+        # Label
+        self.label = QLabel(self.label_text)
+        self.label.setAlignment(Qt.AlignCenter)
+        self.label.setWordWrap(True)
+        layout.addWidget(self.label)
+        
+        layout.addStretch()  # Push content to top
+    
+    def set_preview_path(self, path):
+        """Update the preview image path"""
+        self.preview.set_image_path(path)
+    
+    def update_size(self, size):
+        """Update card size and refresh layout"""
+        self.card_size = size
+        self.setFixedSize(size, size)
+        
+        # Update preview size (75% of new card size)
+        preview_size = int(size * 0.75)
+        self.preview.update_size(preview_size)
+    
+    def set_label_text(self, text):
+        """Update the label text"""
+        self.label_text = text
+        self.label.setText(text)

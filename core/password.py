@@ -2,6 +2,7 @@
 Password management - handles authentication, validation, and session state
 """
 from cryptography.fernet import Fernet
+import base64
 
 
 
@@ -29,13 +30,34 @@ class PasswordManager:
         """Change existing password"""
         pass
     
+    def _get_key(self, password):
+        """Generate Fernet key from password"""
+        if isinstance(password, str):
+            password = password.encode()
+        # Simple key derivation: base64 encode the password (padded to 32 bytes)
+        key = base64.urlsafe_b64encode(password.ljust(32)[:32])
+        return key
     
-    
-    def encrypt_data(self, data):
-        pass
-    
-    def decrypt_data(self, encrypted_data, password):
+    def encrypt_data(self, data, password=None):
+        """Encrypt data using password-derived key"""
         if password is None:
             password = self._current_password
-            
-        pass
+        
+        key = self._get_key(password)
+        fernet = Fernet(key)
+        
+        if isinstance(data, str):
+            data = data.encode()
+        
+        return fernet.encrypt(data)
+    
+    def decrypt_data(self, encrypted_data, password=None):
+        """Decrypt data using password-derived key"""
+        if password is None:
+            password = self._current_password
+        
+        key = self._get_key(password)
+        fernet = Fernet(key)
+        
+        decrypted_data = fernet.decrypt(encrypted_data)
+        return decrypted_data.decode()

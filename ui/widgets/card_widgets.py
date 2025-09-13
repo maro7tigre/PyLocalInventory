@@ -4,7 +4,7 @@ from PySide6.QtGui import QAction
 from .preview_widget import PreviewWidget
 
 
-class ClickableWidget(QWidget):
+class ClickableCard(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
         self._selected = False
@@ -141,7 +141,7 @@ class ClickableWidget(QWidget):
     def on_delete(self):
         pass
     
-class CardWidget(ClickableWidget):
+class SqaureCard(ClickableCard):
     def __init__(self, label_text, size=120, category="individual", parent=None):
         self.card_size = size
         self.label_text = label_text

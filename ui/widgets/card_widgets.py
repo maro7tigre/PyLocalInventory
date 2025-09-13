@@ -91,9 +91,9 @@ class ClickableCard(QWidget):
             bg_color = self._bg_normal
             border_color = self._border_normal
         
-        # Apply widget style
+        # Apply widget style - Fixed: Use correct class name in selector
         self.setStyleSheet(f"""
-            ClickableWidget {{
+            ClickableCard {{
                 background-color: {bg_color};
                 border: 2px solid {border_color};
                 border-radius: 4px;

@@ -7,9 +7,11 @@ from .preview_widget import PreviewWidget
 class ClickableCard(QWidget):
     def __init__(self, parent=None):
         super().__init__(parent)
+        self.parent_layout = parent
         self._selected = False
         self._hovered = False
         self._change_label_colors = False
+        self.id = None  # Unique identifier for the card
         
         # Default colors
         self._bg_normal = "#3B3B3B"
@@ -130,16 +132,16 @@ class ClickableCard(QWidget):
     
     # Override these methods in your subclass
     def on_pressed(self):
-        pass
+        self.parent_layout.on_card_pressed(self.id)
     
     def on_edit(self):
-        pass
+        self.parent_layout.on_card_edit(self.id)
     
     def on_duplicate(self):
-        pass
+        self.parent_layout.on_card_duplicate(self.id)
     
     def on_delete(self):
-        pass
+        self.parent_layout.on_card_delete(self.id)
     
 class SqaureCard(ClickableCard):
     def __init__(self, label_text, size=120, category="individual", parent=None):

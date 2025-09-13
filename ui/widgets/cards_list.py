@@ -1,7 +1,8 @@
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QApplication, QMainWindow
 from PySide6.QtCore import Qt, QTimer
-from .card_widgets import SqaureCard
+from card_widgets import SqaureCard
 import uuid
+import sys
 
 
 class BaseCardsList(QWidget):
@@ -144,12 +145,12 @@ class _VerticalCardsList(BaseCardsList):
 class _GridCardsList(BaseCardsList):
     """Grid layout - cards arranged in grid with equal spacing like file manager"""
     
-    def __init__(self, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
+    def __init__(self, category=None, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
         self.card_size = card_size
         self.min_spacing = min_spacing
         self.min_layout_width = card_size + (min_spacing * 2)
         self.cards_order = []  # Track card order for grid positioning
-        super().__init__(card_type, add_available, parent)
+        super().__init__(category, card_type, add_available, parent)
     
     def setup_ui(self):
         self.layout = QVBoxLayout(self)
@@ -230,9 +231,9 @@ class _GridCardsList(BaseCardsList):
 class HorizontalCardsList(QScrollArea):
     """Scrollable horizontal cards list"""
     
-    def __init__(self, card_type=SqaureCard, add_available=True, parent=None):
+    def __init__(self, category=None, card_type=SqaureCard, add_available=True, parent=None):
         super().__init__(parent)
-        self.cards_list = _HorizontalCardsList(card_type, add_available, self)
+        self.cards_list = _HorizontalCardsList(category, card_type, add_available, self)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -247,9 +248,9 @@ class HorizontalCardsList(QScrollArea):
 class VerticalCardsList(QScrollArea):
     """Scrollable vertical cards list"""
     
-    def __init__(self, card_type=SqaureCard, add_available=True, parent=None):
+    def __init__(self, category=None, card_type=SqaureCard, add_available=True, parent=None):
         super().__init__(parent)
-        self.cards_list = _VerticalCardsList(card_type, add_available, self)
+        self.cards_list = _VerticalCardsList(category, card_type, add_available, self)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -264,9 +265,9 @@ class VerticalCardsList(QScrollArea):
 class GridCardsList(QScrollArea):
     """Scrollable grid cards list"""
     
-    def __init__(self, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
+    def __init__(self, category = None, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
         super().__init__(parent)
-        self.cards_list = _GridCardsList(card_type, add_available, card_size, min_spacing, self)
+        self.cards_list = _GridCardsList(category, card_type, add_available, card_size, min_spacing, self)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -276,3 +277,20 @@ class GridCardsList(QScrollArea):
     def __getattr__(self, name):
         """Delegate attribute access to the internal cards list"""
         return getattr(self.cards_list, name)
+
+
+if __name__ == "__main__":
+    app = QApplication(sys.argv)
+    
+    # Create main window
+    window = QMainWindow()
+    window.setWindowTitle("Card Lists Demo")
+    window.resize(800, 600)
+    
+    # Choose which layout to test - change this line to switch layouts
+    scroll_area = HorizontalCardsList(category="indicidual")  # or VerticalCardsList() or GridCardsList()
+    
+    window.setCentralWidget(scroll_area)
+    window.show()
+    
+    sys.exit(app.exec())

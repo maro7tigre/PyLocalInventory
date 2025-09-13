@@ -11,7 +11,7 @@ from .themed_widgets import *
 from .simple_widgets import *
 
 # Import selectable widgets (our new "lego pieces")
-from .selectable_widgets import *
+from .card_widgets import *
 
 __all__ = [
     # Themed widgets (buttons, inputs, etc.)

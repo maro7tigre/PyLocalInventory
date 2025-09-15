@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QApplication, QMainWindow
 from PySide6.QtCore import Qt, QTimer
-from card_widgets import SqaureCard
+from card_widgets import SquareCard
 import uuid
 import sys
 
@@ -8,7 +8,7 @@ import sys
 class BaseCardsList(QWidget):
     """Base class for managing collections of cards with different layouts"""
     
-    def __init__(self, category=None, card_type=SqaureCard, add_available=True, parent=None):
+    def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
         self.card_type = card_type
         self.add_available = add_available
@@ -27,6 +27,7 @@ class BaseCardsList(QWidget):
     
     def load_cards(self):
         """Load available cards - override this method in subclasses"""
+        #TODO: remove existing cards before loading new ones
         # Example implementation - replace with actual data loading
         if self.add_available:
             self.create_add_card()
@@ -145,7 +146,7 @@ class _VerticalCardsList(BaseCardsList):
 class _GridCardsList(BaseCardsList):
     """Grid layout - cards arranged in grid with equal spacing like file manager"""
     
-    def __init__(self, category=None, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
+    def __init__(self, category=None, card_type=SquareCard, add_available=True, card_size=120, min_spacing=10, parent=None):
         self.card_size = card_size
         self.min_spacing = min_spacing
         self.min_layout_width = card_size + (min_spacing * 2)
@@ -231,7 +232,7 @@ class _GridCardsList(BaseCardsList):
 class HorizontalCardsList(QScrollArea):
     """Scrollable horizontal cards list"""
     
-    def __init__(self, category=None, card_type=SqaureCard, add_available=True, parent=None):
+    def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
         self.cards_list = _HorizontalCardsList(category, card_type, add_available, self)
         
@@ -248,7 +249,7 @@ class HorizontalCardsList(QScrollArea):
 class VerticalCardsList(QScrollArea):
     """Scrollable vertical cards list"""
     
-    def __init__(self, category=None, card_type=SqaureCard, add_available=True, parent=None):
+    def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
         self.cards_list = _VerticalCardsList(category, card_type, add_available, self)
         
@@ -265,7 +266,7 @@ class VerticalCardsList(QScrollArea):
 class GridCardsList(QScrollArea):
     """Scrollable grid cards list"""
     
-    def __init__(self, category = None, card_type=SqaureCard, add_available=True, card_size=120, min_spacing=10, parent=None):
+    def __init__(self, category = None, card_type=SquareCard, add_available=True, card_size=120, min_spacing=10, parent=None):
         super().__init__(parent)
         self.cards_list = _GridCardsList(category, card_type, add_available, card_size, min_spacing, self)
         

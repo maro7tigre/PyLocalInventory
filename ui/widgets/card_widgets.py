@@ -91,14 +91,17 @@ class ClickableCard(QWidget):
             bg_color = self._bg_normal
             border_color = self._border_normal
         
+        print(f"Updating style: bg={bg_color}, border={border_color}")
+        
         # Apply widget style - Fixed: Use correct class name in selector
         self.setStyleSheet(f"""
-            ClickableCard {{
-                background-color: {bg_color};
-                border: 2px solid {border_color};
-                border-radius: 4px;
+            [_selfOnly="true"] {{
+            background-color: {bg_color};
+            border: 2px solid {border_color};
+            border-radius: 4px;
             }}
         """)
+
         
         # Apply label colors if enabled
         if self._change_label_colors:
@@ -143,7 +146,7 @@ class ClickableCard(QWidget):
     def on_delete(self):
         self.parent_layout.on_card_delete(self.id)
     
-class SqaureCard(ClickableCard):
+class SquareCard(ClickableCard):
     def __init__(self, label_text, size=120, category="individual", parent=None):
         self.card_size = size
         self.label_text = label_text

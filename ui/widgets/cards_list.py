@@ -288,7 +288,7 @@ if __name__ == "__main__":
     window.resize(800, 600)
     
     # Choose which layout to test - change this line to switch layouts
-    scroll_area = HorizontalCardsList(category="indicidual")  # or VerticalCardsList() or GridCardsList()
+    scroll_area = HorizontalCardsList(category="individual")  # or VerticalCardsList() or GridCardsList()
     
     window.setCentralWidget(scroll_area)
     window.show()

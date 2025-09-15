@@ -91,15 +91,12 @@ class ClickableCard(QWidget):
             bg_color = self._bg_normal
             border_color = self._border_normal
         
-        print(f"Updating style: bg={bg_color}, border={border_color}")
         
         # Apply widget style - Fixed: Use correct class name in selector
         self.setStyleSheet(f"""
-            [_selfOnly="true"] {{
             background-color: {bg_color};
             border: 2px solid {border_color};
             border-radius: 4px;
-            }}
         """)
 
         

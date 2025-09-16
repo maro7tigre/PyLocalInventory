@@ -26,7 +26,6 @@ class InventoryApp(QWidget):
         
         #MARK: theme
         self.setStyleSheet("""
-            QMainWindow, QDialog { background-color: #2D2D30; color: #E0E0E0; }
             QLabel { color: #E0E0E0; }
             QTableWidget { 
                 background-color: #2D2D30; gridline-color: #3E3E42; color: #E0E0E0;
@@ -41,7 +40,7 @@ class InventoryApp(QWidget):
         
         # Header
         header = QHBoxLayout()
-        title = QLabel(self.section)
+        title = QLabel(f"{self.section} Overview :")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         header.addWidget(title)
         header.addStretch()
@@ -68,85 +67,48 @@ class InventoryApp(QWidget):
     #MARK: table (overwrite)
     def setup_table(self):
         self.table = QTableWidget()
-        self.table.setColumnCount(8)
-        self.table.setHorizontalHeaderLabels(["ID", "Company", "Role", "Product", "Price HT", "Price TTC", "Quantity", "Icon"])
+        self.table.setColumnCount(len(self.columns))
+        self.table.setHorizontalHeaderLabels(self.columns)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.setColumnHidden(0, True)
         self.table.verticalHeader().setVisible(False)
 
-
     def refresh_table(self):
-        products = self.db.get_products()
-        self.table.setRowCount(len(products))
+        items = self.db.get_items(self.section)
+        self.table.setRowCount(len(items))
         
-        for row, product in enumerate(products):
-            self.table.setItem(row, 0, QTableWidgetItem(str(product["id"])))
-            self.table.setItem(row, 1, QTableWidgetItem(product["company"]))
-            self.table.setItem(row, 2, QTableWidgetItem(product["role"]))
-            self.table.setItem(row, 3, QTableWidgetItem(product["product"]))
-            
-            # Convert and display prices
-            product_currency = product.get("currency", "USD")
-            price_ht = self.convert_currency(product["price_ht"], product_currency, self.display_currency)
-            price_ttc = self.convert_currency(product["price_ttc"], product_currency, self.display_currency)
-            
-            symbol = CURRENCY_SYMBOLS[self.display_currency]
-            self.table.setItem(row, 4, QTableWidgetItem(f"{symbol} {price_ht:.2f}"))
-            self.table.setItem(row, 5, QTableWidgetItem(f"{symbol} {price_ttc:.2f}"))
-            self.table.setItem(row, 6, QTableWidgetItem(str(product["quantity"])))
-            
-            # Icon column with package emoji
-            icon_item = QTableWidgetItem("📦")
-            icon_item.setTextAlignment(Qt.AlignCenter)
-            self.table.setItem(row, 7, icon_item)
-
-    def change_currency(self, currency):
-        self.display_currency = currency
-        self.refresh_table()
-
-
+        for row, item in enumerate(items):
+            for column, data in enumerate(self.columns):
+                self.table.setItem(row, column, QTableWidgetItem(str(item[data])))
 
     def get_selected_id(self):
         row = self.table.currentRow()
         return int(self.table.item(row, 0).text()) if row != -1 else None
-
-    def edit_product(self):
-        if (product_id := self.get_selected_id()) is None:
-            QMessageBox.warning(self, "Error", "Please select a product")
-            return
-            
-        products = self.db.get_products()
-        product = next((p for p in products if p["id"] == product_id), None)
-        if product:
-            dialog = ProductDialog(self, product)
-            if dialog.exec() == QDialog.Accepted:
-                self.db.update_product(product_id, dialog.get_data())
-                self.refresh_table()
-
-    def delete_product(self):
-        if (product_id := self.get_selected_id()) is None:
-            QMessageBox.warning(self, "Error", "Please select a product")
-            return
-            
-        if QMessageBox.question(self, "Confirm", "Delete this product?") == QMessageBox.Yes:
-            self.db.delete_product(product_id)
-            self.refresh_table()
-            
             
     def add_item(self):
         """overwrite the method in subclass"""
-        pass
+        if (item_id := self.get_selected_id()) is None:
+            QMessageBox.warning(self, "Error", "Please select a item to delete")
+            return
+        pass #TODO: open the add dialog
+    
+        self.refresh_table()
     
     def edit_item(self):
         """overwrite the method in subclass"""
-        pass
+        if (item_id := self.get_selected_id()) is None:
+            QMessageBox.warning(self, "Error", "Please select a item to delete")
+            return
+        #items = self.db.get_items(self.section)
+        pass #TODO: open the edit dialog with item data
+    
+        self.refresh_table()
     
     def delete_item(self):
-        """overwrite the method in subclass"""
-        pass
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    window = InventoryApp()
-    window.show()
-    sys.exit(app.exec())
+        if (item_id := self.get_selected_id()) is None:
+            QMessageBox.warning(self, "Error", "Please select a item to delete")
+            return
+            
+        if QMessageBox.question(self, "Confirm", "Delete this item?") == QMessageBox.Yes:
+            self.db.delete_item(item_id, self.section)
+            self.refresh_table()

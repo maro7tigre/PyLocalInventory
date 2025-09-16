@@ -102,6 +102,7 @@ class PreviewWidget(QWidget):
     def _get_category_text(self):
         """Get default text/emoji for each category"""
         category_map = {
+            "profiles": "👤",
             "individual": "👤",
             "company": "🏢", 
             "product": "📦",

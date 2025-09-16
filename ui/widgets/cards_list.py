@@ -1,6 +1,6 @@
 from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QApplication, QMainWindow
 from PySide6.QtCore import Qt, QTimer
-from card_widgets import SquareCard
+from .card_widgets import SquareCard
 import uuid
 import sys
 

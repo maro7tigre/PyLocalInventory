@@ -57,7 +57,7 @@ class ProductDialog(QDialog):
 
     def get_data(self):
         return {
-            "company": self.fields["company"].text(),
+            "company": self.fields["company"].text(), 
             "role": self.fields["role"].currentText(),
             "product": self.fields["product"].text(),
             "price_ht": self.fields["price_ht"].value(),

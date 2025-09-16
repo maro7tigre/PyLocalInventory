@@ -1,11 +1,12 @@
 """
 Profile management dialog - create, delete, and switch between user profiles
 """
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel
-from PySide6.QtWidgets import QSplitter, QWidget, QHBoxLayout, QPushButton
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QFileDialog
+from PySide6.QtWidgets import QSplitter, QWidget, QHBoxLayout, QLineEdit
 from PySide6.QtCore import Qt
+import os
 
-from ui.widgets.themed_widgets import RedButton, GreenButton
+from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
 
 class ProfilesDialog(QDialog):
@@ -13,7 +14,8 @@ class ProfilesDialog(QDialog):
         super().__init__(parent)
         self.setWindowTitle("Profiles Manager")
         self.setModal(True)
-        self.setMinimumSize(500, 400)
+        self.setMinimumSize(800, 500)
+        self.load_config()
         
         # Apply dark theme
         self.setStyleSheet("""
@@ -26,10 +28,27 @@ class ProfilesDialog(QDialog):
         # Main vertical layout
         layout = QVBoxLayout()
 
-        # Header
+        # Header row with label, stretch, line edit, and browse button
+        header_layout = QHBoxLayout()
         header_label = QLabel("Profiles Dialog")
         header_label.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: bold;")
-        layout.addWidget(header_label, alignment=Qt.AlignLeft)
+        header_layout.addWidget(header_label)
+
+        header_layout.addStretch()
+
+        self.profiles_path_edit = QLineEdit()
+        self.profiles_path_edit.setReadOnly(True)
+        self.profiles_path_edit.setFixedWidth(350)
+        # Set initial path from config
+        self.profiles_path_edit.setText(self.profiles_path)
+        header_layout.addWidget(self.profiles_path_edit)
+
+        browse_btn = BlueButton("Browse")
+        browse_btn.setFixedSize(100, 30)
+        browse_btn.clicked.connect(self.browse_profiles_path)
+        header_layout.addWidget(browse_btn)
+
+        layout.addLayout(header_layout)
 
         # Splitter for left and right layouts
         splitter = QSplitter(Qt.Horizontal)
@@ -49,7 +68,11 @@ class ProfilesDialog(QDialog):
         # Confirm and Cancel buttons centered
         button_layout = QHBoxLayout()
         confirm_btn = GreenButton("Confirm")
+        confirm_btn.clicked.connect(self.confirm)
+        confirm_btn.setFixedSize(150, 30)
         cancel_btn = RedButton("Cancel")
+        cancel_btn.clicked.connect(self.cancel)
+        cancel_btn.setFixedSize(150, 30)
         button_layout.addStretch()
         button_layout.addWidget(confirm_btn)
         button_layout.addWidget(cancel_btn)
@@ -59,15 +82,50 @@ class ProfilesDialog(QDialog):
         self.setLayout(layout)
 
     def create_left_layout(self):
-        # Replace with your actual left layout setup
+        """Setup the left panel with profiles list"""
         left_layout = QVBoxLayout()
         left_layout.addWidget(GridCardsList(category="profiles"))
         return left_layout
 
     def create_right_layout(self):
-        # Replace with your actual right layout setup
+        """Setup the right panel with profile details"""
         right_layout = QVBoxLayout()
         right_layout.addWidget(QLabel("Right Content"))
         return right_layout
         
+    def browse_profiles_path(self):
+        """Open directory dialog to select profiles folder"""
+        dialog = QFileDialog()
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
         
+        # Start from current profiles path or home directory
+        start_dir = self.profiles_path if os.path.exists(self.profiles_path) else os.path.expanduser("~")
+        
+        selected_dir = dialog.getExistingDirectory(
+            self, 
+            "Select Profiles Directory", 
+            start_dir
+        )
+        
+        # Update path if user selected a directory (not cancelled)
+        if selected_dir:
+            self.profiles_path = selected_dir
+            self.profiles_path_edit.setText(selected_dir)
+
+    def confirm(self):
+        """Save changes and close dialog"""
+        self.accept()
+        
+    def cancel(self):
+        """Close dialog without saving changes"""
+        self.reject()
+    
+    # MARK: Config
+    def load_config(self):
+        """Load configuration from file or set defaults"""
+        self.profiles_path = "./profiles"
+        
+    def save_config(self):
+        """Save current configuration to file"""
+        pass #TODO: implement saving config

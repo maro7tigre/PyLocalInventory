@@ -56,7 +56,7 @@ class ThemedMainWindow(QMainWindow):
 class GreenButton(QPushButton):
     def __init__(self, text=""):
         super().__init__(text)
-        self.setStyleSheet("""
+        self.enabled_style = """
             QPushButton {
                 background-color: #2b2b2b;
                 color: #4CAF50;
@@ -72,12 +72,30 @@ class GreenButton(QPushButton):
             QPushButton:pressed {
                 background-color: #45a049;
             }
-        """)
+        """
+        self.disabled_style = """
+            QPushButton {
+                background-color: #1a1a1a;
+                color: #888888;
+                border: 2px solid #444444;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """
+        self.setStyleSheet(self.enabled_style)
+
+    def set_enable(self, enabled: bool):
+        self.setEnabled(enabled)
+        if enabled:
+            self.setStyleSheet(self.enabled_style)
+        else:
+            self.setStyleSheet(self.disabled_style)
 
 class RedButton(QPushButton):
     def __init__(self, text=""):
         super().__init__(text)
-        self.setStyleSheet("""
+        self.enabled_style = """
             QPushButton {
                 background-color: #2b2b2b;
                 color: #f44336;
@@ -93,12 +111,30 @@ class RedButton(QPushButton):
             QPushButton:pressed {
                 background-color: #da190b;
             }
-        """)
+        """
+        self.disabled_style = """
+            QPushButton {
+                background-color: #1a1a1a;
+                color: #888888;
+                border: 2px solid #444444;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """
+        self.setStyleSheet(self.enabled_style)
+
+    def set_enable(self, enabled: bool):
+        self.setEnabled(enabled)
+        if enabled:
+            self.setStyleSheet(self.enabled_style)
+        else:
+            self.setStyleSheet(self.disabled_style)
 
 class OrangeButton(QPushButton):
     def __init__(self, text=""):
         super().__init__(text)
-        self.setStyleSheet("""
+        self.enabled_style = """
             QPushButton {
                 background-color: #2b2b2b;
                 color: #ff9800;
@@ -114,12 +150,30 @@ class OrangeButton(QPushButton):
             QPushButton:pressed {
                 background-color: #e68900;
             }
-        """)
+        """
+        self.disabled_style = """
+            QPushButton {
+                background-color: #1a1a1a;
+                color: #888888;
+                border: 2px solid #444444;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """
+        self.setStyleSheet(self.enabled_style)
+
+    def set_enable(self, enabled: bool):
+        self.setEnabled(enabled)
+        if enabled:
+            self.setStyleSheet(self.enabled_style)
+        else:
+            self.setStyleSheet(self.disabled_style)
 
 class BlueButton(QPushButton):
     def __init__(self, text=""):
         super().__init__(text)
-        self.setStyleSheet("""
+        self.enabled_style = """
             QPushButton {
                 background-color: #2b2b2b;
                 color: #2196F3;
@@ -135,7 +189,25 @@ class BlueButton(QPushButton):
             QPushButton:pressed {
                 background-color: #0b7dda;
             }
-        """)
+        """
+        self.disabled_style = """
+            QPushButton {
+                background-color: #1a1a1a;
+                color: #888888;
+                border: 2px solid #444444;
+                padding: 8px 16px;
+                border-radius: 4px;
+                font-weight: bold;
+            }
+        """
+        self.setStyleSheet(self.enabled_style)
+
+    def set_enable(self, enabled: bool):
+        self.setEnabled(enabled)
+        if enabled:
+            self.setStyleSheet(self.enabled_style)
+        else:
+            self.setStyleSheet(self.disabled_style)
 
 # MARK: Line Edits
 class ColoredLineEdit(QLineEdit):

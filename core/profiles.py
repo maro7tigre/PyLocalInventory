@@ -40,18 +40,20 @@ class ProfileManager:
         pass
     
     
-class ProfileClass:
+class ProfileClass: 
     def __init__(self, name):
         self.name = name
         self.encrypted_phrase = None  # Placeholder for encrypted validation phrase
         self.config_path = "./config.json"
         self.database_path = "./database.db"
         self.parameters = {
-            "company name": {"value": "", "display name":{"fr": "nom de l'entreprise", "es" : "nombre de la empresa"} ,"required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
-            
+            "company name": {"value": "", "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
+            "address": {"value": "", "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": True, "default": "", "options": [], "type": "string"},
+            "email": {"value": "", "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
+            "phone": {"value": "", "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"}
         }
         self.available_parameters = {
-            "dialog" : ["company name"],
+            "dialog" : ["company name", "address", "email", "phone"],
             "table" : ["company name"]
         }
         

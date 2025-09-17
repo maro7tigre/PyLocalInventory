@@ -207,7 +207,7 @@ class ProfileClass:
         self.database_path = "./database.db"
         self.parameters = {
             "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
-            "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": True, "default": "", "options": [], "type": "string"},
+            "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": False, "default": "", "options": [], "type": "string"},
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
             "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"}
         }

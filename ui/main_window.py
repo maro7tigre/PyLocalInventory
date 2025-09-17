@@ -9,7 +9,6 @@ from PySide6.QtGui import QAction
 from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLineEdit
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
-from ui.dialogs.encryption_dialog import EncryptionDialog
 from ui.tabs.home_tab import HomeTab
 from ui.tabs.operations_tab import OperationsTab
 from ui.tabs.products_tab import ProductsTab

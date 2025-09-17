@@ -9,6 +9,7 @@ import os
 
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
+from core.profiles import ProfileClass, ProfileManager
 
 class ProfilesDialog(QDialog):
     def __init__(self, parent=None):
@@ -18,9 +19,15 @@ class ProfilesDialog(QDialog):
         self.setMinimumSize(800, 500)
         self.load_config()
         
+        self.right_enabled = False
         # Initialize right panel components
         self.image_path = ""
         self.right_components = []  # Store all editable components
+        self.parameter_edits = {}  # Store parameter line edits by key
+        
+        self.profile_manager = ProfileManager()
+        self.empty_profile = self.profile_manager.empty_profile
+        self.current_profile = None
         
         # Apply dark theme
         self.setStyleSheet("""
@@ -103,35 +110,19 @@ class ProfilesDialog(QDialog):
         layout.addLayout(button_layout)
         
         self.setLayout(layout)
+        
+        # Initialize with empty profile
         self.enable_right_layout(False)
+        self.refresh_info()
         
-    def browse_profiles_path(self):
-        """Open directory dialog to select profiles folder"""
-        dialog = QFileDialog()
-        dialog.setFileMode(QFileDialog.Directory)
-        dialog.setOption(QFileDialog.ShowDirsOnly, True)
-        
-        # Start from current profiles path or home directory
-        start_dir = self.profiles_path if os.path.exists(self.profiles_path) else os.path.expanduser("~")
-        
-        selected_dir = dialog.getExistingDirectory(
-            self, 
-            "Select Profiles Directory", 
-            start_dir
-        )
-        
-        # Update path if user selected a directory (not cancelled)
-        if selected_dir:
-            self.profiles_path = selected_dir
-            self.profiles_path_edit.setText(selected_dir)
-
+    # MARK: Left Layout
     def create_left_layout(self):
         """Setup the left panel with profiles list"""
         left_layout = QVBoxLayout()
         left_layout.addWidget(GridCardsList(category="profiles"))
         return left_layout
 
-    #MARK: right layout
+    # MARK: Right Layout
     def create_right_layout(self):
         """Setup the right panel with profile details"""
         right_layout = QVBoxLayout()
@@ -155,8 +146,8 @@ class ProfilesDialog(QDialog):
         
         # Scrollable area
         scroll_area = QScrollArea()
-        scroll_widget = QWidget()
-        scroll_layout = QVBoxLayout()
+        self.scroll_widget = QWidget()
+        self.scroll_layout = QVBoxLayout()
         
         # Image preview
         self.image_label = QLabel("Click to select image")
@@ -170,33 +161,37 @@ class ProfilesDialog(QDialog):
             }
         """)
         self.image_label.mousePressEvent = self.select_image
-        scroll_layout.addWidget(self.image_label)
+        self.scroll_layout.addWidget(self.image_label)
         
         # Name field
-        scroll_layout.addWidget(QLabel("Name:"))
+        self.scroll_layout.addWidget(QLabel("Name:"))
         self.name_edit = QLineEdit()
-        scroll_layout.addWidget(self.name_edit)
+        self.scroll_layout.addWidget(self.name_edit)
         
-        # Dialog parameters (company name, etc.)
-        scroll_layout.addWidget(QLabel("Company Name:"))
-        self.company_name_edit = QLineEdit()
-        scroll_layout.addWidget(self.company_name_edit)
+        # Create parameter fields dynamically
+        self.parameter_edits = {}
+        for param_key in self.empty_profile.available_parameters["dialog"]:
+            display_name = self.empty_profile.get_display_name(param_key, self.language)
+            self.scroll_layout.addWidget(QLabel(f"{display_name}:"))
+            edit = QLineEdit()
+            self.parameter_edits[param_key] = edit
+            self.scroll_layout.addWidget(edit)
         
         # Password fields
-        scroll_layout.addWidget(QLabel("Password:"))
+        self.scroll_layout.addWidget(QLabel("Password:"))
         self.password_edit = QLineEdit()
         self.password_edit.setEchoMode(QLineEdit.Password)
-        scroll_layout.addWidget(self.password_edit)
+        self.scroll_layout.addWidget(self.password_edit)
         
-        scroll_layout.addWidget(QLabel("Confirm Password:"))
+        self.scroll_layout.addWidget(QLabel("Confirm Password:"))
         self.confirm_password_edit = QLineEdit()
         self.confirm_password_edit.setEchoMode(QLineEdit.Password)
-        scroll_layout.addWidget(self.confirm_password_edit)
+        self.scroll_layout.addWidget(self.confirm_password_edit)
         
-        scroll_layout.addStretch()
+        self.scroll_layout.addStretch()
         
-        scroll_widget.setLayout(scroll_layout)
-        scroll_area.setWidget(scroll_widget)
+        self.scroll_widget.setLayout(self.scroll_layout)
+        scroll_area.setWidget(self.scroll_widget)
         scroll_area.setWidgetResizable(True)
         
         right_layout.addWidget(scroll_area)
@@ -206,13 +201,60 @@ class ProfilesDialog(QDialog):
             self.save_btn,
             self.cancel_edit_btn,
             self.name_edit,
-            self.company_name_edit,
             self.password_edit,
             self.confirm_password_edit
         ]
+        self.right_components.extend(self.parameter_edits.values())
         
         return right_layout
     
+    # MARK: Profile Management
+    def refresh_info(self, profile=None):
+        """Update right panel with profile information"""
+        if profile is None:
+            profile = self.empty_profile
+        
+        self.current_profile = profile
+        
+        # Update name
+        self.name_edit.setText(profile.name)
+        
+        # Update image preview
+        if profile.preview_path and os.path.exists(profile.preview_path):
+            pixmap = QPixmap(profile.preview_path)
+            if not pixmap.isNull():
+                scaled_pixmap = pixmap.scaled(
+                    self.image_label.size(),
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation
+                )
+                self.image_label.setPixmap(scaled_pixmap)
+                self.image_label.setText("")
+            self.image_path = profile.preview_path
+        else:
+            self.image_label.clear()
+            self.image_label.setText("Click to select image")
+            self.image_path = ""
+        
+        # Update parameter fields
+        for param_key, edit in self.parameter_edits.items():
+            current_value = profile.get_value(param_key)
+            if current_value is None:
+                default_value = profile.get_parameter_info(param_key, "default")
+                edit.setText(default_value if default_value else "")
+            else:
+                edit.setText(current_value)
+        
+        # Enable/disable password fields based on encrypted_phrase
+        password_enabled = profile.encrypted_phrase is None and self.right_enabled
+        self.password_edit.setEnabled(password_enabled)
+        self.confirm_password_edit.setEnabled(password_enabled)
+        
+        # Clear password fields
+        self.password_edit.setText("")
+        self.confirm_password_edit.setText("")
+    
+    # MARK: UI Interactions
     def select_image(self, event):
         """Open file dialog to select profile image"""
         dialog = QFileDialog()
@@ -244,12 +286,18 @@ class ProfilesDialog(QDialog):
             elif hasattr(component, 'setEnabled'):  # Line edits and other widgets
                 component.setEnabled(enabled)
         
+        # Override password fields regardless of encrypted_phrase state
+        self.password_edit.setEnabled(enabled)
+        self.confirm_password_edit.setEnabled(enabled)
+        
         # Handle image selection separately
         if enabled:
             self.image_label.mousePressEvent = self.select_image
         else:
             self.image_label.mousePressEvent = lambda event: None
+        self.right_enabled = enabled
     
+    # MARK: Profile Actions
     def save_profile(self):
         """Save current profile data"""
         # TODO: Implement profile saving logic
@@ -259,8 +307,27 @@ class ProfilesDialog(QDialog):
         """Cancel current profile editing"""
         # TODO: Implement cancel edit logic
         pass
+        
+    def browse_profiles_path(self):
+        """Open directory dialog to select profiles folder"""
+        dialog = QFileDialog()
+        dialog.setFileMode(QFileDialog.Directory)
+        dialog.setOption(QFileDialog.ShowDirsOnly, True)
+        
+        # Start from current profiles path or home directory
+        start_dir = self.profiles_path if os.path.exists(self.profiles_path) else os.path.expanduser("~")
+        
+        selected_dir = dialog.getExistingDirectory(
+            self, 
+            "Select Profiles Directory", 
+            start_dir
+        )
+        
+        # Update path if user selected a directory (not cancelled)
+        if selected_dir:
+            self.profiles_path = selected_dir
+            self.profiles_path_edit.setText(selected_dir)
 
-    #MARK: events
     def confirm(self):
         """Save changes and close dialog"""
         self.accept()
@@ -273,6 +340,7 @@ class ProfilesDialog(QDialog):
     def load_config(self):
         """Load configuration from file or set defaults"""
         self.profiles_path = "./profiles"
+        self.language = "en"
         
     def save_config(self):
         """Save current configuration to file"""

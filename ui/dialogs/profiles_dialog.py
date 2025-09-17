@@ -29,6 +29,9 @@ class ProfilesDialog(QDialog):
         self.empty_profile = self.profile_manager.empty_profile
         self.current_profile = None
         
+        # Store references to header and footer buttons for disabling
+        self.header_footer_components = []
+        
         # Apply dark theme
         self.setStyleSheet("""
             QDialog {
@@ -73,10 +76,13 @@ class ProfilesDialog(QDialog):
         self.profiles_path_edit.setText(self.profiles_path)
         header_layout.addWidget(self.profiles_path_edit)
 
-        browse_btn = BlueButton("Browse")
-        browse_btn.setFixedSize(100, 30)
-        browse_btn.clicked.connect(self.browse_profiles_path)
-        header_layout.addWidget(browse_btn)
+        self.browse_btn = BlueButton("Browse")
+        self.browse_btn.setFixedSize(100, 30)
+        self.browse_btn.clicked.connect(self.browse_profiles_path)
+        header_layout.addWidget(self.browse_btn)
+        
+        # Store browse button for disabling
+        self.header_footer_components.append(self.browse_btn)
 
         layout.addLayout(header_layout)
 
@@ -84,36 +90,78 @@ class ProfilesDialog(QDialog):
         splitter = QSplitter(Qt.Horizontal)
 
         # Create left and right widgets and set their layouts
-        left_widget = QWidget()
+        self.left_widget = QWidget()
         right_widget = QWidget()
-        left_widget.setLayout(self.create_left_layout())
+        self.left_widget.setLayout(self.create_left_layout())
         right_widget.setLayout(self.create_right_layout())
 
-        splitter.addWidget(left_widget)
+        # Store splitter reference for resize handling
+        self.splitter = splitter
+        splitter.addWidget(self.left_widget)
         splitter.addWidget(right_widget)
         splitter.setSizes([250, 250])  # Initial sizes
+
+        # Create overlay widget for left panel (initially hidden)
+        self.create_overlay()
+
+        # Connect splitter resize to overlay update
+        splitter.splitterMoved.connect(self.update_overlay_size)
 
         layout.addWidget(splitter, stretch=1)
 
         # Confirm and Cancel buttons centered
         button_layout = QHBoxLayout()
-        confirm_btn = GreenButton("Confirm")
-        confirm_btn.clicked.connect(self.confirm)
-        confirm_btn.setFixedSize(150, 30)
-        cancel_btn = RedButton("Cancel")
-        cancel_btn.clicked.connect(self.cancel)
-        cancel_btn.setFixedSize(150, 30)
+        self.confirm_btn = GreenButton("Confirm")
+        self.confirm_btn.clicked.connect(self.confirm)
+        self.confirm_btn.setFixedSize(150, 30)
+        self.cancel_btn = RedButton("Cancel")
+        self.cancel_btn.clicked.connect(self.cancel)
+        self.cancel_btn.setFixedSize(150, 30)
         button_layout.addStretch()
-        button_layout.addWidget(confirm_btn)
-        button_layout.addWidget(cancel_btn)
+        button_layout.addWidget(self.confirm_btn)
+        button_layout.addWidget(self.cancel_btn)
         button_layout.addStretch()
         layout.addLayout(button_layout)
+        
+        # Store footer buttons for disabling
+        self.header_footer_components.extend([self.confirm_btn, self.cancel_btn])
         
         self.setLayout(layout)
         
         # Initialize with empty profile
-        self.enable_right_layout(False)
+        self.enable_right_layout(True)
         self.refresh_info()
+        
+    def create_overlay(self):
+        """Create semi-transparent overlay for left panel"""
+        self.overlay = QWidget(self.left_widget)
+        self.overlay.setStyleSheet("""
+            QWidget {
+                background-color: rgba(0, 0, 0, 120);
+                border-radius: 5px;
+            }
+        """)
+        # Position overlay to cover entire left widget
+        self.overlay.setGeometry(0, 0, self.left_widget.width(), self.left_widget.height())
+        self.overlay.hide()
+        
+        # Make overlay consume all mouse events to prevent clicks
+        self.overlay.setAttribute(Qt.WA_TransparentForMouseEvents, False)
+        
+    def update_overlay_size(self):
+        """Update overlay size to match left widget"""
+        if hasattr(self, 'overlay'):
+            self.overlay.setGeometry(0, 0, self.left_widget.width(), self.left_widget.height())
+        
+    def showEvent(self, event):
+        """Ensure overlay is properly sized when dialog is shown"""
+        super().showEvent(event)
+        self.update_overlay_size()
+        
+    def resizeEvent(self, event):
+        """Update overlay size when dialog is resized"""
+        super().resizeEvent(event)
+        self.update_overlay_size()
         
     # MARK: Left Layout
     def create_left_layout(self):
@@ -280,6 +328,7 @@ class ProfilesDialog(QDialog):
     
     def enable_right_layout(self, enabled):
         """Enable or disable all editable components in right layout"""
+        # Enable/disable right panel components
         for component in self.right_components:
             if hasattr(component, 'set_enable'):  # Themed buttons
                 component.set_enable(enabled)
@@ -295,18 +344,34 @@ class ProfilesDialog(QDialog):
             self.image_label.mousePressEvent = self.select_image
         else:
             self.image_label.mousePressEvent = lambda event: None
+            
+        # Enable/disable header and footer components (opposite of right panel)
+        for component in self.header_footer_components:
+            if hasattr(component, 'set_enable'):  # Themed buttons
+                component.set_enable(not enabled)
+            elif hasattr(component, 'setEnabled'):  # Standard widgets
+                component.setEnabled(not enabled)
+        
+        # Show/hide overlay on left panel
+        if enabled:
+            self.update_overlay_size()
+            self.overlay.show()
+            self.overlay.raise_()  # Bring overlay to front
+        else:
+            self.overlay.hide()
+            
         self.right_enabled = enabled
     
     # MARK: Profile Actions
     def save_profile(self):
         """Save current profile data"""
         # TODO: Implement profile saving logic
-        pass
+        self.enable_right_layout(False)  # Example: disable edit mode after saving
     
     def cancel_edit(self):
         """Cancel current profile editing"""
         # TODO: Implement cancel edit logic
-        pass
+        self.enable_right_layout(False)  # Disable edit mode
         
     def browse_profiles_path(self):
         """Open directory dialog to select profiles folder"""
@@ -344,4 +409,4 @@ class ProfilesDialog(QDialog):
         
     def save_config(self):
         """Save current configuration to file"""
-        pass #TODO: implement saving config
+        pass  # TODO: implement saving config

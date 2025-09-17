@@ -6,6 +6,8 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QFileDialog, QScrol
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 import os
+import time
+import shutil
 
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
@@ -25,6 +27,7 @@ class ProfilesDialog(QDialog):
         
         # Initialize right panel components
         self.image_path = ""
+        self.original_image_path = ""  # Track original image to detect changes
         self.right_components = []  # Store all editable components
         self.parameter_edits = {}  # Store parameter line edits by key
         
@@ -266,21 +269,42 @@ class ProfilesDialog(QDialog):
         
         return right_layout
     
+    def release_image_resources(self):
+        """Release any resources held by the image label to prevent file locking"""
+        try:
+            # Clear the pixmap to release file handles
+            self.image_label.clear()
+            self.image_label.setText("Click to select image")
+            # Force garbage collection of any lingering QPixmap objects
+            import gc
+            gc.collect()
+            # Small delay to ensure file handles are released on Windows
+            time.sleep(0.05)
+        except Exception as e:
+            print(f"Warning: Could not fully release image resources: {e}")
+    
     # MARK: Profile Management
     def refresh_info(self, profile=None):
         """Update right panel with profile information"""
         if profile is None:
             profile = self.empty_profile
         
+        # Release any existing image resources first
+        self.release_image_resources()
+        
         self.current_profile = profile
         
         # Update name
         self.name_edit.setText(profile.name)
         
-        # Update image preview
+        # Update image preview and track original path
         if profile.preview_path and os.path.exists(profile.preview_path):
-            pixmap = QPixmap(profile.preview_path)
-            if not pixmap.isNull():
+            # Load image from file data instead of file path to avoid locking
+            with open(profile.preview_path, 'rb') as f:
+                image_data = f.read()
+            
+            pixmap = QPixmap()
+            if pixmap.loadFromData(image_data):
                 scaled_pixmap = pixmap.scaled(
                     self.image_label.size(),
                     Qt.KeepAspectRatio,
@@ -288,11 +312,15 @@ class ProfilesDialog(QDialog):
                 )
                 self.image_label.setPixmap(scaled_pixmap)
                 self.image_label.setText("")
+            
+            # Track the original image path
             self.image_path = profile.preview_path
+            self.original_image_path = profile.preview_path
         else:
             self.image_label.clear()
             self.image_label.setText("Click to select image")
             self.image_path = ""
+            self.original_image_path = ""
         
         # Update parameter fields
         for param_key, edit in self.parameter_edits.items():
@@ -333,17 +361,27 @@ class ProfilesDialog(QDialog):
         )
         
         if image_path:
+            # Release current image resources before loading new one
+            self.release_image_resources()
+            
             self.image_path = image_path
-            # Load and display the image
-            pixmap = QPixmap(image_path)
-            if not pixmap.isNull():
-                scaled_pixmap = pixmap.scaled(
-                    self.image_label.size(),
-                    Qt.KeepAspectRatio,
-                    Qt.SmoothTransformation
-                )
-                self.image_label.setPixmap(scaled_pixmap)
-                self.image_label.setText("")
+            
+            # Load image from file data to avoid locking
+            try:
+                with open(image_path, 'rb') as f:
+                    image_data = f.read()
+                
+                pixmap = QPixmap()
+                if pixmap.loadFromData(image_data):
+                    scaled_pixmap = pixmap.scaled(
+                        self.image_label.size(),
+                        Qt.KeepAspectRatio,
+                        Qt.SmoothTransformation
+                    )
+                    self.image_label.setPixmap(scaled_pixmap)
+                    self.image_label.setText("")
+            except Exception as e:
+                QMessageBox.warning(self, "Error", f"Could not load image: {e}")
     
     def enable_right_layout(self, enabled):
         """Enable or disable all editable components in right layout"""
@@ -377,6 +415,41 @@ class ProfilesDialog(QDialog):
             
         self.right_enabled = enabled
     
+    def safe_copy_image(self, source_path, dest_path):
+        """Safely copy image file, handling self-copy and file locking"""
+        try:
+            # Normalize paths for comparison
+            source_abs = os.path.abspath(source_path)
+            dest_abs = os.path.abspath(dest_path)
+            
+            # Check if trying to copy file onto itself
+            if source_abs == dest_abs:
+                print(f"Skipping self-copy: {source_path} -> {dest_path}")
+                return True
+            
+            # Release any image resources that might lock the file
+            self.release_image_resources()
+            
+            # Ensure destination directory exists
+            os.makedirs(os.path.dirname(dest_path), exist_ok=True)
+            
+            # Copy with retries for Windows file locking
+            max_retries = 3
+            for attempt in range(max_retries):
+                try:
+                    shutil.copy2(source_path, dest_path)
+                    return True
+                except (OSError, IOError) as e:
+                    if attempt < max_retries - 1:
+                        time.sleep(0.2)  # Wait before retry
+                        continue
+                    else:
+                        raise e
+                        
+        except Exception as e:
+            print(f"Error copying image {source_path} -> {dest_path}: {e}")
+            return False
+    
     # MARK: Profile Actions
     def save_profile(self):
         """Save current profile data"""
@@ -405,10 +478,25 @@ class ProfilesDialog(QDialog):
             for param_key, edit in self.parameter_edits.items():
                 profile_data[param_key] = edit.text().strip()
             
+            # Handle image copying based on edit mode
+            image_to_use = None
+            if self.image_path:
+                # For edit mode, check if image changed
+                if self.edit_mode == 'edit':
+                    if self.image_path != self.original_image_path:
+                        # Image was changed, use new path
+                        image_to_use = self.image_path
+                    # If image_path == original_image_path, don't copy (prevents self-copy)
+                else:
+                    # For new/duplicate, always use selected image
+                    image_to_use = self.image_path
+            
             # Handle different save modes
             if self.edit_mode == 'new':
-                profile = self.profile_manager.create_profile(profile_data, self.image_path)
+                profile = self.profile_manager.create_profile(profile_data, image_to_use)
+                
                 # Set password and encrypted phrase
+                time.sleep(0.1)
                 from core.password import PasswordManager
                 password_manager = PasswordManager(self.profile_manager)
                 profile.encrypted_phrase = password_manager.encrypt_data(
@@ -416,14 +504,16 @@ class ProfilesDialog(QDialog):
                 profile.save_to_config()
                 
             elif self.edit_mode == 'duplicate':
-                profile = self.profile_manager.create_profile(profile_data, self.image_path)
+                profile = self.profile_manager.create_profile(profile_data, image_to_use)
+                
                 # Copy password from source if available
+                time.sleep(0.1)
                 if self.current_profile and self.current_profile.encrypted_phrase:
                     profile.encrypted_phrase = self.current_profile.encrypted_phrase
                     profile.save_to_config()
                 
             elif self.edit_mode == 'edit':
-                self.profile_manager.update_profile(self.current_profile.name, profile_data, self.image_path)
+                self.profile_manager.update_profile(self.current_profile.name, profile_data, image_to_use)
                 
             # Refresh the profiles list
             self.refresh_profiles_list()
@@ -438,6 +528,9 @@ class ProfilesDialog(QDialog):
         """Cancel current profile editing"""
         self.enable_right_layout(False)
         self.edit_mode = None
+        # Reset image paths
+        self.image_path = ""
+        self.original_image_path = ""
         self.refresh_info()
         
     def browse_profiles_path(self):
@@ -477,6 +570,8 @@ class ProfilesDialog(QDialog):
     def on_add_card_pressed(self):
         """Handle add card press"""
         self.edit_mode = 'new'
+        self.image_path = ""
+        self.original_image_path = ""
         self.refresh_info(self.empty_profile)
         self.enable_right_layout(True)
     

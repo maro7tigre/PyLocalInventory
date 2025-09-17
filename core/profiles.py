@@ -4,6 +4,7 @@ Profile management module for handling profiles.
 import os
 import json
 import shutil
+import time
 
 class ProfileManager:
     def __init__(self):
@@ -252,43 +253,91 @@ class ProfileClass:
         if not os.path.exists(self.config_path):
             return
         
-        try:
-            with open(self.config_path, 'r', encoding='utf-8') as f:
-                data = json.load(f)
-            
-            # Load parameter values
-            for key in self.parameters:
-                if key in data:
-                    self.parameters[key]["value"] = data[key]
-            
-            # Load encrypted phrase if exists
-            if "encrypted_phrase" in data:
-                self.encrypted_phrase = bytes.fromhex(data["encrypted_phrase"])
+        max_retries = 3
+        retry_delay = 0.1
         
-        except Exception as e:
-            print(f"Failed to load config for profile {self.name}: {e}")
+        for attempt in range(max_retries):
+            try:
+                with open(self.config_path, 'r', encoding='utf-8') as f:
+                    data = json.load(f)
+                
+                # Load parameter values
+                for key in self.parameters:
+                    if key in data:
+                        self.parameters[key]["value"] = data[key]
+                
+                # Load encrypted phrase if exists
+                if "encrypted_phrase" in data:
+                    self.encrypted_phrase = bytes.fromhex(data["encrypted_phrase"])
+                
+                return  # Success, exit retry loop
+                
+            except (OSError, IOError) as e:
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"Failed to load config for profile {self.name} after {max_retries} attempts: {e}")
+            except Exception as e:
+                print(f"Failed to load config for profile {self.name}: {e}")
+                break
     
     def save_to_config(self):
         """Save profile data to JSON config file"""
-        try:
-            data = {}
-            
-            # Save parameter values
-            for key, param in self.parameters.items():
-                if param["value"] is not None:
-                    data[key] = param["value"]
-            
-            # Save encrypted phrase if exists
-            if self.encrypted_phrase:
-                data["encrypted_phrase"] = self.encrypted_phrase.hex()
-            
-            # Ensure directory exists
-            os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
-            
-            # Write to file
-            with open(self.config_path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, ensure_ascii=False)
+        max_retries = 3
+        retry_delay = 0.1
         
-        except Exception as e:
-            print(f"Failed to save config for profile {self.name}: {e}")
-            raise e
+        for attempt in range(max_retries):
+            try:
+                data = {}
+                
+                # Save parameter values
+                for key, param in self.parameters.items():
+                    if param["value"] is not None:
+                        data[key] = param["value"]
+                
+                # Save encrypted phrase if exists
+                if self.encrypted_phrase:
+                    data["encrypted_phrase"] = self.encrypted_phrase.hex()
+                
+                # Ensure directory exists
+                os.makedirs(os.path.dirname(self.config_path), exist_ok=True)
+                
+                # Write to temporary file first, then rename for atomic operation
+                temp_path = self.config_path + '.tmp'
+                with open(temp_path, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, ensure_ascii=False)
+                
+                # Atomic rename to replace the original file
+                if os.name == 'nt':  # Windows
+                    if os.path.exists(self.config_path):
+                        os.remove(self.config_path)
+                    os.rename(temp_path, self.config_path)
+                else:  # Unix-like systems
+                    os.rename(temp_path, self.config_path)
+                
+                return  # Success, exit retry loop
+                
+            except (OSError, IOError) as e:
+                # Clean up temp file if it exists
+                if os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                
+                if attempt < max_retries - 1:
+                    time.sleep(retry_delay)
+                    continue
+                else:
+                    print(f"Failed to save config for profile {self.name} after {max_retries} attempts: {e}")
+                    raise e
+            except Exception as e:
+                # Clean up temp file if it exists
+                if 'temp_path' in locals() and os.path.exists(temp_path):
+                    try:
+                        os.remove(temp_path)
+                    except:
+                        pass
+                print(f"Failed to save config for profile {self.name}: {e}")
+                raise e

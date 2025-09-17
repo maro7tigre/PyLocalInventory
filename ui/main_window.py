@@ -104,11 +104,8 @@ class MainWindow(ThemedMainWindow):
     
     def refresh_app(self): 
         """Reset and rebuild main widget based on current state"""
-        # Clear existing layout
-        for i in reversed(range(self.main_layout.count())):
-            child = self.main_layout.itemAt(i).widget()
-            if child:
-                child.setParent(None)
+        # Clear existing layout properly
+        self.clear_layout(self.main_layout)
         
         # Set profiles path in profile manager
         self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
@@ -119,6 +116,16 @@ class MainWindow(ThemedMainWindow):
             self.setup_password_entry()
         else:
             self.setup_main_tabs()
+    
+    def clear_layout(self, layout):
+        """Properly clear all items from a layout"""
+        while layout.count():
+            child = layout.takeAt(0)  # Take the item instead of just getting it
+            if child.widget():
+                child.widget().deleteLater()  # Schedule widget for deletion
+            elif child.layout():
+                self.clear_layout(child.layout())  # Recursively clear nested layouts
+                child.layout().deleteLater()  # Delete the layout too
     
     def setup_profile_selection(self):
         """Show profile selection interface"""

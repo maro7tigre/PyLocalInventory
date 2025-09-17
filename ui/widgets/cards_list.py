@@ -13,6 +13,7 @@ class BaseCardsList(QWidget):
         self.card_type = card_type
         self.add_available = add_available
         self.category = category
+        self.parent_dialog = parent  # Store reference to parent dialog
         self.cards = {}  # Dictionary to store cards by ID
         self.selected_card = None  # Currently selected card ID
         self.add_card = None  # Reference to add card if enabled
@@ -26,15 +27,34 @@ class BaseCardsList(QWidget):
         pass
     
     def load_cards(self):
-        """Load available cards - override this method in subclasses"""
-        #TODO: remove existing cards before loading new ones
-        # Example implementation - replace with actual data loading
+        """Load available cards - load from parent's profile manager"""
+        # Clear existing cards
+        for card in list(self.cards.values()):
+            self.remove_card_from_layout(card)
+            card.deleteLater()
+        self.cards.clear()
+        
+        if self.add_card:
+            self.remove_card_from_layout(self.add_card)
+            self.add_card.deleteLater()
+            self.add_card = None
+        
+        # Create add card if enabled
         if self.add_available:
             self.create_add_card()
         
-        # TODO: Replace with actual card data loading
-        for i in range(5):
-            self.create_card(f"Card {i+1}")
+        # Load actual profile data if we have a profiles dialog parent
+        if hasattr(self.parent_dialog, 'profile_manager') and self.category == "profiles":
+            for profile_name, profile in self.parent_dialog.profile_manager.available_profiles.items():
+                self.create_card(
+                    label_text=profile_name,
+                    card_id=profile_name,
+                    preview_path=profile.preview_path if hasattr(profile, 'preview_path') else None
+                )
+        else:
+            # Fallback to example data for other categories
+            for i in range(5):
+                self.create_card(f"Item {i+1}")
     
     def create_add_card(self):
         """Create the special 'add' card"""
@@ -49,7 +69,8 @@ class BaseCardsList(QWidget):
         
         card = self.card_type(label_text, parent=self, category=self.category)
         card.id = card_id
-        card.set_preview_path(preview_path)
+        if preview_path:
+            card.set_preview_path(preview_path)
         
         self.cards[card_id] = card
         self.add_card_to_layout(card)
@@ -85,26 +106,35 @@ class BaseCardsList(QWidget):
         if card_id and card_id in self.cards:
             self.cards[card_id].set_selected(True)
     
-    # Events to override in subclasses
+    # Events to delegate to parent dialog
     def on_add_card_pressed(self):
-        """Handle add card press - override in subclasses"""
-        pass
+        """Handle add card press - delegate to parent"""
+        if hasattr(self.parent_dialog, 'on_add_card_pressed'):
+            self.parent_dialog.on_add_card_pressed()
     
     def on_card_pressed(self, card_id):
-        """Handle regular card press"""
+        """Handle regular card press - delegate to parent"""
         self.select_card(card_id)
+        if hasattr(self.parent_dialog, 'on_card_pressed'):
+            self.parent_dialog.on_card_pressed(card_id)
     
     def on_card_edit(self, card_id):
-        """Handle card edit - override in subclasses"""
-        pass
+        """Handle card edit - delegate to parent"""
+        if hasattr(self.parent_dialog, 'on_card_edit'):
+            self.parent_dialog.on_card_edit(card_id)
     
     def on_card_duplicate(self, card_id):
-        """Handle card duplicate - override in subclasses"""
-        pass
+        """Handle card duplicate - delegate to parent"""
+        if hasattr(self.parent_dialog, 'on_card_duplicate'):
+            self.parent_dialog.on_card_duplicate(card_id)
     
     def on_card_delete(self, card_id):
-        """Handle card delete - override in subclasses"""
-        self.remove_card(card_id)
+        """Handle card delete - delegate to parent"""
+        if hasattr(self.parent_dialog, 'on_card_delete'):
+            self.parent_dialog.on_card_delete(card_id)
+        else:
+            # Fallback behavior
+            self.remove_card(card_id)
 
 
 class _HorizontalCardsList(BaseCardsList):
@@ -234,7 +264,7 @@ class HorizontalCardsList(QScrollArea):
     
     def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
-        self.cards_list = _HorizontalCardsList(category, card_type, add_available, self)
+        self.cards_list = _HorizontalCardsList(category, card_type, add_available, parent)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
@@ -251,7 +281,7 @@ class VerticalCardsList(QScrollArea):
     
     def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
-        self.cards_list = _VerticalCardsList(category, card_type, add_available, self)
+        self.cards_list = _VerticalCardsList(category, card_type, add_available, parent)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
@@ -268,7 +298,7 @@ class GridCardsList(QScrollArea):
     
     def __init__(self, category = None, card_type=SquareCard, add_available=True, card_size=120, min_spacing=10, parent=None):
         super().__init__(parent)
-        self.cards_list = _GridCardsList(category, card_type, add_available, card_size, min_spacing, self)
+        self.cards_list = _GridCardsList(category, card_type, add_available, card_size, min_spacing, parent)
         
         self.setWidget(self.cards_list)
         self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)

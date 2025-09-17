@@ -2,7 +2,7 @@
 Profile management dialog - create, delete, and switch between user profiles
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QFileDialog, QScrollArea,
-                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton)
+                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton, QMessageBox)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 import os
@@ -17,15 +17,24 @@ class ProfilesDialog(QDialog):
         self.setWindowTitle("Profiles Manager")
         self.setModal(True)
         self.setMinimumSize(800, 500)
-        self.load_config()
+        self.load_config(parent)
         
         self.right_enabled = False
+        self.is_editing_existing = False
+        self.edit_mode = None  # None, 'new', 'edit', 'duplicate'
+        
         # Initialize right panel components
         self.image_path = ""
         self.right_components = []  # Store all editable components
         self.parameter_edits = {}  # Store parameter line edits by key
         
-        self.profile_manager = ProfileManager()
+        # Use parent's profile manager or create new one
+        if hasattr(parent, 'profile_manager'):
+            self.profile_manager = parent.profile_manager
+        else:
+            self.profile_manager = ProfileManager()
+        
+        self.profile_manager.profiles_path = self.profiles_path
         self.empty_profile = self.profile_manager.empty_profile
         self.current_profile = None
         
@@ -129,7 +138,7 @@ class ProfilesDialog(QDialog):
         self.setLayout(layout)
         
         # Initialize with empty profile
-        self.enable_right_layout(True)
+        self.enable_right_layout(False)
         self.refresh_info()
         
     def create_overlay(self):
@@ -167,7 +176,8 @@ class ProfilesDialog(QDialog):
     def create_left_layout(self):
         """Setup the left panel with profiles list"""
         left_layout = QVBoxLayout()
-        left_layout.addWidget(GridCardsList(category="profiles"))
+        self.cards_list = GridCardsList(category="profiles", parent=self)
+        left_layout.addWidget(self.cards_list)
         return left_layout
 
     # MARK: Right Layout
@@ -302,9 +312,18 @@ class ProfilesDialog(QDialog):
         self.password_edit.setText("")
         self.confirm_password_edit.setText("")
     
+    def refresh_profiles_list(self):
+        """Reload profiles from filesystem and update cards list"""
+        self.profile_manager.load_profiles()
+        # Clear existing cards and reload
+        self.cards_list.load_cards()
+    
     # MARK: UI Interactions
     def select_image(self, event):
         """Open file dialog to select profile image"""
+        if not self.right_enabled:
+            return
+            
         dialog = QFileDialog()
         image_path, _ = dialog.getOpenFileName(
             self,
@@ -335,10 +354,6 @@ class ProfilesDialog(QDialog):
             elif hasattr(component, 'setEnabled'):  # Line edits and other widgets
                 component.setEnabled(enabled)
         
-        # Override password fields regardless of encrypted_phrase state
-        self.password_edit.setEnabled(enabled)
-        self.confirm_password_edit.setEnabled(enabled)
-        
         # Handle image selection separately
         if enabled:
             self.image_label.mousePressEvent = self.select_image
@@ -365,13 +380,65 @@ class ProfilesDialog(QDialog):
     # MARK: Profile Actions
     def save_profile(self):
         """Save current profile data"""
-        # TODO: Implement profile saving logic
-        self.enable_right_layout(False)  # Example: disable edit mode after saving
+        try:
+            # Validate required fields
+            name = self.name_edit.text().strip()
+            if not name:
+                QMessageBox.warning(self, "Error", "Profile name is required.")
+                return
+            
+            # Check password fields if creating new profile
+            if self.edit_mode in ['new', 'duplicate']:
+                password = self.password_edit.text()
+                confirm_password = self.confirm_password_edit.text()
+                
+                if not password:
+                    QMessageBox.warning(self, "Error", "Password is required for new profiles.")
+                    return
+                
+                if password != confirm_password:
+                    QMessageBox.warning(self, "Error", "Passwords do not match.")
+                    return
+            
+            # Collect profile data
+            profile_data = {'name': name}
+            for param_key, edit in self.parameter_edits.items():
+                profile_data[param_key] = edit.text().strip()
+            
+            # Handle different save modes
+            if self.edit_mode == 'new':
+                profile = self.profile_manager.create_profile(profile_data, self.image_path)
+                # Set password and encrypted phrase
+                from core.password import PasswordManager
+                password_manager = PasswordManager(self.profile_manager)
+                profile.encrypted_phrase = password_manager.encrypt_data(
+                    password_manager.validation_phrase, password)
+                profile.save_to_config()
+                
+            elif self.edit_mode == 'duplicate':
+                profile = self.profile_manager.create_profile(profile_data, self.image_path)
+                # Copy password from source if available
+                if self.current_profile and self.current_profile.encrypted_phrase:
+                    profile.encrypted_phrase = self.current_profile.encrypted_phrase
+                    profile.save_to_config()
+                
+            elif self.edit_mode == 'edit':
+                self.profile_manager.update_profile(self.current_profile.name, profile_data, self.image_path)
+                
+            # Refresh the profiles list
+            self.refresh_profiles_list()
+            self.enable_right_layout(False)
+            
+            QMessageBox.information(self, "Success", "Profile saved successfully.")
+            
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save profile: {str(e)}")
     
     def cancel_edit(self):
         """Cancel current profile editing"""
-        # TODO: Implement cancel edit logic
-        self.enable_right_layout(False)  # Disable edit mode
+        self.enable_right_layout(False)
+        self.edit_mode = None
+        self.refresh_info()
         
     def browse_profiles_path(self):
         """Open directory dialog to select profiles folder"""
@@ -392,21 +459,86 @@ class ProfilesDialog(QDialog):
         if selected_dir:
             self.profiles_path = selected_dir
             self.profiles_path_edit.setText(selected_dir)
+            self.profile_manager.profiles_path = selected_dir
+            self.refresh_profiles_list()
 
     def confirm(self):
         """Save changes and close dialog"""
-        self.accept()
+        if self.profile_manager.selected_profile:
+            self.accept()
+        else:
+            QMessageBox.warning(self, "Warning", "Please select a profile or create a new one.")
         
     def cancel(self):
         """Close dialog without saving changes"""
         self.reject()
     
+    # MARK: Cards List Events
+    def on_add_card_pressed(self):
+        """Handle add card press"""
+        self.edit_mode = 'new'
+        self.refresh_info(self.empty_profile)
+        self.enable_right_layout(True)
+    
+    def on_card_pressed(self, card_id):
+        """Handle regular card press"""
+        if card_id in self.profile_manager.available_profiles:
+            profile = self.profile_manager.available_profiles[card_id]
+            self.profile_manager.selected_profile = profile
+            self.refresh_info(profile)
+    
+    def on_card_edit(self, card_id):
+        """Handle card edit"""
+        if card_id in self.profile_manager.available_profiles:
+            profile = self.profile_manager.available_profiles[card_id]
+            self.edit_mode = 'edit'
+            self.refresh_info(profile)
+            self.enable_right_layout(True)
+    
+    def on_card_duplicate(self, card_id):
+        """Handle card duplicate"""
+        if card_id in self.profile_manager.available_profiles:
+            source_profile = self.profile_manager.available_profiles[card_id]
+            self.edit_mode = 'duplicate'
+            
+            # Create a copy with modified name
+            duplicate_profile = ProfileClass(f"{source_profile.name}_copy")
+            for key, param in source_profile.parameters.items():
+                duplicate_profile.parameters[key]["value"] = param["value"]
+            duplicate_profile.preview_path = source_profile.preview_path
+            
+            self.refresh_info(duplicate_profile)
+            self.enable_right_layout(True)
+    
+    def on_card_delete(self, card_id):
+        """Handle card delete"""
+        if card_id in self.profile_manager.available_profiles:
+            profile_name = self.profile_manager.available_profiles[card_id].name
+            
+            reply = QMessageBox.question(
+                self, "Delete Profile", 
+                f"Are you sure you want to delete profile '{profile_name}'?\nThis action cannot be undone.",
+                QMessageBox.Yes | QMessageBox.No,
+                QMessageBox.No
+            )
+            
+            if reply == QMessageBox.Yes:
+                try:
+                    self.profile_manager.delete_profile(card_id)
+                    self.refresh_profiles_list()
+                    QMessageBox.information(self, "Success", "Profile deleted successfully.")
+                except Exception as e:
+                    QMessageBox.critical(self, "Error", f"Failed to delete profile: {str(e)}")
+    
     # MARK: Config
-    def load_config(self):
-        """Load configuration from file or set defaults"""
-        self.profiles_path = "./profiles"
+    def load_config(self, parent):
+        """Load configuration from parent or set defaults"""
+        if hasattr(parent, 'profiles_path'):
+            self.profiles_path = parent.profiles_path
+        else:
+            self.profiles_path = "./profiles"
         self.language = "en"
         
     def save_config(self):
         """Save current configuration to file"""
-        pass  # TODO: implement saving config
+        pass  # Configuration is handled by parent main window

@@ -3,7 +3,7 @@ Main window class - coordinates all UI components and handles window layout
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction
 
 from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLineEdit
@@ -18,6 +18,7 @@ from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.log_tab import LogTab
 from core.profiles import ProfileManager
 from core.password import PasswordManager
+from core.database import Database
 
 class MainWindow(ThemedMainWindow):
     def __init__(self):
@@ -25,15 +26,56 @@ class MainWindow(ThemedMainWindow):
         self.setWindowTitle("PyLocalInventory")
         self.setMinimumSize(1000, 700)
         
+        # Load application settings
+        self.settings = QSettings("PyLocalInventory", "MainApp")
+        self.load_app_config()
+        
         # Core managers
-        self.profile = ProfileManager()
-        self.password = PasswordManager(self.profile)
+        self.profile_manager = ProfileManager()
+        self.password_manager = PasswordManager(self.profile_manager)
+        
+        # Database sections configuration
+        self.sections_dictionary = {
+            "Inventory": ["ID", "Company", "Role", "Product", "Price_HT", "Price_TTC", "Quantity", "Icon"],
+            "Clients": ["ID", "Name", "Email", "Phone", "Address"],
+            "Orders": ["ID", "Client_ID", "Product_ID", "Quantity", "Total_Price", "Date"],
+            "Products": ["ID", "Name", "Unit_Price", "Sale_Price"],
+            "Suppliers": ["ID", "Name", "Email", "Phone", "Address"]
+        }
+        
+        # Database manager
+        self.database = Database(self.profile_manager, self.sections_dictionary)
 
         
         # UI setup
         self.setup_menu()
         self.setup_main_widget()
         self.refresh_app()
+    
+    def load_app_config(self):
+        """Load application configuration from QSettings"""
+        # Restore window geometry
+        geometry = self.settings.value("geometry")
+        if geometry:
+            self.restoreGeometry(geometry)
+        
+        # Load profiles path (default to ./profiles)
+        profiles_path = self.settings.value("profiles_path", "./profiles")
+        # Store for use by ProfileManager
+        self.profiles_path = profiles_path
+    
+    def save_app_config(self):
+        """Save application configuration to QSettings"""
+        # Save window geometry
+        self.settings.setValue("geometry", self.saveGeometry())
+        
+        # Save profiles path
+        self.settings.setValue("profiles_path", getattr(self, 'profiles_path', './profiles'))
+    
+    def closeEvent(self, event):
+        """Handle application close event"""
+        self.save_app_config()
+        event.accept()
     
     def setup_menu(self):
         """Create menu bar with main navigation options"""
@@ -56,21 +98,24 @@ class MainWindow(ThemedMainWindow):
     
     def setup_main_widget(self):
         """Initialize main widget container"""
-        self.main_widget = QWidget() #TODO: figure out how to clean before adding to
+        self.main_widget = QWidget()
         self.setCentralWidget(self.main_widget)
         self.main_layout = QVBoxLayout(self.main_widget)
     
     def refresh_app(self): 
         """Reset and rebuild main widget based on current state"""
-        # Clear existing layout #TODO: is this actually the right way to  do it ???
+        # Clear existing layout
         for i in reversed(range(self.main_layout.count())):
             child = self.main_layout.itemAt(i).widget()
             if child:
                 child.setParent(None)
         
-        if not self.profile.validate():
+        # Set profiles path in profile manager
+        self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
+        
+        if not self.profile_manager.validate():
             self.setup_profile_selection()
-        elif not self.password.validate():
+        elif not self.password_manager.validate():
             self.setup_password_entry()
         else:
             self.setup_main_tabs()
@@ -123,28 +168,28 @@ class MainWindow(ThemedMainWindow):
     
     def setup_main_tabs(self):
         """Show main application tabs"""
+        # Refresh database connection for current profile
+        self.database.refresh_connection()
+        
         tab_widget = QTabWidget()
         
         # Add tabs
         tab_widget.addTab(HomeTab(), "Home")
         tab_widget.addTab(OperationsTab(), "Operations")
-        tab_widget.addTab(ProductsTab(), "Inventory")
-        tab_widget.addTab(ClientsTab(), "Clients")
-        tab_widget.addTab(SuppliersTab(), "Suppliers")
+        tab_widget.addTab(ProductsTab(self.database), "Inventory")
+        tab_widget.addTab(ClientsTab(self.database), "Clients")
+        tab_widget.addTab(SuppliersTab(self.database), "Suppliers")
         tab_widget.addTab(LogTab(), "Log")
         
         self.main_layout.addWidget(tab_widget)
         
-        
-        
-    
     def validate_password(self):
         """Validate entered password"""
         password = self.password_input.text()
-        if not self.password.validate(password):
+        if not self.password_manager.validate(password):
             self.password_input.set_border_color("#f44336")  # Red border for incorrect password
         else:
-            self.password.set_password(password)
+            self.password_manager.set_password(password)
             self.refresh_app()
             
     def reset_password_border(self):
@@ -154,7 +199,10 @@ class MainWindow(ThemedMainWindow):
     def open_profiles_dialog(self):
         """Open profiles management dialog"""
         dialog = ProfilesDialog(self)
-        dialog.exec()
+        if dialog.exec():
+            # Profile may have changed, refresh the main window
+            self.profiles_path = dialog.profiles_path  # Update profiles path if changed
+            self.refresh_app()
     
     def open_backups_dialog(self):
         """Open backups management dialog"""
@@ -163,7 +211,6 @@ class MainWindow(ThemedMainWindow):
     
     def logout(self):
         """Log out current user"""
-        self.password.logout()
-        self.profile.logout()
-        
+        self.password_manager.logout()
+        self.profile_manager.logout()
         self.refresh_app()

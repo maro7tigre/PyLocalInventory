@@ -5,19 +5,40 @@ from cryptography.fernet import Fernet
 import base64
 
 
-
 class PasswordManager:
-    def __init__(self, profile=None):
-        self.profile = profile
+    def __init__(self, profile_manager=None):
+        self.profile_manager = profile_manager
         self.valid = False
         self._current_password = None
-        self.validation_phrase = "Welocome to PyLocalInventory"
+        self.validation_phrase = "Welcome to PyLocalInventory"
     
-    def validate(self, password = None):
+    def validate(self, password=None):
         """Validate provided password and return True/False"""
-        if self.profile.validate():
-            return self.decrypt_data(self.profile.selected_profile.encrypted_phrase, password) == self.validation_phrase
-        return False
+        if not self.profile_manager or not self.profile_manager.selected_profile:
+            return False
+            
+        selected_profile = self.profile_manager.selected_profile
+        
+        # If profile has no encrypted phrase, it doesn't need a password yet
+        if not selected_profile.encrypted_phrase:
+            return False
+        
+        # If no password provided, check if we have a current password
+        if password is None:
+            password = self._current_password
+        
+        if not password:
+            return False
+        
+        try:
+            decrypted = self.decrypt_data(selected_profile.encrypted_phrase, password)
+            is_valid = decrypted == self.validation_phrase
+            if is_valid:
+                self.valid = True
+                self._current_password = password
+            return is_valid
+        except:
+            return False
     
     def logout(self):
         """Clear current session and reset authentication state"""
@@ -25,12 +46,24 @@ class PasswordManager:
         self._current_password = None
     
     def set_password(self, password):
-        """Set new password for current profile"""
+        """Set new password for current session"""
         self._current_password = password
+        self.valid = True
     
     def change_password(self, old_password, new_password):
         """Change existing password"""
-        pass
+        if not self.validate(old_password):
+            return False
+        
+        if self.profile_manager and self.profile_manager.selected_profile:
+            # Encrypt validation phrase with new password
+            self.profile_manager.selected_profile.encrypted_phrase = self.encrypt_data(
+                self.validation_phrase, new_password)
+            self.profile_manager.selected_profile.save_to_config()
+            self._current_password = new_password
+            return True
+        
+        return False
     
     def _get_key(self, password):
         """Generate Fernet key from password"""
@@ -45,6 +78,9 @@ class PasswordManager:
         if password is None:
             password = self._current_password
         
+        if not password:
+            raise ValueError("No password available for encryption")
+        
         key = self._get_key(password)
         fernet = Fernet(key)
         
@@ -57,6 +93,9 @@ class PasswordManager:
         """Decrypt data using password-derived key"""
         if password is None:
             password = self._current_password
+        
+        if not password:
+            raise ValueError("No password available for decryption")
         
         key = self._get_key(password)
         fernet = Fernet(key)

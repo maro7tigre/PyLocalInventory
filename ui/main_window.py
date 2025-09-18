@@ -10,7 +10,8 @@ from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLine
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.tabs.home_tab import HomeTab
-from ui.tabs.operations_tab import OperationsTab
+from ui.tabs.sales_tab import SalesTab
+from ui.tabs.imports_tab import ImportsTab
 from ui.tabs.products_tab import ProductsTab
 from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
@@ -36,10 +37,11 @@ class MainWindow(ThemedMainWindow):
         # Database sections configuration
         self.sections_dictionary = {
             "Inventory": ["ID", "Company", "Role", "Product", "Price_HT", "Price_TTC", "Quantity", "Icon"],
-            "Clients": ["ID", "Name", "Email", "Phone", "Address"],
-            "Orders": ["ID", "Client_ID", "Product_ID", "Quantity", "Total_Price", "Date"],
-            "Products": ["ID", "Name", "Unit_Price", "Sale_Price"],
-            "Suppliers": ["ID", "Name", "Email", "Phone", "Address"]
+            "Clients": ["ID", "name", "display_name", "client_type", "address", "email", "phone", "notes", "preview_image"],
+            "Products": ["ID", "name", "unit_price", "sale_price"],
+            "Suppliers": ["ID", "name", "display_name", "address", "email", "phone", "notes", "preview_image"],
+            "Imports": ["ID", "supplier_id", "product_id", "quantity", "unit_price", "tva", "total_price", "date", "notes"],
+            "Sales": ["ID", "client_id", "product_id", "quantity", "unit_price", "tva", "total_price", "date", "notes"]
         }
         
         # Database manager
@@ -173,21 +175,25 @@ class MainWindow(ThemedMainWindow):
         self.main_layout.addStretch()
     
     def setup_main_tabs(self):
-        """Show main application tabs"""
-        # Refresh database connection for current profile
-        self.database.refresh_connection()
-        
-        tab_widget = QTabWidget()
-        
-        # Add tabs
-        tab_widget.addTab(HomeTab(), "Home")
-        tab_widget.addTab(OperationsTab(), "Operations")
-        tab_widget.addTab(ProductsTab(self.database), "Inventory")
-        tab_widget.addTab(ClientsTab(self.database), "Clients")
-        tab_widget.addTab(SuppliersTab(self.database), "Suppliers")
-        tab_widget.addTab(LogTab(), "Log")
-        
-        self.main_layout.addWidget(tab_widget)
+            """Show main application tabs"""
+            # Refresh database connection for current profile
+            self.database.refresh_connection()
+            
+            tab_widget = QTabWidget()
+            
+            # Add tabs with updated imports
+            from ui.tabs.imports_tab import ImportsTab
+            from ui.tabs.sales_tab import SalesTab
+            
+            tab_widget.addTab(HomeTab(), "Home")
+            tab_widget.addTab(ImportsTab(self.database), "Imports")
+            tab_widget.addTab(SalesTab(self.database), "Sales")
+            tab_widget.addTab(ProductsTab(self.database), "Products")
+            tab_widget.addTab(ClientsTab(self.database), "Clients")
+            tab_widget.addTab(SuppliersTab(self.database), "Suppliers")
+            tab_widget.addTab(LogTab(), "Log")
+            
+            self.main_layout.addWidget(tab_widget)
         
     def validate_password(self):
         """Validate entered password"""

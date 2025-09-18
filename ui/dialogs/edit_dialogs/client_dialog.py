@@ -1,94 +1,86 @@
-import sys
-import re
-from PySide6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
-    QLabel, QLineEdit, QPushButton, QMessageBox, QTextEdit
-)
-from PySide6.QtCore import Qt
+"""
+Client Edit Dialog - Inherits from BaseEditDialog
+Replaces the old repetitive client_dialog.py with a clean, customized version
+"""
 
-class ClientEditDialog(QDialog):
-    def __init__(self, client_data, parent=None):
-        super().__init__(parent)
-        self.client_data = client_data
-        self.setWindowTitle("Edit Client")
-        self.setup_ui()
-        self.load_client_data()
-        
-    def setup_ui(self):
-        # Create layouts
-        main_layout = QVBoxLayout()
-        form_layout = QVBoxLayout()
-        button_layout = QHBoxLayout()
-        
-        # Create form fields
-        self.id_label = QLabel("Client ID:")
-        self.id_value = QLabel()
-        self.id_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        
-        self.name_label = QLabel("Client Name:")
-        self.name_edit = QLineEdit()
-        
-        self.phone_label = QLabel("Phone Number:")
-        self.phone_edit = QLineEdit()
-        
-        self.email_label = QLabel("Email Address:")
-        self.email_edit = QLineEdit()
-        
-        self.notes_label = QLabel("Notes:")
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setMaximumHeight(100)
-        
-        # Add fields to form layout
-        form_layout.addWidget(self.id_label)
-        form_layout.addWidget(self.id_value)
-        form_layout.addWidget(self.name_label)
-        form_layout.addWidget(self.name_edit)
-        form_layout.addWidget(self.phone_label)
-        form_layout.addWidget(self.phone_edit)
-        form_layout.addWidget(self.email_label)
-        form_layout.addWidget(self.email_edit)
-        form_layout.addWidget(self.notes_label)
-        form_layout.addWidget(self.notes_edit)
-        
-        # Create buttons
-        self.save_button = QPushButton("Save")
-        self.cancel_button = QPushButton("Cancel")
-        
-        # Connect buttons to functions
-        self.save_button.clicked.connect(self.save_changes)
-        self.cancel_button.clicked.connect(self.reject)
-        
-        # Add buttons to button layout
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_button)
-        button_layout.addWidget(self.cancel_button)
-        
-        # Combine layouts
-        main_layout.addLayout(form_layout)
-        main_layout.addSpacing(10)
-        main_layout.addLayout(button_layout)
-        
-        self.setLayout(main_layout)
-        self.resize(450, 400)
-        
-    def load_client_data(self):
-        """Load client data into the form fields"""
-        if self.client_data:
-            self.id_value.setText(str(self.client_data.get('id', '')))
-            self.name_edit.setText(self.client_data.get('name', ''))
-            self.phone_edit.setText(self.client_data.get('phone', ''))
-            self.email_edit.setText(self.client_data.get('email', ''))
-            self.notes_edit.setPlainText(self.client_data.get('notes', ''))
+from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
+from classes.client_class import ClientClass
+from PySide6.QtWidgets import QDialog, QMessageBox
+import re
+
+
+class ClientEditDialog(BaseEditDialog):
+    """Client-specific edit dialog with custom validation and UI config"""
     
-    def validate_email(self, email):
-        """Simple email validation using regex"""
+    def __init__(self, client_id=None, database=None, parent=None):
+        """
+        Initialize client dialog
+        
+        Args:
+            client_id: ID of existing client (None for new client)
+            database: Database instance
+            parent: Parent widget
+        """
+        self.client_id = client_id
+        self.database = database
+        
+        # Create or load client object
+        if client_id:
+            self.client = ClientClass(client_id, database, "Existing Client")
+            self.client.load_database_data()
+        else:
+            self.client = ClientClass(0, database, "New Client")
+        
+        # Define client-specific UI configuration
+        ui_config = {
+            'preview image': {
+                'size': (120, 120),
+                'browsing_enabled': True
+            },
+            'notes': {
+                'height': 80  # Taller text area for notes
+            },
+            'client type': {
+                'read_only': False  # Allow changing client type
+            }
+        }
+        
+        # Initialize base dialog
+        super().__init__(self.client, ui_config, parent)
+        
+        # Set specific window title
+        if client_id:
+            self.setWindowTitle(f"Edit Client - {self.client.get_value('name') or 'Unnamed'}")
+        else:
+            self.setWindowTitle("New Client")
+    
+    def validate_data(self):
+        """Client-specific validation (extends base validation)"""
+        errors = super().validate_data()  # Get base validation errors
+        
+        # Additional client-specific validation
+        email = self.get_widget_value(self.parameter_widgets.get('email'))
+        phone = self.get_widget_value(self.parameter_widgets.get('phone'))
+        
+        # Validate email format if provided
+        if email and not self._validate_email(email):
+            errors.append("Please enter a valid email address")
+        
+        # Validate phone format if provided
+        if phone and not self._validate_phone(phone):
+            errors.append("Please enter a valid phone number (7-15 digits)")
+        
+        return errors
+    
+    def _validate_email(self, email):
+        """Validate email format using regex"""
         if not email:  # Email is optional
             return True
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
     
-    def validate_phone(self, phone):
-        """Simple phone validation - allows numbers, spaces, hyphens, and parentheses"""
+    def _validate_phone(self, phone):
+        """Validate phone format - allows numbers, spaces, hyphens, and parentheses"""
         if not phone:  # Phone is optional
             return True
         # Remove common formatting characters
@@ -97,64 +89,40 @@ class ClientEditDialog(QDialog):
         return cleaned_phone.isdigit() and len(cleaned_phone) >= 7 and len(cleaned_phone) <= 15
     
     def save_changes(self):
-        """Validate and save the changes"""
-        # Get values from form fields
-        name = self.name_edit.text().strip()
-        phone = self.phone_edit.text().strip()
-        email = self.email_edit.text().strip()
-        notes = self.notes_edit.toPlainText().strip()
-        
-        # Validate required fields
-        if not name:
-            QMessageBox.warning(self, "Validation Error", "Client name is required.")
+        """Save client changes to database"""
+        # Validate data first
+        errors = self.validate_data()
+        if errors:
+            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
-            
-        # Validate phone format if provided
-        if phone and not self.validate_phone(phone):
-            QMessageBox.warning(self, "Validation Error", 
-                               "Please enter a valid phone number (7-15 digits).")
-            return
-            
-        # Validate email format if provided
-        if email and not self.validate_email(email):
-            QMessageBox.warning(self, "Validation Error", 
-                               "Please enter a valid email address.")
-            return
-            
-        # Update client data with new values
-        self.client_data['name'] = name
-        self.client_data['phone'] = phone
-        self.client_data['email'] = email
-        self.client_data['notes'] = notes
         
-        # For demonstration, show what would be saved
-        print(f"Saved client changes: {self.client_data}")
-        
-        # Accept the dialog (close with success)
-        self.accept()
-
-
-# Example usage and demonstration
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+        try:
+            # Update client object with form data
+            for param_key, widget in self.parameter_widgets.items():
+                value = self.get_widget_value(widget)
+                self.client.set_value(param_key, value)
+            
+            # Save to database
+            client_data = self.client.get_value(destination="database")
+            
+            if self.client_id:
+                # Update existing client
+                success = self.database.update_item(self.client_id, client_data, "Clients")
+                action = "updated"
+            else:
+                # Add new client
+                success = self.database.add_item(client_data, "Clients")
+                action = "created"
+            
+            if success:
+                QMessageBox.information(self, "Success", f"Client {action} successfully!")
+                self.accept()  # Close dialog
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to save client to database")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save client: {str(e)}")
     
-    # Sample client data (this would come from your database)
-    sample_client = {
-        'id': 3001,
-        'name': 'John Smith',
-        'phone': '(555) 987-6543',
-        'email': 'john.smith@example.com',
-        'notes': 'Preferred contact method: email. Important client with regular orders.'
-    }
-    
-    # Create and show the dialog
-    dialog = ClientEditDialog(sample_client)
-    
-    if dialog.exec() == QDialog.Accepted:
-        print("Client changes were saved")
-        # Here you would typically update the database with the changes
-        print(f"Updated client data: {sample_client}")
-    else:
-        print("Client edit was cancelled")
-    
-    sys.exit(app.exec())
+    def get_client_data(self):
+        """Get the client object (useful for parent windows)"""
+        return self.client

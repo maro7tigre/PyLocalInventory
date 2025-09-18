@@ -1,155 +1,133 @@
-import sys
-import re
-from PySide6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
-    QLabel, QLineEdit, QPushButton, QMessageBox, QTextEdit
-)
-from PySide6.QtCore import Qt
+"""
+Supplier Edit Dialog - Inherits from BaseEditDialog
+Replaces the old repetitive supplier_dialog.py with a clean, customized version
+"""
 
-class SupplierEditDialog(QDialog):
-    def __init__(self, supplier_data, parent=None):
-        super().__init__(parent)
-        self.supplier_data = supplier_data
-        self.setWindowTitle("Edit Supplier")
-        self.setup_ui()
-        self.load_supplier_data()
-        
-    def setup_ui(self):
-        # Create layouts
-        main_layout = QVBoxLayout()
-        form_layout = QVBoxLayout()
-        button_layout = QHBoxLayout()
-        
-        # Create form fields
-        self.id_label = QLabel("Supplier ID:")
-        self.id_value = QLabel()
-        self.id_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
-        
-        self.name_label = QLabel("Supplier Name:")
-        self.name_edit = QLineEdit()
-        
-        self.phone_label = QLabel("Phone Number:")
-        self.phone_edit = QLineEdit()
-        
-        self.email_label = QLabel("Email Address:")
-        self.email_edit = QLineEdit()
-        
-        self.notes_label = QLabel("Notes:")
-        self.notes_edit = QTextEdit()
-        self.notes_edit.setMaximumHeight(100)
-        
-        # Add fields to form layout
-        form_layout.addWidget(self.id_label)
-        form_layout.addWidget(self.id_value)
-        form_layout.addWidget(self.name_label)
-        form_layout.addWidget(self.name_edit)
-        form_layout.addWidget(self.phone_label)
-        form_layout.addWidget(self.phone_edit)
-        form_layout.addWidget(self.email_label)
-        form_layout.addWidget(self.email_edit)
-        form_layout.addWidget(self.notes_label)
-        form_layout.addWidget(self.notes_edit)
-        
-        # Create buttons
-        self.save_button = QPushButton("Save")
-        self.cancel_button = QPushButton("Cancel")
-        
-        # Connect buttons to functions
-        self.save_button.clicked.connect(self.save_changes)
-        self.cancel_button.clicked.connect(self.reject)
-        
-        # Add buttons to button layout
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_button)
-        button_layout.addWidget(self.cancel_button)
-        
-        # Combine layouts
-        main_layout.addLayout(form_layout)
-        main_layout.addSpacing(10)
-        main_layout.addLayout(button_layout)
-        
-        self.setLayout(main_layout)
-        self.resize(450, 400)
-        
-    def load_supplier_data(self):
-        """Load supplier data into the form fields"""
-        if self.supplier_data:
-            self.id_value.setText(str(self.supplier_data.get('id', '')))
-            self.name_edit.setText(self.supplier_data.get('name', ''))
-            self.phone_edit.setText(self.supplier_data.get('phone', ''))
-            self.email_edit.setText(self.supplier_data.get('email', ''))
-            self.notes_edit.setPlainText(self.supplier_data.get('notes', ''))
+from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
+from classes.supplier_class import SupplierClass
+from PySide6.QtWidgets import QDialog, QMessageBox
+import re
+
+
+class SupplierEditDialog(BaseEditDialog):
+    """Supplier-specific edit dialog with custom validation and UI config"""
     
-    def validate_email(self, email):
-        """Simple email validation using regex"""
+    def __init__(self, supplier_id=None, database=None, parent=None):
+        """
+        Initialize supplier dialog
+        
+        Args:
+            supplier_id: ID of existing supplier (None for new supplier)
+            database: Database instance
+            parent: Parent widget
+        """
+        self.supplier_id = supplier_id
+        self.database = database
+        
+        # Create or load supplier object
+        if supplier_id:
+            self.supplier = SupplierClass(supplier_id, database, "Existing Supplier")
+            self.supplier.load_database_data()
+        else:
+            self.supplier = SupplierClass(0, database, "New Supplier")
+        
+        # Define supplier-specific UI configuration
+        ui_config = {
+            'preview image': {
+                'size': (110, 110),  # Medium size for supplier logos
+                'browsing_enabled': True
+            },
+            'notes': {
+                'height': 100  # Extra tall for supplier notes (contracts, terms, etc.)
+            },
+            'name': {
+                'required': True  # Name is always required for suppliers
+            }
+        }
+        
+        # Initialize base dialog
+        super().__init__(self.supplier, ui_config, parent)
+        
+        # Set specific window title
+        if supplier_id:
+            self.setWindowTitle(f"Edit Supplier - {self.supplier.get_value('name') or 'Unnamed'}")
+        else:
+            self.setWindowTitle("New Supplier")
+    
+    def validate_data(self):
+        """Supplier-specific validation (extends base validation)"""
+        errors = super().validate_data()  # Get base validation errors
+        
+        # Additional supplier-specific validation
+        email = self.get_widget_value(self.parameter_widgets.get('email'))
+        phone = self.get_widget_value(self.parameter_widgets.get('phone'))
+        name = self.get_widget_value(self.parameter_widgets.get('name'))
+        
+        # Validate email format if provided
+        if email and not self._validate_email(email):
+            errors.append("Please enter a valid email address")
+        
+        # Validate phone format if provided  
+        if phone and not self._validate_phone(phone):
+            errors.append("Please enter a valid phone number (7-15 digits)")
+        
+        # Business rule: Suppliers should have at least email OR phone for contact
+        if name and not email and not phone:
+            errors.append("Please provide at least an email address or phone number for contact")
+        
+        return errors
+    
+    def _validate_email(self, email):
+        """Validate email format using regex"""
+        if not email:  # Email is optional
+            return True
         pattern = r'^[a-zA-Z0-9._%+-]+@[a-zA-Z0-9.-]+\.[a-zA-Z]{2,}$'
         return re.match(pattern, email) is not None
     
-    def validate_phone(self, phone):
-        """Simple phone validation - allows numbers, spaces, hyphens, and parentheses"""
+    def _validate_phone(self, phone):
+        """Validate phone format - allows numbers, spaces, hyphens, and parentheses"""
+        if not phone:  # Phone is optional
+            return True
         # Remove common formatting characters
         cleaned_phone = re.sub(r'[+\s\-()]', '', phone)
-        # Check if what remains are only digits
-        return cleaned_phone.isdigit() and len(cleaned_phone) >= 7
+        # Check if what remains are only digits and has reasonable length
+        return cleaned_phone.isdigit() and len(cleaned_phone) >= 7 and len(cleaned_phone) <= 15
     
     def save_changes(self):
-        """Validate and save the changes"""
-        # Get values from form fields
-        name = self.name_edit.text().strip()
-        phone = self.phone_edit.text().strip()
-        email = self.email_edit.text().strip()
-        notes = self.notes_edit.toPlainText().strip()
-        
-        # Validate required fields
-        if not name:
-            QMessageBox.warning(self, "Validation Error", "Supplier name is required.")
+        """Save supplier changes to database"""
+        # Validate data first
+        errors = self.validate_data()
+        if errors:
+            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
-            
-        # Validate phone format
-        if phone and not self.validate_phone(phone):
-            QMessageBox.warning(self, "Validation Error", 
-                               "Please enter a valid phone number (at least 7 digits).")
-            return
-            
-        # Validate email format if provided
-        if email and not self.validate_email(email):
-            QMessageBox.warning(self, "Validation Error", 
-                               "Please enter a valid email address.")
-            return
-            
-        # Update supplier data with new values
-        self.supplier_data['name'] = name
-        self.supplier_data['phone'] = phone
-        self.supplier_data['email'] = email
-        self.supplier_data['notes'] = notes
         
-        # For demonstration, show what would be saved
-        print(f"Saved changes: {self.supplier_data}")
-        
-        # Accept the dialog (close with success)
-        self.accept()
-
-
-# Example usage and demonstration
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+        try:
+            # Update supplier object with form data
+            for param_key, widget in self.parameter_widgets.items():
+                value = self.get_widget_value(widget)
+                self.supplier.set_value(param_key, value)
+            
+            # Save to database
+            supplier_data = self.supplier.get_value(destination="database")
+            
+            if self.supplier_id:
+                # Update existing supplier
+                success = self.database.update_item(self.supplier_id, supplier_data, "Suppliers")
+                action = "updated"
+            else:
+                # Add new supplier
+                success = self.database.add_item(supplier_data, "Suppliers")
+                action = "created"
+            
+            if success:
+                QMessageBox.information(self, "Success", f"Supplier {action} successfully!")
+                self.accept()  # Close dialog
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to save supplier to database")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save supplier: {str(e)}")
     
-    # Sample supplier data (this would come from your database)
-    sample_supplier = {
-        'id': 2001,
-        'name': 'ABC Supplies Inc.',
-        'phone': '(555) 123-4567',
-        'email': 'contact@abcsupplies.com',
-        'notes': 'Primary supplier for electronic components. Contact: John Smith'
-    }
-    
-    # Create and show the dialog
-    dialog = SupplierEditDialog(sample_supplier)
-    
-    if dialog.exec() == QDialog.Accepted:
-        print("Supplier changes were saved")
-        # Here you would typically update the database with the changes
-    else:
-        print("Supplier edit was cancelled")
-    
-    sys.exit(app.exec())
+    def get_supplier_data(self):
+        """Get the supplier object (useful for parent windows)"""
+        return self.supplier

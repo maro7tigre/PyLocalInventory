@@ -1,136 +1,133 @@
-import sys
-from PySide6.QtWidgets import (
-    QApplication, QDialog, QVBoxLayout, QHBoxLayout, 
-    QLabel, QLineEdit, QPushButton, QMessageBox
-)
-from PySide6.QtCore import Qt
+"""
+Product Edit Dialog - Inherits from BaseEditDialog
+Replaces the old repetitive product_dialog.py with a clean, customized version
+"""
 
-class ProductEditDialog(QDialog):
-    def __init__(self, product_data, parent=None):
-        super().__init__(parent)
-        self.product_data = product_data
-        self.setWindowTitle("Edit Product")
-        self.setup_ui()
-        self.load_product_data()
+from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
+from classes.product_class import ProductClass
+from PySide6.QtWidgets import QDialog, QMessageBox
+
+
+class ProductEditDialog(BaseEditDialog):
+    """Product-specific edit dialog with custom validation and UI config"""
+    
+    def __init__(self, product_id=None, database=None, parent=None):
+        """
+        Initialize product dialog
         
-    def setup_ui(self):
-        # Create layouts
-        main_layout = QVBoxLayout()
-        form_layout = QVBoxLayout()
-        button_layout = QHBoxLayout()
+        Args:
+            product_id: ID of existing product (None for new product)
+            database: Database instance
+            parent: Parent widget
+        """
+        self.product_id = product_id
+        self.database = database
         
-        # Create form fields
-        self.id_label = QLabel("Product ID:")
-        self.id_value = QLabel()
-        self.id_value.setTextInteractionFlags(Qt.TextSelectableByMouse)
+        # Create or load product object
+        if product_id:
+            self.product = ProductClass(product_id, database, "Existing Product")
+            self.product.load_database_data()
+        else:
+            self.product = ProductClass(0, database, "New Product")
         
-        self.name_label = QLabel("Product Name:")
-        self.name_edit = QLineEdit()
+        # Define product-specific UI configuration
+        ui_config = {
+            'preview image': {
+                'size': (100, 100),  # Smaller than client images
+                'browsing_enabled': True
+            },
+            'unit price': {
+                'minimum': 0.0,
+                'maximum': 999999.99,
+                'unit': '€'
+            },
+            'sale price': {
+                'minimum': 0.0,
+                'maximum': 999999.99,
+                'unit': '€'
+            }
+        }
         
-        self.unit_price_label = QLabel("Unit Price:")
-        self.unit_price_edit = QLineEdit()
+        # Initialize base dialog
+        super().__init__(self.product, ui_config, parent)
         
-        self.sale_price_label = QLabel("Sale Price:")
-        self.sale_price_edit = QLineEdit()
+        # Set specific window title
+        if product_id:
+            self.setWindowTitle(f"Edit Product - {self.product.get_value('name') or 'Unnamed'}")
+        else:
+            self.setWindowTitle("New Product")
+    
+    def validate_data(self):
+        """Product-specific validation (extends base validation)"""
+        errors = super().validate_data()  # Get base validation errors
         
-        # Add fields to form layout
-        form_layout.addWidget(self.id_label)
-        form_layout.addWidget(self.id_value)
-        form_layout.addWidget(self.name_label)
-        form_layout.addWidget(self.name_edit)
-        form_layout.addWidget(self.unit_price_label)
-        form_layout.addWidget(self.unit_price_edit)
-        form_layout.addWidget(self.sale_price_label)
-        form_layout.addWidget(self.sale_price_edit)
+        # Additional product-specific validation
+        unit_price = self.get_widget_value(self.parameter_widgets.get('unit price', 0))
+        sale_price = self.get_widget_value(self.parameter_widgets.get('sale price', 0))
         
-        # Create buttons
-        self.save_button = QPushButton("Save")
-        self.cancel_button = QPushButton("Cancel")
+        # Business rule: Sale price should typically be higher than unit price
+        if unit_price and sale_price and sale_price < unit_price:
+            errors.append("Warning: Sale price is lower than unit price. This may result in losses.")
         
-        # Connect buttons to functions
-        self.save_button.clicked.connect(self.save_changes)
-        self.cancel_button.clicked.connect(self.reject)
+        # Business rule: Both prices should be positive
+        if unit_price and unit_price < 0:
+            errors.append("Unit price cannot be negative")
         
-        # Add buttons to button layout
-        button_layout.addStretch()
-        button_layout.addWidget(self.save_button)
-        button_layout.addWidget(self.cancel_button)
+        if sale_price and sale_price < 0:
+            errors.append("Sale price cannot be negative")
         
-        # Combine layouts
-        main_layout.addLayout(form_layout)
-        main_layout.addLayout(button_layout)
-        
-        self.setLayout(main_layout)
-        self.resize(400, 250)
-        
-    def load_product_data(self):
-        """Load product data into the form fields"""
-        if self.product_data:
-            self.id_value.setText(str(self.product_data.get('id', '')))
-            self.name_edit.setText(self.product_data.get('name', ''))
-            self.unit_price_edit.setText(str(self.product_data.get('unit_price', '')))
-            self.sale_price_edit.setText(str(self.product_data.get('sale_price', '')))
+        return errors
     
     def save_changes(self):
-        """Validate and save the changes"""
-        # Get values from form fields
-        name = self.name_edit.text().strip()
-        unit_price = self.unit_price_edit.text().strip()
-        sale_price = self.sale_price_edit.text().strip()
-        
-        # Validate required fields
-        if not name:
-            QMessageBox.warning(self, "Validation Error", "Product name is required.")
-            return
+        """Save product changes to database"""
+        # Validate data first
+        errors = self.validate_data()
+        if errors:
+            # Check if errors are just warnings (like sale price < unit price)
+            warning_errors = [e for e in errors if e.startswith("Warning:")]
+            critical_errors = [e for e in errors if not e.startswith("Warning:")]
             
-        # Validate numeric fields
+            if critical_errors:
+                QMessageBox.warning(self, "Validation Error", "\n".join(critical_errors))
+                return
+            elif warning_errors:
+                # Show warning but allow user to continue
+                reply = QMessageBox.question(
+                    self, "Warning", 
+                    "\n".join(warning_errors) + "\n\nDo you want to continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+        
         try:
-            unit_price_float = float(unit_price)
-            if unit_price_float < 0:
-                raise ValueError("Price cannot be negative")
-        except ValueError:
-            QMessageBox.warning(self, "Validation Error", "Unit price must be a valid number.")
-            return
+            # Update product object with form data
+            for param_key, widget in self.parameter_widgets.items():
+                value = self.get_widget_value(widget)
+                self.product.set_value(param_key, value)
             
-        try:
-            sale_price_float = float(sale_price)
-            if sale_price_float < 0:
-                raise ValueError("Price cannot be negative")
-        except ValueError:
-            QMessageBox.warning(self, "Validation Error", "Sale price must be a valid number.")
-            return
+            # Save to database
+            product_data = self.product.get_value(destination="database")
             
-        # Update product data with new values
-        self.product_data['name'] = name
-        self.product_data['unit_price'] = unit_price_float
-        self.product_data['sale_price'] = sale_price_float
-        
-        # For demonstration, show what would be saved
-        print(f"Saved changes: {self.product_data}")
-        
-        # Accept the dialog (close with success)
-        self.accept()
-
-
-# Example usage and demonstration
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
+            if self.product_id:
+                # Update existing product
+                success = self.database.update_item(self.product_id, product_data, "Products")
+                action = "updated"
+            else:
+                # Add new product
+                success = self.database.add_item(product_data, "Products")
+                action = "created"
+            
+            if success:
+                QMessageBox.information(self, "Success", f"Product {action} successfully!")
+                self.accept()  # Close dialog
+            else:
+                QMessageBox.critical(self, "Error", f"Failed to save product to database")
+                
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save product: {str(e)}")
     
-    # Sample product data (this would come from your database)
-    sample_product = {
-        'id': 1001,
-        'name': 'Sample Product',
-        'unit_price': 19.99,
-        'sale_price': 15.99
-    }
-    
-    # Create and show the dialog
-    dialog = ProductEditDialog(sample_product)
-    
-    if dialog.exec() == QDialog.Accepted:
-        print("Changes were saved")
-        # Here you would typically update the database with the changes
-    else:
-        print("Edit was cancelled")
-    
-    sys.exit(app.exec())
+    def get_product_data(self):
+        """Get the product object (useful for parent windows)"""
+        return self.product

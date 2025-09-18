@@ -8,9 +8,6 @@ from PySide6.QtCore import Qt
 from core.database import Database
 from ui.widgets.themed_widgets import RedButton, BlueButton
 
-
-
-
 class InventoryApp(QWidget):
     def __init__(self, parent=None, section="Inventory", columns=None):
         super().__init__(parent)

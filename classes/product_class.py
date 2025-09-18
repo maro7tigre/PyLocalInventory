@@ -14,3 +14,9 @@ class ProductClass(BaseClass):
             "dialog" : ["name", "unit price", "sale price"],
             "database" : ["name", "unit price", "sale price"]
         }
+        
+    def get_quantity(self):
+        pass
+    
+    def get_history(self):
+        pass

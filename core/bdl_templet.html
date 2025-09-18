@@ -1,0 +1,187 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Bon De Livraison</title>
+  <style>
+    body {
+      font-family: Arial, sans-serif;
+      font-size: 14px;
+      margin: 40px;
+    }
+
+    .document {
+      border: 1px solid #000;
+      padding: 20px;
+    }
+
+    header {
+      display: flex;
+      justify-content: space-between;
+      align-items: flex-start;
+      margin-bottom: 20px;
+    }
+
+    .logo {
+      width: 50%;
+    }
+
+    .logo-placeholder {
+      width: 120px;
+      height: 50px;
+      border: 1px solid #000;
+      display: flex;
+      justify-content: center;
+      align-items: center;
+      margin-bottom: 5px;
+      font-size: 12px;
+    }
+
+    .company {
+      font-weight: bold;
+    }
+
+    .doc-info {
+      width: 40%;
+      border: 1px solid #000;
+      padding: 5px;
+    }
+
+    .doc-info h2 {
+      text-align: center;
+      margin: 5px 0 10px 0;
+    }
+
+    .doc-info table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .doc-info td {
+      border: 1px solid #000;
+      padding: 4px;
+    }
+
+    .client-info {
+      margin-bottom: 20px;
+    }
+
+    .client-info table {
+      width: 100%;
+      border-collapse: collapse;
+    }
+
+    .client-info td {
+      padding: 4px;
+    }
+
+    .label {
+      width: 25%;
+      font-weight: bold;
+    }
+
+    .items table {
+      width: 100%;
+      border-collapse: collapse;
+      margin-bottom: 20px;
+    }
+
+    .items th, .items td {
+      border: 1px solid #000;
+      padding: 6px;
+      text-align: center;
+    }
+
+    footer {
+      width: 40%;
+      margin-left: auto;
+    }
+
+    footer table {
+      width: 100%;
+    }
+
+    footer td {
+      padding: 4px;
+    }
+  </style>
+</head>
+<body>
+  <div class="document">
+    <header>
+      <div class="logo">
+        <div class="logo-placeholder">LOGO</div>
+        <p class="company">{{ company_name }}</p>
+        <p class="info">
+          Tél : {{ company_phone }}<br>
+          Siret : {{ company_siret }}<br>
+          N° TVA : {{ company_tva }}
+        </p>
+      </div>
+      <div class="doc-info">
+        <h2>Bon de livraison</h2>
+        <table>
+          <tr>
+            <td>Date</td>
+            <td>{{ date }}</td>
+          </tr>
+          <tr>
+            <td>Réf. document</td>
+            <td>{{ document_ref }}</td>
+          </tr>
+        </table>
+      </div>
+    </header>
+
+    <section class="client-info">
+      <table>
+        <tr>
+          <td class="label">Client :</td>
+          <td class="value">{{ client_name }}</td>
+        </tr>
+        <tr>
+          <td class="label">Adresse :</td>
+          <td class="value">{{ client_address }}</td>
+        </tr>
+        <tr>
+          <td class="label">Votre commercial :</td>
+          <td class="value">{{ commercial }}</td>
+        </tr>
+      </table>
+    </section>
+
+    <section class="items">
+      <table>
+        <thead>
+          <tr>
+            <th>Code</th>
+            <th>Désignation</th>
+            <th>Qté commandée</th>
+            <th>Qté livrée</th>
+          </tr>
+        </thead>
+        <tbody>
+          {{ items }}
+        </tbody>
+      </table>
+    </section>
+
+    <footer>
+      <table>
+        <tr>
+          <td>Total commandé :</td>
+          <td>{{ total_commande }}</td>
+        </tr>
+        <tr>
+          <td>Total livré :</td>
+          <td>{{ total_livre }}</td>
+        </tr>
+        <tr>
+          <td>Reste à livrer :</td>
+          <td>{{ reste_a_livrer }}</td>
+        </tr>
+      </table>
+    </footer>
+  </div>
+</body>
+</html>

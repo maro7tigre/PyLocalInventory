@@ -13,6 +13,10 @@ from .simple_widgets import *
 # Import selectable widgets (our new "lego pieces")
 from .card_widgets import *
 
+# Import specialized widgets
+from .welcome_widget import WelcomeWidget
+from .password_widget import PasswordWidget
+
 __all__ = [
     # Themed widgets (buttons, inputs, etc.)
     'ThemedMainWindow', 'ThemedDialog', 'GreenButton', 'RedButton', 'OrangeButton', 'BlueButton',
@@ -23,4 +27,8 @@ __all__ = [
     # Simple widgets
     
     # Selectable widgets
+    'ClickableCard', 'SquareCard',
+    
+    # Specialized widgets
+    'WelcomeWidget', 'PasswordWidget',
 ]

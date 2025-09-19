@@ -101,7 +101,7 @@ class BaseCardsList(QWidget):
         if self.selected_card and self.selected_card in self.cards:
             self.cards[self.selected_card].set_selected(False)
         
-        # Select new card
+        # Select new card (can be None to deselect all)
         self.selected_card = card_id
         if card_id and card_id in self.cards:
             self.cards[card_id].set_selected(True)

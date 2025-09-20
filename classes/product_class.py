@@ -5,20 +5,22 @@ class ProductClass(BaseClass):
         super().__init__(id, database)
         self.section = "Products"
         self.parameters = {
-            "name": {"value": name, "display name": {"en": "name", "fr": "nom", "es": "nombre"}, "required": True, "default": "", "options": [], "type": "string"},
-            "unit price": {"value": 0.0, "display name": {"en": "unit price", "fr": "prix unitaire", "es": "precio unitario"}, "required": False, "default": 0.0, "options": [], "type": "float"},
-            "sale price": {"value": 0.0, "display name": {"en": "sale price", "fr": "prix de vente", "es": "precio de venta"}, "required": False, "default": 0.0, "options": [], "type": "float"},
+            "id"        : { "value": id  , "display_name": {"en": "ID"            , "fr": "ID"               , "es": "ID"                 }, "required": True , "default": 0    , "options": [], "type": "int" },
+            "name"      : { "value": name, "display_name": {"en": "Product Name"  , "fr": "Nom du Produit"   , "es": "Nombre del Producto"}, "required": True , "default": ""   , "options": [], "type": "string" },
+            "unit_price": { "value": 0.0 , "display_name": {"en": "Unit Price"    , "fr": "Prix Unitaire"    , "es": "Precio Unitario"    }, "required": False, "default": 0.0  , "options": [], "type": "float", "unit": "MAD", "min": 0.0, "max": 999999.99 },
+            "sale_price": { "value": 0.0 , "display_name": {"en": "Sale Price"    , "fr": "Prix de Vente"    , "es": "Precio de Venta"    }, "required": False, "default": 0.0  , "options": [], "type": "float", "unit": "MAD", "min": 0.0, "max": 999999.99 },
+            "quantity"  : {                "display_name": {"en": "Stock Quantity", "fr": "Quantité en Stock", "es": "Cantidad en Stock"  }, "required": False, "type": "method", "method": self.calculate_quantity }
         }
+        # Available parameters with read/write permissions
         self.available_parameters = {
-            "table": ["name", "unit price", "sale price"],
-            "dialog": ["name", "unit price", "sale price"],
-            "database": ["name", "unit price", "sale price"],
-            "operation": ["name"],
-            "report": ["name", "unit price", "sale price"]
+            "table"   : { "id": "r" , "name": "r" , "unit_price": "r" , "sale_price": "r"  , "quantity": "r" },
+            "dialog"  : { "id": "r" , "name": "rw", "unit_price": "rw", "sale_price": "rw" },
+            "database": { "id": "rw", "name": "rw", "unit_price": "rw", "sale_price": "rw" },
+            "report"  : { "id": "r" , "name": "r" , "unit_price": "r" , "sale_price": "r"  , "quantity": "r" }
         }
         
-    def get_quantity(self):
-        """Calculate quantity from imports and sales in database"""
+    def calculate_quantity(self):
+        """Calculate current stock quantity from imports and sales"""
         if not self.database or not self.database.cursor:
             return 0
         

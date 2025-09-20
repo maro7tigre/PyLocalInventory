@@ -24,7 +24,7 @@ class ProductClass(BaseClass):
                 "display_name": {"en": "Product Name", "fr": "Nom du Produit", "es": "Nombre del Producto"},
                 "required": True,
                 "default": "",
-                "options": [],
+                "options": ["iron", "wood", "whool"],
                 "type": "string"
             },
             "unit_price": {
@@ -86,7 +86,8 @@ class ProductClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "name": "r",
+                "preview_image": "r",
+                "name": "rw",
                 "unit_price": "r",
                 "sale_price": "r",
                 "quantity": "r",
@@ -180,11 +181,11 @@ class ProductClass(BaseClass):
                             if param_key == 'id':
                                 db_value = item.get('ID', 0)
                             elif param_key == 'preview_image':
-                                db_value = item.get('preview image', '')
+                                db_value = item.get('preview_image', '') or item.get('preview image', '')
                             elif param_key == 'unit_price':
-                                db_value = item.get('unit price', 0)
+                                db_value = item.get('unit_price', 0) or item.get('unit price', 0)
                             elif param_key == 'sale_price':
-                                db_value = item.get('sale price', 0)
+                                db_value = item.get('sale_price', 0) or item.get('sale price', 0)
                             
                             self.set_value(param_key, db_value)
                     return True
@@ -206,11 +207,11 @@ class ProductClass(BaseClass):
                 
                 # Map parameter names to database field names
                 if param_key == 'preview_image':
-                    data['preview image'] = value or ''
+                    data['preview_image'] = value or ''
                 elif param_key == 'unit_price':
-                    data['unit price'] = value or 0.0
+                    data['unit_price'] = value or 0.0
                 elif param_key == 'sale_price':
-                    data['sale price'] = value or 0.0
+                    data['sale_price'] = value or 0.0
                 else:
                     data[param_key] = value
             

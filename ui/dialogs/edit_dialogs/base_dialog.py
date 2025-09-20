@@ -144,10 +144,43 @@ class BaseEditDialog(QDialog):
         for param_key, widget in self.parameter_widgets.items():
             value = ParameterWidgetFactory.get_widget_value(widget)
             
-            # Use base class validation
-            is_valid, error_msg = self.data_object.validate_parameter(param_key, value)
-            if not is_valid:
-                errors.append(error_msg)
+            # Use base class validation but remove options validation
+            param_info = self.data_object.parameters[param_key]
+            
+            # Check required
+            if param_info.get('required', False) and not value:
+                display_name = self.data_object.get_display_name(param_key)
+                errors.append(f"{display_name} is required")
+                continue
+            
+            # Check type-specific constraints
+            param_type = param_info.get('type', 'string')
+            
+            if param_type in ['int', 'float'] and value is not None:
+                try:
+                    num_value = float(value)
+                    
+                    min_val = param_info.get('min')
+                    max_val = param_info.get('max')
+                    
+                    if min_val is not None and num_value < min_val:
+                        display_name = self.data_object.get_display_name(param_key)
+                        errors.append(f"{display_name} must be at least {min_val}")
+                    
+                    if max_val is not None and num_value > max_val:
+                        display_name = self.data_object.get_display_name(param_key)
+                        errors.append(f"{display_name} must be at most {max_val}")
+                    
+                except (ValueError, TypeError):
+                    display_name = self.data_object.get_display_name(param_key)
+                    errors.append(f"{display_name} must be a valid number")
+            
+            # NOTE: Removed options validation - autocomplete is just for suggestions
+            # elif param_type == 'string':
+            #     options = param_info.get('options', [])
+            #     if options and value and value not in options:
+            #         display_name = self.data_object.get_display_name(param_key)
+            #         errors.append(f"{display_name} must be one of: {', '.join(options)}")
         
         return errors
     

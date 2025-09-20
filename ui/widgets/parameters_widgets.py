@@ -156,8 +156,10 @@ class ImageWidget(QWidget):
         self.profile_images_dir = profile_images_dir
         self.current_path = None
         
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
+        # Main horizontal layout - preview on left, buttons on right
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(10)
         
         # Preview widget
         preview_size = param_info.get('preview_size', 100)
@@ -168,18 +170,34 @@ class ImageWidget(QWidget):
             self.preview = QLabel("Image Preview")
             self.preview.setFixedSize(preview_size, preview_size)
             self.preview.setStyleSheet("border: 1px solid gray; text-align: center;")
-        layout.addWidget(self.preview)
         
-        # Browse button (only if editable)
+        # Set fixed size for preview to prevent layout issues
+        self.preview.setFixedSize(preview_size, preview_size)
+        main_layout.addWidget(self.preview, 0, Qt.AlignTop)
+        
+        # Buttons container (only if editable)
         if editable:
-            self.browse_btn = QPushButton("Browse...")
-            self.browse_btn.clicked.connect(self.browse_image)
-            layout.addWidget(self.browse_btn)
+            buttons_container = QWidget()
+            buttons_container.setFixedWidth(80)  # Fixed width for buttons
+            buttons_layout = QVBoxLayout(buttons_container)
+            buttons_layout.setContentsMargins(0, 0, 0, 0)
+            buttons_layout.setSpacing(5)
             
-            # Clear button
+            self.browse_btn = QPushButton("Browse...")
+            self.browse_btn.setFixedHeight(30)
+            self.browse_btn.clicked.connect(self.browse_image)
+            buttons_layout.addWidget(self.browse_btn)
+            
             self.clear_btn = QPushButton("Clear")
+            self.clear_btn.setFixedHeight(30)
             self.clear_btn.clicked.connect(self.clear_image)
-            layout.addWidget(self.clear_btn)
+            buttons_layout.addWidget(self.clear_btn)
+            
+            buttons_layout.addStretch()  # Push buttons to top
+            main_layout.addWidget(buttons_container, 0, Qt.AlignTop)
+        
+        # Add stretch to push everything to the left
+        main_layout.addStretch()
         
         self.apply_style()
     
@@ -255,7 +273,8 @@ class ImageWidget(QWidget):
                     background-color: #3C3C3C;
                     color: white;
                     border: 1px solid #555555;
-                    padding: 4px;
+                    padding: 4px 8px;
+                    min-width: 70px;
                 }
                 QPushButton:hover {
                     background-color: #4C4C4C;
@@ -268,7 +287,8 @@ class ImageWidget(QWidget):
                     background-color: #3C3C3C;
                     color: white;
                     border: 1px solid #555555;
-                    padding: 4px;
+                    padding: 4px 8px;
+                    min-width: 70px;
                 }
                 QPushButton:hover {
                     background-color: #4C4C4C;

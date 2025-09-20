@@ -185,25 +185,32 @@ class Database:
             return False
         
         columns = self.sections_dictionary[section][1:]  # Skip ID column
-        set_clauses = [f"'{col}' = ?" for col in columns]
-        set_clause = ', '.join(set_clauses)
         
+        # Only update columns that are provided in data
+        update_columns = []
         values = []
-        # Get values in correct order, handling missing keys
+        
         for col in columns:
             if col in data:
+                update_columns.append(col)
                 values.append(data[col])
-            else:
-                # Handle common parameter name mappings
-                if col == 'preview_image' and 'preview_image' in data:
-                    values.append(data['preview_image'])
-                elif col == 'unit_price' and 'unit_price' in data:
-                    values.append(data['unit_price'])
-                elif col == 'sale_price' and 'sale_price' in data:
-                    values.append(data['sale_price'])
-                else:
-                    values.append('')  # Default empty value
+            # Handle parameter name mappings
+            elif col == 'preview_image' and 'preview_image' in data:
+                update_columns.append(col)
+                values.append(data['preview_image'])
+            elif col == 'unit_price' and 'unit_price' in data:
+                update_columns.append(col)
+                values.append(data['unit_price'])
+            elif col == 'sale_price' and 'sale_price' in data:
+                update_columns.append(col)
+                values.append(data['sale_price'])
         
+        if not update_columns:
+            print(f"No valid columns to update for {section}")
+            return False
+        
+        set_clauses = [f"'{col}' = ?" for col in update_columns]
+        set_clause = ', '.join(set_clauses)
         values.append(item_id)  # Add ID for WHERE clause
         
         try:
@@ -213,7 +220,7 @@ class Database:
                 values
             )
             self.conn.commit()
-            print(f"Updated item {item_id} in {section}")
+            print(f"Updated item {item_id} in {section}: {dict(zip(update_columns, values[:-1]))}")
             return True
         except sqlite3.Error as e:
             print(f"Error updating item in {section}: {e}")

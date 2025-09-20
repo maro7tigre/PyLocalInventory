@@ -1,26 +1,38 @@
 """
-Table Widget with Add/Edit/Delete/Report functionality
+Updated Table Widget - Works with parameter system
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
-                               QMessageBox, QDialog)
+                               QMessageBox, QDialog, QAbstractItemView)
 from PySide6.QtGui import QFont, QPixmap
 from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
-from ui.widgets.report_viewer import ReportViewerWidget
 from ui.widgets.preview_widget import PreviewWidget
-from core.reports_generator import ReportsGenerator
+from ui.widgets.parameters_widgets import ParameterWidgetFactory
 
 
-class TableWidget(QWidget):
-    """ table with CRUD operations and reporting"""
+class ParameterTableWidget(QWidget):
+    """Universal table widget that works with any parameter-based class"""
     
-    def __init__(self, section="Items", database=None, columns=None, parent=None):
+    def __init__(self, object_class, database=None, dialog_class=None, parent=None):
+        """
+        Args:
+            object_class: Class to manage (ProductClass, ClientClass, etc.)
+            database: Database instance
+            dialog_class: Dialog class for editing (optional)
+            parent: Parent widget
+        """
         super().__init__(parent)
-        self.section = section
+        self.object_class = object_class
         self.database = database
-        self.columns = columns or ["ID", "Name"]
-        self.reports_generator = ReportsGenerator(database) if database else None
+        self.dialog_class = dialog_class
+        self.parent_widget = parent
+        
+        # Create a temporary object to get parameter information
+        temp_obj = object_class(0, database)
+        self.section = temp_obj.section
+        self.table_columns = temp_obj.get_visible_parameters("table")
+        self.parameter_definitions = temp_obj.parameters
         
         self.setup_ui()
         self.apply_theme()
@@ -33,7 +45,7 @@ class TableWidget(QWidget):
         # Header with title and buttons
         header_layout = QHBoxLayout()
         
-        title = QLabel(f"{self.section} Overview")
+        title = QLabel(f"{self.section} Management")
         title.setFont(QFont("Arial", 16, QFont.Bold))
         header_layout.addWidget(title)
         header_layout.addStretch()
@@ -51,61 +63,164 @@ class TableWidget(QWidget):
         self.delete_btn.clicked.connect(self.delete_item)
         header_layout.addWidget(self.delete_btn)
         
-        self.report_btn = GreenButton("Report")
-        self.report_btn.clicked.connect(self.show_report)
-        header_layout.addWidget(self.report_btn)
+        self.refresh_btn = GreenButton("Refresh")
+        self.refresh_btn.clicked.connect(self.refresh_table)
+        header_layout.addWidget(self.refresh_btn)
         
         layout.addLayout(header_layout)
         
-        # Table
+        # Table setup
         self.table = QTableWidget()
-        self.table.setColumnCount(len(self.columns))
-        self.table.setHorizontalHeaderLabels(self.columns)
+        self.setup_table()
+        layout.addWidget(self.table)
+    
+    def setup_table(self):
+        """Setup table columns and properties"""
+        # Set column count and headers
+        self.table.setColumnCount(len(self.table_columns))
+        
+        # Create display headers using parameter display names
+        headers = []
+        for param_key in self.table_columns:
+            if param_key in self.parameter_definitions:
+                temp_obj = self.object_class(0, self.database)
+                display_name = temp_obj.get_display_name(param_key)
+                headers.append(display_name)
+            else:
+                headers.append(param_key)
+        
+        self.table.setHorizontalHeaderLabels(headers)
+        
+        # Table properties
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
-        self.table.setColumnHidden(0, True)  # Hide ID column
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionMode(QAbstractItemView.SingleSelection)
         
-        layout.addWidget(self.table)
+        # Hide ID column if present
+        if 'id' in self.table_columns:
+            id_index = self.table_columns.index('id')
+            self.table.setColumnHidden(id_index, True)
     
     def refresh_table(self):
         """Refresh table data from database"""
         if not self.database:
             return
         
-        items = self.database.get_items(self.section)
-        self.table.setRowCount(len(items))
+        try:
+            # Get all items from database
+            items = self.database.get_items(self.section)
+            self.table.setRowCount(len(items))
+            
+            for row, item in enumerate(items):
+                # Create object instance to get calculated values
+                item_id = item.get('ID', 0)
+                obj = self.object_class(item_id, self.database)
+                obj.load_database_data()
+                
+                for col, param_key in enumerate(self.table_columns):
+                    self.set_table_cell(row, col, param_key, obj)
         
-        for row, item in enumerate(items):
-            for col, column_name in enumerate(self.columns):
-                if column_name == "preview image" and column_name in item:
-                    # Handle preview image column specially
-                    preview_widget = PreviewWidget(50, "individual")
-                    if item[column_name]:
-                        preview_widget.set_image_path(item[column_name])
-                    self.table.setCellWidget(row, col, preview_widget)
+        except Exception as e:
+            print(f"Error refreshing table: {e}")
+            QMessageBox.warning(self, "Error", f"Failed to refresh table: {e}")
+    
+    def set_table_cell(self, row, col, param_key, obj):
+        """Set table cell value based on parameter type"""
+        try:
+            value = obj.get_value(param_key)
+            param_info = obj.parameters.get(param_key, {})
+            param_type = param_info.get('type', 'string')
+            
+            if param_type == 'image':
+                # Create preview widget for image
+                preview_widget = PreviewWidget(50, "product")
+                if value:
+                    preview_widget.set_image_path(value)
+                self.table.setCellWidget(row, col, preview_widget)
+            
+            elif param_type == 'float':
+                # Format float values with unit if available
+                unit = param_info.get('unit', '')
+                if value is not None:
+                    formatted_value = f"{float(value):.2f} {unit}".strip()
                 else:
-                    value = item.get(column_name, "")
-                    self.table.setItem(row, col, QTableWidgetItem(str(value)))
+                    formatted_value = f"0.00 {unit}".strip()
+                
+                item = QTableWidgetItem(formatted_value)
+                item.setData(Qt.UserRole, value)  # Store raw value
+                self.table.setItem(row, col, item)
+            
+            elif param_type == 'int':
+                # Format integer values
+                formatted_value = str(int(value)) if value is not None else "0"
+                item = QTableWidgetItem(formatted_value)
+                item.setData(Qt.UserRole, value)  # Store raw value
+                self.table.setItem(row, col, item)
+            
+            else:
+                # String and other types
+                formatted_value = str(value) if value is not None else ""
+                item = QTableWidgetItem(formatted_value)
+                item.setData(Qt.UserRole, value)  # Store raw value
+                self.table.setItem(row, col, item)
+        
+        except Exception as e:
+            print(f"Error setting cell ({row}, {col}): {e}")
+            self.table.setItem(row, col, QTableWidgetItem("Error"))
     
     def get_selected_id(self):
         """Get ID of selected item"""
         row = self.table.currentRow()
         if row == -1:
             return None
-        return int(self.table.item(row, 0).text()) if self.table.item(row, 0) else None
+        
+        # Find ID column
+        if 'id' not in self.table_columns:
+            return None
+        
+        id_col = self.table_columns.index('id')
+        item = self.table.item(row, id_col)
+        
+        if item:
+            return int(item.data(Qt.UserRole) or item.text())
+        
+        # Fallback: try to get from first column if it's numeric
+        first_item = self.table.item(row, 0)
+        if first_item and first_item.text().isdigit():
+            return int(first_item.text())
+        
+        return None
     
     def add_item(self):
-        """Add new item - override in subclasses"""
-        QMessageBox.information(self, "Info", f"Add {self.section[:-1]} dialog would open here")
+        """Add new item"""
+        if self.dialog_class:
+            try:
+                dialog = self.dialog_class(None, self.database, self.parent_widget)
+                if dialog.exec() == QDialog.Accepted:
+                    self.refresh_table()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to open add dialog: {e}")
+        else:
+            QMessageBox.information(self, "Info", f"Add {self.section[:-1]} dialog not configured")
     
     def edit_item(self):
-        """Edit selected item - override in subclasses"""
+        """Edit selected item"""
         item_id = self.get_selected_id()
         if item_id is None:
             QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to edit")
             return
-        QMessageBox.information(self, "Info", f"Edit {self.section[:-1]} {item_id} dialog would open here")
+        
+        if self.dialog_class:
+            try:
+                dialog = self.dialog_class(item_id, self.database, self.parent_widget)
+                if dialog.exec() == QDialog.Accepted:
+                    self.refresh_table()
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Failed to open edit dialog: {e}")
+        else:
+            QMessageBox.information(self, "Info", f"Edit {self.section[:-1]} dialog not configured")
     
     def delete_item(self):
         """Delete selected item"""
@@ -114,70 +229,33 @@ class TableWidget(QWidget):
             QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to delete")
             return
         
+        # Get item name for confirmation
+        row = self.table.currentRow()
+        item_name = "item"
+        
+        # Try to get name from name column
+        if 'name' in self.table_columns:
+            name_col = self.table_columns.index('name')
+            name_item = self.table.item(row, name_col)
+            if name_item:
+                item_name = name_item.text() or f"ID {item_id}"
+        
         reply = QMessageBox.question(
             self, "Confirm Deletion", 
-            f"Are you sure you want to delete this {self.section[:-1].lower()}?\nThis action cannot be undone.",
+            f"Are you sure you want to delete '{item_name}'?\nThis action cannot be undone.",
             QMessageBox.Yes | QMessageBox.No,
             QMessageBox.No
         )
         
         if reply == QMessageBox.Yes:
-            if self.database.delete_item(item_id, self.section):
-                QMessageBox.information(self, "Success", f"{self.section[:-1]} deleted successfully")
-                self.refresh_table()
-            else:
-                QMessageBox.critical(self, "Error", f"Failed to delete {self.section[:-1].lower()}")
-    
-    def show_report(self):
-        """Show report for selected item"""
-        item_id = self.get_selected_id()
-        if item_id is None:
-            QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to generate report")
-            return
-        
-        if not self.reports_generator:
-            QMessageBox.warning(self, "Error", "Reports generator not available")
-            return
-        
-        # Generate report based on section
-        if self.section == "Clients":
-            headers, data, summary = self.reports_generator.generate_client_report(item_id)
-            title = f"Client Report - ID {item_id}"
-        elif self.section == "Products":
-            headers, data, summary = self.reports_generator.generate_product_report(item_id)
-            title = f"Product Report - ID {item_id}"
-        elif self.section == "Suppliers":
-            headers, data, summary = self.reports_generator.generate_supplier_report(item_id)
-            title = f"Supplier Report - ID {item_id}"
-        else:
-            QMessageBox.information(self, "Info", f"Reports not available for {self.section}")
-            return
-        
-        # Show report dialog
-        self.show_report_dialog(title, headers, data, summary)
-    
-    def show_report_dialog(self, title, headers, data, summary):
-        """Show report in a dialog"""
-        dialog = QDialog(self)
-        dialog.setWindowTitle(title)
-        dialog.setModal(True)
-        dialog.resize(800, 600)
-        
-        layout = QVBoxLayout(dialog)
-        
-        report_viewer = ReportViewerWidget(title)
-        report_viewer.set_report_data(headers, data, summary)
-        layout.addWidget(report_viewer)
-        
-        # Apply dark theme to dialog
-        dialog.setStyleSheet("""
-            QDialog {
-                background-color: #2b2b2b;
-                color: #ffffff;
-            }
-        """)
-        
-        dialog.exec()
+            try:
+                if self.database.delete_item(item_id, self.section):
+                    QMessageBox.information(self, "Success", f"'{item_name}' deleted successfully")
+                    self.refresh_table()
+                else:
+                    QMessageBox.critical(self, "Error", f"Failed to delete '{item_name}'")
+            except Exception as e:
+                QMessageBox.critical(self, "Error", f"Error deleting item: {e}")
     
     def apply_theme(self):
         """Apply dark theme styling"""
@@ -206,3 +284,18 @@ class TableWidget(QWidget):
                 border: none;
             }
         """)
+
+
+# Convenience wrapper for products
+class ProductsTableWidget(ParameterTableWidget):
+    """Specialized table widget for products"""
+    
+    def __init__(self, database=None, parent=None):
+        from classes.product_class import ProductClass
+        try:
+            from ui.dialogs.edit_dialogs.product_dialog import ProductEditDialog
+        except ImportError:
+            # Fallback if product dialog isn't available yet
+            ProductEditDialog = None
+            
+        super().__init__(ProductClass, database, ProductEditDialog, parent)

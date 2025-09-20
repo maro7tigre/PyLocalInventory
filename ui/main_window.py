@@ -1,5 +1,5 @@
 """
-Main window class - coordinates all UI components and handles window layout
+Main window class - Only Products, Home, and Log tabs
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
@@ -12,12 +12,12 @@ from ui.widgets.password_widget import PasswordWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.tabs.home_tab import HomeTab
-from ui.tabs.sales_tab import SalesTab
-from ui.tabs.imports_tab import ImportsTab
 from ui.tabs.products_tab import ProductsTab
-from ui.tabs.clients_tab import ClientsTab
-from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.log_tab import LogTab
+
+# Import parameter classes
+from classes.product_class import ProductClass
+
 from core.profiles import ProfileManager
 from core.password import PasswordManager
 from core.database import Database
@@ -39,18 +39,13 @@ class MainWindow(ThemedMainWindow):
         # Load saved profile if it exists
         self.load_saved_profile()
         
-        # Database sections configuration
-        self.sections_dictionary = {
-            "Inventory": ["ID", "Company", "Role", "Product", "Price_HT", "Price_TTC", "Quantity", "Icon"],
-            "Clients": ["ID", "name", "display_name", "client_type", "address", "email", "phone", "notes", "preview_image"],
-            "Products": ["ID", "name", "unit_price", "sale_price"],
-            "Suppliers": ["ID", "name", "display_name", "address", "email", "phone", "notes", "preview_image"],
-            "Imports": ["ID", "supplier_id", "product_id", "quantity", "unit_price", "tva", "total_price", "date", "notes"],
-            "Sales": ["ID", "client_id", "product_id", "quantity", "unit_price", "tva", "total_price", "date", "notes"]
-        }
+        # Define parameter classes for database structure (ONLY PRODUCTS)
+        self.parameter_classes = [
+            ProductClass,
+        ]
         
-        # Database manager
-        self.database = Database(self.profile_manager, self.sections_dictionary)
+        # Database manager with parameter classes
+        self.database = Database(self.profile_manager, self.parameter_classes)
 
         # UI setup
         self.setup_menu()
@@ -165,22 +160,41 @@ class MainWindow(ThemedMainWindow):
         self.main_layout.addWidget(password_widget)
     
     def setup_main_tabs(self):
-        """Show main application tabs"""
+        """Show main application tabs - ONLY HOME, PRODUCTS, LOG"""
         # Refresh database connection for current profile
         self.database.refresh_connection()
         
         tab_widget = QTabWidget()
         
-        # Add tabs
+        # Add only the requested tabs
         tab_widget.addTab(HomeTab(), "Home")
-        tab_widget.addTab(ImportsTab(self.database), "Imports")
-        tab_widget.addTab(SalesTab(self.database), "Sales")
-        tab_widget.addTab(ProductsTab(self.database), "Products")
-        tab_widget.addTab(ClientsTab(self.database), "Clients")
-        tab_widget.addTab(SuppliersTab(self.database), "Suppliers")
+        
+        # Products tab - using the simple direct implementation
+        try:
+            products_tab = ProductsTab(self.database, self)
+            tab_widget.addTab(products_tab, "Products")
+            print("✓ Added Products tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Products tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Products tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Products (Error)")
+        
         tab_widget.addTab(LogTab(), "Log")
         
         self.main_layout.addWidget(tab_widget)
+        
+        # Debug: Print database structure
+        print("\nDatabase sections built:")
+        for section, columns in self.database.sections_dictionary.items():
+            print(f"  {section}: {columns}")
         
     def validate_password(self, password):
         """Validate entered password"""

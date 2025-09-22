@@ -1,5 +1,5 @@
 """
-Enhanced Products Tab - With editable table, autocomplete, and proper selection styling
+Products Tab - Clean version without annoying success popups
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
@@ -72,7 +72,7 @@ class ProductsTableDelegate(QStyledItemDelegate):
 
 
 class ProductsTab(QWidget):
-    """Enhanced Products tab with editable table"""
+    """Products tab with editable table"""
     
     def __init__(self, database=None, parent=None):
         super().__init__(parent)
@@ -82,7 +82,7 @@ class ProductsTab(QWidget):
         # Get product class info
         from classes.product_class import ProductClass
         temp_product = ProductClass(0, database)
-        self.table_columns = temp_product.get_visible_parameters("table")  # This already returns a list
+        self.table_columns = temp_product.get_visible_parameters("table")
         self.table_permissions = temp_product.available_parameters["table"]
         self.parameter_definitions = temp_product.parameters
         
@@ -170,9 +170,7 @@ class ProductsTab(QWidget):
     def is_column_editable(self, column_key):
         """Check if column is editable (has 'w' permission)"""
         permission = self.table_permissions.get(column_key, '')
-        editable = 'w' in permission.lower()
-        print(f"Column {column_key}: permission='{permission}', editable={editable}")  # Debug print
-        return editable
+        return 'w' in permission.lower()
     
     def get_column_param_info(self, column_key):
         """Get parameter info for column"""
@@ -188,8 +186,6 @@ class ProductsTab(QWidget):
             # Get products from database
             products = self.database.get_items("Products")
             self.table.setRowCount(len(products))
-            
-            print(f"Loading {len(products)} products")
             
             for row, product_data in enumerate(products):
                 # Create ProductClass instance to get calculated values
@@ -361,7 +357,7 @@ class ProductsTab(QWidget):
             dialog = ProductEditDialog(None, self.database, self.parent_widget)
             if dialog.exec():
                 self.refresh_table()
-                QMessageBox.information(self, "Success", "Product added successfully!")
+                # No success popup - table refresh shows it worked
         
         except ImportError as e:
             QMessageBox.warning(self, "Error", f"Could not import ProductEditDialog: {e}")
@@ -381,7 +377,7 @@ class ProductsTab(QWidget):
             dialog = ProductEditDialog(product_id, self.database, self.parent_widget)
             if dialog.exec():
                 self.refresh_table()
-                QMessageBox.information(self, "Success", "Product updated successfully!")
+                # No success popup - table refresh shows it worked
         
         except ImportError as e:
             QMessageBox.warning(self, "Error", f"Could not import ProductEditDialog: {e}")
@@ -421,7 +417,7 @@ class ProductsTab(QWidget):
         if reply == QMessageBox.Yes:
             try:
                 if self.database.delete_item(product_id, "Products"):
-                    QMessageBox.information(self, "Success", f"'{product_name}' deleted successfully")
+                    # No success popup - table refresh shows it worked
                     self.refresh_table()
                 else:
                     QMessageBox.critical(self, "Error", f"Failed to delete '{product_name}'")

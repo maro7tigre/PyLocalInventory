@@ -147,7 +147,7 @@ class StringWidget(QWidget):
 
 
 class ImageWidget(QWidget):
-    """Widget for image parameters with preview and file selection"""
+    """Widget for image parameters with preview and file selection - Fixed alignment"""
     
     def __init__(self, param_info, editable=True, profile_images_dir=None, parent=None):
         super().__init__(parent)
@@ -161,40 +161,41 @@ class ImageWidget(QWidget):
         main_layout.setContentsMargins(0, 0, 0, 0)
         main_layout.setSpacing(10)
         
-        # Preview widget
+        # Preview widget with fixed size
         preview_size = param_info.get('preview_size', 100)
         if PreviewWidget:
             self.preview = PreviewWidget(size=preview_size, category="product")
         else:
             # Fallback to simple label
             self.preview = QLabel("Image Preview")
-            self.preview.setFixedSize(preview_size, preview_size)
             self.preview.setStyleSheet("border: 1px solid gray; text-align: center;")
         
-        # Set fixed size for preview to prevent layout issues
+        # Set fixed size for preview
         self.preview.setFixedSize(preview_size, preview_size)
-        main_layout.addWidget(self.preview, 0, Qt.AlignTop)
+        main_layout.addWidget(self.preview)
         
         # Buttons container (only if editable)
         if editable:
             buttons_container = QWidget()
-            buttons_container.setFixedWidth(80)  # Fixed width for buttons
+            buttons_container.setFixedSize(100, preview_size)  # Match preview height
             buttons_layout = QVBoxLayout(buttons_container)
             buttons_layout.setContentsMargins(0, 0, 0, 0)
             buttons_layout.setSpacing(5)
             
+            # Calculate button height to fit nicely in container
+            button_height = (preview_size - 5) // 2  # Subtract spacing, divide by 2
+            
             self.browse_btn = QPushButton("Browse...")
-            self.browse_btn.setFixedHeight(30)
+            self.browse_btn.setFixedHeight(button_height)
             self.browse_btn.clicked.connect(self.browse_image)
             buttons_layout.addWidget(self.browse_btn)
             
             self.clear_btn = QPushButton("Clear")
-            self.clear_btn.setFixedHeight(30)
+            self.clear_btn.setFixedHeight(button_height)
             self.clear_btn.clicked.connect(self.clear_image)
             buttons_layout.addWidget(self.clear_btn)
             
-            buttons_layout.addStretch()  # Push buttons to top
-            main_layout.addWidget(buttons_container, 0, Qt.AlignTop)
+            main_layout.addWidget(buttons_container)
         
         # Add stretch to push everything to the left
         main_layout.addStretch()
@@ -208,7 +209,8 @@ class ImageWidget(QWidget):
         """Set image path and optionally copy to profile directory"""
         if not path or not os.path.exists(path):
             self.current_path = None
-            self.preview.set_image_path(None)
+            if hasattr(self.preview, 'set_image_path'):
+                self.preview.set_image_path(None)
             return
         
         if copy_to_profile and self.profile_images_dir:
@@ -248,6 +250,9 @@ class ImageWidget(QWidget):
     
     def browse_image(self):
         """Open file dialog to select image"""
+        if not self.editable:
+            return
+            
         file_path, _ = QFileDialog.getOpenFileName(
             self,
             "Select Image",
@@ -274,7 +279,6 @@ class ImageWidget(QWidget):
                     color: white;
                     border: 1px solid #555555;
                     padding: 4px 8px;
-                    min-width: 70px;
                 }
                 QPushButton:hover {
                     background-color: #4C4C4C;
@@ -288,7 +292,6 @@ class ImageWidget(QWidget):
                     color: white;
                     border: 1px solid #555555;
                     padding: 4px 8px;
-                    min-width: 70px;
                 }
                 QPushButton:hover {
                     background-color: #4C4C4C;

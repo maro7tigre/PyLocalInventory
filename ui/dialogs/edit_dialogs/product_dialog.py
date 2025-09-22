@@ -1,5 +1,5 @@
 """
-Updated Product Dialog - Uses new base dialog system
+Product Dialog - Clean version without success popups
 """
 
 from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
@@ -82,8 +82,7 @@ class ProductEditDialog(BaseEditDialog):
         return ParameterWidgetFactory.get_widget_value(widget)
     
     def save_changes(self):
-        """Save product changes with custom success message"""
-        # Call parent save method
+        """Save product changes without annoying success popup"""
         try:
             # Validate data first
             errors = self.validate_data()
@@ -118,10 +117,8 @@ class ProductEditDialog(BaseEditDialog):
             success = self.product.save_to_database()
             
             if success:
-                action = "updated" if self.product_id else "created"
-                product_name = self.product.get_value('name') or 'Unnamed Product'
-                QMessageBox.information(self, "Success", f"Product '{product_name}' {action} successfully!")
-                self.accept()  # Close dialog
+                # No success popup - just close dialog
+                self.accept()
             else:
                 QMessageBox.critical(self, "Error", "Failed to save product to database")
                 

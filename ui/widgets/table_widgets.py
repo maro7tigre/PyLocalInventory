@@ -1,5 +1,5 @@
 """
-Updated Table Widget - Works with parameter system
+Table Widget - Clean version without success popups
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
@@ -200,6 +200,7 @@ class ParameterTableWidget(QWidget):
                 dialog = self.dialog_class(None, self.database, self.parent_widget)
                 if dialog.exec() == QDialog.Accepted:
                     self.refresh_table()
+                    # No success popup - table refresh shows it worked
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open add dialog: {e}")
         else:
@@ -217,6 +218,7 @@ class ParameterTableWidget(QWidget):
                 dialog = self.dialog_class(item_id, self.database, self.parent_widget)
                 if dialog.exec() == QDialog.Accepted:
                     self.refresh_table()
+                    # No success popup - table refresh shows it worked
             except Exception as e:
                 QMessageBox.critical(self, "Error", f"Failed to open edit dialog: {e}")
         else:
@@ -250,7 +252,7 @@ class ParameterTableWidget(QWidget):
         if reply == QMessageBox.Yes:
             try:
                 if self.database.delete_item(item_id, self.section):
-                    QMessageBox.information(self, "Success", f"'{item_name}' deleted successfully")
+                    # No success popup - table refresh shows it worked
                     self.refresh_table()
                 else:
                     QMessageBox.critical(self, "Error", f"Failed to delete '{item_name}'")

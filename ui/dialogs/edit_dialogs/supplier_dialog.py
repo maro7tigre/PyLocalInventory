@@ -1,6 +1,5 @@
 """
-Supplier Edit Dialog - Inherits from BaseEditDialog
-Replaces the old repetitive supplier_dialog.py with a clean, customized version
+Supplier Dialog - Clean version updated to work with new SupplierClass
 """
 
 from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
@@ -26,14 +25,16 @@ class SupplierEditDialog(BaseEditDialog):
         
         # Create or load supplier object
         if supplier_id:
-            self.supplier = SupplierClass(supplier_id, database, "Existing Supplier")
+            self.supplier = SupplierClass(supplier_id, database)
             self.supplier.load_database_data()
+            window_title = f"Edit Supplier - {self.supplier.get_value('name') or 'Unnamed'}"
         else:
-            self.supplier = SupplierClass(0, database, "New Supplier")
+            self.supplier = SupplierClass(0, database)
+            window_title = "New Supplier"
         
         # Define supplier-specific UI configuration
         ui_config = {
-            'preview image': {
+            'preview_image': {
                 'size': (110, 110),  # Medium size for supplier logos
                 'browsing_enabled': True
             },
@@ -49,25 +50,29 @@ class SupplierEditDialog(BaseEditDialog):
         super().__init__(self.supplier, ui_config, parent)
         
         # Set specific window title
-        if supplier_id:
-            self.setWindowTitle(f"Edit Supplier - {self.supplier.get_value('name') or 'Unnamed'}")
-        else:
-            self.setWindowTitle("New Supplier")
+        self.setWindowTitle(window_title)
     
     def validate_data(self):
         """Supplier-specific validation (extends base validation)"""
         errors = super().validate_data()  # Get base validation errors
         
-        # Additional supplier-specific validation
-        email = self.get_widget_value(self.parameter_widgets.get('email'))
-        phone = self.get_widget_value(self.parameter_widgets.get('phone'))
-        name = self.get_widget_value(self.parameter_widgets.get('name'))
+        # Get current values from widgets
+        email = None
+        phone = None
+        name = None
         
-        # Validate email format if provided
+        for param_key, widget in self.parameter_widgets.items():
+            if param_key == 'email':
+                email = self.get_widget_value(widget)
+            elif param_key == 'phone':
+                phone = self.get_widget_value(widget)
+            elif param_key == 'name':
+                name = self.get_widget_value(widget)
+        
+        # Additional supplier-specific validation
         if email and not self._validate_email(email):
             errors.append("Please enter a valid email address")
         
-        # Validate phone format if provided  
         if phone and not self._validate_phone(phone):
             errors.append("Please enter a valid phone number (7-15 digits)")
         
@@ -93,37 +98,51 @@ class SupplierEditDialog(BaseEditDialog):
         # Check if what remains are only digits and has reasonable length
         return cleaned_phone.isdigit() and len(cleaned_phone) >= 7 and len(cleaned_phone) <= 15
     
+    def get_widget_value(self, widget):
+        """Helper method to get value from widget"""
+        from ui.widgets.parameters_widgets import ParameterWidgetFactory
+        return ParameterWidgetFactory.get_widget_value(widget)
+    
     def save_changes(self):
-        """Save supplier changes to database"""
-        # Validate data first
-        errors = self.validate_data()
-        if errors:
-            QMessageBox.warning(self, "Validation Error", "\n".join(errors))
-            return
-        
+        """Save supplier changes without annoying success popup"""
         try:
+            # Validate data first
+            errors = self.validate_data()
+            
+            # Separate warnings from critical errors
+            critical_errors = [e for e in errors if not e.lower().startswith('warning')]
+            warnings = [e for e in errors if e.lower().startswith('warning')]
+            
+            # Handle critical errors
+            if critical_errors:
+                QMessageBox.warning(self, "Validation Error", "\n".join(critical_errors))
+                return
+            
+            # Handle warnings
+            if warnings:
+                reply = QMessageBox.question(
+                    self, "Warning", 
+                    "\n".join(warnings) + "\n\nDo you want to continue anyway?",
+                    QMessageBox.Yes | QMessageBox.No,
+                    QMessageBox.No
+                )
+                if reply != QMessageBox.Yes:
+                    return
+            
             # Update supplier object with form data
+            from ui.widgets.parameters_widgets import ParameterWidgetFactory
             for param_key, widget in self.parameter_widgets.items():
-                value = self.get_widget_value(widget)
+                value = ParameterWidgetFactory.get_widget_value(widget)
                 self.supplier.set_value(param_key, value)
             
             # Save to database
-            supplier_data = self.supplier.get_value(destination="database")
-            
-            if self.supplier_id:
-                # Update existing supplier
-                success = self.database.update_item(self.supplier_id, supplier_data, "Suppliers")
-                action = "updated"
-            else:
-                # Add new supplier
-                success = self.database.add_item(supplier_data, "Suppliers")
-                action = "created"
+            success = self.supplier.save_to_database()
             
             if success:
-                QMessageBox.information(self, "Success", f"Supplier {action} successfully!")
-                self.accept()  # Close dialog
+                # No success popup - just close dialog
+                self.accept()
             else:
-                QMessageBox.critical(self, "Error", f"Failed to save supplier to database")
+                QMessageBox.critical(self, "Error", "Failed to save supplier to database")
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save supplier: {str(e)}")
@@ -131,3 +150,24 @@ class SupplierEditDialog(BaseEditDialog):
     def get_supplier_data(self):
         """Get the supplier object (useful for parent windows)"""
         return self.supplier
+
+
+# Helper function to easily create supplier dialogs
+def show_supplier_dialog(supplier_id=None, database=None, parent=None):
+    """
+    Convenience function to show supplier dialog
+    
+    Args:
+        supplier_id: ID of existing supplier (None for new supplier)
+        database: Database instance
+        parent: Parent widget
+        
+    Returns:
+        tuple: (success: bool, supplier_object: SupplierClass or None)
+    """
+    dialog = SupplierEditDialog(supplier_id, database, parent)
+    
+    if dialog.exec() == QDialog.Accepted:
+        return True, dialog.get_supplier_data()
+    else:
+        return False, None

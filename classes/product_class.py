@@ -51,7 +51,7 @@ class ProductClass(BaseClass):
             },
             "preview_image": {
                 "value": None,
-                "display_name": {"en": "Product Image", "fr": "Image du Produit", "es": "Imagen del Producto"},
+                "display_name": {"en": "Image", "fr": "Image", "es": "Imagen"},
                 "required": False,
                 "default": None,
                 "options": [],
@@ -88,7 +88,6 @@ class ProductClass(BaseClass):
                 "id": "r",
                 "preview_image": "r",
                 "name": "rw",
-                "unit_price": "r",
                 "sale_price": "r", 
                 "quantity": "r",
                 "category": "r"

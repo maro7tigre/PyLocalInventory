@@ -1,5 +1,5 @@
 """
-Main window - Products tab with simple database integration
+Main window - Updated with all tabs
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
@@ -13,9 +13,13 @@ from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.tabs.home_tab import HomeTab
 from ui.tabs.products_tab import ProductsTab
+from ui.tabs.clients_tab import ClientsTab
+from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.log_tab import LogTab
 
 from classes.product_class import ProductClass
+from classes.client_class import ClientClass
+from classes.supplier_class import SupplierClass
 
 from core.profiles import ProfileManager
 from core.password import PasswordManager
@@ -54,8 +58,10 @@ class MainWindow(ThemedMainWindow):
         """Register parameter classes with the database"""
         print("📋 Registering parameter classes...")
         
-        # Register ProductClass
+        # Register all parameter classes
         self.database.register_class(ProductClass)
+        self.database.register_class(ClientClass)
+        self.database.register_class(SupplierClass)
         
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
@@ -197,6 +203,42 @@ class MainWindow(ThemedMainWindow):
             error_label.setStyleSheet("color: red; padding: 20px;")
             error_layout.addWidget(error_label)
             tab_widget.addTab(error_widget, "Products (Error)")
+        
+        # Add Clients tab
+        try:
+            clients_tab = ClientsTab(self.database, self)
+            tab_widget.addTab(clients_tab, "Clients")
+            print("✓ Added Clients tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Clients tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Clients tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Clients (Error)")
+        
+        # Add Suppliers tab
+        try:
+            suppliers_tab = SuppliersTab(self.database, self)
+            tab_widget.addTab(suppliers_tab, "Suppliers")
+            print("✓ Added Suppliers tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Suppliers tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Suppliers tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Suppliers (Error)")
         
         tab_widget.addTab(LogTab(self.database), "Log")
         

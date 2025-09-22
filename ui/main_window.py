@@ -1,5 +1,5 @@
 """
-Main window class - Only Products, Home, and Log tabs
+Main window - Products tab with simple database integration
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
@@ -15,12 +15,12 @@ from ui.tabs.home_tab import HomeTab
 from ui.tabs.products_tab import ProductsTab
 from ui.tabs.log_tab import LogTab
 
-# Import parameter classes
 from classes.product_class import ProductClass
 
 from core.profiles import ProfileManager
 from core.password import PasswordManager
 from core.database import Database
+
 
 class MainWindow(ThemedMainWindow):
     def __init__(self):
@@ -39,18 +39,25 @@ class MainWindow(ThemedMainWindow):
         # Load saved profile if it exists
         self.load_saved_profile()
         
-        # Define parameter classes for database structure (ONLY PRODUCTS)
-        self.parameter_classes = [
-            ProductClass,
-        ]
+        # Initialize database system
+        self.database = Database(self.profile_manager)
         
-        # Database manager with parameter classes
-        self.database = Database(self.profile_manager, self.parameter_classes)
+        # Register parameter classes manually
+        self.register_parameter_classes()
 
         # UI setup
         self.setup_menu()
         self.setup_main_widget()
         self.refresh_app()
+    
+    def register_parameter_classes(self):
+        """Register parameter classes with the database"""
+        print("📋 Registering parameter classes...")
+        
+        # Register ProductClass
+        self.database.register_class(ProductClass)
+        
+        print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
     def load_app_config(self):
         """Load application configuration from QSettings"""
@@ -73,9 +80,9 @@ class MainWindow(ThemedMainWindow):
             
             # Try to load the saved profile
             if self.profile_manager.load_profile(saved_profile_name):
-                print(f"Loaded saved profile: {saved_profile_name}")
+                print(f"✓ Loaded saved profile: {saved_profile_name}")
             else:
-                print(f"Could not load saved profile: {saved_profile_name}")
+                print(f"⚠️  Could not load saved profile: {saved_profile_name}")
     
     def save_app_config(self):
         """Save application configuration to QSettings"""
@@ -94,6 +101,8 @@ class MainWindow(ThemedMainWindow):
     def closeEvent(self, event):
         """Handle application close event"""
         self.save_app_config()
+        if self.database:
+            self.database.close()
         event.accept()
     
     def setup_menu(self):
@@ -160,16 +169,18 @@ class MainWindow(ThemedMainWindow):
         self.main_layout.addWidget(password_widget)
     
     def setup_main_tabs(self):
-        """Show main application tabs - ONLY HOME, PRODUCTS, LOG"""
-        # Refresh database connection for current profile
-        self.database.refresh_connection()
+        """Show main application tabs"""
+        # Connect to database with current profile
+        if not self.database.connect():
+            self.show_database_error()
+            return
         
         tab_widget = QTabWidget()
         
-        # Add only the requested tabs
-        tab_widget.addTab(HomeTab(), "Home")
+        # Add tabs manually
+        tab_widget.addTab(HomeTab(self.database), "Home")
         
-        # Products tab - using the simple direct implementation
+        # Add Products tab
         try:
             products_tab = ProductsTab(self.database, self)
             tab_widget.addTab(products_tab, "Products")
@@ -187,15 +198,30 @@ class MainWindow(ThemedMainWindow):
             error_layout.addWidget(error_label)
             tab_widget.addTab(error_widget, "Products (Error)")
         
-        tab_widget.addTab(LogTab(), "Log")
+        tab_widget.addTab(LogTab(self.database), "Log")
         
         self.main_layout.addWidget(tab_widget)
         
-        # Debug: Print database structure
-        print("\nDatabase sections built:")
-        for section, columns in self.database.sections_dictionary.items():
-            print(f"  {section}: {columns}")
-        
+        # Debug info
+        print(f"\n📊 Database Status:")
+        print(f"   • Connected: {self.database.conn is not None}")
+        print(f"   • Registered classes: {len(self.database.registered_classes)}")
+        for section_name in self.database.registered_classes.keys():
+            try:
+                items_count = len(self.database.get_items(section_name))
+                print(f"   • {section_name}: {items_count} items")
+            except Exception as e:
+                print(f"   • {section_name}: error getting items ({e})")
+    
+    def show_database_error(self):
+        """Show database connection error"""
+        error_widget = QWidget()
+        error_layout = QVBoxLayout(error_widget)
+        error_label = QLabel("Database connection failed. Please check your profile configuration.")
+        error_label.setStyleSheet("color: red; font-size: 16px; text-align: center; padding: 50px;")
+        error_layout.addWidget(error_label, Qt.AlignCenter)
+        self.main_layout.addWidget(error_widget)
+    
     def validate_password(self, password):
         """Validate entered password"""
         if not self.password_manager.validate(password):
@@ -232,6 +258,7 @@ class MainWindow(ThemedMainWindow):
         """Log out current user"""
         self.password_manager.logout()
         self.profile_manager.logout()
+        self.database.close()
         # Clear saved profile
         self.settings.setValue("selected_profile", "")
         self.refresh_app()

@@ -1,244 +1,363 @@
 """
-Database interface - SQLite operations with parameter class integration
+Database System - Works with parameter classes
 """
 import sqlite3
 import os
 
+
 class Database:
-    def __init__(self, profile_manager=None, parameter_classes=None):
+    """Database that integrates with parameter class system"""
+    
+    def __init__(self, profile_manager=None):
         self.profile_manager = profile_manager
-        self.parameter_classes = parameter_classes or []
-        self.sections_dictionary = {}  # Will be built from parameter classes
+        self.registered_classes = {}  # section_name -> class
         self.conn = None
         self.cursor = None
         
-        # Build sections dictionary from parameter classes
-        self.build_sections_from_classes()
-        self.refresh_connection()
-    
-    def build_sections_from_classes(self):
-        """Build sections dictionary from parameter classes"""
-        self.sections_dictionary = {}
-        
-        for cls in self.parameter_classes:
-            try:
-                # Create temporary instance to get parameter info
-                temp_instance = cls(0, None)
-                section_name = temp_instance.section
-                
-                # Get database parameters
-                db_params = temp_instance.get_visible_parameters("database")
-                
-                # Always start with ID column
-                columns = ["ID"]
-                
-                # Add database parameters, mapping parameter names to database column names
-                for param_key in db_params:
-                    if param_key in temp_instance.parameters:
-                        # Map parameter names to database column names
-                        if param_key == 'preview_image':
-                            columns.append('preview_image')  # Use snake_case for database
-                        elif param_key == 'unit_price':
-                            columns.append('unit_price')
-                        elif param_key == 'sale_price':
-                            columns.append('sale_price')
-                        elif param_key == 'client_type':
-                            columns.append('client_type')
-                        elif param_key == 'display_name':
-                            columns.append('display_name')
-                        else:
-                            columns.append(param_key)
-                
-                self.sections_dictionary[section_name] = columns
-                print(f"Built database structure for {section_name}: {columns}")
-                
-            except Exception as e:
-                print(f"Error building section for class {cls.__name__}: {e}")
-    
-    def register_class(self, parameter_class):
-        """Register a new parameter class"""
-        if parameter_class not in self.parameter_classes:
-            self.parameter_classes.append(parameter_class)
-            self.build_sections_from_classes()
-            # Recreate tables if database is connected
+    def register_class(self, cls):
+        """Register a parameter class with the database"""
+        try:
+            # Create temporary instance to get metadata
+            temp_obj = cls(0, None)  # Pass None for database to avoid circular dependency
+            section_name = temp_obj.section
+            
+            self.registered_classes[section_name] = cls
+            
+            # Create/update database table for this class if connected
             if self.cursor:
-                self.create_tables()
+                self._create_table_for_class(cls, section_name)
+                
+            print(f"✓ Registered parameter class: {section_name}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Failed to register {cls.__name__}: {e}")
+            return False
     
-    def refresh_connection(self):
-        """Establish or refresh the database connection"""
+    def connect(self):
+        """Establish database connection using profile manager"""
+        if not self.profile_manager or not self.profile_manager.selected_profile:
+            print("No profile selected, cannot connect to database")
+            return False
+            
         # Close existing connection
         if self.conn:
             self.conn.close()
             self.conn = None
             self.cursor = None
         
-        # Check if we have a valid profile
-        if (not self.profile_manager or 
-            not self.profile_manager.selected_profile or
-            not hasattr(self.profile_manager.selected_profile, 'database_path')):
-            return
-        
-        # Get database path from selected profile
-        db_path = self.profile_manager.selected_profile.database_path
-        
-        # Ensure directory exists
-        db_dir = os.path.dirname(db_path)
-        if db_dir and not os.path.exists(db_dir):
-            os.makedirs(db_dir)
-        
-        # Connect to database
-        self.conn = sqlite3.connect(db_path)
-        self.cursor = self.conn.cursor()
-        
-        # Create tables if they don't exist
-        self.create_tables()
+        try:
+            # Get database path from profile
+            db_path = self.profile_manager.selected_profile.database_path
+            
+            # Ensure directory exists
+            db_dir = os.path.dirname(db_path)
+            if db_dir and not os.path.exists(db_dir):
+                os.makedirs(db_dir)
+            
+            # Connect to database
+            self.conn = sqlite3.connect(db_path)
+            self.cursor = self.conn.cursor()
+            
+            # Create tables for all registered classes
+            self._create_all_tables()
+            
+            print(f"✓ Connected to database: {db_path}")
+            return True
+            
+        except Exception as e:
+            print(f"✗ Failed to connect to database: {e}")
+            return False
     
-    def create_tables(self):
-        """Create tables based on parameter classes"""
-        if not self.cursor or not self.sections_dictionary:
-            return
-        
-        for section, columns in self.sections_dictionary.items():
-            if not columns:
-                continue
-                
-            # Build column definitions: first column is always INTEGER PRIMARY KEY AUTOINCREMENT
-            col_defs = [f"{columns[0]} INTEGER PRIMARY KEY AUTOINCREMENT"]
-            # The rest are TEXT columns (we'll handle type conversion in the application layer)
-            col_defs += [f"'{col}' TEXT" for col in columns[1:]]  # Quote column names for safety
-            # Join all column definitions
-            col_defs_str = ", ".join(col_defs)
-            # Execute CREATE TABLE statement
-            try:
-                self.cursor.execute(f"""
-                CREATE TABLE IF NOT EXISTS '{section}' (
-                    {col_defs_str}
+    def _create_table_for_class(self, cls, section_name):
+        """Create database table for a parameter class"""
+        try:
+            # Create temporary instance to get parameter info
+            temp_obj = cls(0, None)
+            
+            # Get parameters that should be stored in database
+            db_params = temp_obj.get_visible_parameters("database")
+            
+            if not db_params:
+                print(f"No database parameters defined for {section_name}")
+                return
+            
+            # Build column definitions
+            columns = ["ID INTEGER PRIMARY KEY AUTOINCREMENT"]
+            
+            for param_key in db_params:
+                if param_key in temp_obj.parameters:
+                    param_info = temp_obj.parameters[param_key]
+                    
+                    # Skip calculated parameters (they're computed, not stored)
+                    if temp_obj.is_parameter_calculated(param_key):
+                        continue
+                    
+                    # Determine SQL type based on parameter type
+                    param_type = param_info.get('type', 'string')
+                    if param_type == 'int':
+                        sql_type = "INTEGER"
+                    elif param_type == 'float':
+                        sql_type = "REAL"
+                    else:  # string, image, date, text
+                        sql_type = "TEXT"
+                    
+                    # Add column with proper quoting
+                    columns.append(f"'{param_key}' {sql_type}")
+            
+            # Create table
+            columns_str = ",\n    ".join(columns)
+            sql = f"""
+                CREATE TABLE IF NOT EXISTS '{section_name}' (
+                    {columns_str}
                 )
-                """)
-                print(f"Created/verified table: {section}")
-            except sqlite3.Error as e:
-                print(f"Error creating table {section}: {e}")
-        
-        if self.conn:
+            """
+            
+            self.cursor.execute(sql)
             self.conn.commit()
+            print(f"✓ Created/verified table: {section_name}")
+            
+        except Exception as e:
+            print(f"✗ Error creating table for {section_name}: {e}")
+    
+    def _create_all_tables(self):
+        """Create tables for all registered classes"""
+        for section_name, cls in self.registered_classes.items():
+            self._create_table_for_class(cls, section_name)
+    
+    def save(self, obj):
+        """Save any parameter object to database"""
+        if not self.cursor:
+            print("Database not connected")
+            return False
+            
+        try:
+            # Use the object's built-in save method
+            if hasattr(obj, 'save_to_database'):
+                return obj.save_to_database()
+            
+            # Fallback: manual save
+            return self._manual_save(obj)
+            
+        except Exception as e:
+            print(f"Error saving {obj.section} object: {e}")
+            return False
+    
+    def _manual_save(self, obj):
+        """Manual save implementation as fallback"""
+        section_name = obj.section
+        data = obj.get_value(destination="database")
         
+        # Filter out calculated parameters
+        filtered_data = {}
+        for key, value in data.items():
+            if not obj.is_parameter_calculated(key):
+                filtered_data[key] = value
+        
+        if hasattr(obj, 'id') and obj.id and obj.id > 0:
+            # Update existing
+            return self.update_item(obj.id, filtered_data, section_name)
+        else:
+            # Insert new
+            return self.add_item(filtered_data, section_name)
+    
+    def load(self, cls, obj_id):
+        """Load and return a parameter object"""
+        if not self.cursor:
+            print("Database not connected")
+            return None
+            
+        try:
+            # Create new instance
+            obj = cls(obj_id, self)
+            
+            # Use the object's built-in load method
+            if hasattr(obj, 'load_database_data'):
+                if obj.load_database_data():
+                    return obj
+                else:
+                    return None
+            
+            return None
+            
+        except Exception as e:
+            print(f"Error loading {cls.__name__} with ID {obj_id}: {e}")
+            return None
+    
+    def delete(self, cls_or_obj, obj_id=None):
+        """Delete an object"""
+        if not self.cursor:
+            print("Database not connected")
+            return False
+        
+        try:
+            if obj_id is None:
+                # Object instance passed
+                obj = cls_or_obj
+                section_name = obj.section
+                obj_id = obj.id
+            else:
+                # Class and ID passed
+                cls = cls_or_obj
+                temp_obj = cls(0, None)
+                section_name = temp_obj.section
+            
+            # Delete from database
+            self.cursor.execute(f"DELETE FROM '{section_name}' WHERE ID = ?", (obj_id,))
+            self.conn.commit()
+            
+            return self.cursor.rowcount > 0
+            
+        except Exception as e:
+            print(f"Error deleting object: {e}")
+            return False
+    
+    def query(self, cls, **filters):
+        """Query objects with optional filters"""
+        if not self.cursor:
+            print("Database not connected")
+            return []
+        
+        try:
+            temp_obj = cls(0, None)
+            section_name = temp_obj.section
+            
+            # Build query
+            if filters:
+                where_clause = " AND ".join([f"'{k}' = ?" for k in filters.keys()])
+                sql = f"SELECT * FROM '{section_name}' WHERE {where_clause}"
+                params = list(filters.values())
+            else:
+                sql = f"SELECT * FROM '{section_name}'"
+                params = []
+            
+            # Execute query
+            self.cursor.execute(sql, params)
+            rows = self.cursor.fetchall()
+            
+            # Convert to objects
+            objects = []
+            for row in rows:
+                obj_id = row[0]  # ID is always first column
+                obj = self.load(cls, obj_id)
+                if obj:
+                    objects.append(obj)
+            
+            return objects
+            
+        except Exception as e:
+            print(f"Error querying {cls.__name__}: {e}")
+            return []
+    
+    def get_all(self, cls):
+        """Get all objects of a given class"""
+        return self.query(cls)
+    
+    # Legacy methods for backward compatibility
+    def add_item(self, data, section):
+        """Add item to database"""
+        if not self.cursor or section not in self.registered_classes:
+            return False
+        
+        try:
+            # Get parameters that should be stored
+            cls = self.registered_classes[section]
+            temp_obj = cls(0, None)
+            db_params = temp_obj.get_visible_parameters("database")
+            
+            # Filter data to only include storable parameters
+            filtered_data = {}
+            for key in db_params:
+                if (key in data and 
+                    not temp_obj.is_parameter_calculated(key)):
+                    filtered_data[key] = data[key]
+            
+            if not filtered_data:
+                return False
+            
+            # Build INSERT query
+            columns = list(filtered_data.keys())
+            placeholders = ['?' for _ in columns]
+            columns_str = "', '".join(columns)
+            placeholders_str = ", ".join(placeholders)
+            
+            sql = f"INSERT INTO '{section}' ('{columns_str}') VALUES ({placeholders_str})"
+            values = list(filtered_data.values())
+            
+            self.cursor.execute(sql, values)
+            self.conn.commit()
+            return True
+            
+        except Exception as e:
+            print(f"Error adding item to {section}: {e}")
+            return False
+    
+    def update_item(self, item_id, data, section):
+        """Update item in database"""
+        if not self.cursor or section not in self.registered_classes:
+            return False
+        
+        try:
+            # Get parameters that should be stored
+            cls = self.registered_classes[section]
+            temp_obj = cls(0, None)
+            db_params = temp_obj.get_visible_parameters("database")
+            
+            # Filter data to only include storable parameters
+            filtered_data = {}
+            for key in db_params:
+                if (key in data and 
+                    not temp_obj.is_parameter_calculated(key)):
+                    filtered_data[key] = data[key]
+            
+            if not filtered_data:
+                return False
+            
+            # Build UPDATE query
+            set_clauses = [f"'{key}' = ?" for key in filtered_data.keys()]
+            set_clause = ", ".join(set_clauses)
+            values = list(filtered_data.values())
+            values.append(item_id)
+            
+            sql = f"UPDATE '{section}' SET {set_clause} WHERE ID = ?"
+            
+            self.cursor.execute(sql, values)
+            self.conn.commit()
+            return True
+            
+        except Exception as e:
+            print(f"Error updating item in {section}: {e}")
+            return False
+    
     def get_items(self, section):
-        """Get all items from a section"""
-        if not self.cursor or section not in self.sections_dictionary:
-            print(f"Section {section} not found in database")
+        """Get all items from section"""
+        if not self.cursor or section not in self.registered_classes:
             return []
         
         try:
             self.cursor.execute(f"SELECT * FROM '{section}'")
             rows = self.cursor.fetchall()
             
+            # Get column names
+            columns = [description[0] for description in self.cursor.description]
+            
             # Convert to list of dictionaries
-            columns = self.sections_dictionary[section]
             return [dict(zip(columns, row)) for row in rows]
-        except sqlite3.Error as e:
+            
+        except Exception as e:
             print(f"Error getting items from {section}: {e}")
             return []
-
-    def add_item(self, data, section):
-        """Add item to a section"""
-        if not self.cursor or section not in self.sections_dictionary:
-            print(f"Cannot add item - section {section} not found")
-            return False
-        
-        columns = self.sections_dictionary[section][1:]  # Skip ID column
-        values = []
-        
-        # Get values in correct order, handling missing keys
-        for col in columns:
-            if col in data:
-                values.append(data[col])
-            else:
-                # Handle common parameter name mappings
-                if col == 'preview_image' and 'preview_image' in data:
-                    values.append(data['preview_image'])
-                elif col == 'unit_price' and 'unit_price' in data:
-                    values.append(data['unit_price'])
-                elif col == 'sale_price' and 'sale_price' in data:
-                    values.append(data['sale_price'])
-                else:
-                    values.append('')  # Default empty value
-        
-        try:
-            placeholders = ', '.join(['?'] * len(columns))
-            columns_quoted = ', '.join([f"'{col}'" for col in columns])
-            
-            self.cursor.execute(
-                f"INSERT INTO '{section}' ({columns_quoted}) VALUES ({placeholders})",
-                values
-            )
-            self.conn.commit()
-            print(f"Added item to {section}: {dict(zip(columns, values))}")
-            return True
-        except sqlite3.Error as e:
-            print(f"Error adding item to {section}: {e}")
-            return False
-
-    def update_item(self, item_id, data, section):
-        """Update item in a section"""
-        if not self.cursor or section not in self.sections_dictionary:
-            print(f"Cannot update item - section {section} not found")
-            return False
-        
-        columns = self.sections_dictionary[section][1:]  # Skip ID column
-        
-        # Only update columns that are provided in data
-        update_columns = []
-        values = []
-        
-        for col in columns:
-            if col in data:
-                update_columns.append(col)
-                values.append(data[col])
-            # Handle parameter name mappings
-            elif col == 'preview_image' and 'preview_image' in data:
-                update_columns.append(col)
-                values.append(data['preview_image'])
-            elif col == 'unit_price' and 'unit_price' in data:
-                update_columns.append(col)
-                values.append(data['unit_price'])
-            elif col == 'sale_price' and 'sale_price' in data:
-                update_columns.append(col)
-                values.append(data['sale_price'])
-        
-        if not update_columns:
-            print(f"No valid columns to update for {section}")
-            return False
-        
-        set_clauses = [f"'{col}' = ?" for col in update_columns]
-        set_clause = ', '.join(set_clauses)
-        values.append(item_id)  # Add ID for WHERE clause
-        
-        try:
-            id_column = self.sections_dictionary[section][0]
-            self.cursor.execute(
-                f"UPDATE '{section}' SET {set_clause} WHERE '{id_column}' = ?",
-                values
-            )
-            self.conn.commit()
-            print(f"Updated item {item_id} in {section}: {dict(zip(update_columns, values[:-1]))}")
-            return True
-        except sqlite3.Error as e:
-            print(f"Error updating item in {section}: {e}")
-            return False
-
+    
     def delete_item(self, item_id, section):
-        """Delete item from a section"""
-        if not self.cursor or section not in self.sections_dictionary:
-            print(f"Cannot delete item - section {section} not found")
+        """Delete item from section"""
+        if not self.cursor or section not in self.registered_classes:
             return False
         
         try:
-            id_column = self.sections_dictionary[section][0]
-            self.cursor.execute(f"DELETE FROM '{section}' WHERE '{id_column}' = ?", (item_id,))
+            self.cursor.execute(f"DELETE FROM '{section}' WHERE ID = ?", (item_id,))
             self.conn.commit()
-            print(f"Deleted item {item_id} from {section}")
-            return True
-        except sqlite3.Error as e:
+            return self.cursor.rowcount > 0
+        except Exception as e:
             print(f"Error deleting item from {section}: {e}")
             return False
     

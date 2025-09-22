@@ -1,5 +1,5 @@
 """
-Updated Product Class - Works with improved base class system
+Product Class - Works with the database system
 """
 from classes.base_class import BaseClass
 
@@ -24,7 +24,7 @@ class ProductClass(BaseClass):
                 "display_name": {"en": "Product Name", "fr": "Nom du Produit", "es": "Nombre del Producto"},
                 "required": True,
                 "default": "",
-                "options": ["iron", "wood", "whool"],
+                "options": ["iron", "wood", "wool", "steel", "aluminum", "plastic"],
                 "type": "string"
             },
             "unit_price": {
@@ -63,7 +63,7 @@ class ProductClass(BaseClass):
                 "display_name": {"en": "Category", "fr": "Catégorie", "es": "Categoría"},
                 "required": False,
                 "default": "",
-                "options": ["Electronics", "Clothing", "Food", "Books", "Tools", "Other"],
+                "options": ["Electronics", "Clothing", "Food", "Books", "Tools", "Raw Materials", "Other"],
                 "type": "string"
             },
             "description": {
@@ -89,7 +89,7 @@ class ProductClass(BaseClass):
                 "preview_image": "r",
                 "name": "rw",
                 "unit_price": "r",
-                "sale_price": "r",
+                "sale_price": "r", 
                 "quantity": "r",
                 "category": "r"
             },
@@ -103,11 +103,13 @@ class ProductClass(BaseClass):
             },
             "database": {
                 "name": "rw",
-                "unit_price": "rw",
+                "unit_price": "rw", 
                 "sale_price": "rw",
                 "preview_image": "rw",
                 "category": "rw",
                 "description": "rw"
+                # Note: quantity is calculated and not stored in database
+                # Note: id is handled automatically by database
             },
             "report": {
                 "id": "r",
@@ -131,7 +133,7 @@ class ProductClass(BaseClass):
             imports_result = self.database.cursor.fetchone()
             total_imports = imports_result[0] if imports_result and imports_result[0] else 0
             
-            # Get total sales for this product
+            # Get total sales for this product  
             self.database.cursor.execute("SELECT SUM(quantity) FROM Sales WHERE product_id = ?", (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0
@@ -167,53 +169,42 @@ class ProductClass(BaseClass):
             return False
         
         try:
+            # Get raw data from database
             items = self.database.get_items("Products")
             for item in items:
-                # Use string comparison for database ID field
                 if str(item.get('ID', '')) == str(self.id):
-                    # Load non-calculated parameters
+                    # Load all non-calculated parameters
                     for param_key in self.parameters:
                         if not self.is_parameter_calculated(param_key) and param_key in item:
-                            # Map database field names to parameter names
-                            db_value = item[param_key]
-                            
-                            # Handle special cases for database field mapping
-                            if param_key == 'id':
-                                db_value = item.get('ID', 0)
-                            elif param_key == 'preview_image':
-                                db_value = item.get('preview_image', '') or item.get('preview image', '')
-                            elif param_key == 'unit_price':
-                                db_value = item.get('unit_price', 0) or item.get('unit price', 0)
-                            elif param_key == 'sale_price':
-                                db_value = item.get('sale_price', 0) or item.get('sale price', 0)
-                            
-                            self.set_value(param_key, db_value)
+                            try:
+                                # Handle field name mapping if needed
+                                if param_key == 'id':
+                                    value = item.get('ID', 0)
+                                else:
+                                    value = item.get(param_key)
+                                
+                                if value is not None:
+                                    self.set_value(param_key, value)
+                            except (KeyError, ValueError) as e:
+                                print(f"Warning: Could not load {param_key}: {e}")
                     return True
             return False
+                
         except Exception as e:
             print(f"Error loading product data for ID {self.id}: {e}")
             return False
     
     def save_to_database(self):
-        """Save product to database with proper field mapping"""
+        """Save product to database"""
         if not self.database:
             return False
         
         try:
-            # Get data for database destination
+            # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):
                 value = self.get_value(param_key)
-                
-                # Map parameter names to database field names
-                if param_key == 'preview_image':
-                    data['preview_image'] = value or ''
-                elif param_key == 'unit_price':
-                    data['unit_price'] = value or 0.0
-                elif param_key == 'sale_price':
-                    data['sale_price'] = value or 0.0
-                else:
-                    data[param_key] = value
+                data[param_key] = value
             
             if self.id and self.id > 0:
                 # Update existing product

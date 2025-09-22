@@ -1,3 +1,0 @@
-"""
-Managers package initialization
-"""

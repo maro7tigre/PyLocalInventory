@@ -1,5 +1,5 @@
 """
-Database System - Works with parameter classes
+Database System - Updated to support multi-item operations with foreign keys
 """
 import sqlite3
 import os
@@ -59,6 +59,9 @@ class Database:
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
             
+            # Enable foreign key support in SQLite
+            self.cursor.execute("PRAGMA foreign_keys = ON")
+            
             # Create tables for all registered classes
             self._create_all_tables()
             
@@ -70,7 +73,7 @@ class Database:
             return False
     
     def _create_table_for_class(self, cls, section_name):
-        """Create database table for a parameter class"""
+        """Create database table for a parameter class with foreign key support"""
         try:
             # Create temporary instance to get parameter info
             temp_obj = cls(0, None)
@@ -84,6 +87,7 @@ class Database:
             
             # Build column definitions
             columns = ["ID INTEGER PRIMARY KEY AUTOINCREMENT"]
+            foreign_keys = []
             
             for param_key in db_params:
                 if param_key in temp_obj.parameters:
@@ -104,12 +108,29 @@ class Database:
                     
                     # Add column with proper quoting
                     columns.append(f"'{param_key}' {sql_type}")
+                    
+                    # Add foreign key constraints for ID fields
+                    if param_key.endswith('_id') and param_key != 'id':
+                        # Determine referenced table based on naming convention
+                        if param_key == 'client_id':
+                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Clients'(ID)")
+                        elif param_key == 'supplier_id':
+                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Suppliers'(ID)")
+                        elif param_key == 'product_id':
+                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Products'(ID)")
+                        elif param_key == 'sales_id':
+                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Sales'(ID) ON DELETE CASCADE")
+                        elif param_key == 'import_id':
+                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Imports'(ID) ON DELETE CASCADE")
+            
+            # Combine columns and foreign keys
+            all_constraints = columns + foreign_keys
+            constraints_str = ",\n    ".join(all_constraints)
             
             # Create table
-            columns_str = ",\n    ".join(columns)
             sql = f"""
                 CREATE TABLE IF NOT EXISTS '{section_name}' (
-                    {columns_str}
+                    {constraints_str}
                 )
             """
             
@@ -121,9 +142,24 @@ class Database:
             print(f"✗ Error creating table for {section_name}: {e}")
     
     def _create_all_tables(self):
-        """Create tables for all registered classes"""
+        """Create tables for all registered classes in proper order"""
+        # Create tables in order to respect foreign key dependencies
+        creation_order = [
+            'Products', 'Clients', 'Suppliers',  # Base tables first
+            'Sales', 'Imports',                   # Operation tables
+            'Sales_Items', 'Import_Items'         # Item tables last
+        ]
+        
+        # Create tables in order if they exist in registered classes
+        for section_name in creation_order:
+            if section_name in self.registered_classes:
+                cls = self.registered_classes[section_name]
+                self._create_table_for_class(cls, section_name)
+        
+        # Create any remaining tables not in the order list
         for section_name, cls in self.registered_classes.items():
-            self._create_table_for_class(cls, section_name)
+            if section_name not in creation_order:
+                self._create_table_for_class(cls, section_name)
     
     def save(self, obj):
         """Save any parameter object to database"""
@@ -158,8 +194,13 @@ class Database:
             # Update existing
             return self.update_item(obj.id, filtered_data, section_name)
         else:
-            # Insert new
-            return self.add_item(filtered_data, section_name)
+            # Insert new and update object's ID
+            new_id = self.add_item(filtered_data, section_name)
+            if new_id:
+                obj.id = new_id
+                obj.set_value('id', new_id)
+                return True
+            return False
     
     def load(self, cls, obj_id):
         """Load and return a parameter object"""
@@ -185,12 +226,15 @@ class Database:
             return None
     
     def delete(self, cls_or_obj, obj_id=None):
-        """Delete an object"""
+        """Delete an object and its related items (cascading)"""
         if not self.cursor:
             print("Database not connected")
             return False
         
         try:
+            # Begin transaction for cascading deletes
+            self.cursor.execute("BEGIN")
+            
             if obj_id is None:
                 # Object instance passed
                 obj = cls_or_obj
@@ -202,15 +246,34 @@ class Database:
                 temp_obj = cls(0, None)
                 section_name = temp_obj.section
             
-            # Delete from database
+            # Delete from database (foreign key constraints will handle cascading)
             self.cursor.execute(f"DELETE FROM '{section_name}' WHERE ID = ?", (obj_id,))
+            
+            # Commit transaction
             self.conn.commit()
             
             return self.cursor.rowcount > 0
             
         except Exception as e:
+            # Rollback on error
+            self.conn.rollback()
             print(f"Error deleting object: {e}")
             return False
+    
+    def begin_transaction(self):
+        """Begin a database transaction"""
+        if self.cursor:
+            self.cursor.execute("BEGIN")
+    
+    def commit_transaction(self):
+        """Commit the current transaction"""
+        if self.conn:
+            self.conn.commit()
+    
+    def rollback_transaction(self):
+        """Rollback the current transaction"""
+        if self.conn:
+            self.conn.rollback()
     
     def query(self, cls, **filters):
         """Query objects with optional filters"""
@@ -253,11 +316,11 @@ class Database:
         """Get all objects of a given class"""
         return self.query(cls)
     
-    # Legacy methods for backward compatibility
+    # Updated legacy methods for backward compatibility
     def add_item(self, data, section):
-        """Add item to database"""
+        """Add item to database and return the new ID"""
         if not self.cursor or section not in self.registered_classes:
-            return False
+            return None
         
         try:
             # Get parameters that should be stored
@@ -273,7 +336,7 @@ class Database:
                     filtered_data[key] = data[key]
             
             if not filtered_data:
-                return False
+                return None
             
             # Build INSERT query
             columns = list(filtered_data.keys())
@@ -286,11 +349,13 @@ class Database:
             
             self.cursor.execute(sql, values)
             self.conn.commit()
-            return True
+            
+            # Return the ID of the inserted record
+            return self.cursor.lastrowid
             
         except Exception as e:
             print(f"Error adding item to {section}: {e}")
-            return False
+            return None
     
     def update_item(self, item_id, data, section):
         """Update item in database"""

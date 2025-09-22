@@ -1,5 +1,6 @@
 """
 Sales Class - Updated to handle multiple items per sales operation
+Example showing new parameter types: date, table
 """
 from classes.base_class import BaseClass
 from classes.sales_item_class import SalesItemClass
@@ -34,7 +35,7 @@ class SalesClass(BaseClass):
                 "required": True,
                 "default": "",
                 "options": [],
-                "type": "date"
+                "type": "date"  # NEW: Using date type instead of string
             },
             "tva": {
                 "value": 0.0,
@@ -57,8 +58,10 @@ class SalesClass(BaseClass):
             "items": {
                 "display_name": {"en": "Items", "fr": "Articles", "es": "Artículos"},
                 "required": False,
-                "type": "table",
-                "method": self.get_sales_items
+                "type": "table",  # NEW: Using table type
+                "method": self.get_sales_items,
+                "item_class": SalesItemClass,  # Specify which item class to use
+                "parent_operation": self  # Reference to parent operation
             },
             "subtotal": {
                 "display_name": {"en": "Subtotal", "fr": "Sous-total", "es": "Subtotal"},
@@ -94,13 +97,14 @@ class SalesClass(BaseClass):
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw",
-                "items": "rw"
+                "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {
                 "client_id": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw"
+                # Note: items are stored separately in Sales_Items table
             },
             "report": {
                 "id": "r",
@@ -120,7 +124,6 @@ class SalesClass(BaseClass):
             return []
         
         try:
-            
             # Get all sales items for this sales operation
             self.database.cursor.execute("SELECT ID FROM Sales_Items WHERE sales_id = ?", (self.id,))
             item_ids = self.database.cursor.fetchall()
@@ -160,7 +163,6 @@ class SalesClass(BaseClass):
             return False
         
         try:
-            
             # Create new sales item
             item = SalesItemClass(0, self.database, self.id, product_id)
             item.set_value('quantity', quantity)

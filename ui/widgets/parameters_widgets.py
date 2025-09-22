@@ -2,10 +2,11 @@
 Parameter Widgets Factory - Creates appropriate widgets for different parameter types
 """
 import os
+from datetime import datetime
 from PySide6.QtWidgets import (QLineEdit, QSpinBox, QDoubleSpinBox, QWidget, 
                                QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
-                               QFileDialog, QMessageBox)
-from PySide6.QtCore import Qt, Signal
+                               QFileDialog, QMessageBox, QDateEdit)
+from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QPixmap
 
 try:
@@ -143,6 +144,144 @@ class StringWidget(QWidget):
                     color: white;
                     border: 1px solid #555555;
                 }
+            """)
+
+
+class DateWidget(QWidget):
+    """Widget for date parameters"""
+    
+    def __init__(self, param_info, editable=True, parent=None):
+        super().__init__(parent)
+        self.param_info = param_info
+        self.editable = editable
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.date_edit = QDateEdit()
+        self.date_edit.setCalendarPopup(True)
+        self.date_edit.setDate(QDate.currentDate())  # Default to today
+        self.date_edit.setEnabled(editable)
+        
+        layout.addWidget(self.date_edit)
+        self.apply_style()
+    
+    def date(self):
+        """Get date as string in YYYY-MM-DD format"""
+        return self.date_edit.date().toString("yyyy-MM-dd")
+    
+    def setDate(self, date_str):
+        """Set date from string (YYYY-MM-DD format)"""
+        if date_str and isinstance(date_str, str):
+            try:
+                date_obj = QDate.fromString(date_str, "yyyy-MM-dd")
+                if date_obj.isValid():
+                    self.date_edit.setDate(date_obj)
+            except:
+                # Fallback to current date if invalid
+                self.date_edit.setDate(QDate.currentDate())
+        else:
+            self.date_edit.setDate(QDate.currentDate())
+    
+    def apply_style(self):
+        if not self.editable:
+            self.date_edit.setStyleSheet("""
+                QDateEdit {
+                    background-color: #1e1e1e;
+                    color: #888888;
+                    border: 1px solid #444444;
+                }
+            """)
+        else:
+            self.date_edit.setStyleSheet("""
+                QDateEdit {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                    padding: 5px;
+                }
+                QDateEdit::drop-down {
+                    border: none;
+                    background-color: #404040;
+                }
+                QDateEdit::down-arrow {
+                    image: none;
+                    border-left: 5px solid transparent;
+                    border-right: 5px solid transparent;
+                    border-top: 5px solid white;
+                }
+            """)
+
+
+class ButtonWidget(QWidget):
+    """Widget for button parameters (like delete buttons in tables)"""
+    
+    clicked = Signal()  # Signal emitted when button is clicked
+    
+    def __init__(self, param_info, editable=True, parent=None):
+        super().__init__(parent)
+        self.param_info = param_info
+        self.editable = editable
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        # Get button properties from param_info
+        button_text = param_info.get('text', '🗑️')  # Default trash emoji
+        button_color = param_info.get('color', 'red')  # Default red
+        button_size = param_info.get('size', 30)  # Default size
+        
+        self.button = QPushButton(button_text)
+        self.button.setFixedSize(button_size, button_size)
+        self.button.setEnabled(editable)
+        self.button.clicked.connect(self.clicked.emit)
+        
+        layout.addWidget(self.button)
+        layout.addStretch()
+        
+        self.apply_style(button_color)
+    
+    def apply_style(self, color='red'):
+        """Apply button styling based on color"""
+        if color == 'red':
+            border_color = '#f44336'
+            hover_bg = '#f44336'
+        elif color == 'blue':
+            border_color = '#2196F3'
+            hover_bg = '#2196F3'
+        elif color == 'green':
+            border_color = '#4CAF50'
+            hover_bg = '#4CAF50'
+        else:
+            border_color = '#666666'
+            hover_bg = '#666666'
+        
+        if not self.editable:
+            self.button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: #1e1e1e;
+                    color: #888888;
+                    border: 1px solid #444444;
+                    border-radius: 4px;
+                }}
+            """)
+        else:
+            self.button.setStyleSheet(f"""
+                QPushButton {{
+                    background-color: transparent;
+                    color: {border_color};
+                    border: 2px solid {border_color};
+                    border-radius: 4px;
+                    font-weight: bold;
+                }}
+                QPushButton:hover {{
+                    background-color: {hover_bg};
+                    color: white;
+                }}
+                QPushButton:pressed {{
+                    background-color: {hover_bg};
+                    opacity: 0.8;
+                }}
             """)
 
 
@@ -312,6 +451,32 @@ class ParameterWidgetFactory:
             return NumericWidget(param_info, editable)
         elif param_type == 'image':
             return ImageWidget(param_info, editable, profile_images_dir)
+        elif param_type == 'date':
+            return DateWidget(param_info, editable)
+        elif param_type == 'button':
+            return ButtonWidget(param_info, editable)
+        elif param_type == 'table':
+            # Import here to avoid circular imports
+            try:
+                from ui.widgets.table_parameter_widget import TableParameterWidget
+                
+                # Get table-specific configuration from param_info
+                item_class = param_info.get('item_class')
+                parent_operation = param_info.get('parent_operation')
+                
+                if item_class:
+                    return TableParameterWidget(item_class, parent_operation, 
+                                              profile_images_dir, editable)  # Using profile_images_dir as database
+                else:
+                    # Return placeholder if no item class specified
+                    placeholder = QLabel("Table parameter needs item_class")
+                    placeholder.setStyleSheet("color: #ff9800; font-style: italic;")
+                    return placeholder
+                    
+            except ImportError as e:
+                placeholder = QLabel(f"Table widget not available: {e}")
+                placeholder.setStyleSheet("color: #f44336; font-style: italic;")
+                return placeholder
         else:  # string or unknown type
             return StringWidget(param_info, editable)
     
@@ -324,6 +489,10 @@ class ParameterWidgetFactory:
             return widget.text()
         elif isinstance(widget, ImageWidget):
             return widget.get_image_path()
+        elif isinstance(widget, DateWidget):
+            return widget.date()
+        elif isinstance(widget, ButtonWidget):
+            return None  # Buttons don't have values
         else:
             # Fallback for unknown widget types
             if hasattr(widget, 'text'):
@@ -341,6 +510,10 @@ class ParameterWidgetFactory:
             widget.setText(value)
         elif isinstance(widget, ImageWidget):
             widget.set_image_path(value, copy_to_profile=False)
+        elif isinstance(widget, DateWidget):
+            widget.setDate(value)
+        elif isinstance(widget, ButtonWidget):
+            pass  # Buttons don't have settable values
         else:
             # Fallback for unknown widget types
             if hasattr(widget, 'setText'):

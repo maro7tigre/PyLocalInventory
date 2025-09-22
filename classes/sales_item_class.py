@@ -1,5 +1,6 @@
 """
 Sales Item Class - Represents individual items within a sales operation
+Updated example showing button parameter for delete actions
 """
 from classes.base_class import BaseClass
 
@@ -58,6 +59,15 @@ class SalesItemClass(BaseClass):
                 "required": False,
                 "type": "float",
                 "method": self.calculate_subtotal
+            },
+            "delete_action": {
+                "display_name": {"en": "Delete", "fr": "Supprimer", "es": "Eliminar"},
+                "required": False,
+                "type": "button",  # NEW: Button parameter type
+                "text": "🗑️",  # Trash emoji
+                "color": "red",  # Red styling
+                "size": 25,  # Button size
+                "action": self.delete_self  # Method to call when clicked
             }
         }
         
@@ -67,24 +77,28 @@ class SalesItemClass(BaseClass):
                 "product_id": "rw",
                 "quantity": "rw", 
                 "unit_price": "rw",
-                "subtotal": "r"
+                "subtotal": "r",
+                "delete_action": "r"  # Delete button visible in table
             },
             "dialog": {
                 "product_id": "rw",
                 "quantity": "rw",
                 "unit_price": "rw"
+                # No delete button in dialog (use dialog's delete button instead)
             },
             "database": {
                 "sales_id": "rw",
                 "product_id": "rw", 
                 "quantity": "rw",
                 "unit_price": "rw"
+                # Calculated and button parameters not stored in database
             },
             "report": {
                 "product_id": "r",
                 "quantity": "r",
                 "unit_price": "r",
                 "subtotal": "r"
+                # No delete button in reports
             }
         }
     
@@ -93,6 +107,22 @@ class SalesItemClass(BaseClass):
         quantity = self.get_value('quantity') or 0
         unit_price = self.get_value('unit_price') or 0.0
         return quantity * unit_price
+    
+    def delete_self(self):
+        """Delete this item from database - called by delete button"""
+        if self.database and self.id:
+            try:
+                success = self.database.delete_item(self.id, self.section)
+                if success:
+                    print(f"Successfully deleted sales item {self.id}")
+                    return True
+                else:
+                    print(f"Failed to delete sales item {self.id}")
+                    return False
+            except Exception as e:
+                print(f"Error deleting sales item {self.id}: {e}")
+                return False
+        return False
     
     def get_product_name(self):
         """Get the name of the associated product"""
@@ -107,6 +137,19 @@ class SalesItemClass(BaseClass):
         except Exception as e:
             print(f"Error getting product name: {e}")
             return f"Product {self.get_value('product_id')}"
+    
+    def get_product_options(self):
+        """Get list of available products for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT ID, name FROM Products ORDER BY name")
+            results = self.database.cursor.fetchall()
+            return [f"{row[0]} - {row[1]}" for row in results]
+        except Exception as e:
+            print(f"Error getting product options: {e}")
+            return []
         
     def save_to_database(self):
         """Save sales item to database"""

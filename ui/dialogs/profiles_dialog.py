@@ -103,14 +103,14 @@ class ProfilesDialog(QDialog):
 
         # Create left and right widgets and set their layouts
         self.left_widget = QWidget()
-        right_widget = QWidget()
+        self.right_widget = QWidget()
         self.left_widget.setLayout(self.create_left_layout())
-        right_widget.setLayout(self.create_right_layout())
+        self.right_widget.setLayout(self.create_right_layout())
 
         # Store splitter reference for resize handling
         self.splitter = splitter
         splitter.addWidget(self.left_widget)
-        splitter.addWidget(right_widget)
+        splitter.addWidget(self.right_widget)
         splitter.setSizes([250, 250])  # Initial sizes
 
         # Create overlay widget for left panel (initially hidden)
@@ -143,6 +143,20 @@ class ProfilesDialog(QDialog):
         # Initialize with empty profile
         self.enable_right_layout(False)
         self.refresh_info()
+        
+        # Auto-select the currently selected profile
+        self.auto_select_current_profile()
+    
+    def auto_select_current_profile(self):
+        """Auto-select the currently selected profile when dialog opens"""
+        if (self.profile_manager.selected_profile and 
+            self.profile_manager.selected_profile.name in self.profile_manager.available_profiles):
+            
+            # Select the card in the cards list
+            self.cards_list.select_card(self.profile_manager.selected_profile.name)
+            
+            # Update the right panel with the selected profile
+            self.refresh_info(self.profile_manager.selected_profile)
         
     def create_overlay(self):
         """Create semi-transparent overlay for left panel"""
@@ -186,7 +200,7 @@ class ProfilesDialog(QDialog):
     # MARK: Right Layout
     def create_right_layout(self):
         """Setup the right panel with profile details"""
-        right_layout = QVBoxLayout()
+        self.right_layout = QVBoxLayout()
         
         # Header with save and cancel buttons
         header_layout = QHBoxLayout()
@@ -203,7 +217,7 @@ class ProfilesDialog(QDialog):
         header_layout.addWidget(self.save_btn)
         header_layout.addWidget(self.cancel_edit_btn)
         
-        right_layout.addLayout(header_layout)
+        self.right_layout.addLayout(header_layout)
         
         # Scrollable area
         scroll_area = QScrollArea()
@@ -255,7 +269,7 @@ class ProfilesDialog(QDialog):
         scroll_area.setWidget(self.scroll_widget)
         scroll_area.setWidgetResizable(True)
         
-        right_layout.addWidget(scroll_area)
+        self.right_layout.addWidget(scroll_area)
         
         # Store components for enable/disable functionality
         self.right_components = [
@@ -267,7 +281,28 @@ class ProfilesDialog(QDialog):
         ]
         self.right_components.extend(self.parameter_edits.values())
         
-        return right_layout
+        return self.right_layout
+    
+    def set_right_panel_edit_mode(self, edit_mode):
+        """Set border color based on edit mode"""
+        if edit_mode:
+            # Blue border for edit mode - apply only to the right widget itself, not children
+            self.right_widget.setStyleSheet("""
+                QWidget#right_panel {
+                    border: 2px solid #2196F3;
+                    border-radius: 4px;
+                }
+            """)
+            self.right_widget.setObjectName("right_panel")
+        else:
+            # Grey border for normal mode
+            self.right_widget.setStyleSheet("""
+                QWidget#right_panel {
+                    border: 2px solid #555555;
+                    border-radius: 4px;
+                }
+            """)
+            self.right_widget.setObjectName("right_panel")
     
     def release_image_resources(self):
         """Release any resources held by the image label to prevent file locking"""
@@ -413,6 +448,9 @@ class ProfilesDialog(QDialog):
         else:
             self.overlay.hide()
             
+        # Update right panel border color based on edit mode
+        self.set_right_panel_edit_mode(enabled)
+            
         self.right_enabled = enabled
     
     def safe_copy_image(self, source_path, dest_path):
@@ -503,6 +541,9 @@ class ProfilesDialog(QDialog):
                     password_manager.validation_phrase, password)
                 profile.save_to_config()
                 
+                # Select the newly created profile
+                self.profile_manager.selected_profile = profile
+                
             elif self.edit_mode == 'duplicate':
                 profile = self.profile_manager.create_profile(profile_data, image_to_use)
                 
@@ -512,12 +553,20 @@ class ProfilesDialog(QDialog):
                     profile.encrypted_phrase = self.current_profile.encrypted_phrase
                     profile.save_to_config()
                 
+                # Select the newly created profile
+                self.profile_manager.selected_profile = profile
+                
             elif self.edit_mode == 'edit':
                 self.profile_manager.update_profile(self.current_profile.name, profile_data, image_to_use)
+                # Keep the same selected profile (it was updated)
                 
             # Refresh the profiles list
             self.refresh_profiles_list()
             self.enable_right_layout(False)
+            
+            # Auto-select the saved profile
+            if self.edit_mode in ['new', 'duplicate']:
+                self.auto_select_current_profile()
             
             QMessageBox.information(self, "Success", "Profile saved successfully.")
             
@@ -532,6 +581,10 @@ class ProfilesDialog(QDialog):
         self.image_path = ""
         self.original_image_path = ""
         self.refresh_info()
+        
+        # Re-select the current profile if there is one
+        if self.profile_manager.selected_profile:
+            self.auto_select_current_profile()
         
     def browse_profiles_path(self):
         """Open directory dialog to select profiles folder"""
@@ -572,6 +625,10 @@ class ProfilesDialog(QDialog):
         self.edit_mode = 'new'
         self.image_path = ""
         self.original_image_path = ""
+        
+        # Unselect any currently selected card
+        self.cards_list.select_card(None)
+        
         self.refresh_info(self.empty_profile)
         self.enable_right_layout(True)
     
@@ -602,6 +659,9 @@ class ProfilesDialog(QDialog):
                 duplicate_profile.parameters[key]["value"] = param["value"]
             duplicate_profile.preview_path = source_profile.preview_path
             
+            # Unselect any currently selected card
+            self.cards_list.select_card(None)
+            
             self.refresh_info(duplicate_profile)
             self.enable_right_layout(True)
     
@@ -619,7 +679,16 @@ class ProfilesDialog(QDialog):
             
             if reply == QMessageBox.Yes:
                 try:
+                    # Check if we're deleting the currently selected profile
+                    was_selected = (self.profile_manager.selected_profile and 
+                                  self.profile_manager.selected_profile.name == profile_name)
+                    
                     self.profile_manager.delete_profile(card_id)
+                    
+                    # If we deleted the selected profile, clear the selection
+                    if was_selected:
+                        self.profile_manager.selected_profile = None
+                    
                     self.refresh_profiles_list()
                     QMessageBox.information(self, "Success", "Profile deleted successfully.")
                 except Exception as e:

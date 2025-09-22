@@ -1,5 +1,5 @@
 """
-Main window class - coordinates all UI components and handles window layout
+Main window - Products tab with simple database integration
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
@@ -7,17 +7,20 @@ from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction
 
 from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLineEdit
+from ui.widgets.welcome_widget import WelcomeWidget
+from ui.widgets.password_widget import PasswordWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.tabs.home_tab import HomeTab
-from ui.tabs.operations_tab import OperationsTab
 from ui.tabs.products_tab import ProductsTab
-from ui.tabs.clients_tab import ClientsTab
-from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.log_tab import LogTab
+
+from classes.product_class import ProductClass
+
 from core.profiles import ProfileManager
 from core.password import PasswordManager
 from core.database import Database
+
 
 class MainWindow(ThemedMainWindow):
     def __init__(self):
@@ -33,23 +36,28 @@ class MainWindow(ThemedMainWindow):
         self.profile_manager = ProfileManager()
         self.password_manager = PasswordManager(self.profile_manager)
         
-        # Database sections configuration
-        self.sections_dictionary = {
-            "Inventory": ["ID", "Company", "Role", "Product", "Price_HT", "Price_TTC", "Quantity", "Icon"],
-            "Clients": ["ID", "Name", "Email", "Phone", "Address"],
-            "Orders": ["ID", "Client_ID", "Product_ID", "Quantity", "Total_Price", "Date"],
-            "Products": ["ID", "Name", "Unit_Price", "Sale_Price"],
-            "Suppliers": ["ID", "Name", "Email", "Phone", "Address"]
-        }
+        # Load saved profile if it exists
+        self.load_saved_profile()
         
-        # Database manager
-        self.database = Database(self.profile_manager, self.sections_dictionary)
+        # Initialize database system
+        self.database = Database(self.profile_manager)
+        
+        # Register parameter classes manually
+        self.register_parameter_classes()
 
-        
         # UI setup
         self.setup_menu()
         self.setup_main_widget()
         self.refresh_app()
+    
+    def register_parameter_classes(self):
+        """Register parameter classes with the database"""
+        print("📋 Registering parameter classes...")
+        
+        # Register ProductClass
+        self.database.register_class(ProductClass)
+        
+        print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
     def load_app_config(self):
         """Load application configuration from QSettings"""
@@ -60,8 +68,21 @@ class MainWindow(ThemedMainWindow):
         
         # Load profiles path (default to ./profiles)
         profiles_path = self.settings.value("profiles_path", "./profiles")
-        # Store for use by ProfileManager
         self.profiles_path = profiles_path
+    
+    def load_saved_profile(self):
+        """Load the last selected profile from config"""
+        saved_profile_name = self.settings.value("selected_profile")
+        if saved_profile_name:
+            # Set profiles path first
+            self.profile_manager.profiles_path = self.profiles_path
+            self.profile_manager.load_profiles()
+            
+            # Try to load the saved profile
+            if self.profile_manager.load_profile(saved_profile_name):
+                print(f"✓ Loaded saved profile: {saved_profile_name}")
+            else:
+                print(f"⚠️  Could not load saved profile: {saved_profile_name}")
     
     def save_app_config(self):
         """Save application configuration to QSettings"""
@@ -70,10 +91,18 @@ class MainWindow(ThemedMainWindow):
         
         # Save profiles path
         self.settings.setValue("profiles_path", getattr(self, 'profiles_path', './profiles'))
+        
+        # Save selected profile
+        if self.profile_manager.selected_profile:
+            self.settings.setValue("selected_profile", self.profile_manager.selected_profile.name)
+        else:
+            self.settings.setValue("selected_profile", "")
     
     def closeEvent(self, event):
         """Handle application close event"""
         self.save_app_config()
+        if self.database:
+            self.database.close()
         event.accept()
     
     def setup_menu(self):
@@ -119,95 +148,105 @@ class MainWindow(ThemedMainWindow):
     def clear_layout(self, layout):
         """Properly clear all items from a layout"""
         while layout.count():
-            child = layout.takeAt(0)  # Take the item instead of just getting it
+            child = layout.takeAt(0)
             if child.widget():
-                child.widget().deleteLater()  # Schedule widget for deletion
+                child.widget().deleteLater()
             elif child.layout():
-                self.clear_layout(child.layout())  # Recursively clear nested layouts
-                child.layout().deleteLater()  # Delete the layout too
+                self.clear_layout(child.layout())
+                child.layout().deleteLater()
     
     def setup_profile_selection(self):
-        """Show profile selection interface"""
-        # Center the open profile button
-        self.main_layout.addStretch()
-        
-        button_layout = QHBoxLayout()
-        button_layout.addStretch()
-        
-        open_profile_btn = GreenButton("Open Profile")
-        open_profile_btn.clicked.connect(self.open_profiles_dialog)
-        button_layout.addWidget(open_profile_btn)
-        
-        button_layout.addStretch()
-        self.main_layout.addLayout(button_layout)
-        self.main_layout.addStretch()
+        """Show welcome widget with profile selection"""
+        welcome_widget = WelcomeWidget()
+        welcome_widget.profile_requested.connect(self.open_profiles_dialog)
+        self.main_layout.addWidget(welcome_widget)
     
     def setup_password_entry(self):
-        """Show password entry interface"""
-        # Center the password form
-        self.main_layout.addStretch()
-        
-        form_layout = QVBoxLayout()
-        form_layout.setAlignment(Qt.AlignCenter)
-        
-        # Password label
-        password_label = QLabel("Password:")
-        password_label.setAlignment(Qt.AlignCenter)
-        form_layout.addWidget(password_label)
-        
-        # Password input
-        self.password_input = ColoredLineEdit()
-        self.password_input.setEchoMode(ColoredLineEdit.Password)
-        self.password_input.setMaximumWidth(300)
-        self.password_input.returnPressed.connect(self.validate_password)
-        self.password_input.textChanged.connect(self.reset_password_border)
-        form_layout.addWidget(self.password_input, alignment=Qt.AlignCenter)
-        
-        # Confirm button
-        confirm_btn = GreenButton("Confirm")
-        confirm_btn.clicked.connect(self.validate_password)
-        confirm_btn.setMaximumWidth(100)
-        form_layout.addWidget(confirm_btn, alignment=Qt.AlignCenter)
-        
-        self.main_layout.addLayout(form_layout)
-        self.main_layout.addStretch()
+        """Show password entry widget"""
+        password_widget = PasswordWidget(self.profile_manager.selected_profile)
+        password_widget.password_submitted.connect(self.validate_password)
+        password_widget.profile_change_requested.connect(self.open_profiles_dialog)
+        self.main_layout.addWidget(password_widget)
     
     def setup_main_tabs(self):
         """Show main application tabs"""
-        # Refresh database connection for current profile
-        self.database.refresh_connection()
+        # Connect to database with current profile
+        if not self.database.connect():
+            self.show_database_error()
+            return
         
         tab_widget = QTabWidget()
         
-        # Add tabs
-        tab_widget.addTab(HomeTab(), "Home")
-        tab_widget.addTab(OperationsTab(), "Operations")
-        tab_widget.addTab(ProductsTab(self.database), "Inventory")
-        tab_widget.addTab(ClientsTab(self.database), "Clients")
-        tab_widget.addTab(SuppliersTab(self.database), "Suppliers")
-        tab_widget.addTab(LogTab(), "Log")
+        # Add tabs manually
+        tab_widget.addTab(HomeTab(self.database), "Home")
+        
+        # Add Products tab
+        try:
+            products_tab = ProductsTab(self.database, self)
+            tab_widget.addTab(products_tab, "Products")
+            print("✓ Added Products tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Products tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Products tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Products (Error)")
+        
+        tab_widget.addTab(LogTab(self.database), "Log")
         
         self.main_layout.addWidget(tab_widget)
         
-    def validate_password(self):
+        # Debug info
+        print(f"\n📊 Database Status:")
+        print(f"   • Connected: {self.database.conn is not None}")
+        print(f"   • Registered classes: {len(self.database.registered_classes)}")
+        for section_name in self.database.registered_classes.keys():
+            try:
+                items_count = len(self.database.get_items(section_name))
+                print(f"   • {section_name}: {items_count} items")
+            except Exception as e:
+                print(f"   • {section_name}: error getting items ({e})")
+    
+    def show_database_error(self):
+        """Show database connection error"""
+        error_widget = QWidget()
+        error_layout = QVBoxLayout(error_widget)
+        error_label = QLabel("Database connection failed. Please check your profile configuration.")
+        error_label.setStyleSheet("color: red; font-size: 16px; text-align: center; padding: 50px;")
+        error_layout.addWidget(error_label, Qt.AlignCenter)
+        self.main_layout.addWidget(error_widget)
+    
+    def validate_password(self, password):
         """Validate entered password"""
-        password = self.password_input.text()
         if not self.password_manager.validate(password):
-            self.password_input.set_border_color("#f44336")  # Red border for incorrect password
+            # Find the password widget and show error
+            for i in range(self.main_layout.count()):
+                widget = self.main_layout.itemAt(i).widget()
+                if hasattr(widget, 'set_password_error'):
+                    widget.set_password_error()
+                    break
+            return False
         else:
             self.password_manager.set_password(password)
+            # Save the successful profile selection
+            self.save_app_config()
             self.refresh_app()
-            
-    def reset_password_border(self):
-        """Reset password input border to default when text changes"""
-        self.password_input.reset_border_color()
+            return True
     
     def open_profiles_dialog(self):
         """Open profiles management dialog"""
         dialog = ProfilesDialog(self)
         if dialog.exec():
             # Profile may have changed, refresh the main window
-            self.profiles_path = dialog.profiles_path  # Update profiles path if changed
+            self.profiles_path = dialog.profiles_path
+            # Save the new profile selection
+            self.save_app_config()
             self.refresh_app()
     
     def open_backups_dialog(self):
@@ -219,4 +258,7 @@ class MainWindow(ThemedMainWindow):
         """Log out current user"""
         self.password_manager.logout()
         self.profile_manager.logout()
+        self.database.close()
+        # Clear saved profile
+        self.settings.setValue("selected_profile", "")
         self.refresh_app()

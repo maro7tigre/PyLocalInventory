@@ -1,404 +1,349 @@
 """
-Parameter Widgets System
-Provides specialized widgets for different parameter types used by BaseEditDialog
+Parameter Widgets Factory - Creates appropriate widgets for different parameter types
 """
-
-from PySide6.QtWidgets import (QWidget, QHBoxLayout, QVBoxLayout, QLineEdit, 
-                               QLabel, QSpinBox, QDoubleSpinBox, QCompleter, 
-                               QFileDialog, QPushButton, QFrame, QTextEdit)
-from PySide6.QtCore import Qt, QStringListModel, Signal
-from PySide6.QtGui import QPixmap, QValidator
 import os
+from PySide6.QtWidgets import (QLineEdit, QSpinBox, QDoubleSpinBox, QWidget, 
+                               QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
+                               QFileDialog, QMessageBox)
+from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QPixmap
+
+try:
+    from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+except ImportError:
+    # Fallback if autocomplete widget not available
+    AutoCompleteLineEdit = None
+
+try:
+    from ui.widgets.preview_widget import PreviewWidget
+except ImportError:
+    # Fallback if preview widget not available
+    PreviewWidget = None
+
 import shutil
 
 
-class AutoCompleteLineEdit(QLineEdit):
-    """String parameter with autocomplete suggestions and validation"""
-    
-    def __init__(self, options=None, parent=None):
-        super().__init__(parent)
-        self.options = options or []
-        self.is_valid_option = True
-        
-        if self.options:
-            # Setup autocomplete
-            completer = QCompleter(self.options)
-            completer.setCaseSensitivity(Qt.CaseInsensitive)
-            completer.setFilterMode(Qt.MatchStartsWith)
-            self.setCompleter(completer)
-        
-        # Connect text change to validation
-        self.textChanged.connect(self._validate_input)
-        self._apply_default_style()
-        
-    def _validate_input(self, text):
-        """Validate input against options and update border color"""
-        if not self.options:
-            self.is_valid_option = True
-            self._update_border_color("#ffffff")
-            return
-            
-        # Check if text matches any option (case insensitive)
-        matches = any(option.lower() == text.lower() for option in self.options)
-        self.is_valid_option = matches or text == ""
-        
-        # Update border color
-        if text == "":
-            self._update_border_color("#ffffff")  # Default
-        elif matches:
-            self._update_border_color("#4CAF50")  # Green for valid
-        else:
-            self._update_border_color("#ff9800")  # Orange for invalid
-    
-    def _update_border_color(self, color):
-        """Update border color"""
-        self.setStyleSheet(f"""
-            QLineEdit {{
-                background-color: #3c3c3c;
-                color: #ffffff;
-                border: 2px solid {color};
-                padding: 8px;
-                border-radius: 4px;
-            }}
-            QLineEdit:focus {{
-                border-color: #2196F3;
-            }}
-        """)
-    
-    def _apply_default_style(self):
-        """Apply default styling"""
-        self._update_border_color("#ffffff")
-
-
 class NumericWidget(QWidget):
-    """Numeric parameter (int/float) with unit display and validation"""
+    """Widget for int/float parameters with validation"""
     
-    def __init__(self, param_type="float", unit="", minimum=None, maximum=None, parent=None):
+    def __init__(self, param_info, editable=True, parent=None):
         super().__init__(parent)
-        self.param_type = param_type
-        self.unit = unit
+        self.param_info = param_info
+        self.editable = editable
         
         layout = QHBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
-        # Create appropriate numeric input
-        if param_type == "int":
-            self.input = QSpinBox()
-            if minimum is not None:
-                self.input.setMinimum(int(minimum))
-            if maximum is not None:
-                self.input.setMaximum(int(maximum))
-        else:  # float
-            self.input = QDoubleSpinBox()
-            self.input.setDecimals(2)
-            if minimum is not None:
-                self.input.setMinimum(float(minimum))
-            if maximum is not None:
-                self.input.setMaximum(float(maximum))
+        # Determine if int or float
+        param_type = param_info.get('type', 'int')
         
-        # Style the input
-        self.input.setStyleSheet("""
-            QSpinBox, QDoubleSpinBox {
-                background-color: #3c3c3c;
-                color: #ffffff;
-                border: 2px solid #ffffff;
-                padding: 8px;
-                border-radius: 4px;
-            }
-        """)
+        if param_type == 'float':
+            self.spinbox = QDoubleSpinBox()
+            self.spinbox.setDecimals(2)
+        else:
+            self.spinbox = QSpinBox()
         
-        layout.addWidget(self.input)
+        # Set range
+        min_val = param_info.get('min', -999999)
+        max_val = param_info.get('max', 999999)
+        self.spinbox.setRange(min_val, max_val)
         
-        # Add unit label if provided
+        # Set enabled state
+        self.spinbox.setEnabled(editable)
+        
+        layout.addWidget(self.spinbox)
+        
+        # Add unit label if present
+        unit = param_info.get('unit', '')
         if unit:
             unit_label = QLabel(unit)
-            unit_label.setStyleSheet("color: #cccccc; margin-left: 5px;")
             layout.addWidget(unit_label)
+        
+        self.apply_style()
     
     def value(self):
-        """Get current value"""
-        return self.input.value()
+        return self.spinbox.value()
     
     def setValue(self, value):
-        """Set value"""
-        try:
-            if self.param_type == "int":
-                self.input.setValue(int(float(value)))
-            else:
-                self.input.setValue(float(value))
-        except (ValueError, TypeError):
-            self.input.setValue(0)
+        if value is not None:
+            self.spinbox.setValue(float(value))
     
-    def setEnabled(self, enabled):
-        """Enable/disable input"""
-        self.input.setEnabled(enabled)
+    def apply_style(self):
+        if not self.editable:
+            self.spinbox.setStyleSheet("""
+                QSpinBox, QDoubleSpinBox {
+                    background-color: #1e1e1e;
+                    color: #888888;
+                    border: 1px solid #444444;
+                }
+            """)
+        else:
+            self.spinbox.setStyleSheet("""
+                QSpinBox, QDoubleSpinBox {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                }
+            """)
 
 
-class ImagePreviewWidget(QWidget):
-    """Image parameter with preview and browse capability"""
+class StringWidget(QWidget):
+    """Widget for string parameters with autocomplete and validation"""
     
-    imageChanged = Signal(str)  # Emits new image path
-    
-    def __init__(self, size=(100, 100), browsing_enabled=True, profile_images_dir=None, parent=None):
+    def __init__(self, param_info, editable=True, parent=None):
         super().__init__(parent)
-        self.size = size
-        self.browsing_enabled = browsing_enabled
-        self.profile_images_dir = profile_images_dir  # Directory to copy images to
-        self.current_image_path = ""
+        self.param_info = param_info
+        self.editable = editable
         
-        self.setFixedSize(*size)
-        self.setup_ui()
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
         
-    def setup_ui(self):
-        """Setup preview area"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(2, 2, 2, 2)
+        # Get options for autocomplete
+        options = param_info.get('options', [])
         
-        # Preview label
-        self.preview_label = QLabel("Click to browse")
-        self.preview_label.setAlignment(Qt.AlignCenter)
-        self.preview_label.setStyleSheet("""
-            QLabel {
-                border: 2px dashed #555555;
-                background-color: #404040;
-                color: #aaaaaa;
-                border-radius: 4px;
-            }
-        """)
+        if options and AutoCompleteLineEdit:
+            self.line_edit = AutoCompleteLineEdit(options=options)
+        else:
+            self.line_edit = QLineEdit()
         
-        layout.addWidget(self.preview_label)
+        # Set enabled state
+        self.line_edit.setEnabled(editable)
         
-        # Connect click event if browsing is enabled
-        if self.browsing_enabled:
-            self.preview_label.mousePressEvent = self._browse_image
+        # Connect validation
+        self.line_edit.textChanged.connect(self.validate_input)
+        
+        layout.addWidget(self.line_edit)
+        self.apply_style()
     
-    def _browse_image(self, event):
-        """Open file dialog to select image"""
-        if not self.browsing_enabled:
-            return
-            
-        file_path, _ = QFileDialog.getOpenFileName(
-            self, "Select Image", "", 
-            "Image Files (*.png *.jpg *.jpeg *.bmp *.gif)"
-        )
+    def text(self):
+        return self.line_edit.text()
+    
+    def setText(self, text):
+        if text is not None:
+            self.line_edit.setText(str(text))
+    
+    def validate_input(self, text):
+        """Validate input against min/max length if specified"""
+        # You can add length validation here if needed
+        pass
+    
+    def apply_style(self):
+        if not self.editable:
+            self.line_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: #1e1e1e;
+                    color: #888888;
+                    border: 1px solid #444444;
+                }
+            """)
+        else:
+            self.line_edit.setStyleSheet("""
+                QLineEdit {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                }
+            """)
+
+
+class ImageWidget(QWidget):
+    """Widget for image parameters with preview and file selection - Fixed alignment"""
+    
+    def __init__(self, param_info, editable=True, profile_images_dir=None, parent=None):
+        super().__init__(parent)
+        self.param_info = param_info
+        self.editable = editable
+        self.profile_images_dir = profile_images_dir
+        self.current_path = None
         
-        if file_path:
-            self.set_image_path(file_path)
+        # Main horizontal layout - preview on left, buttons on right
+        main_layout = QHBoxLayout(self)
+        main_layout.setContentsMargins(0, 0, 0, 0)
+        main_layout.setSpacing(10)
+        
+        # Preview widget with fixed size
+        preview_size = param_info.get('preview_size', 100)
+        if PreviewWidget:
+            self.preview = PreviewWidget(size=preview_size, category="product")
+        else:
+            # Fallback to simple label
+            self.preview = QLabel("Image Preview")
+            self.preview.setStyleSheet("border: 1px solid gray; text-align: center;")
+        
+        # Set fixed size for preview
+        self.preview.setFixedSize(preview_size, preview_size)
+        main_layout.addWidget(self.preview)
+        
+        # Buttons container (only if editable)
+        if editable:
+            buttons_container = QWidget()
+            buttons_container.setFixedSize(100, preview_size)  # Match preview height
+            buttons_layout = QVBoxLayout(buttons_container)
+            buttons_layout.setContentsMargins(0, 0, 0, 0)
+            buttons_layout.setSpacing(5)
+            
+            # Calculate button height to fit nicely in container
+            button_height = (preview_size - 5) // 2  # Subtract spacing, divide by 2
+            
+            self.browse_btn = QPushButton("Browse...")
+            self.browse_btn.setFixedHeight(button_height)
+            self.browse_btn.clicked.connect(self.browse_image)
+            buttons_layout.addWidget(self.browse_btn)
+            
+            self.clear_btn = QPushButton("Clear")
+            self.clear_btn.setFixedHeight(button_height)
+            self.clear_btn.clicked.connect(self.clear_image)
+            buttons_layout.addWidget(self.clear_btn)
+            
+            main_layout.addWidget(buttons_container)
+        
+        # Add stretch to push everything to the left
+        main_layout.addStretch()
+        
+        self.apply_style()
+    
+    def get_image_path(self):
+        return self.current_path
     
     def set_image_path(self, path, copy_to_profile=True):
-        """Set image path and update preview"""
-        if not os.path.exists(path):
+        """Set image path and optionally copy to profile directory"""
+        if not path or not os.path.exists(path):
+            self.current_path = None
+            if hasattr(self.preview, 'set_image_path'):
+                self.preview.set_image_path(None)
             return
-            
-        # Copy to profile images directory if specified
-        final_path = path
+        
         if copy_to_profile and self.profile_images_dir:
             try:
+                # Ensure profile images directory exists
                 os.makedirs(self.profile_images_dir, exist_ok=True)
+                
+                # Copy file to profile directory
                 filename = os.path.basename(path)
                 dest_path = os.path.join(self.profile_images_dir, filename)
                 
                 # Handle duplicate filenames
                 counter = 1
+                base_name, ext = os.path.splitext(filename)
                 while os.path.exists(dest_path):
-                    name, ext = os.path.splitext(filename)
-                    dest_path = os.path.join(self.profile_images_dir, f"{name}_{counter}{ext}")
+                    new_filename = f"{base_name}_{counter}{ext}"
+                    dest_path = os.path.join(self.profile_images_dir, new_filename)
                     counter += 1
                 
                 shutil.copy2(path, dest_path)
-                final_path = dest_path
+                self.current_path = dest_path
             except Exception as e:
-                print(f"Failed to copy image: {e}")
-                final_path = path
-        
-        self.current_image_path = final_path
-        self._update_preview(final_path)
-        self.imageChanged.emit(final_path)
-    
-    def _update_preview(self, path):
-        """Update preview with image"""
-        pixmap = QPixmap(path)
-        if not pixmap.isNull():
-            scaled_pixmap = pixmap.scaled(
-                self.size[0] - 6, self.size[1] - 6,
-                Qt.KeepAspectRatio, Qt.SmoothTransformation
-            )
-            self.preview_label.setPixmap(scaled_pixmap)
-            self.preview_label.setText("")  # Clear text when image is loaded
+                QMessageBox.warning(self, "Warning", f"Could not copy image: {e}")
+                self.current_path = path
         else:
-            self.preview_label.setText("Invalid image")
-    
-    def get_image_path(self):
-        """Get current image path"""
-        return self.current_image_path
-    
-    def set_browsing_enabled(self, enabled):
-        """Enable/disable browsing"""
-        self.browsing_enabled = enabled
-        if enabled:
-            self.preview_label.mousePressEvent = self._browse_image
-        else:
-            self.preview_label.mousePressEvent = lambda e: None
-
-
-class MultiLineTextWidget(QTextEdit):
-    """Multi-line text widget for longer text fields like notes"""
-    
-    def __init__(self, height=80, parent=None):
-        super().__init__(parent)
-        self.setMaximumHeight(height)
+            self.current_path = path
         
-        # Apply dark theme styling
-        self.setStyleSheet("""
-            QTextEdit {
-                background-color: #3c3c3c;
-                color: #ffffff;
-                border: 2px solid #ffffff;
-                padding: 8px;
-                border-radius: 4px;
-            }
-        """)
+        if hasattr(self.preview, 'set_image_path'):
+            # Using PreviewWidget
+            self.preview.set_image_path(self.current_path)
+        else:
+            # Using fallback label
+            if self.current_path and os.path.exists(self.current_path):
+                self.preview.setText(f"Image: {os.path.basename(self.current_path)}")
+            else:
+                self.preview.setText("No Image")
     
-    def text(self):
-        """Get plain text (compatible with QLineEdit interface)"""
-        return self.toPlainText()
+    def browse_image(self):
+        """Open file dialog to select image"""
+        if not self.editable:
+            return
+            
+        file_path, _ = QFileDialog.getOpenFileName(
+            self,
+            "Select Image",
+            "",
+            "Image Files (*.png *.jpg *.jpeg *.gif *.bmp *.svg)"
+        )
+        
+        if file_path:
+            self.set_image_path(file_path)
     
-    def setText(self, text):
-        """Set plain text (compatible with QLineEdit interface)"""
-        self.setPlainText(text)
+    def clear_image(self):
+        """Clear current image"""
+        self.current_path = None
+        if hasattr(self.preview, 'set_image_path'):
+            self.preview.set_image_path(None)
+        else:
+            self.preview.setText("No Image")
+    
+    def apply_style(self):
+        if hasattr(self, 'browse_btn'):
+            self.browse_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3C3C3C;
+                    color: white;
+                    border: 1px solid #555555;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #4C4C4C;
+                }
+            """)
+        
+        if hasattr(self, 'clear_btn'):
+            self.clear_btn.setStyleSheet("""
+                QPushButton {
+                    background-color: #3C3C3C;
+                    color: white;
+                    border: 1px solid #555555;
+                    padding: 4px 8px;
+                }
+                QPushButton:hover {
+                    background-color: #4C4C4C;
+                }
+            """)
 
 
 class ParameterWidgetFactory:
-    """Factory to create appropriate widgets based on parameter definition"""
+    """Factory class to create appropriate widgets for parameters"""
     
     @staticmethod
-    def create_widget(param_info, ui_config=None, profile_images_dir=None):
-        """
-        Create widget based on parameter info
-        
-        Args:
-            param_info: dict with parameter definition from classes
-            ui_config: dict with UI-specific configuration like:
-                {
-                    'size': (100, 100),  # For image widgets
-                    'browsing_enabled': True,  # For image widgets
-                    'read_only': False,  # For all widgets
-                    'height': 80,  # For text widgets
-                    'minimum': 0,  # For numeric widgets
-                    'maximum': 1000,  # For numeric widgets
-                    'unit': '€'  # For numeric widgets
-                }
-            profile_images_dir: Directory to store copied images
-        """
-        if ui_config is None:
-            ui_config = {}
-            
+    def create_widget(param_info, ui_config=None, profile_images_dir=None, editable=True):
+        """Create appropriate widget based on parameter type"""
+        ui_config = ui_config or {}
         param_type = param_info.get('type', 'string')
         
-        # Create widget based on type
-        if param_type == 'string':
-            options = param_info.get('options', [])
-            widget = AutoCompleteLineEdit(options)
-            
-        elif param_type in ['int', 'float']:
-            # Get unit from UI config or param info
-            unit = ui_config.get('unit', param_info.get('unit', ''))
-            # Get min/max from UI config or param info
-            minimum = ui_config.get('minimum', param_info.get('minimum'))
-            maximum = ui_config.get('maximum', param_info.get('maximum'))
-            
-            widget = NumericWidget(param_type, unit, minimum, maximum)
-            
-        elif param_type == 'text':
-            # Multi-line text area
-            height = ui_config.get('height', 80)
-            widget = MultiLineTextWidget(height)
-            
+        if param_type in ['int', 'float']:
+            return NumericWidget(param_info, editable)
         elif param_type == 'image':
-            size = ui_config.get('size', (100, 100))
-            browsing_enabled = ui_config.get('browsing_enabled', True)
-            widget = ImagePreviewWidget(size, browsing_enabled, profile_images_dir)
-            
+            return ImageWidget(param_info, editable, profile_images_dir)
+        else:  # string or unknown type
+            return StringWidget(param_info, editable)
+    
+    @staticmethod
+    def get_widget_value(widget):
+        """Get value from any parameter widget"""
+        if isinstance(widget, NumericWidget):
+            return widget.value()
+        elif isinstance(widget, StringWidget):
+            return widget.text()
+        elif isinstance(widget, ImageWidget):
+            return widget.get_image_path()
         else:
-            # Fallback to simple line edit
-            widget = QLineEdit()
-            widget.setStyleSheet("""
-                QLineEdit {
-                    background-color: #3c3c3c;
-                    color: #ffffff;
-                    border: 2px solid #ffffff;
-                    padding: 8px;
-                    border-radius: 4px;
-                }
-            """)
-            
-        # Apply read-only setting
-        if ui_config.get('read_only', False):
-            widget.setEnabled(False)
-            
-        return widget
-
-
-# Example and testing
-if __name__ == "__main__":
-    import sys
-    from PySide6.QtWidgets import QApplication, QVBoxLayout, QWidget
+            # Fallback for unknown widget types
+            if hasattr(widget, 'text'):
+                return widget.text()
+            elif hasattr(widget, 'value'):
+                return widget.value()
+            return None
     
-    app = QApplication(sys.argv)
-    
-    # Test window
-    window = QWidget()
-    window.setWindowTitle("Parameter Widgets Test")
-    window.resize(400, 500)
-    
-    layout = QVBoxLayout(window)
-    
-    # Test different widget types
-    
-    # String with options
-    layout.addWidget(QLabel("String with options:"))
-    string_widget = ParameterWidgetFactory.create_widget({
-        'type': 'string',
-        'options': ['Option 1', 'Option 2', 'Option 3']
-    })
-    layout.addWidget(string_widget)
-    
-    # Float with unit
-    layout.addWidget(QLabel("Float with unit:"))
-    float_widget = ParameterWidgetFactory.create_widget({
-        'type': 'float',
-        'unit': '€',
-        'minimum': 0,
-        'maximum': 1000
-    })
-    layout.addWidget(float_widget)
-    
-    # Text area
-    layout.addWidget(QLabel("Text area:"))
-    text_widget = ParameterWidgetFactory.create_widget({
-        'type': 'text'
-    }, {'height': 60})
-    layout.addWidget(text_widget)
-    
-    # Image preview
-    layout.addWidget(QLabel("Image preview:"))
-    image_widget = ParameterWidgetFactory.create_widget({
-        'type': 'image'
-    }, {'size': (80, 80)})
-    layout.addWidget(image_widget)
-    
-    # Apply dark theme to window
-    window.setStyleSheet("""
-        QWidget {
-            background-color: #2b2b2b;
-            color: #ffffff;
-        }
-        QLabel {
-            color: #ffffff;
-            font-weight: bold;
-            margin-top: 10px;
-        }
-    """)
-    
-    window.show()
-    sys.exit(app.exec())
+    @staticmethod
+    def set_widget_value(widget, value):
+        """Set value on any parameter widget"""
+        if isinstance(widget, NumericWidget):
+            widget.setValue(value)
+        elif isinstance(widget, StringWidget):
+            widget.setText(value)
+        elif isinstance(widget, ImageWidget):
+            widget.set_image_path(value, copy_to_profile=False)
+        else:
+            # Fallback for unknown widget types
+            if hasattr(widget, 'setText'):
+                widget.setText(str(value) if value is not None else '')
+            elif hasattr(widget, 'setValue'):
+                widget.setValue(float(value) if value is not None else 0)

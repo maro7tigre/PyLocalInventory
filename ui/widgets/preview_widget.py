@@ -64,6 +64,14 @@ class PreviewWidget(QWidget):
         self._image_path = path
         self._refresh_content()
     
+    def get_image_path(self):
+        """Get current image path"""
+        return self._image_path
+    
+    def has_content(self):
+        """Check if widget has image content"""
+        return self._image_path is not None and os.path.exists(self._image_path)
+    
     def _refresh_content(self):
         """Refresh the displayed content based on current state"""
         if self._image_path and os.path.exists(self._image_path):

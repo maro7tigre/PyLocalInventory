@@ -1,16 +1,19 @@
 """
-Sale Edit Dialog - Inherits from BaseEditDialog
-For managing sale transactions
+Sale Edit Dialog - Updated to use inline sales items table
+For managing sale transactions with items table
 """
 
 from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
-from classes.sales_class import SaleClass
-from PySide6.QtWidgets import QDialog, QMessageBox
+from classes.sales_class import SalesClass
+from classes.sales_item_class import SalesItemClass
+from ui.widgets.operations_table import OperationsTableWidget
+from PySide6.QtWidgets import QDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QLabel, QWidget
+from PySide6.QtGui import QFont
 from datetime import datetime
 
 
 class SaleEditDialog(BaseEditDialog):
-    """Sale-specific edit dialog with client and product selection"""
+    """Sale-specific edit dialog with inline sales items editing"""
     
     def __init__(self, sale_id=None, database=None, parent=None):
         """
@@ -26,10 +29,10 @@ class SaleEditDialog(BaseEditDialog):
         
         # Create or load sale object
         if sale_id:
-            self.sale_obj = SaleClass(sale_id, database, 0, 0)
+            self.sale_obj = SalesClass(sale_id, database, 0)
             self.sale_obj.load_database_data()
         else:
-            self.sale_obj = SaleClass(0, database, 0, 0)
+            self.sale_obj = SalesClass(0, database, 0)
             # Set default date to today
             self.sale_obj.set_value("date", datetime.now().strftime("%Y-%m-%d"))
         
@@ -38,23 +41,10 @@ class SaleEditDialog(BaseEditDialog):
             'client_id': {
                 'options': self._get_client_options()
             },
-            'product_id': {
-                'options': self._get_product_options()
-            },
-            'unit_price': {
-                'minimum': 0.0,
-                'maximum': 999999.99,
-                'unit': '€'
-            },
             'tva': {
                 'minimum': 0.0,
                 'maximum': 100.0,
                 'unit': '%'
-            },
-            'total_price': {
-                'minimum': 0.0,
-                'maximum': 999999.99,
-                'unit': '€'
             }
         }
         
@@ -66,9 +56,259 @@ class SaleEditDialog(BaseEditDialog):
             self.setWindowTitle(f"Edit Sale - ID {sale_id}")
         else:
             self.setWindowTitle("New Sale")
+    
+    def setup_ui(self):
+        """Setup dialog UI with simple, clean layout that ensures table scrolling works"""
+        from PySide6.QtWidgets import QFormLayout, QWidget
         
-        # Connect quantity, price, and tva changes to auto-calculate total
-        self._connect_calculation_updates()
+        # Set fixed dialog size to ensure predictable layout
+        self.setFixedSize(900, 700)
+        
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(15, 15, 15, 15)
+        layout.setSpacing(10)
+        
+        # Show ID (read-only) if available
+        if hasattr(self.sale_obj, 'id') and self.sale_obj.id:
+            id_layout = QHBoxLayout()
+            id_layout.addWidget(QLabel("ID:"))
+            id_label = QLabel(str(self.sale_obj.id))
+            id_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
+            id_layout.addWidget(id_label)
+            id_layout.addStretch()
+            layout.addLayout(id_layout)
+        
+        # Sale parameters section (compact, fixed height)
+        params_widget = QWidget()
+        params_widget.setFixedHeight(120)  # Fixed height for parameters
+        params_layout = QFormLayout(params_widget)
+        params_layout.setContentsMargins(5, 5, 5, 5)
+        params_layout.setSpacing(8)
+        
+        # Get parameters that should be shown in dialog
+        visible_params = self.sale_obj.get_visible_parameters("dialog")
+        
+        # Create widgets for each visible parameter
+        for param_key in visible_params:
+            if param_key not in self.sale_obj.parameters:
+                continue
+            
+            param_info = self.sale_obj.parameters[param_key]
+            
+            # Skip calculated parameters
+            if self.sale_obj.is_parameter_calculated(param_key):
+                continue
+            
+            # Check if parameter is editable
+            editable = self.sale_obj.is_parameter_editable(param_key, "dialog")
+            
+            # Get profile images directory
+            profile_images_dir = self.get_profile_images_dir()
+            
+            # Create appropriate widget
+            from ui.widgets.parameters_widgets import ParameterWidgetFactory
+            widget = ParameterWidgetFactory.create_widget(
+                param_info, 
+                self.ui_config.get(param_key, {}), 
+                profile_images_dir,
+                editable
+            )
+            
+            self.parameter_widgets[param_key] = widget
+            
+            # Get display name
+            display_name = self.sale_obj.get_display_name(param_key)
+            
+            # Add required indicator
+            if param_info.get('required', False):
+                display_name += " *"
+            
+            params_layout.addRow(QLabel(display_name + ":"), widget)
+        
+        layout.addWidget(params_widget)
+        
+        # Sales Items label
+        items_label = QLabel("Sales Items")
+        items_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
+        items_label.setStyleSheet("color: #ffffff; margin: 5px 0;")
+        layout.addWidget(items_label)
+        
+        # Create sales items table (this will have internal scrolling)
+        self.sales_items_table = OperationsTableWidget(
+            item_class=SalesItemClass,
+            parent_operation=self.sale_obj,
+            database=self.database,
+            columns=['product_preview', 'product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
+            parent=self
+        )
+        
+        # Connect table changes to update totals
+        self.sales_items_table.items_changed.connect(self.update_totals)
+        
+        # Give the table most of the remaining space (around 400px)
+        self.sales_items_table.setMinimumHeight(400)
+        self.sales_items_table.setMaximumHeight(400)
+        layout.addWidget(self.sales_items_table)
+        
+        # Totals section (compact, fixed height)
+        totals_widget = QWidget()
+        totals_widget.setFixedHeight(60)  # Fixed height for totals
+        totals_layout = QHBoxLayout(totals_widget)
+        totals_layout.setContentsMargins(5, 5, 5, 5)
+        
+        # Add total fields
+        self.add_total_fields(totals_layout)
+        
+        layout.addWidget(totals_widget)
+        
+        # Button section (fixed height)
+        button_widget = QWidget()
+        button_widget.setFixedHeight(50)
+        button_layout = QHBoxLayout(button_widget)
+        button_layout.addStretch()
+        
+        from ui.widgets.themed_widgets import GreenButton, RedButton
+        self.save_btn = GreenButton("Save")
+        self.save_btn.clicked.connect(self.save_changes)
+        button_layout.addWidget(self.save_btn)
+        
+        self.cancel_btn = RedButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        button_layout.addWidget(self.cancel_btn)
+        
+        layout.addWidget(button_widget)
+        
+        # Apply dark theme
+        self.apply_theme()
+    
+    def apply_theme(self):
+        """Apply dark theme styling"""
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+            }
+            QScrollArea {
+                background-color: #2b2b2b;
+                border: none;
+            }
+            QWidget {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+        """)
+    
+    def get_profile_images_dir(self):
+        """Get profile images directory if available"""
+        try:
+            if (hasattr(self.parent(), 'profile_manager') and 
+                self.parent().profile_manager and
+                self.parent().profile_manager.selected_profile):
+                
+                import os
+                profile_dir = os.path.dirname(self.parent().profile_manager.selected_profile.config_path)
+                return os.path.join(profile_dir, "images")
+        except:
+            pass
+        return None
+    
+    def add_total_fields(self, parent_layout):
+        """Add read-only total calculation fields in horizontal layout"""
+        from ui.widgets.parameters_widgets import ParameterWidgetFactory
+        
+        # Subtotal
+        subtotal_widget = ParameterWidgetFactory.create_widget(
+            {
+                'type': 'float',
+                'display_name': {'en': 'Subtotal'},
+                'unit': 'MAD'
+            },
+            {},
+            None,
+            editable=False
+        )
+        ParameterWidgetFactory.set_widget_value(subtotal_widget, 0.0)
+        self.subtotal_widget = subtotal_widget
+        
+        # VAT Amount  
+        vat_widget = ParameterWidgetFactory.create_widget(
+            {
+                'type': 'float',
+                'display_name': {'en': 'VAT Amount'},
+                'unit': 'MAD'
+            },
+            {},
+            None,
+            editable=False
+        )
+        ParameterWidgetFactory.set_widget_value(vat_widget, 0.0)
+        self.vat_widget = vat_widget
+        
+        # Total
+        total_widget = ParameterWidgetFactory.create_widget(
+            {
+                'type': 'float',
+                'display_name': {'en': 'Total Price'},
+                'unit': 'MAD'
+            },
+            {},
+            None,
+            editable=False
+        )
+        ParameterWidgetFactory.set_widget_value(total_widget, 0.0)
+        self.total_widget = total_widget
+        
+        # Add labels and widgets to horizontal layout
+        parent_layout.addWidget(QLabel("Subtotal:"))
+        parent_layout.addWidget(subtotal_widget)
+        parent_layout.addWidget(QLabel("VAT:"))
+        parent_layout.addWidget(vat_widget)
+        parent_layout.addWidget(QLabel("Total:"))
+        parent_layout.addWidget(total_widget)
+        parent_layout.addStretch()  # Push everything to the left
+        
+        # Initial calculation
+        self.update_totals()
+    
+    def get_widget_value(self, widget):
+        """Helper method to get value from widget"""
+        from ui.widgets.parameters_widgets import ParameterWidgetFactory
+        return ParameterWidgetFactory.get_widget_value(widget)
+    
+    def update_totals(self):
+        """Update total calculation fields"""
+        try:
+            # Get current items
+            items = self.sales_items_table.get_items_data()
+            
+            # Calculate subtotal
+            subtotal = sum(item.get_value('subtotal') or 0 for item in items)
+            
+            # Get VAT percentage from the tva parameter widget
+            vat_percent = 0
+            if 'tva' in self.parameter_widgets:
+                vat_percent = self.get_widget_value(self.parameter_widgets['tva']) or 0
+            
+            # Calculate VAT amount
+            vat_amount = subtotal * (vat_percent / 100)
+            
+            # Calculate total
+            total = subtotal + vat_amount
+            
+            # Update widgets
+            from ui.widgets.parameters_widgets import ParameterWidgetFactory
+            if hasattr(self, 'subtotal_widget'):
+                ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
+            if hasattr(self, 'vat_widget'):
+                ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
+            if hasattr(self, 'total_widget'):
+                ParameterWidgetFactory.set_widget_value(self.total_widget, total)
+                
+        except Exception as e:
+            print(f"Error updating totals: {e}")
     
     def _get_client_options(self):
         """Get list of clients for dropdown"""
@@ -81,31 +321,12 @@ class SaleEditDialog(BaseEditDialog):
         except:
             return []
     
-    def _get_product_options(self):
-        """Get list of products for dropdown"""
-        if not self.database:
-            return []
-        
-        try:
-            products = self.database.get_items("Products")
-            return [f"{p['ID']} - {p['name']}" for p in products]
-        except:
-            return []
-    
-    def _connect_calculation_updates(self):
-        """Connect value changes to auto-calculate total price"""
-        # TODO: Connect signals to auto-calculate total when quantity, unit_price, or tva changes
-        pass
-    
     def validate_data(self):
         """Sale-specific validation (extends base validation)"""
         errors = super().validate_data()  # Get base validation errors
         
         # Additional sale-specific validation
         client_text = self.get_widget_value(self.parameter_widgets.get('client_id', ''))
-        product_text = self.get_widget_value(self.parameter_widgets.get('product_id', ''))
-        quantity = self.get_widget_value(self.parameter_widgets.get('quantity', 0))
-        unit_price = self.get_widget_value(self.parameter_widgets.get('unit_price', 0))
         
         # Extract client ID from selection
         try:
@@ -114,23 +335,13 @@ class SaleEditDialog(BaseEditDialog):
             errors.append("Please select a valid client")
             client_id = 0
         
-        # Extract product ID from selection
-        try:
-            product_id = int(product_text.split(' - ')[0]) if product_text else 0
-        except (ValueError, IndexError):
-            errors.append("Please select a valid product")
-            product_id = 0
+        # Check if we have at least one item
+        items = self.sales_items_table.get_items_data()
+        if not items:
+            errors.append("Please add at least one item to the sale")
         
-        # Business rules validation
-        if quantity <= 0:
-            errors.append("Quantity must be greater than 0")
-        
-        if unit_price <= 0:
-            errors.append("Unit price must be greater than 0")
-        
-        # Store extracted IDs for saving
+        # Store extracted ID for saving
         self._extracted_client_id = client_id
-        self._extracted_product_id = product_id
         
         return errors
     
@@ -145,20 +356,14 @@ class SaleEditDialog(BaseEditDialog):
         try:
             # Update sale object with form data
             for param_key, widget in self.parameter_widgets.items():
-                if param_key in ['client_id', 'product_id']:
-                    # Use extracted IDs
-                    if param_key == 'client_id':
-                        self.sale_obj.set_value(param_key, self._extracted_client_id)
-                    else:
-                        self.sale_obj.set_value(param_key, self._extracted_product_id)
+                if param_key == 'client_id':
+                    # Use extracted ID
+                    self.sale_obj.set_value(param_key, self._extracted_client_id)
                 else:
                     value = self.get_widget_value(widget)
                     self.sale_obj.set_value(param_key, value)
             
-            # Calculate total price
-            self.sale_obj.calculate_total_price()
-            
-            # Save to database
+            # Save sale to database first
             sale_data = self.sale_obj.get_value(destination="database")
             
             if self.sale_id:
@@ -166,15 +371,31 @@ class SaleEditDialog(BaseEditDialog):
                 success = self.database.update_item(self.sale_id, sale_data, "Sales")
                 action = "updated"
             else:
-                # Add new sale
-                success = self.database.add_item(sale_data, "Sales")
-                action = "created"
+                # Add new sale and get the new ID
+                new_id = self.database.add_item(sale_data, "Sales")
+                if new_id:
+                    self.sale_id = new_id
+                    self.sale_obj.id = new_id
+                    self.sale_obj.set_value('id', new_id)
+                    success = True
+                    action = "created"
+                else:
+                    success = False
             
             if success:
-                QMessageBox.information(self, "Success", f"Sale {action} successfully!")
+                # Save all sales items
+                items_saved = 0
+                for item in self.sales_items_table.get_items_data():
+                    # Ensure the item has the correct sales_id
+                    item.set_value('sales_id', self.sale_obj.id)
+                    if item.save_to_database():
+                        items_saved += 1
+                
+                QMessageBox.information(self, "Success", 
+                    f"Sale {action} successfully!\n{items_saved} items saved.")
                 self.accept()  # Close dialog
             else:
-                QMessageBox.critical(self, "Error", f"Failed to save sale to database")
+                QMessageBox.critical(self, "Error", "Failed to save sale to database")
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save sale: {str(e)}")

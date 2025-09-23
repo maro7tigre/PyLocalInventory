@@ -15,11 +15,14 @@ from ui.tabs.home_tab import HomeTab
 from ui.tabs.products_tab import ProductsTab
 from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
+from ui.tabs.sales_tab import SalesTab
 from ui.tabs.log_tab import LogTab
 
 from classes.product_class import ProductClass
 from classes.client_class import ClientClass
 from classes.supplier_class import SupplierClass
+from classes.sales_class import SalesClass
+from classes.sales_item_class import SalesItemClass
 
 from core.profiles import ProfileManager
 from core.password import PasswordManager
@@ -62,6 +65,8 @@ class MainWindow(ThemedMainWindow):
         self.database.register_class(ProductClass)
         self.database.register_class(ClientClass)
         self.database.register_class(SupplierClass)
+        self.database.register_class(SalesClass)
+        self.database.register_class(SalesItemClass)
         
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
@@ -239,6 +244,24 @@ class MainWindow(ThemedMainWindow):
             error_label.setStyleSheet("color: red; padding: 20px;")
             error_layout.addWidget(error_label)
             tab_widget.addTab(error_widget, "Suppliers (Error)")
+        
+        # Add Sales tab
+        try:
+            sales_tab = SalesTab(self.database)
+            tab_widget.addTab(sales_tab, "Sales")
+            print("✓ Added Sales tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Sales tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Sales tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Sales (Error)")
         
         tab_widget.addTab(LogTab(self.database), "Log")
         

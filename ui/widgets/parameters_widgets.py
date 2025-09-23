@@ -456,27 +456,11 @@ class ParameterWidgetFactory:
         elif param_type == 'button':
             return ButtonWidget(param_info, editable)
         elif param_type == 'table':
-            # Import here to avoid circular imports
-            try:
-                from ui.widgets.table_parameter_widget import TableParameterWidget
-                
-                # Get table-specific configuration from param_info
-                item_class = param_info.get('item_class')
-                parent_operation = param_info.get('parent_operation')
-                
-                if item_class:
-                    return TableParameterWidget(item_class, parent_operation, 
-                                              profile_images_dir, editable)  # Using profile_images_dir as database
-                else:
-                    # Return placeholder if no item class specified
-                    placeholder = QLabel("Table parameter needs item_class")
-                    placeholder.setStyleSheet("color: #ff9800; font-style: italic;")
-                    return placeholder
-                    
-            except ImportError as e:
-                placeholder = QLabel(f"Table widget not available: {e}")
-                placeholder.setStyleSheet("color: #f44336; font-style: italic;")
-                return placeholder
+            # Table parameters are now handled directly by OperationsTableWidget
+            # Return a placeholder since table parameters should be created directly
+            placeholder = QLabel("Table parameters should use OperationsTableWidget directly")
+            placeholder.setStyleSheet("color: #ff9800; font-style: italic;")
+            return placeholder
         else:  # string or unknown type
             return StringWidget(param_info, editable)
     
@@ -520,3 +504,76 @@ class ParameterWidgetFactory:
                 widget.setText(str(value) if value is not None else '')
             elif hasattr(widget, 'setValue'):
                 widget.setValue(float(value) if value is not None else 0)
+
+
+# Test widget for sales table - as requested
+class SalesTableTestWidget(QWidget):
+    """Test widget for sales table with delete buttons"""
+    
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self.setup_ui()
+        self.apply_theme()
+    
+    def setup_ui(self):
+        """Setup test interface"""
+        layout = QVBoxLayout(self)
+        
+        # Title
+        title = QLabel("Sales Table Test - With Delete Buttons")
+        title.setFont(QFont("Arial", 16, QFont.Weight.Bold))
+        layout.addWidget(title)
+        
+        # Create table parameter directly using table type
+        table_param_info = {
+            'type': 'table',
+            'item_class': None,  # Will be set below
+            'parent_operation': None,
+            'display_name': {'en': 'Sales Items'}
+        }
+        
+        # Import SalesItemClass for the test
+        try:
+            from classes.sales_item_class import SalesItemClass
+            table_param_info['item_class'] = SalesItemClass
+            
+            # Create the table widget
+            self.sales_table = ParameterWidgetFactory.create_widget(table_param_info, editable=True)
+            layout.addWidget(self.sales_table)
+            
+            # Connect to changes
+            if hasattr(self.sales_table, 'items_changed'):
+                self.sales_table.items_changed.connect(self.on_items_changed)
+            
+        except ImportError as e:
+            error_label = QLabel(f"Could not load SalesItemClass: {e}")
+            error_label.setStyleSheet("color: #f44336; font-style: italic;")
+            layout.addWidget(error_label)
+    
+    def on_items_changed(self):
+        """Handle when items change"""
+        print("Sales items changed!")
+    
+    def apply_theme(self):
+        """Apply theme"""
+        self.setStyleSheet("""
+            QWidget { background-color: #2b2b2b; color: #ffffff; }
+            QLabel { color: #ffffff; }
+        """)
+
+
+if __name__ == "__main__":
+    """Test the sales table widget"""
+    import sys
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QFont
+    
+    app = QApplication(sys.argv)
+    
+    # Test the sales table
+    window = SalesTableTestWidget()
+    window.setWindowTitle("Sales Table Parameter Test")
+    window.resize(900, 600)
+    window.show()
+    
+    sys.exit(app.exec())

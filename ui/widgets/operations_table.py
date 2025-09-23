@@ -55,7 +55,7 @@ class OperationsTableWidget(ParameterTableWidget):
                             child.widget().deleteLater()
     
     def setup_ui(self):
-        """Setup table interface with proper scrollable area"""
+        """Setup table interface with dynamic scrollable area that adapts to container size"""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
         
@@ -64,21 +64,26 @@ class OperationsTableWidget(ParameterTableWidget):
         self.setup_table()
         
         # Create scroll area and configure it properly
-        scroll_area = QScrollArea()
-        scroll_area.setWidget(self.table)
-        scroll_area.setWidgetResizable(True)
-        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area = QScrollArea()  # Store reference for dynamic sizing
+        self.scroll_area.setWidget(self.table)
+        self.scroll_area.setWidgetResizable(True)
+        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
-        # Set size constraints - this is crucial for scrolling to work
-        scroll_area.setMinimumHeight(200)
-        scroll_area.setMaximumHeight(350)
+        # Set minimum height
+        self.scroll_area.setMinimumHeight(200)
         
         # Make sure the table doesn't have conflicting size policies
         from PySide6.QtWidgets import QSizePolicy
         self.table.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
         
-        layout.addWidget(scroll_area)
+        layout.addWidget(self.scroll_area)
+        
+        # Start timer to update scroll area size dynamically
+        from PySide6.QtCore import QTimer
+        self.resize_timer = QTimer()
+        self.resize_timer.timeout.connect(self.update_scroll_area_size)
+        self.resize_timer.start(100)  # Check every 100ms
     
     def setup_table(self):
         """Setup table columns and properties with proper image column sizing"""
@@ -156,6 +161,33 @@ class OperationsTableWidget(ParameterTableWidget):
                 background-color: #777777;
             }
         """)
+    
+    def update_scroll_area_size(self):
+        """Dynamically update scroll area maximum height based on available space"""
+        if not hasattr(self, 'scroll_area'):
+            return
+        
+        # Get the widget's current height
+        available_height = self.height()
+        
+        if available_height > 200:  # Only if we have reasonable space
+            # Set maximum height to 80% of available space (leave room for headers/margins)
+            max_height = int(available_height * 0.8)
+            
+            # Ensure it's at least minimum and not too large
+            max_height = max(200, min(max_height, 600))
+            
+            # Only update if significantly different to avoid constant resizing
+            current_max = self.scroll_area.maximumHeight()
+            if abs(current_max - max_height) > 20:  # 20px threshold
+                self.scroll_area.setMaximumHeight(max_height)
+    
+    def resizeEvent(self, event):
+        """Handle resize events to update scroll area"""
+        super().resizeEvent(event)
+        # Trigger immediate update on resize
+        if hasattr(self, 'scroll_area'):
+            self.update_scroll_area_size()
     
     def refresh_table(self):
         """Refresh table data - override to maintain inline editing behavior"""

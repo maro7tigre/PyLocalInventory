@@ -61,8 +61,9 @@ class SaleEditDialog(BaseEditDialog):
         """Setup dialog UI with simple, clean layout that ensures table scrolling works"""
         from PySide6.QtWidgets import QFormLayout, QWidget
         
-        # Set fixed dialog size to ensure predictable layout
-        self.setFixedSize(900, 700)
+        # Set reasonable default size but allow resizing
+        self.resize(900, 700)
+        self.setMinimumSize(600, 500)  # Minimum usable size
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -145,10 +146,9 @@ class SaleEditDialog(BaseEditDialog):
         # Connect table changes to update totals
         self.sales_items_table.items_changed.connect(self.update_totals)
         
-        # Give the table most of the remaining space (around 400px)
-        self.sales_items_table.setMinimumHeight(400)
-        self.sales_items_table.setMaximumHeight(400)
-        layout.addWidget(self.sales_items_table)
+        # Give the table most of the remaining space (stretches with dialog)
+        self.sales_items_table.setMinimumHeight(300)  # Minimum functional height
+        layout.addWidget(self.sales_items_table, 1)  # Stretch factor 1 = takes extra space
         
         # Totals section (compact, fixed height)
         totals_widget = QWidget()

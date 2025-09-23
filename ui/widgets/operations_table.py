@@ -1,94 +1,61 @@
 """
-Operations Table Widget - Clean inline editing table without action buttons
-Properly inherits from ParameterTableWidget for consistent behavior
+Operations Table Widget - Simple standalone inline editing table
+No inheritance from complex ParameterTableWidget - clean slate approach
 """
-from PySide6.QtWidgets import QTableWidgetItem, QAbstractItemView, QVBoxLayout, QTableWidget, QScrollArea
+from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
+                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy)
 from PySide6.QtCore import Qt, Signal
-from ui.widgets.table_widgets import ParameterTableWidget
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.parameters_widgets import ButtonWidget
 
 
-class OperationsTableWidget(ParameterTableWidget):
-    """Table widget for operations items with inline editing capabilities"""
+class OperationsTableWidget(QWidget):
+    """Simple, clean table widget for operations items with inline editing"""
     
     items_changed = Signal()
     
     def __init__(self, item_class, parent_operation=None, database=None, columns=None, parent=None):
+        super().__init__(parent)
+        
         self.item_class = item_class
         self.parent_operation = parent_operation
+        self.database = database
+        self.table_columns = columns or []
         self.items = []
         self._updating_table = False  # Flag to prevent recursion
         
-        # Initialize parent class but without dialog_class (no add/edit/delete buttons)
-        super().__init__(item_class, database, None, parent)
-        
-        # Override columns if specified
-        if columns:
-            self.table_columns = columns
-        
-        # Remove the header buttons completely
-        self.remove_action_buttons()
-        
-        # Make table fully editable
-        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        
-        # Connect item change signals
-        self.table.itemChanged.connect(self.on_item_changed)
+        # Setup the clean, simple UI
+        self.setup_ui()
         
         # Setup table with empty row
         self.refresh_table()
     
-    def remove_action_buttons(self):
-        """Remove the add/edit/delete/refresh buttons from the header"""
-        # Get the layout and remove the header with buttons
-        layout = self.layout()
-        if layout.count() > 0:
-            header_layout_item = layout.takeAt(0)  # Remove header layout
-            if header_layout_item:
-                # Delete all widgets in the header layout
-                header_layout = header_layout_item.layout()
-                if header_layout:
-                    while header_layout.count():
-                        child = header_layout.takeAt(0)
-                        if child.widget():
-                            child.widget().deleteLater()
-    
     def setup_ui(self):
-        """Setup table interface with dynamic scrollable area that adapts to container size"""
+        """Setup simple table interface"""
+        # Create main layout
         layout = QVBoxLayout(self)
         layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
         
-        # Create table first
+        # Create table widget
         self.table = QTableWidget()
         self.setup_table()
         
-        # Create scroll area and configure it properly
-        self.scroll_area = QScrollArea()  # Store reference for dynamic sizing
-        self.scroll_area.setWidget(self.table)
-        self.scroll_area.setWidgetResizable(True)
-        self.scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        # Set proper size policies
+        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
-        # Set minimum height
-        self.scroll_area.setMinimumHeight(200)
+        # Enable native scrolling
+        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
-        # Make sure the table doesn't have conflicting size policies
-        from PySide6.QtWidgets import QSizePolicy
-        self.table.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Preferred)
+        # Add to layout
+        layout.addWidget(self.table)
         
-        layout.addWidget(self.scroll_area)
-        
-        # Start timer to update scroll area size dynamically
-        from PySide6.QtCore import QTimer
-        self.resize_timer = QTimer()
-        self.resize_timer.timeout.connect(self.update_scroll_area_size)
-        self.resize_timer.start(100)  # Check every 100ms
+        # Set widget size policy
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
     
     def setup_table(self):
-        """Setup table columns and properties with proper image column sizing"""
-        from PySide6.QtWidgets import QHeaderView
-        
+        """Setup table columns and properties"""
         # Set column count and headers
         self.table.setColumnCount(len(self.table_columns))
         
@@ -115,26 +82,27 @@ class OperationsTableWidget(ParameterTableWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         
         # Set row height to exactly match preview image size
-        self.table.verticalHeader().setDefaultSectionSize(45)  # Match preview size
+        self.table.verticalHeader().setDefaultSectionSize(45)
         
         # Set column widths - fixed width for preview and delete columns
         header = self.table.horizontalHeader()
         for i, param_key in enumerate(self.table_columns):
             if param_key == 'product_preview':
-                # Fixed width for preview images
-                self.table.setColumnWidth(i, 70)  # Slightly reduced width
+                self.table.setColumnWidth(i, 70)
                 header.setSectionResizeMode(i, QHeaderView.Fixed)
             elif param_key == 'delete_action':
-                # Fixed width for delete buttons
                 self.table.setColumnWidth(i, 50)
                 header.setSectionResizeMode(i, QHeaderView.Fixed)
             else:
-                # Stretch other columns
                 header.setSectionResizeMode(i, QHeaderView.Stretch)
         
-        # Apply minimal dark theme to table (no background color override)
+        # Connect item change signals
+        self.table.itemChanged.connect(self.on_item_changed)
+        
+        # Apply minimal dark theme
         self.apply_table_theme()
     
     def apply_table_theme(self):
@@ -162,40 +130,12 @@ class OperationsTableWidget(ParameterTableWidget):
             }
         """)
     
-    def update_scroll_area_size(self):
-        """Dynamically update scroll area maximum height based on available space"""
-        if not hasattr(self, 'scroll_area'):
-            return
-        
-        # Get the widget's current height
-        available_height = self.height()
-        
-        if available_height > 200:  # Only if we have reasonable space
-            # Set maximum height to 80% of available space (leave room for headers/margins)
-            max_height = int(available_height * 0.8)
-            
-            # Ensure it's at least minimum and not too large
-            max_height = max(200, min(max_height, 600))
-            
-            # Only update if significantly different to avoid constant resizing
-            current_max = self.scroll_area.maximumHeight()
-            if abs(current_max - max_height) > 20:  # 20px threshold
-                self.scroll_area.setMaximumHeight(max_height)
-    
-    def resizeEvent(self, event):
-        """Handle resize events to update scroll area"""
-        super().resizeEvent(event)
-        # Trigger immediate update on resize
-        if hasattr(self, 'scroll_area'):
-            self.update_scroll_area_size()
-    
     def refresh_table(self):
-        """Refresh table data - override to maintain inline editing behavior"""
-        # Clear existing content but keep structure
+        """Refresh table data"""
+        # Clear existing content
         self.table.setRowCount(0)
         
-        # Load existing items if any (implement this based on your needs)
-        # For now, just ensure we have an empty row
+        # Ensure we have an empty row
         self.ensure_empty_row()
     
     def ensure_empty_row(self):
@@ -242,7 +182,6 @@ class OperationsTableWidget(ParameterTableWidget):
                     delete_btn = self.create_delete_button(row)
                     
                     # Create container widget to center the delete button
-                    from PySide6.QtWidgets import QWidget, QHBoxLayout
                     container = QWidget()
                     container_layout = QHBoxLayout(container)
                     container_layout.setContentsMargins(0, 0, 0, 0)
@@ -253,11 +192,10 @@ class OperationsTableWidget(ParameterTableWidget):
                     self.table.setCellWidget(row, col, container)
                 elif param_key == 'product_preview':
                     # Add empty preview widget with proper sizing and centering
-                    preview_widget = PreviewWidget(45, "product")  # Slightly smaller
+                    preview_widget = PreviewWidget(45, "product")
                     preview_widget.setFixedSize(45, 45)
                     
                     # Create container widget to center the preview
-                    from PySide6.QtWidgets import QWidget, QHBoxLayout
                     container = QWidget()
                     container_layout = QHBoxLayout(container)
                     container_layout.setContentsMargins(0, 0, 0, 0)

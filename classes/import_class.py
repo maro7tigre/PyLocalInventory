@@ -77,6 +77,18 @@ class ImportClass(BaseClass):
                 "required": False,
                 "type": "float",
                 "method": self.calculate_total_price
+            },
+            "supplier_name": {
+                "display_name": {"en": "Supplier Name", "fr": "Nom du Fournisseur", "es": "Nombre del Proveedor"},
+                "required": False,
+                "type": "string",
+                "method": self.get_supplier_name
+            },
+            "supplier_preview": {
+                "display_name": {"en": "Supplier Preview", "fr": "Aperçu Fournisseur", "es": "Vista Previa Proveedor"},
+                "required": False,
+                "type": "image",
+                "method": self.get_supplier_preview
             }
         }
         
@@ -84,7 +96,8 @@ class ImportClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "supplier_id": "r",
+                "supplier_preview": "r",
+                "supplier_name": "r",
                 "date": "r",
                 "subtotal": "r",
                 "total_price": "r"
@@ -196,6 +209,20 @@ class ImportClass(BaseClass):
         except Exception as e:
             print(f"Error getting supplier name: {e}")
             return f"Supplier {self.get_value('supplier_id')}"
+    
+    def get_supplier_preview(self):
+        """Get the preview image path of the associated supplier"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return None
+        
+        try:
+            supplier_id = self.get_value('supplier_id')
+            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE ID = ?", (supplier_id,))
+            result = self.database.cursor.fetchone()
+            return result[0] if result and result[0] else None
+        except Exception as e:
+            print(f"Error getting supplier preview: {e}")
+            return None
         
     def save_to_database(self):
         """Save import operation to database"""

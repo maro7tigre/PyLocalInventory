@@ -16,6 +16,7 @@ from ui.tabs.products_tab import ProductsTab
 from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
+from ui.tabs.imports_tab import ImportsTab
 from ui.tabs.log_tab import LogTab
 
 from classes.product_class import ProductClass
@@ -23,6 +24,8 @@ from classes.client_class import ClientClass
 from classes.supplier_class import SupplierClass
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
+from classes.import_class import ImportClass
+from classes.import_item_class import ImportItemClass
 
 from core.profiles import ProfileManager
 from core.password import PasswordManager
@@ -67,6 +70,8 @@ class MainWindow(ThemedMainWindow):
         self.database.register_class(SupplierClass)
         self.database.register_class(SalesClass)
         self.database.register_class(SalesItemClass)
+        self.database.register_class(ImportClass)
+        self.database.register_class(ImportItemClass)
         
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
@@ -262,6 +267,24 @@ class MainWindow(ThemedMainWindow):
             error_label.setStyleSheet("color: red; padding: 20px;")
             error_layout.addWidget(error_label)
             tab_widget.addTab(error_widget, "Sales (Error)")
+        
+        # Add Imports tab
+        try:
+            imports_tab = ImportsTab(self.database)
+            tab_widget.addTab(imports_tab, "Imports")
+            print("✓ Added Imports tab successfully")
+        except Exception as e:
+            print(f"✗ Error adding Imports tab: {e}")
+            import traceback
+            traceback.print_exc()
+            
+            # Add error placeholder
+            error_widget = QWidget()
+            error_layout = QVBoxLayout(error_widget)
+            error_label = QLabel(f"Imports tab error: {str(e)}")
+            error_label.setStyleSheet("color: red; padding: 20px;")
+            error_layout.addWidget(error_label)
+            tab_widget.addTab(error_widget, "Imports (Error)")
         
         tab_widget.addTab(LogTab(self.database), "Log")
         

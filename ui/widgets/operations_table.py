@@ -340,7 +340,6 @@ class OperationsTableWidget(QWidget):
         """Handle product selection and auto-fill price/preview"""
         # Create a temporary sales item to get product data
         temp_item = self.item_class(0, self.database)
-        temp_item.set_value('product_name', product_name)
         temp_item.update_product_selection(product_name)
         
         # Update unit_price column if it exists

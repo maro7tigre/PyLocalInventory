@@ -41,18 +41,24 @@ class OperationsTableWidget(QWidget):
         self.table = QTableWidget()
         self.setup_table()
         
-        # Set proper size policies
+        # Set proper size policies for the widget itself
+        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        
+        # Set proper size policies for the table
         self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         
         # Enable native scrolling
         self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         
+        # Ensure no absolute positioning
+        self.table.setStyleSheet("")  # Clear any inherited styles
+        
         # Add to layout
         layout.addWidget(self.table)
         
-        # Set widget size policy
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        # Ensure the layout respects the parent
+        self.setLayout(layout)
     
     def setup_table(self):
         """Setup table columns and properties"""

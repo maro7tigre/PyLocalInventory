@@ -3,7 +3,6 @@ Sale Edit Dialog - Updated to use inline sales items table
 For managing sale transactions with items table
 """
 
-from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from ui.widgets.operations_table import OperationsTableWidget
@@ -12,7 +11,7 @@ from PySide6.QtGui import QFont
 from datetime import datetime
 
 
-class SaleEditDialog(BaseEditDialog):
+class SaleEditDialog(QDialog):
     """Sale-specific edit dialog with inline sales items editing"""
     
     def __init__(self, sale_id=None, database=None, parent=None):
@@ -48,14 +47,23 @@ class SaleEditDialog(BaseEditDialog):
             }
         }
         
-        # Initialize base dialog
-        super().__init__(self.sale_obj, ui_config, parent)
+        # Initialize QDialog directly, not BaseEditDialog to avoid layout conflicts
+        QDialog.__init__(self, parent)
+        self.data_object = self.sale_obj
+        self.ui_config = ui_config
+        self.parameter_widgets = {}
+        
+        # Set dialog properties
+        self.setModal(True)
         
         # Set specific window title
         if sale_id:
             self.setWindowTitle(f"Edit Sale - ID {sale_id}")
         else:
             self.setWindowTitle("New Sale")
+        
+        # Setup our custom UI
+        self.setup_ui()
     
     def setup_ui(self):
         """Setup dialog UI with simple, clean layout that ensures table scrolling works"""
@@ -63,7 +71,9 @@ class SaleEditDialog(BaseEditDialog):
         
         # Set reasonable default size but allow resizing
         self.resize(900, 700)
-        self.setMinimumSize(600, 500)  # Minimum usable size
+        # Calculate proper minimum size to prevent overlay
+        # 120 (params) + 30 (label) + 200 (table min) + 60 (totals) + 50 (buttons) + 60 (margins/spacing + buffer)
+        self.setMinimumSize(600, 520)  # Added extra 15px buffer to prevent overlay
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -147,10 +157,10 @@ class SaleEditDialog(BaseEditDialog):
         self.sales_items_table.items_changed.connect(self.update_totals)
         
         # Give the table most of the remaining space (stretches with dialog)
-        self.sales_items_table.setMinimumHeight(300)  # Minimum functional height
+        self.sales_items_table.setMinimumHeight(200)  # Reduced minimum for better resizing
         layout.addWidget(self.sales_items_table, 1)  # Stretch factor 1 = takes extra space
         
-        # Totals section (compact, fixed height)
+        # Totals section (compact, fixed height) - ALWAYS AFTER TABLE
         totals_widget = QWidget()
         totals_widget.setFixedHeight(60)  # Fixed height for totals
         totals_layout = QHBoxLayout(totals_widget)
@@ -180,6 +190,22 @@ class SaleEditDialog(BaseEditDialog):
         
         # Apply dark theme
         self.apply_theme()
+    
+    def minimumSizeHint(self):
+        """Calculate minimum size to prevent component overlay"""
+        from PySide6.QtCore import QSize
+        
+        # Calculate minimum height needed for all components
+        min_height = (
+            120 +  # params section (fixed)
+            30 +   # sales items label 
+            200 +  # table minimum height
+            60 +   # totals section (fixed)
+            50 +   # button section (fixed)
+            60     # margins and spacing + buffer
+        )
+        
+        return QSize(600, min_height)
     
     def apply_theme(self):
         """Apply dark theme styling"""
@@ -322,8 +348,19 @@ class SaleEditDialog(BaseEditDialog):
             return []
     
     def validate_data(self):
-        """Sale-specific validation (extends base validation)"""
-        errors = super().validate_data()  # Get base validation errors
+        """Sale-specific validation"""
+        errors = []
+        
+        # Basic parameter validation
+        for param_key, widget in self.parameter_widgets.items():
+            param_info = self.sale_obj.parameters.get(param_key, {})
+            
+            # Check if required parameter is empty
+            if param_info.get('required', False):
+                value = self.get_widget_value(widget)
+                if not value or (isinstance(value, str) and not value.strip()):
+                    display_name = self.sale_obj.get_display_name(param_key)
+                    errors.append(f"{display_name} is required")
         
         # Additional sale-specific validation
         client_text = self.get_widget_value(self.parameter_widgets.get('client_id', ''))

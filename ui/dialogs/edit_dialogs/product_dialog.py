@@ -55,12 +55,15 @@ class ProductEditDialog(BaseEditDialog):
         # Get current values from widgets
         unit_price = None
         sale_price = None
+        username = None
         
         for param_key, widget in self.parameter_widgets.items():
             if param_key == 'unit_price':
                 unit_price = self.get_widget_value(widget)
             elif param_key == 'sale_price':
                 sale_price = self.get_widget_value(widget)
+            elif param_key == 'username':
+                username = self.get_widget_value(widget)
         
         # Additional product-specific validation
         if unit_price is not None and sale_price is not None:
@@ -73,6 +76,10 @@ class ProductEditDialog(BaseEditDialog):
         
         if sale_price is not None and sale_price < 0:
             errors.append("Sale price cannot be negative")
+        
+        # Validate username uniqueness
+        if username and not self.product.validate_username_uniqueness(username):
+            errors.append(f"Username '{username}' already exists for another product")
         
         return errors
     

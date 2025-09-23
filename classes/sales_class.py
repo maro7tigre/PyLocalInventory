@@ -21,13 +21,26 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
-            "client_id": {
-                "value": client_id,
+            "client_username": {
+                "value": "",
                 "display_name": {"en": "Client", "fr": "Client", "es": "Cliente"},
                 "required": True,
-                "default": 0,
-                "options": [],
-                "type": "int"
+                "default": "",
+                "type": "string",
+                "autocomplete": True,
+                "options": self.get_client_username_options
+            },
+            "client_id": {
+                "display_name": {"en": "Client ID", "fr": "ID Client", "es": "ID Cliente"},
+                "required": False,
+                "type": "int",
+                "method": self.get_client_id
+            },
+            "client_name": {
+                "display_name": {"en": "Client Name", "fr": "Nom Client", "es": "Nombre Cliente"},
+                "required": False,
+                "type": "string",
+                "method": self.get_client_name
             },
             "date": {
                 "value": "",
@@ -87,20 +100,21 @@ class SalesClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "client_id": "r",
+                "client_username": "r",
+                "client_name": "r",
                 "date": "r",
                 "subtotal": "r",
                 "total_price": "r"
             },
             "dialog": {
-                "client_id": "rw",
+                "client_username": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {
-                "client_id": "rw",
+                "client_username": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw"
@@ -186,19 +200,79 @@ class SalesClass(BaseClass):
             print(f"Error removing item {item_id} from sales {self.id}: {e}")
             return False
     
+    def get_client_username_options(self):
+        """Get list of available client usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Clients WHERE username IS NOT NULL AND username != '' ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting client username options: {e}")
+            return []
+    
+    def get_client_id(self):
+        """Get the ID of the client by username"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return 0
+        
+        try:
+            client_username = self.get_value('client_username')
+            if not client_username:
+                return 0
+            self.database.cursor.execute("SELECT ID FROM Clients WHERE username = ?", (client_username,))
+            result = self.database.cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            print(f"Error getting client ID: {e}")
+            return 0
+    
     def get_client_name(self):
         """Get the name of the associated client"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Client {self.get_value('client_id')}"
+            return f"Client {self.get_value('client_username')}"
         
         try:
-            client_id = self.get_value('client_id')
-            self.database.cursor.execute("SELECT name FROM Clients WHERE ID = ?", (client_id,))
+            client_username = self.get_value('client_username')
+            if not client_username:
+                return ""
+            self.database.cursor.execute("SELECT name FROM Clients WHERE username = ?", (client_username,))
             result = self.database.cursor.fetchone()
-            return result[0] if result else f"Client {client_id}"
+            return result[0] if result else f"Client {client_username}"
         except Exception as e:
             print(f"Error getting client name: {e}")
-            return f"Client {self.get_value('client_id')}"
+            return f"Client {self.get_value('client_username')}"
+    
+    def set_value(self, param_key, value):
+        """Override set_value to handle connected parameters"""
+        # Call parent set_value first
+        super().set_value(param_key, value)
+        
+        # Handle connected parameters for client_username
+        if param_key == 'client_username' and value:
+            # This will trigger recalculation of client_id and client_name
+            pass
+    
+    def get_parameter_options(self, param_key):
+        """Override to provide dynamic options for client_username"""
+        if param_key == 'client_username':
+            return self.get_client_options()
+        return self.parameters.get(param_key, {}).get('options', [])
+    
+    def get_client_options(self):
+        """Get list of available client usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Clients ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting client options: {e}")
+            return []
 
     def save_to_database(self):
         """Save sales operation to database"""

@@ -60,6 +60,7 @@ class SupplierEditDialog(BaseEditDialog):
         email = None
         phone = None
         name = None
+        username = None
         
         for param_key, widget in self.parameter_widgets.items():
             if param_key == 'email':
@@ -68,6 +69,8 @@ class SupplierEditDialog(BaseEditDialog):
                 phone = self.get_widget_value(widget)
             elif param_key == 'name':
                 name = self.get_widget_value(widget)
+            elif param_key == 'username':
+                username = self.get_widget_value(widget)
         
         # Additional supplier-specific validation
         if email and not self._validate_email(email):
@@ -79,6 +82,10 @@ class SupplierEditDialog(BaseEditDialog):
         # Business rule: Suppliers should have at least email OR phone for contact
         if name and not email and not phone:
             errors.append("Please provide at least an email address or phone number for contact")
+        
+        # Validate username uniqueness
+        if username and not self.supplier.validate_username_uniqueness(username):
+            errors.append(f"Username '{username}' already exists for another supplier")
         
         return errors
     

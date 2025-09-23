@@ -37,8 +37,8 @@ class ImportEditDialog(QDialog):
         
         # Define import-specific UI configuration
         ui_config = {
-            'supplier_id': {
-                'options': self._get_supplier_options()
+            'supplier_username': {
+                'autocomplete': True
             },
             'tva': {
                 'minimum': 0.0,
@@ -336,17 +336,7 @@ class ImportEditDialog(QDialog):
         except Exception as e:
             print(f"Error updating totals: {e}")
     
-    def _get_supplier_options(self):
-        """Get list of suppliers for dropdown"""
-        if not self.database:
-            return []
-        
-        try:
-            suppliers = self.database.get_items("Suppliers")
-            return [f"{s['ID']} - {s['name']}" for s in suppliers]
-        except:
-            return []
-    
+
     def validate_data(self):
         """Import-specific validation"""
         errors = []
@@ -363,24 +353,31 @@ class ImportEditDialog(QDialog):
                     errors.append(f"{display_name} is required")
         
         # Additional import-specific validation
-        supplier_text = self.get_widget_value(self.parameter_widgets.get('supplier_id', ''))
+        supplier_username = self.get_widget_value(self.parameter_widgets.get('supplier_username', ''))
         
-        # Extract supplier ID from selection
-        try:
-            supplier_id = int(supplier_text.split(' - ')[0]) if supplier_text else 0
-        except (ValueError, IndexError):
-            errors.append("Please select a valid supplier")
-            supplier_id = 0
+        # Validate supplier username exists
+        if supplier_username and not self._validate_supplier_exists(supplier_username):
+            errors.append(f"Supplier username '{supplier_username}' does not exist")
         
         # Check if we have at least one item
         items = self.import_items_table.get_items_data()
         if not items:
             errors.append("Please add at least one item to the import")
         
-        # Store extracted ID for saving
-        self._extracted_supplier_id = supplier_id
-        
         return errors
+    
+    def _validate_supplier_exists(self, username):
+        """Check if supplier username exists in database"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return False
+        
+        try:
+            self.database.cursor.execute("SELECT COUNT(*) FROM Suppliers WHERE username = ?", (username,))
+            result = self.database.cursor.fetchone()
+            return result[0] > 0 if result else False
+        except Exception as e:
+            print(f"Error validating supplier: {e}")
+            return False
     
     def save_changes(self):
         """Save import changes to database"""
@@ -393,12 +390,8 @@ class ImportEditDialog(QDialog):
         try:
             # Update import object with form data
             for param_key, widget in self.parameter_widgets.items():
-                if param_key == 'supplier_id':
-                    # Use extracted ID
-                    self.import_obj.set_value(param_key, self._extracted_supplier_id)
-                else:
-                    value = self.get_widget_value(widget)
-                    self.import_obj.set_value(param_key, value)
+                value = self.get_widget_value(widget)
+                self.import_obj.set_value(param_key, value)
             
             # Save import to database first
             import_data = self.import_obj.get_value(destination="database")

@@ -27,19 +27,35 @@ class ImportItemClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
+            "product_name": {
+                "value": "",
+                "display_name": {"en": "Product", "fr": "Produit", "es": "Producto"},
+                "required": True,
+                "default": "",
+                "type": "string",
+                "autocomplete": True,
+                "options": self.get_product_options
+            },
             "product_id": {
                 "value": product_id,
-                "display_name": {"en": "Product", "fr": "Produit", "es": "Producto"},
+                "display_name": {"en": "Product ID", "fr": "ID Produit", "es": "ID Producto"},
                 "required": True,
                 "default": 0,
                 "options": [],
                 "type": "int"
             },
+            "product_preview": {
+                "display_name": {"en": "Preview", "fr": "Aperçu", "es": "Vista Previa"},
+                "required": False,
+                "type": "image",
+                "preview_size": 50,
+                "method": self.get_product_preview
+            },
             "quantity": {
-                "value": 0,
+                "value": 1,
                 "display_name": {"en": "Quantity", "fr": "Quantité", "es": "Cantidad"},
                 "required": True,
-                "default": 0,
+                "default": 1,
                 "options": [],
                 "type": "int",
                 "min": 1
@@ -58,18 +74,6 @@ class ImportItemClass(BaseClass):
                 "required": False,
                 "type": "float",
                 "method": self.calculate_subtotal
-            },
-            "product_preview": {
-                "display_name": {"en": "Product Preview", "fr": "Aperçu Produit", "es": "Vista Previa Producto"},
-                "required": False,
-                "type": "image",
-                "method": self.get_product_preview
-            },
-            "product_name": {
-                "display_name": {"en": "Product Name", "fr": "Nom du Produit", "es": "Nombre del Producto"},
-                "required": False,
-                "type": "string",
-                "method": self.get_product_name
             },
             "delete_action": {
                 "display_name": {"en": "Delete", "fr": "Supprimer", "es": "Eliminar"},
@@ -106,6 +110,66 @@ class ImportItemClass(BaseClass):
                 "subtotal": "r"
             }
         }
+    
+    def get_product_options(self):
+        """Get list of available product names for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL AND name != '' ORDER BY name")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting product name options: {e}")
+            return []
+    
+    def get_product_data_by_name(self, product_name):
+        """Get product data by name including ID and unit price"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return None
+        
+        try:
+            self.database.cursor.execute("SELECT ID, unit_price, preview_image FROM Products WHERE name = ?", (product_name,))
+            result = self.database.cursor.fetchone()
+            if result:
+                return {
+                    'id': result[0],
+                    'unit_price': result[1] or 0.0,
+                    'preview_image': result[2]
+                }
+            return None
+        except Exception as e:
+            print(f"Error getting product data by name: {e}")
+            return None
+    
+    def set_value(self, param_key, value):
+        """Override set_value to handle product selection updates and connected parameters"""
+        # For product_name, we need to find the product and set connected parameters
+        if param_key == 'product_name' and value:
+            product_data = self.get_product_data_by_name(value.strip())
+            if product_data:
+                # Set the product_id first
+                super().set_value('product_id', product_data['id'])
+                
+                # Set quantity to 1 if not already set or is 0
+                current_quantity = self.get_value('quantity') or 0
+                if current_quantity == 0:
+                    super().set_value('quantity', 1)
+                
+                # Update price only if current price is 0 or not set
+                current_price = self.get_value('unit_price') or 0.0
+                if current_price == 0.0:
+                    super().set_value('unit_price', product_data['unit_price'])
+            return
+        
+        # Call parent set_value for other parameters
+        super().set_value(param_key, value)
+        
+        # Handle quantity or unit_price changes to update subtotal
+        if param_key in ['quantity', 'unit_price']:
+            # Subtotal will be recalculated automatically via the method
+            pass
     
     def calculate_subtotal(self):
         """Calculate subtotal (quantity * unit_price)"""
@@ -161,12 +225,12 @@ class ImportItemClass(BaseClass):
             return []
     
     def get_product_data(self, product_name):
-        """Get product data by name"""
+        """Get product data by name including ID and unit price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return None
         
         try:
-            self.database.cursor.execute("SELECT ID, name, price FROM Products WHERE name = ?", (product_name,))
+            self.database.cursor.execute("SELECT ID, name, unit_price FROM Products WHERE name = ?", (product_name,))
             result = self.database.cursor.fetchone()
             if result:
                 return {
@@ -180,22 +244,38 @@ class ImportItemClass(BaseClass):
             return None
     
     def update_product_selection(self, product_name):
-        """Update product_id and unit_price when product_name changes"""
-        product_data = self.get_product_data(product_name)
-        if product_data:
-            self.set_value('product_id', product_data['id'])
-            # Set unit_price to the product price if current unit_price is 0
-            if self.get_value('unit_price') == 0:
-                self.set_value('unit_price', product_data['price'])
+        """Update product_id and unit_price when product_name changes - DEPRECATED, use set_value instead"""
+        # This method is kept for backward compatibility but should not be used
+        # Use set_value('product_name', name) instead
+        pass
     
     def set_value(self, param_key, value, destination="internal"):
-        """Override to handle product_name updates"""
+        """Override to handle product_name updates and connected parameters"""
+        # For product_name, we need to find the product and set connected parameters
+        if param_key == 'product_name' and value:
+            product_data = self.get_product_data(value.strip())
+            if product_data:
+                # Set the product_id first
+                super().set_value('product_id', product_data['id'])
+                
+                # Set quantity to 1 if not already set or is 0
+                current_quantity = self.get_value('quantity') or 0
+                if current_quantity == 0:
+                    super().set_value('quantity', 1)
+                
+                # Update price only if current price is 0 or not set
+                current_price = self.get_value('unit_price') or 0.0
+                if current_price == 0.0:
+                    super().set_value('unit_price', product_data['price'])
+            return
+        
         # Call parent's set_value without destination parameter
         super().set_value(param_key, value)
         
-        # If product_name is updated, update the product_id and unit_price
-        if param_key == 'product_name' and value:
-            self.update_product_selection(value)
+        # Handle quantity or unit_price changes to update subtotal
+        if param_key in ['quantity', 'unit_price']:
+            # Subtotal will be recalculated automatically via the method
+            pass
         
     def save_to_database(self):
         """Save import item to database"""

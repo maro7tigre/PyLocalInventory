@@ -27,6 +27,15 @@ class ProductClass(BaseClass):
                 "options": ["iron", "wood", "wool", "steel", "aluminum", "plastic"],
                 "type": "string"
             },
+            "username": {
+                "value": "",
+                "display_name": {"en": "Username", "fr": "Nom d'utilisateur", "es": "Nombre de Usuario"},
+                "required": True,
+                "default": "",
+                "type": "string",
+                "autocomplete": True,
+                "options": self.get_username_options
+            },
             "unit_price": {
                 "value": 0.0,
                 "display_name": {"en": "Unit Price", "fr": "Prix Unitaire", "es": "Precio Unitario"},
@@ -87,12 +96,14 @@ class ProductClass(BaseClass):
             "table": {
                 "id": "r",
                 "preview_image": "r",
+                "username": "rw",
                 "name": "rw",
                 "sale_price": "r", 
                 "quantity": "r",
                 "category": "r"
             },
             "dialog": {
+                "username": "rw",
                 "name": "rw",
                 "unit_price": "rw",
                 "sale_price": "rw",
@@ -101,6 +112,7 @@ class ProductClass(BaseClass):
                 "description": "rw"
             },
             "database": {
+                "username": "rw",
                 "name": "rw",
                 "unit_price": "rw", 
                 "sale_price": "rw",
@@ -128,12 +140,14 @@ class ProductClass(BaseClass):
         
         try:
             # Get total imports for this product
-            self.database.cursor.execute("SELECT SUM(quantity) FROM Imports WHERE product_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT SUM(quantity) FROM Import_Items WHERE product_id = ?", (self.id,))
             imports_result = self.database.cursor.fetchone()
             total_imports = imports_result[0] if imports_result and imports_result[0] else 0
             
-            # Get total sales for this product  
-            self.database.cursor.execute("SELECT SUM(quantity) FROM Sales WHERE product_id = ?", (self.id,))
+            # Get total sales for this product from Sales_Items table
+            self.database.cursor.execute("""
+                SELECT SUM(quantity) FROM Sales_Items WHERE product_id = ?
+            """, (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0
             
@@ -141,6 +155,25 @@ class ProductClass(BaseClass):
         except Exception as e:
             print(f"Error calculating quantity for product {self.id}: {e}")
             return 0
+    
+    def get_parameter_options(self, param_key):
+        """Override to provide dynamic options for username autocomplete"""
+        if param_key == 'username':
+            return self.get_username_options()
+        return self.parameters.get(param_key, {}).get('options', [])
+    
+    def get_username_options(self):
+        """Get list of available product usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Products WHERE username IS NOT NULL AND username != '' ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting product username options: {e}")
+            return []
     
     def get_profit_margin(self):
         """Calculate profit margin percentage"""
@@ -193,12 +226,55 @@ class ProductClass(BaseClass):
             print(f"Error loading product data for ID {self.id}: {e}")
             return False
     
+    def get_username_options(self):
+        """Get list of available product usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Products WHERE username IS NOT NULL AND username != '' ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting product username options: {e}")
+            return []
+    
+    def validate_username_uniqueness(self, username):
+        """Check if username is unique among products"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return True
+        
+        try:
+            # Check if username exists in other products (excluding current one)
+            if self.id and self.id > 0:
+                self.database.cursor.execute(
+                    "SELECT COUNT(*) FROM Products WHERE username = ? AND ID != ?", 
+                    (username, self.id)
+                )
+            else:
+                self.database.cursor.execute(
+                    "SELECT COUNT(*) FROM Products WHERE username = ?", 
+                    (username,)
+                )
+            
+            result = self.database.cursor.fetchone()
+            return result[0] == 0 if result else True
+        except Exception as e:
+            print(f"Error checking username uniqueness: {e}")
+            return True
+    
     def save_to_database(self):
-        """Save product to database"""
+        """Save product to database with username validation"""
         if not self.database:
             return False
         
         try:
+            # Validate username uniqueness
+            username = self.get_value('username')
+            if username and not self.validate_username_uniqueness(username):
+                print(f"Username '{username}' already exists for another product")
+                return False
+            
             # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):

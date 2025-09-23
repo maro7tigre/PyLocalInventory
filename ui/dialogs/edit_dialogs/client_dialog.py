@@ -60,6 +60,7 @@ class ClientEditDialog(BaseEditDialog):
         email = None
         phone = None
         name = None
+        username = None
         
         for param_key, widget in self.parameter_widgets.items():
             if param_key == 'email':
@@ -68,6 +69,8 @@ class ClientEditDialog(BaseEditDialog):
                 phone = self.get_widget_value(widget)
             elif param_key == 'name':
                 name = self.get_widget_value(widget)
+            elif param_key == 'username':
+                username = self.get_widget_value(widget)
         
         # Additional client-specific validation
         if email and not self._validate_email(email):
@@ -75,6 +78,10 @@ class ClientEditDialog(BaseEditDialog):
         
         if phone and not self._validate_phone(phone):
             errors.append("Please enter a valid phone number (7-15 digits)")
+        
+        # Validate username uniqueness
+        if username and not self.client.validate_username_uniqueness(username):
+            errors.append(f"Username '{username}' already exists for another client")
         
         return errors
     

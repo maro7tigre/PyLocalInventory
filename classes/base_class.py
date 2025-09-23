@@ -81,6 +81,9 @@ class BaseClass:
         # Set the value
         self.parameters[param_key]["value"] = value
         
+        # Handle connected parameters
+        self._handle_connected_parameters(param_key, value)
+        
     def set_values(self, values_dict):
         """Set multiple parameter values"""
         for key, value in values_dict.items():
@@ -128,7 +131,7 @@ class BaseClass:
         return 'method' in param_info and param_info['method'] is not None
     
     def validate_parameter(self, param_key, value):
-        """Validate parameter value against constraints"""
+        """Validate parameter value against constraints including uniqueness"""
         if param_key not in self.parameters:
             return False, f"Parameter '{param_key}' not found"
         
@@ -137,6 +140,11 @@ class BaseClass:
         # Check required
         if param_info.get('required', False) and not value:
             return False, f"{self.get_display_name(param_key)} is required"
+        
+        # Check uniqueness
+        if param_info.get('unique', False) and value:
+            if not self._validate_uniqueness(param_key, value):
+                return False, f"{self.get_display_name(param_key)} must be unique"
         
         # Check type-specific constraints
         param_type = param_info.get('type', 'string')
@@ -164,6 +172,12 @@ class BaseClass:
                 return False, f"{self.get_display_name(param_key)} must be one of: {', '.join(options)}"
         
         return True, ""
+    
+    def _validate_uniqueness(self, param_key, value):
+        """Validate uniqueness constraint - override in subclasses"""
+        # Base implementation always returns True
+        # Subclasses should override this for database validation
+        return True
     
     def load_database_data(self):
         """Load data from database - override in subclasses"""
@@ -205,3 +219,32 @@ class BaseClass:
     def get_quantity(self):
         """Get quantity - override in subclasses that need it"""
         return 0
+    
+    def _handle_connected_parameters(self, param_key, value):
+        """Handle connected parameters when a parameter value changes"""
+        # Override in subclasses to implement connected parameter logic
+        pass
+    
+    def get_parameter_options(self, param_key):
+        """Get options for a parameter (for autocomplete)"""
+        if param_key not in self.parameters:
+            return []
+        
+        param_info = self.parameters[param_key]
+        return param_info.get('options', [])
+    
+    def is_parameter_connected(self, param_key):
+        """Check if parameter has connected parameters"""
+        if param_key not in self.parameters:
+            return False
+        
+        param_info = self.parameters[param_key]
+        return 'connected_params' in param_info and param_info['connected_params']
+    
+    def get_connected_parameters(self, param_key):
+        """Get list of connected parameters for a given parameter"""
+        if param_key not in self.parameters:
+            return []
+        
+        param_info = self.parameters[param_key]
+        return param_info.get('connected_params', [])

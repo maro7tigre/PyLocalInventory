@@ -31,14 +31,25 @@ class AutoCompleteLineEdit(QLineEdit):
         
         super().keyPressEvent(event)
     
+    def _get_options_list(self):
+        """Get the actual options list, calling method if necessary"""
+        if callable(self.options):
+            try:
+                return self.options() or []
+            except Exception as e:
+                print(f"Error calling options method: {e}")
+                return []
+        return self.options or []
+    
     def _setup_completer(self):
         """Initialize completer if options are available"""
-        if not self.options:
+        options_list = self._get_options_list()
+        if not options_list:
             if self.completer:
                 self.setCompleter(None)
                 self.completer = None
             return
-        
+
         if not self.completer:
             self.completer = QCompleter(self)
             self.completer.setCaseSensitivity(Qt.CaseInsensitive)
@@ -49,13 +60,14 @@ class AutoCompleteLineEdit(QLineEdit):
     
     def _calculate_suggestions(self, text):
         """Calculate suggestions with scoring system"""
+        options_list = self._get_options_list()
         if not text.strip():
-            return {option: 1 for option in self.options}
+            return {option: 1 for option in options_list}
         
         input_words = text.lower().split()
         suggestions = {}
         
-        for option in self.options:
+        for option in options_list:
             option_words = option.lower().split()
             score = 0
             
@@ -91,14 +103,23 @@ class AutoCompleteLineEdit(QLineEdit):
         
         return suggestions
     
+    def update_options(self, new_options):
+        """Update options and refresh completer"""
+        self.options = new_options
+        self._setup_completer()
+    
+    def refresh_options(self):
+        """Refresh options if they are callable (for dynamic database updates)"""
+        if callable(self.options):
+            self._setup_completer()
+    
     def _update_autocomplete(self, text):
         """Update completer model and border styling based on input"""
-        if not self.options or self.suggestions_frozen:
+        options_list = self._get_options_list()
+        if not options_list or self.suggestions_frozen:
             return
-        
-        suggestions = self._calculate_suggestions(text)
-        
-        # Sort suggestions by score (highest first)
+
+        suggestions = self._calculate_suggestions(text)        # Sort suggestions by score (highest first)
         sorted_suggestions = sorted(suggestions.keys(), key=lambda x: suggestions[x], reverse=True)
         
         # Update completer model with sorted suggestions

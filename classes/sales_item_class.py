@@ -6,7 +6,7 @@ from classes.base_class import BaseClass
 
 
 class SalesItemClass(BaseClass):
-    def __init__(self, id, database, sales_id=0, product_name=""):
+    def __init__(self, id, database, sales_id=0, product_id=0):
         super().__init__(id, database)
         self.section = "Sales_Items"
         
@@ -28,29 +28,35 @@ class SalesItemClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
+            "product_id": {
+                "value": product_id,
+                "display_name": {"en": "Product ID", "fr": "ID Produit", "es": "ID Producto"},
+                "required": True,
+                "default": 0,
+                "options": [],
+                "type": "int"
+            },
             "product_name": {
                 "value": "",
                 "display_name": {"en": "Product", "fr": "Produit", "es": "Producto"},
                 "required": True,
                 "default": "",
-                "options": [],
                 "type": "string",
-                "autocomplete": True
+                "autocomplete": True,
+                "options": self.get_product_options
             },
             "product_preview": {
-                "value": None,
                 "display_name": {"en": "Preview", "fr": "Aperçu", "es": "Vista Previa"},
                 "required": False,
-                "default": None,
-                "options": [],
                 "type": "image",
-                "preview_size": 50
+                "preview_size": 50,
+                "method": self.get_product_preview
             },
             "quantity": {
-                "value": 0,
+                "value": 1,
                 "display_name": {"en": "Quantity", "fr": "Quantité", "es": "Cantidad"},
                 "required": True,
-                "default": 0,
+                "default": 1,
                 "options": [],
                 "type": "int",
                 "min": 1
@@ -81,11 +87,6 @@ class SalesItemClass(BaseClass):
             }
         }
         
-        # Initialize product name if provided
-        if product_name:
-            self.set_value('product_name', product_name)
-            self.update_product_selection(product_name)
-        
         # Define where parameters can be used and their permissions
         self.available_parameters = {
             "table": {
@@ -105,7 +106,7 @@ class SalesItemClass(BaseClass):
             },
             "database": {
                 "sales_id": "rw",
-                "product_name": "rw", 
+                "product_id": "rw",
                 "quantity": "rw",
                 "unit_price": "rw"
                 # Calculated and image parameters not stored in database
@@ -118,6 +119,51 @@ class SalesItemClass(BaseClass):
                 # No delete button in reports
             }
         }
+    
+    def get_product_options(self):
+        """Get list of available product names for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL AND name != '' ORDER BY name")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting product name options: {e}")
+            return []
+    
+    def get_product_name(self):
+        """Get the name of the associated product"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return f"Product {self.get_value('product_id')}"
+        
+        try:
+            product_id = self.get_value('product_id')
+            if not product_id:
+                return ""
+            self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
+            result = self.database.cursor.fetchone()
+            return result[0] if result else f"Product {product_id}"
+        except Exception as e:
+            print(f"Error getting product name: {e}")
+            return f"Product {self.get_value('product_id')}"
+    
+    def get_product_preview(self):
+        """Get the preview image path of the associated product"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return None
+        
+        try:
+            product_id = self.get_value('product_id')
+            if not product_id:
+                return None
+            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = ?", (product_id,))
+            result = self.database.cursor.fetchone()
+            return result[0] if result and result[0] else None
+        except Exception as e:
+            print(f"Error getting product preview: {e}")
+            return None
     
     def calculate_subtotal(self):
         """Calculate subtotal (quantity * unit_price)"""
@@ -142,14 +188,33 @@ class SalesItemClass(BaseClass):
         return False
     
     def set_value(self, param_key, value):
-        """Override set_value to handle product selection updates"""
-        # Call parent set_value first
-        result = super().set_value(param_key, value)
-        
-        # If product_name was changed, update price and preview
+        """Override set_value to handle product selection updates and connected parameters"""
+        # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:
-            self.update_product_selection(value)
+            product_data = self.get_product_data_by_name(value.strip())
+            if product_data:
+                # Set the product_id first
+                super().set_value('product_id', product_data['id'])
+                
+                # Set quantity to 1 if not already set or is 0
+                current_quantity = self.get_value('quantity') or 0
+                if current_quantity == 0:
+                    super().set_value('quantity', 1)
+                
+                # Update price only if current price is 0 or not set
+                current_price = self.get_value('unit_price') or 0.0
+                if current_price == 0.0:
+                    super().set_value('unit_price', product_data['sale_price'])
+            return
         
+        # Call parent set_value for other parameters
+        super().set_value(param_key, value)
+        
+        # Handle quantity or unit_price changes to update subtotal
+        if param_key in ['quantity', 'unit_price']:
+            # Subtotal will be recalculated automatically via the method
+            pass
+    
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for product_name"""
         if param_key == 'product_name':
@@ -169,27 +234,22 @@ class SalesItemClass(BaseClass):
             print(f"Error getting product options: {e}")
             return []
     
-    def get_parameter_options(self, param_key):
-        """Override to provide dynamic options for product_name"""
-        if param_key == 'product_name':
-            return self.get_product_options()
-        return self.parameters.get(param_key, {}).get('options', [])
-    
-    def get_product_data(self, product_name):
-        """Get product data by name"""
+    def get_product_data_by_name(self, product_name):
+        """Get product data by name including ID and sale price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return None
         
         try:
             self.database.cursor.execute(
-                "SELECT sale_price, preview_image FROM Products WHERE name = ? LIMIT 1", 
+                "SELECT ID, sale_price, preview_image FROM Products WHERE name = ? LIMIT 1", 
                 (product_name,)
             )
             result = self.database.cursor.fetchone()
             if result:
                 return {
-                    'sale_price': result[0] or 0.0,
-                    'preview_image': result[1]
+                    'id': result[0],
+                    'sale_price': result[1] or 0.0,
+                    'preview_image': result[2]
                 }
             return None
         except Exception as e:
@@ -197,23 +257,10 @@ class SalesItemClass(BaseClass):
             return None
     
     def update_product_selection(self, product_name):
-        """Update product selection and auto-fill price and preview"""
-        if not product_name or not product_name.strip():
-            self.set_value('product_preview', None)
-            return
-        
-        product_data = self.get_product_data(product_name.strip())
-        if product_data:
-            # Update price only if current price is 0 or user hasn't manually changed it
-            current_price = self.get_value('unit_price') or 0.0
-            if current_price == 0.0:
-                self.set_value('unit_price', product_data['sale_price'])
-            
-            # Update preview image
-            self.set_value('product_preview', product_data['preview_image'])
-        else:
-            # Clear preview if product not found
-            self.set_value('product_preview', None)
+        """Update product selection and auto-fill price and preview - DEPRECATED, use set_value instead"""
+        # This method is kept for backward compatibility but should not be used
+        # Use set_value('product_name', name) instead
+        pass
         
     def save_to_database(self):
         """Save sales item to database"""

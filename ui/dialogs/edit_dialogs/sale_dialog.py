@@ -37,8 +37,8 @@ class SaleEditDialog(QDialog):
         
         # Define sale-specific UI configuration
         ui_config = {
-            'client_id': {
-                'options': self._get_client_options()
+            'client_username': {
+                'autocomplete': True
             },
             'tva': {
                 'minimum': 0.0,
@@ -336,17 +336,7 @@ class SaleEditDialog(QDialog):
         except Exception as e:
             print(f"Error updating totals: {e}")
     
-    def _get_client_options(self):
-        """Get list of clients for dropdown"""
-        if not self.database:
-            return []
-        
-        try:
-            clients = self.database.get_items("Clients")
-            return [f"{c['ID']} - {c['name']}" for c in clients]
-        except:
-            return []
-    
+
     def validate_data(self):
         """Sale-specific validation"""
         errors = []
@@ -363,24 +353,31 @@ class SaleEditDialog(QDialog):
                     errors.append(f"{display_name} is required")
         
         # Additional sale-specific validation
-        client_text = self.get_widget_value(self.parameter_widgets.get('client_id', ''))
+        client_username = self.get_widget_value(self.parameter_widgets.get('client_username', ''))
         
-        # Extract client ID from selection
-        try:
-            client_id = int(client_text.split(' - ')[0]) if client_text else 0
-        except (ValueError, IndexError):
-            errors.append("Please select a valid client")
-            client_id = 0
+        # Validate client username exists
+        if client_username and not self._validate_client_exists(client_username):
+            errors.append(f"Client username '{client_username}' does not exist")
         
         # Check if we have at least one item
         items = self.sales_items_table.get_items_data()
         if not items:
             errors.append("Please add at least one item to the sale")
         
-        # Store extracted ID for saving
-        self._extracted_client_id = client_id
-        
         return errors
+    
+    def _validate_client_exists(self, username):
+        """Check if client username exists in database"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return False
+        
+        try:
+            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = ?", (username,))
+            result = self.database.cursor.fetchone()
+            return result[0] > 0 if result else False
+        except Exception as e:
+            print(f"Error validating client: {e}")
+            return False
     
     def save_changes(self):
         """Save sale changes to database"""
@@ -393,12 +390,8 @@ class SaleEditDialog(QDialog):
         try:
             # Update sale object with form data
             for param_key, widget in self.parameter_widgets.items():
-                if param_key == 'client_id':
-                    # Use extracted ID
-                    self.sale_obj.set_value(param_key, self._extracted_client_id)
-                else:
-                    value = self.get_widget_value(widget)
-                    self.sale_obj.set_value(param_key, value)
+                value = self.get_widget_value(widget)
+                self.sale_obj.set_value(param_key, value)
             
             # Save sale to database first
             sale_data = self.sale_obj.get_value(destination="database")

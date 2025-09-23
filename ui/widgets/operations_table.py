@@ -411,17 +411,11 @@ class OperationsTableWidget(QWidget):
                     if param_key == 'delete_action':
                         continue  # Skip action columns
                     elif param_key == 'product_preview':
-                        # Get preview from widget container
-                        container_widget = self.table.cellWidget(row, col)
-                        if container_widget:
-                            # Find the PreviewWidget inside the container
-                            for child in container_widget.findChildren(PreviewWidget):
-                                item.set_value(param_key, child.get_image_path())
-                                break
+                        # Skip calculated/method-based parameters - they're auto-calculated
+                        continue
                     elif param_key == 'subtotal':
-                        # Calculate subtotal
-                        subtotal = item.calculate_subtotal() if hasattr(item, 'calculate_subtotal') else 0.0
-                        item.set_value(param_key, subtotal)
+                        # Skip calculated parameters - they're auto-calculated
+                        continue
                     else:
                         # Get value from table cell
                         cell_item = self.table.item(row, col)

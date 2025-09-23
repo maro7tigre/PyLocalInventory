@@ -27,10 +27,10 @@ class SupplierClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
-            "display_name": {
-                "value": name,
-                "display_name": {"en": "Display Name", "fr": "Nom d'Affichage", "es": "Nombre para Mostrar"},
-                "required": False,
+            "username": {
+                "value": "",
+                "display_name": {"en": "Username", "fr": "Nom d'utilisateur", "es": "Nombre de Usuario"},
+                "required": True,
                 "default": "",
                 "options": [],
                 "type": "string"
@@ -83,12 +83,12 @@ class SupplierClass(BaseClass):
             "table": {
                 "id": "r",
                 "preview_image": "r",
-                "name": "rw",
-                "display_name": "r"
+                "username": "rw",
+                "name": "rw"
             },
             "dialog": {
+                "username": "rw",
                 "name": "rw",
-                "display_name": "rw",
                 "address": "rw",
                 "email": "rw",
                 "phone": "rw",
@@ -96,8 +96,8 @@ class SupplierClass(BaseClass):
                 "preview_image": "rw"
             },
             "database": {
+                "username": "rw",
                 "name": "rw",
-                "display_name": "rw",
                 "address": "rw",
                 "email": "rw",
                 "phone": "rw",
@@ -114,6 +114,25 @@ class SupplierClass(BaseClass):
                 "phone": "r"
             }
         }
+    
+    def get_parameter_options(self, param_key):
+        """Override to provide dynamic options for username autocomplete"""
+        if param_key == 'username':
+            return self.get_username_options()
+        return self.parameters.get(param_key, {}).get('options', [])
+    
+    def get_username_options(self):
+        """Get list of available supplier usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Suppliers WHERE username IS NOT NULL AND username != '' ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting supplier username options: {e}")
+            return []
     
     def get_supplier_transactions(self):
         """Get all transactions (imports) from this supplier"""
@@ -205,12 +224,42 @@ class SupplierClass(BaseClass):
             print(f"Error loading supplier data for ID {self.id}: {e}")
             return False
     
+    def validate_username_uniqueness(self, username):
+        """Check if username is unique among suppliers"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return True
+        
+        try:
+            # Check if username exists in other suppliers (excluding current one)
+            if self.id and self.id > 0:
+                self.database.cursor.execute(
+                    "SELECT COUNT(*) FROM Suppliers WHERE username = ? AND ID != ?", 
+                    (username, self.id)
+                )
+            else:
+                self.database.cursor.execute(
+                    "SELECT COUNT(*) FROM Suppliers WHERE username = ?", 
+                    (username,)
+                )
+            
+            result = self.database.cursor.fetchone()
+            return result[0] == 0 if result else True
+        except Exception as e:
+            print(f"Error checking username uniqueness: {e}")
+            return True
+    
     def save_to_database(self):
-        """Save supplier to database"""
+        """Save supplier to database with username validation"""
         if not self.database:
             return False
         
         try:
+            # Validate username uniqueness
+            username = self.get_value('username')
+            if username and not self.validate_username_uniqueness(username):
+                print(f"Username '{username}' already exists for another supplier")
+                return False
+            
             # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):

@@ -20,13 +20,26 @@ class ImportClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
-            "supplier_id": {
-                "value": supplier_id,
+            "supplier_username": {
+                "value": "",
                 "display_name": {"en": "Supplier", "fr": "Fournisseur", "es": "Proveedor"},
                 "required": True,
-                "default": 0,
-                "options": [],
-                "type": "int"
+                "default": "",
+                "type": "string",
+                "autocomplete": True,
+                "options": self.get_supplier_username_options
+            },
+            "supplier_id": {
+                "display_name": {"en": "Supplier ID", "fr": "ID Fournisseur", "es": "ID Proveedor"},
+                "required": False,
+                "type": "int",
+                "method": self.get_supplier_id
+            },
+            "supplier_name": {
+                "display_name": {"en": "Supplier Name", "fr": "Nom du Fournisseur", "es": "Nombre del Proveedor"},
+                "required": False,
+                "type": "string",
+                "method": self.get_supplier_name
             },
             "date": {
                 "value": "",
@@ -97,20 +110,21 @@ class ImportClass(BaseClass):
             "table": {
                 "id": "r",
                 "supplier_preview": "r",
+                "supplier_username": "r",
                 "supplier_name": "r",
                 "date": "r",
                 "subtotal": "r",
                 "total_price": "r"
             },
             "dialog": {
-                "supplier_id": "rw",
+                "supplier_username": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw",
                 "items": "rw"
             },
             "database": {
-                "supplier_id": "rw",
+                "supplier_username": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw"
@@ -196,19 +210,50 @@ class ImportClass(BaseClass):
             print(f"Error removing item {item_id} from import {self.id}: {e}")
             return False
     
+    def get_supplier_username_options(self):
+        """Get list of available supplier usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Suppliers WHERE username IS NOT NULL AND username != '' ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting supplier username options: {e}")
+            return []
+    
+    def get_supplier_id(self):
+        """Get the ID of the supplier by username"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return 0
+        
+        try:
+            supplier_username = self.get_value('supplier_username')
+            if not supplier_username:
+                return 0
+            self.database.cursor.execute("SELECT ID FROM Suppliers WHERE username = ?", (supplier_username,))
+            result = self.database.cursor.fetchone()
+            return result[0] if result else 0
+        except Exception as e:
+            print(f"Error getting supplier ID: {e}")
+            return 0
+    
     def get_supplier_name(self):
         """Get the name of the associated supplier"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Supplier {self.get_value('supplier_id')}"
+            return f"Supplier {self.get_value('supplier_username')}"
         
         try:
-            supplier_id = self.get_value('supplier_id')
-            self.database.cursor.execute("SELECT name FROM Suppliers WHERE ID = ?", (supplier_id,))
+            supplier_username = self.get_value('supplier_username')
+            if not supplier_username:
+                return ""
+            self.database.cursor.execute("SELECT name FROM Suppliers WHERE username = ?", (supplier_username,))
             result = self.database.cursor.fetchone()
-            return result[0] if result else f"Supplier {supplier_id}"
+            return result[0] if result else f"Supplier {supplier_username}"
         except Exception as e:
             print(f"Error getting supplier name: {e}")
-            return f"Supplier {self.get_value('supplier_id')}"
+            return f"Supplier {self.get_value('supplier_username')}"
     
     def get_supplier_preview(self):
         """Get the preview image path of the associated supplier"""
@@ -216,13 +261,44 @@ class ImportClass(BaseClass):
             return None
         
         try:
-            supplier_id = self.get_value('supplier_id')
-            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE ID = ?", (supplier_id,))
+            supplier_username = self.get_value('supplier_username')
+            if not supplier_username:
+                return None
+            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE username = ?", (supplier_username,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
             print(f"Error getting supplier preview: {e}")
             return None
+    
+    def set_value(self, param_key, value):
+        """Override set_value to handle connected parameters"""
+        # Call parent set_value first
+        super().set_value(param_key, value)
+        
+        # Handle connected parameters for supplier_username
+        if param_key == 'supplier_username' and value:
+            # This will trigger recalculation of supplier_id and supplier_name
+            pass
+    
+    def get_parameter_options(self, param_key):
+        """Override to provide dynamic options for supplier_username"""
+        if param_key == 'supplier_username':
+            return self.get_supplier_options()
+        return self.parameters.get(param_key, {}).get('options', [])
+    
+    def get_supplier_options(self):
+        """Get list of available supplier usernames for autocomplete"""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
+        
+        try:
+            self.database.cursor.execute("SELECT username FROM Suppliers ORDER BY username")
+            results = self.database.cursor.fetchall()
+            return [row[0] for row in results if row[0]]
+        except Exception as e:
+            print(f"Error getting supplier options: {e}")
+            return []
         
     def save_to_database(self):
         """Save import operation to database"""

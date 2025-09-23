@@ -56,7 +56,13 @@ class AutoCompleteLineEdit(QLineEdit):
             self.completer.setMaxVisibleItems(3)
             self.completer.setCompletionMode(QCompleter.PopupCompletion)
             self.completer.setFilterMode(Qt.MatchContains)
+            self.completer.activated.connect(self._on_completion_selected)
             self.setCompleter(self.completer)
+    
+    def _on_completion_selected(self, text):
+        """Handle when user selects from completion dropdown"""
+        self.setText(text)
+        self.editingFinished.emit()  # Trigger the edit finished signal
     
     def _calculate_suggestions(self, text):
         """Calculate suggestions with scoring system"""

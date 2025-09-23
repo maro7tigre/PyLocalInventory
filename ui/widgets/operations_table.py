@@ -214,6 +214,11 @@ class OperationsTableWidget(QWidget):
                     # Add autocomplete widget for product names
                     autocomplete_widget = self.create_product_autocomplete_widget(row)
                     self.table.setCellWidget(row, col, autocomplete_widget)
+                elif param_key == 'quantity':
+                    # Set default quantity to 1
+                    temp_item = self.item_class(0, self.database)
+                    default_qty = temp_item.parameters.get('quantity', {}).get('default', 1)
+                    self.table.setItem(row, col, QTableWidgetItem(str(default_qty)))
                 else:
                     # Add empty editable cell
                     self.table.setItem(row, col, QTableWidgetItem(""))
@@ -236,12 +241,12 @@ class OperationsTableWidget(QWidget):
         """Create an autocomplete widget for product names"""
         from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
         
-        # Get product options
+        # Get product options method from the item class
         temp_item = self.item_class(0, self.database)
-        product_options = temp_item.get_parameter_options('product_name')
+        product_options_method = temp_item.parameters.get('product_name', {}).get('options')
         
-        # Create autocomplete widget with options
-        autocomplete = AutoCompleteLineEdit(options=product_options)
+        # Create autocomplete widget with the options method
+        autocomplete = AutoCompleteLineEdit(options=product_options_method)
         
         # Connect to handle selection
         autocomplete.textChanged.connect(
@@ -338,9 +343,29 @@ class OperationsTableWidget(QWidget):
     
     def handle_product_selection(self, row, product_name):
         """Handle product selection and auto-fill price/preview"""
-        # Create a temporary sales item to get product data
+        # Create a temporary item to get product data using connected parameters
         temp_item = self.item_class(0, self.database)
-        temp_item.update_product_selection(product_name)
+        
+        # Use set_value to trigger connected parameters system
+        temp_item.set_value('product_name', product_name)
+        
+        # Set quantity to 1 if it's currently empty/zero
+        if 'quantity' in self.table_columns:
+            qty_col = self.table_columns.index('quantity')
+            qty_item = self.table.item(row, qty_col)
+            current_qty = 0
+            if qty_item and qty_item.text().strip():
+                try:
+                    current_qty = float(qty_item.text())
+                except ValueError:
+                    current_qty = 0
+            
+            # Set quantity to 1 if it's currently 0 or empty
+            if current_qty == 0:
+                if not qty_item:
+                    qty_item = QTableWidgetItem()
+                    self.table.setItem(row, qty_col, qty_item)
+                qty_item.setText("1")
         
         # Update unit_price column if it exists
         if 'unit_price' in self.table_columns:
@@ -356,7 +381,7 @@ class OperationsTableWidget(QWidget):
         # Update preview if it exists
         if 'product_preview' in self.table_columns:
             preview_col = self.table_columns.index('product_preview')
-            preview_path = temp_item.get_value('product_preview')
+            preview_path = temp_item.get_product_preview()
             container_widget = self.table.cellWidget(row, preview_col)
             
             # Find the PreviewWidget inside the container

@@ -504,6 +504,9 @@ class BaseTab(QWidget):
         # Sort items
         filtered = self.sort_items(filtered, order_option)
         
+        # Store filtered items for later use
+        self.filtered_items = filtered
+        
         # Update table
         self.populate_table_with_items(filtered)
     

@@ -64,6 +64,32 @@ class SalesTab(BaseTab):
     def __init__(self, database=None, parent=None):
         super().__init__(SalesClass, SalesEditDialog, database, parent)
     
+    def setup_ui(self):
+        """Override setup_ui to add reports button"""
+        # Call parent setup first
+        super().setup_ui()
+        
+        # Find the controls layout and add reports button
+        controls_layout = None
+        for i in range(self.layout().count()):
+            item = self.layout().itemAt(i)
+            if item and hasattr(item, 'layout') and item.layout():
+                # Check if this is the controls layout by looking for buttons
+                for j in range(item.layout().count()):
+                    widget = item.layout().itemAt(j).widget() if item.layout().itemAt(j) else None
+                    if widget and hasattr(widget, 'text') and 'Add' in widget.text():
+                        controls_layout = item.layout()
+                        break
+                if controls_layout:
+                    break
+        
+        if controls_layout:
+            from ui.widgets.themed_widgets import BlueButton
+            self.reports_btn = BlueButton("Reports")
+            self.reports_btn.clicked.connect(self.show_reports)
+            # Insert before the last item (which should be the refresh button)
+            controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)
+    
     def get_preview_category(self):
         """Override to specify preview category for sales operations"""
         return "individual"  # Since sales are typically associated with clients
@@ -212,3 +238,46 @@ class SalesTab(BaseTab):
             print(f"Error sorting sales: {e}")
         
         return items
+    
+    def show_reports(self):
+        """Show reports dialog for selected sales record"""
+        try:
+            # Get selected row
+            current_row = self.table.currentRow()
+            
+            if current_row < 0:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.information(self, "No Selection", "Please select a sales record to generate a report.")
+                return
+            
+            # Get the sales object from the current row
+            if current_row >= len(self.filtered_items):
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Error", f"Selected row is invalid. Row: {current_row}, Filtered items: {len(self.filtered_items)}")
+                return
+            
+            selected_sales = self.filtered_items[current_row]
+            
+            # Get profile manager from parent (main window)
+            profile_manager = None
+            if hasattr(self.parent_widget, 'profile_manager'):
+                profile_manager = self.parent_widget.profile_manager
+            elif hasattr(self.parent_widget, 'parent') and hasattr(self.parent_widget.parent, 'profile_manager'):
+                profile_manager = self.parent_widget.parent.profile_manager
+            
+            if not profile_manager:
+                from PySide6.QtWidgets import QMessageBox
+                QMessageBox.warning(self, "Error", "Could not access profile manager.")
+                return
+            
+            # Show reports dialog
+            from ui.dialogs.reports_dialog import ReportsDialog
+            dialog = ReportsDialog(selected_sales, profile_manager, self)
+            dialog.exec()
+            
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to show reports dialog:\n{str(e)}")
+            print(f"Error in show_reports: {e}")
+            import traceback
+            traceback.print_exc()

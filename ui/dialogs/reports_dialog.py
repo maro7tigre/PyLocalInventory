@@ -1,0 +1,412 @@
+"""
+Reports Dialog - For selecting report type and generating PDF reports
+"""
+import os
+import sys
+import glob
+import subprocess
+import tempfile
+import shutil
+from datetime import datetime, timedelta
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
+                               QPushButton, QMessageBox, QApplication)
+from PySide6.QtCore import Qt
+from ui.widgets.themed_widgets import BlueButton, RedButton
+
+
+class ReportsDialog(QDialog):
+    """Dialog for selecting and generating reports"""
+    
+    def __init__(self, sales_obj, profile_manager, parent=None):
+        super().__init__(parent)
+        self.sales_obj = sales_obj
+        self.profile_manager = profile_manager
+        self.setWindowTitle("Generate Report")
+        self.setModal(True)
+        self.resize(400, 200)
+        self.setup_ui()
+    
+    def setup_ui(self):
+        """Setup dialog UI"""
+        layout = QVBoxLayout(self)
+        layout.setSpacing(20)
+        
+        # Title
+        title_label = QLabel("Select Report Type")
+        title_label.setStyleSheet("font-size: 16px; font-weight: bold; color: #ffffff;")
+        title_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(title_label)
+        
+        # Sales info
+        if self.sales_obj:
+            client_name = self.sales_obj.get_value('client_name') or 'Unknown Client'
+            date = self.sales_obj.get_value('date') or 'Unknown Date'
+            info_label = QLabel(f"Client: {client_name}\nDate: {date}")
+            info_label.setStyleSheet("color: #cccccc; text-align: center;")
+            info_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+            layout.addWidget(info_label)
+        
+        # Report type buttons
+        buttons_layout = QHBoxLayout()
+        
+        self.devis_btn = BlueButton("Devis")
+        self.devis_btn.clicked.connect(lambda: self.generate_report("devis"))
+        buttons_layout.addWidget(self.devis_btn)
+        
+        self.bdl_btn = BlueButton("Bon de Livraison")
+        self.bdl_btn.clicked.connect(lambda: self.generate_report("bdl"))
+        buttons_layout.addWidget(self.bdl_btn)
+        
+        layout.addLayout(buttons_layout)
+        
+        # Cancel button
+        cancel_layout = QHBoxLayout()
+        cancel_layout.addStretch()
+        
+        self.cancel_btn = RedButton("Cancel")
+        self.cancel_btn.clicked.connect(self.reject)
+        cancel_layout.addWidget(self.cancel_btn)
+        
+        layout.addLayout(cancel_layout)
+        
+        # Apply dark theme
+        self.setStyleSheet("""
+            QDialog {
+                background-color: #2b2b2b;
+                color: #ffffff;
+            }
+            QLabel {
+                color: #ffffff;
+                background-color: transparent;
+            }
+        """)
+    
+    def generate_report(self, report_type):
+        """Generate report of specified type"""
+        try:
+            # Disable buttons during generation
+            self.devis_btn.setEnabled(False)
+            self.bdl_btn.setEnabled(False)
+            self.cancel_btn.setEnabled(False)
+            
+            # Show progress
+            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            
+            # Generate report directly
+            pdf_path = self._generate_report_sync(report_type)
+            
+            # Restore cursor and enable buttons
+            QApplication.restoreOverrideCursor()
+            self.devis_btn.setEnabled(True)
+            self.bdl_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
+            
+            # Handle success - show message but don't close dialog
+            QMessageBox.information(self, "Success", f"Report generated successfully!\n\nSaved to: {pdf_path}")
+            
+            # Open the generated file
+            try:
+                self.open_pdf(pdf_path)
+            except Exception as e:
+                QMessageBox.warning(self, "Warning", f"Report generated but failed to open:\n{str(e)}")
+            
+        except Exception as e:
+            QApplication.restoreOverrideCursor()
+            self.devis_btn.setEnabled(True)
+            self.bdl_btn.setEnabled(True)
+            self.cancel_btn.setEnabled(True)
+            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{str(e)}")
+    
+    def _generate_report_sync(self, report_type):
+        """Synchronously generate report and return PDF path"""
+        # Get current profile path
+        if not self.profile_manager.selected_profile:
+            raise Exception("No profile selected")
+        
+        profile_path = os.path.dirname(self.profile_manager.selected_profile.config_path)
+        reports_dir = os.path.join(profile_path, "reports")
+        
+        # Create reports directory if it doesn't exist
+        os.makedirs(reports_dir, exist_ok=True)
+        
+        # Clean up old reports (older than 2 days)
+        self._cleanup_old_reports(reports_dir)
+        
+        # Generate unique filename
+        date_str = datetime.now().strftime("%d_%m_%Y")
+        counter = 0
+        while True:
+            filename = f"{date_str}_{counter}.pdf"
+            filepath = os.path.join(reports_dir, filename)
+            if not os.path.exists(filepath):
+                break
+            counter += 1
+        
+        # Generate HTML content
+        html_content = self._generate_html_content(report_type)
+        
+        # Convert HTML to PDF (or HTML fallback)
+        actual_output_path = self._html_to_pdf(html_content, filepath)
+        
+        return actual_output_path
+    
+    def _cleanup_old_reports(self, reports_dir):
+        """Delete reports older than 2 days"""
+        cutoff_date = datetime.now() - timedelta(days=2)
+        
+        for pdf_file in glob.glob(os.path.join(reports_dir, "*.pdf")):
+            try:
+                file_mtime = datetime.fromtimestamp(os.path.getmtime(pdf_file))
+                if file_mtime < cutoff_date:
+                    os.remove(pdf_file)
+            except Exception as e:
+                print(f"Error deleting old report {pdf_file}: {e}")
+    
+    def _generate_html_content(self, report_type):
+        """Generate HTML content based on report type"""
+        # Get template path
+        template_path = os.path.join("report", f"{report_type}_templet.html")
+        
+        if not os.path.exists(template_path):
+            raise Exception(f"Template file not found: {template_path}")
+        
+        # Read template
+        with open(template_path, 'r', encoding='utf-8') as f:
+            template_content = f.read()
+        
+        # Get sales data
+        sales_data = self._extract_sales_data()
+        
+        # Replace placeholders
+        html_content = self._replace_placeholders(template_content, sales_data)
+        
+        return html_content
+    
+    def _extract_sales_data(self):
+        """Extract data from sales object"""
+        try:
+            # Get profile data
+            profile = self.profile_manager.selected_profile
+            company_name = profile.get_value("company name") or "Your Company"
+            company_phone = profile.get_value("phone") or ""
+            company_address = profile.get_value("address") or ""
+            
+            # Extract sales data
+            client_username = self.sales_obj.get_value('client_username') or ""
+            client_name = self.sales_obj.get_value('client_name') or ""
+            date = self.sales_obj.get_value('date') or datetime.now().strftime("%d-%m-%Y")
+            total_price = self.sales_obj.get_value('total_price') or 0
+            
+            # Generate document reference
+            sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
+            doc_ref = f"DOC-{sales_id:06d}"
+            
+            # Get sales items - ensure they are loaded from database
+            items_html = ""
+            total_quantity = 0
+            
+            # Load sales items if not already loaded
+            if not hasattr(self.sales_obj, 'items') or not self.sales_obj.items:
+                print("DEBUG: Loading sales items from database...")
+                sales_id_value = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID')
+                if sales_id_value and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                    try:
+                        # Load items from database
+                        items_data = self.sales_obj.database.get_items_by_operation_id(sales_id_value, 'Sales_Items')
+                        print(f"DEBUG: Found {len(items_data)} sales items in database")
+                        
+                        # Create item objects
+                        from classes.sales_item_class import SalesItemClass
+                        self.sales_obj.items = []
+                        for item_data in items_data:
+                            item_obj = SalesItemClass(0, self.sales_obj.database)
+                            # Load item data
+                            for key, value in item_data.items():
+                                if key in item_obj.parameters:
+                                    try:
+                                        item_obj.set_value(key, value)
+                                    except:
+                                        pass
+                            self.sales_obj.items.append(item_obj)
+                    except Exception as e:
+                        print(f"DEBUG: Error loading sales items: {e}")
+            
+            if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
+                print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
+                for item in self.sales_obj.items:
+                    product_name = item.get_value('product_name') or ""
+                    
+                    # If product_name is empty, try to get it from product_id
+                    if not product_name:
+                        product_id = item.get_value('product_id')
+                        if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                            try:
+                                # Get product name from Products table
+                                product_data = self.sales_obj.database.cursor.execute(
+                                    "SELECT name FROM Products WHERE ID = ?", (product_id,)
+                                ).fetchone()
+                                if product_data:
+                                    product_name = product_data[0]
+                            except Exception as e:
+                                print(f"DEBUG: Error getting product name: {e}")
+                    
+                    quantity = item.get_value('quantity') or 0
+                    unit_price = item.get_value('unit_price') or 0
+                    subtotal = item.get_value('subtotal') or 0
+                    
+                    print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
+                    
+                    total_quantity += int(quantity) if quantity else 0
+                    
+                    items_html += f"""
+                    <tr>
+                        <td>{sales_id:06d}</td>
+                        <td style="text-align: left">{product_name}</td>
+                        <td>{quantity}</td>
+                        <td>{quantity}</td>
+                    </tr>
+                    """
+            else:
+                print("DEBUG: No sales items found")
+                items_html = '<tr><td colspan="4">No items found for this sale</td></tr>'
+            
+            return {
+                'company_name': company_name,
+                'company_phone': company_phone,
+                'company_siret': "",  # Add if available in profile
+                'company_tva': "",    # Add if available in profile
+                'date': date,
+                'document_ref': doc_ref,
+                'client_name': client_name,
+                'client_address': company_address,  # Use company address as fallback
+                'commercial': "Sales Team",         # Default commercial
+                'items': items_html,
+                'total_commande': str(total_quantity),
+                'total_livre': str(total_quantity),
+                'reste_a_livrer': "0"
+            }
+            
+        except Exception as e:
+            print(f"Error extracting sales data: {e}")
+            # Return default data structure
+            return {
+                'company_name': 'Your Company',
+                'company_phone': '',
+                'company_siret': '',
+                'company_tva': '',
+                'date': datetime.now().strftime("%d-%m-%Y"),
+                'document_ref': 'DOC-000001',
+                'client_name': 'Client Name',
+                'client_address': '',
+                'commercial': 'Sales Team',
+                'items': '<tr><td colspan="4">No items found</td></tr>',
+                'total_commande': '0',
+                'total_livre': '0',
+                'reste_a_livrer': '0'
+            }
+    
+    def _replace_placeholders(self, template_content, data):
+        """Replace template placeholders with actual data"""
+        for key, value in data.items():
+            placeholder = f"{{{{ {key} }}}}"
+            template_content = template_content.replace(placeholder, str(value))
+        
+        return template_content
+    
+    def _html_to_pdf(self, html_content, output_path):
+        """Convert HTML to PDF - simplified version"""
+        try:
+            # Create a temporary HTML file
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
+                temp_html.write(html_content)
+                temp_html_path = temp_html.name
+            
+            # Try weasyprint first
+            try:
+                import weasyprint
+                print("DEBUG: Using WeasyPrint for PDF generation")
+                html = weasyprint.HTML(string=html_content)
+                html.write_pdf(output_path)
+                os.unlink(temp_html_path)
+                print(f"DEBUG: Successfully generated PDF: {output_path}")
+                return output_path
+            except ImportError:
+                print("DEBUG: WeasyPrint not available")
+                pass
+            except Exception as e:
+                print(f"DEBUG: WeasyPrint failed: {e}")
+            
+            # Try pdfkit as fallback
+            try:
+                import pdfkit
+                print("DEBUG: Using PDFKit for PDF generation")
+                pdfkit.from_string(html_content, output_path)
+                os.unlink(temp_html_path)
+                print(f"DEBUG: Successfully generated PDF with PDFKit: {output_path}")
+                return output_path
+            except ImportError:
+                print("DEBUG: PDFKit not available")
+                pass
+            except Exception as e:
+                print(f"DEBUG: PDFKit failed: {e}")
+            
+            # If PDF generation fails, save as HTML with proper extension
+            print("DEBUG: Falling back to HTML generation")
+            html_output_path = output_path.replace('.pdf', '.html')
+            with open(html_output_path, 'w', encoding='utf-8') as f:
+                f.write(f"""
+<!DOCTYPE html>
+<html>
+<head>
+    <title>Sales Report</title>
+    <style>
+        body {{ font-family: Arial, sans-serif; margin: 20px; background: white; color: black; }}
+        .notice {{ background: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; margin: 10px 0; border-radius: 4px; }}
+    </style>
+</head>
+<body>
+    <div class="notice">
+        <strong>Note:</strong> PDF generation failed. This is an HTML version of your report. 
+        For proper PDF generation, ensure weasyprint is properly installed.
+    </div>
+    {html_content}
+</body>
+</html>
+                """)
+            
+            # Clean up temporary file
+            os.unlink(temp_html_path)
+            print(f"DEBUG: Generated HTML fallback: {html_output_path}")
+            return html_output_path
+            
+        except Exception as e:
+            # Clean up temporary file if it exists
+            if 'temp_html_path' in locals() and os.path.exists(temp_html_path):
+                try:
+                    os.unlink(temp_html_path)
+                except:
+                    pass
+            print(f"DEBUG: HTML to PDF conversion failed: {e}")
+            print(f"DEBUG: Output path: {output_path}")
+            raise Exception(f"Failed to convert HTML to PDF: {str(e)}")
+    
+
+    
+    def on_report_error(self, error_message):
+        """Handle report generation error"""
+        QApplication.restoreOverrideCursor()
+        self.devis_btn.setEnabled(True)
+        self.bdl_btn.setEnabled(True)
+        self.cancel_btn.setEnabled(True)
+        
+        QMessageBox.critical(self, "Error", f"Failed to generate report:\n{error_message}")
+    
+    def open_pdf(self, pdf_path):
+        """Open PDF/HTML file with default system application"""
+        try:
+            if os.name == 'nt':  # Windows
+                os.startfile(pdf_path)
+            elif os.name == 'posix':  # macOS and Linux
+                subprocess.call(['open' if sys.platform == 'darwin' else 'xdg-open', pdf_path])
+        except Exception as e:
+            raise Exception(f"Could not open file: {str(e)}")

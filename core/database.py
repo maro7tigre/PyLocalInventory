@@ -413,6 +413,34 @@ class Database:
             print(f"Error getting items from {section}: {e}")
             return []
     
+    def get_items_by_operation_id(self, operation_id, section):
+        """Get items for a specific operation (Sales_Items or Import_Items)"""
+        if not self.cursor or section not in self.registered_classes:
+            return []
+        
+        try:
+            # Determine the foreign key column name based on section
+            if section == 'Sales_Items':
+                fk_column = 'sales_id'
+            elif section == 'Import_Items':
+                fk_column = 'import_id'
+            else:
+                print(f"Unknown item section: {section}")
+                return []
+            
+            self.cursor.execute(f"SELECT * FROM '{section}' WHERE {fk_column} = ?", (operation_id,))
+            rows = self.cursor.fetchall()
+            
+            # Get column names
+            columns = [description[0] for description in self.cursor.description]
+            
+            # Convert to list of dictionaries
+            return [dict(zip(columns, row)) for row in rows]
+            
+        except Exception as e:
+            print(f"Error getting items from {section} for operation {operation_id}: {e}")
+            return []
+    
     def delete_item(self, item_id, section):
         """Delete item from section"""
         if not self.cursor or section not in self.registered_classes:

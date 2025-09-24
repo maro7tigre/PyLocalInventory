@@ -233,6 +233,7 @@ class ReportsDialog(QDialog):
             
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
+                total_ht = 0
                 for item in self.sales_obj.items:
                     product_name = item.get_value('product_name') or ""
                     
@@ -252,23 +253,30 @@ class ReportsDialog(QDialog):
                     
                     quantity = item.get_value('quantity') or 0
                     unit_price = item.get_value('unit_price') or 0
-                    subtotal = item.get_value('subtotal') or 0
+                    subtotal = item.get_value('subtotal') or (quantity * unit_price)
                     
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
                     total_quantity += int(quantity) if quantity else 0
+                    total_ht += float(subtotal) if subtotal else 0
                     
                     items_html += f"""
                     <tr>
-                        <td>{sales_id:06d}</td>
                         <td style="text-align: left">{product_name}</td>
                         <td>{quantity}</td>
-                        <td>{quantity}</td>
+                        <td>{unit_price:.2f}€</td>
+                        <td>{subtotal:.2f}€</td>
                     </tr>
                     """
             else:
                 print("DEBUG: No sales items found")
                 items_html = '<tr><td colspan="4">No items found for this sale</td></tr>'
+                total_ht = 0
+            
+            # Calculate financial totals for devis
+            total_remise = 0  # No discount system implemented yet
+            total_regle = 0   # Amount already paid (could be from payments table if exists)
+            net_a_payer = total_ht - total_remise - total_regle
             
             return {
                 'company_name': company_name,
@@ -281,6 +289,12 @@ class ReportsDialog(QDialog):
                 'client_address': company_address,  # Use company address as fallback
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_html,
+                # New financial fields for devis
+                'total_remise': f"{total_remise:.2f}€",
+                'total_ht': f"{total_ht:.2f}€",
+                'total_regle': f"{total_regle:.2f}€",
+                'net_a_payer': f"{net_a_payer:.2f}€",
+                # Keep old fields for BDL template compatibility
                 'total_commande': str(total_quantity),
                 'total_livre': str(total_quantity),
                 'reste_a_livrer': "0"
@@ -300,6 +314,12 @@ class ReportsDialog(QDialog):
                 'client_address': '',
                 'commercial': 'Sales Team',
                 'items': '<tr><td colspan="4">No items found</td></tr>',
+                # Financial fields for devis
+                'total_remise': '0.00€',
+                'total_ht': '0.00€',
+                'total_regle': '0.00€',
+                'net_a_payer': '0.00€',
+                # Old fields for BDL compatibility
                 'total_commande': '0',
                 'total_livre': '0',
                 'reste_a_livrer': '0'

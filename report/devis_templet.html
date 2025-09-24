@@ -154,10 +154,10 @@
       <table>
         <thead>
           <tr>
-            <th>Code</th>
             <th>Désignation</th>
-            <th>Qté commandée</th>
-            <th>Qté livrée</th>
+            <th>Qté</th>
+            <th>P.U HT</th>
+            <th>Total HT</th>
           </tr>
         </thead>
         <tbody>
@@ -169,16 +169,20 @@
     <footer>
       <table>
         <tr>
-          <td>Total commandé :</td>
-          <td>{{ total_commande }}</td>
+          <td>Total Remise :</td>
+          <td>{{ total_remise }}</td>
         </tr>
         <tr>
-          <td>Total livré :</td>
-          <td>{{ total_livre }}</td>
+          <td>Total HT :</td>
+          <td>{{ total_ht }}</td>
         </tr>
         <tr>
-          <td>Reste à livrer :</td>
-          <td>{{ reste_a_livrer }}</td>
+          <td>Total Règle :</td>
+          <td>{{ total_regle }}</td>
+        </tr>
+        <tr>
+          <td><strong>Net à payer :</strong></td>
+          <td><strong>{{ net_a_payer }}</strong></td>
         </tr>
       </table>
     </footer>

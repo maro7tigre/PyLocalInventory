@@ -5,12 +5,14 @@ Unified table experience for all entities (Products, Clients, Suppliers, Sales, 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
                                QMessageBox, QPushButton, QAbstractItemView,
-                               QStyledItemDelegate, QLineEdit, QAbstractItemDelegate)
+                               QStyledItemDelegate, QLineEdit, QComboBox)
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt, QTimer
+from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+from datetime import datetime
+import re
 
 
 class BaseTableDelegate(QStyledItemDelegate):
@@ -49,27 +51,6 @@ class BaseTableDelegate(QStyledItemDelegate):
         else:
             # Regular line edit for other editable columns
             editor = QLineEdit(parent)
-
-        # Make selection/Enter immediately commit and close the editor
-        editor._ac_committed = False  # type: ignore[attr-defined]
-
-        def commit_and_close():
-            if getattr(editor, "_ac_committed", False):
-                return
-            editor._ac_committed = True  # type: ignore[attr-defined]
-            self.commitData.emit(editor)
-            self.closeEditor.emit(editor, QAbstractItemDelegate.NoHint)
-
-        # Connect both completer activation and Enter key
-        try:
-            if hasattr(editor, "completer") and editor.completer:
-                editor.completer.activated.connect(lambda *_: QTimer.singleShot(0, commit_and_close))
-        except Exception:
-            pass
-        try:
-            editor.returnPressed.connect(commit_and_close)
-        except Exception:
-            pass
         
         return editor
     
@@ -110,6 +91,10 @@ class BaseTab(QWidget):
         self.parameter_definitions = temp_object.parameters
         self.section = temp_object.section
         
+        # Store all items for filtering
+        self.all_items = []
+        self.filtered_items = []
+        
         self.setup_ui()
         self.refresh_table()
     
@@ -118,34 +103,48 @@ class BaseTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         
-        # Header with title and buttons
-        header_layout = QHBoxLayout()
-        
+        # Title label
         title = QLabel(f"{self.section} Management")
         title.setFont(QFont("Arial", 16, QFont.Bold))
-        header_layout.addWidget(title)
-        header_layout.addStretch()
+        layout.addWidget(title)
+        
+        # Search and controls layout
+        controls_layout = QHBoxLayout()
+        
+        # Search bar
+        self.search_bar = AutoCompleteLineEdit(self, self.get_search_options())
+        self.search_bar.setPlaceholderText(f"Search {self.section.lower()}...")
+        self.search_bar.textChanged.connect(self.filter_table)
+        controls_layout.addWidget(self.search_bar)
+        
+        # Order dropdown
+        self.order_combo = QComboBox()
+        self.setup_order_options()
+        self.order_combo.currentTextChanged.connect(self.filter_table)
+        controls_layout.addWidget(self.order_combo)
+        
+        controls_layout.addStretch()
         
         # Action buttons
         entity_name = self.section[:-1] if self.section.endswith('s') else self.section
         
         self.add_btn = BlueButton(f"Add {entity_name}")
         self.add_btn.clicked.connect(self.add_item)
-        header_layout.addWidget(self.add_btn)
+        controls_layout.addWidget(self.add_btn)
         
         self.edit_btn = BlueButton(f"Edit {entity_name}")
         self.edit_btn.clicked.connect(self.edit_item)
-        header_layout.addWidget(self.edit_btn)
+        controls_layout.addWidget(self.edit_btn)
         
         self.delete_btn = RedButton(f"Delete {entity_name}")
         self.delete_btn.clicked.connect(self.delete_item)
-        header_layout.addWidget(self.delete_btn)
+        controls_layout.addWidget(self.delete_btn)
         
         self.refresh_btn = GreenButton("Refresh")
         self.refresh_btn.clicked.connect(self.refresh_table)
-        header_layout.addWidget(self.refresh_btn)
+        controls_layout.addWidget(self.refresh_btn)
         
-        layout.addLayout(header_layout)
+        layout.addLayout(controls_layout)
         
         # Table setup
         self.table = QTableWidget()
@@ -209,10 +208,10 @@ class BaseTab(QWidget):
         
         try:
             # Get items from database
-            items = self.database.get_items(self.section)
-            self.table.setRowCount(len(items))
+            items_data = self.database.get_items(self.section)
+            self.all_items = []
             
-            for row, item_data in enumerate(items):
+            for item_data in items_data:
                 # Create object instance to get calculated values
                 try:
                     obj = self.object_class(item_data.get('ID', 0), self.database)
@@ -231,20 +230,17 @@ class BaseTab(QWidget):
                             except (KeyError, ValueError):
                                 pass  # Skip invalid parameters
                     
-                    # Set table data
-                    for col, column_key in enumerate(self.table_columns):
-                        self.set_table_cell(row, col, column_key, obj)
+                    self.all_items.append(obj)
                 
                 except Exception as e:
-                    print(f"Error processing {self.section} row {row}: {e}")
-                    # Fallback: show raw data
-                    for col, column_key in enumerate(self.table_columns):
-                        value = item_data.get(column_key, "")
-                        if column_key == 'id':
-                            value = item_data.get('ID', "")
-                        item = QTableWidgetItem(str(value))
-                        item.setData(Qt.UserRole, item_data.get('ID', 0))
-                        self.table.setItem(row, col, item)
+                    print(f"Error processing {self.section} item: {e}")
+                    continue
+            
+            # Update search options
+            self.search_bar.update_options(self.get_search_options())
+            
+            # Apply current filter
+            self.filter_table()
         
         except Exception as e:
             print(f"Error refreshing {self.section} table: {e}")
@@ -273,6 +269,20 @@ class BaseTab(QWidget):
                 container_layout.addStretch()
                 
                 self.table.setCellWidget(row, col, container)
+            
+            elif param_type == 'date':
+                # Format date as day-month-year
+                formatted_value = self.format_date_for_display(value)
+                
+                item = QTableWidgetItem(formatted_value)
+                item.setData(Qt.UserRole, value)  # Store raw value
+                item.setData(Qt.UserRole + 1, obj.id)  # Store object ID
+                
+                # Make read-only cells non-editable
+                if not self.is_column_editable(column_key):
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                
+                self.table.setItem(row, col, item)
             
             elif param_type == 'float':
                 # Format float values with unit if available
@@ -306,8 +316,13 @@ class BaseTab(QWidget):
                 self.table.setItem(row, col, item)
             
             else:
-                # String and other types
-                formatted_value = str(value) if value is not None else ""
+                # String and other types - handle date formatting
+                if column_key == 'date' and value:
+                    # Format date as dd-mm-yyyy
+                    formatted_value = self.format_date_display(value)
+                else:
+                    formatted_value = str(value) if value is not None else ""
+                
                 item = QTableWidgetItem(formatted_value)
                 item.setData(Qt.UserRole, value)  # Store raw value
                 item.setData(Qt.UserRole + 1, obj.id)  # Store object ID
@@ -323,6 +338,197 @@ class BaseTab(QWidget):
             item = QTableWidgetItem("Error")
             item.setFlags(item.flags() & ~Qt.ItemIsEditable)
             self.table.setItem(row, col, item)
+    
+    def format_date_for_display(self, date_value):
+        """Format date value for display as day-month-year"""
+        if not date_value:
+            return ""
+        
+        try:
+            # Handle different input formats
+            if isinstance(date_value, str):
+                # Try parsing different date formats
+                date_formats = ['%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d']
+                for fmt in date_formats:
+                    try:
+                        date_obj = datetime.strptime(date_value, fmt)
+                        return date_obj.strftime('%d-%m-%Y')
+                    except ValueError:
+                        continue
+                # If no format matches, return as is
+                return str(date_value)
+            elif hasattr(date_value, 'strftime'):
+                # Already a date/datetime object
+                return date_value.strftime('%d-%m-%Y')
+            else:
+                return str(date_value)
+        except Exception as e:
+            print(f"Error formatting date {date_value}: {e}")
+            return str(date_value)
+    
+    def get_search_options(self):
+        """Get autocomplete options for search - override in subclasses"""
+        return []
+    
+    def setup_order_options(self):
+        """Setup order dropdown options - override in subclasses"""
+        # Default ordering options
+        self.order_combo.addItem("Default")
+    
+    def get_searchable_fields(self):
+        """Get fields that can be searched - override in subclasses"""
+        return ['name', 'username']
+    
+    def parse_date_search(self, search_text):
+        """Parse date search queries like 'dd-mm-yyyy' or 'dd-mm-yyyy/dd-mm-yyyy'"""
+        date_patterns = [
+            r'(\d{1,2}-\d{1,2}-\d{4})/(\d{1,2}-\d{1,2}-\d{4})',  # Range: dd-mm-yyyy/dd-mm-yyyy
+            r'(\d{1,2}-\d{1,2}-\d{4})'  # Single: dd-mm-yyyy
+        ]
+        
+        for pattern in date_patterns:
+            match = re.search(pattern, search_text)
+            if match:
+                if len(match.groups()) == 2:  # Date range
+                    try:
+                        start_date = datetime.strptime(match.group(1), '%d-%m-%Y').date()
+                        end_date = datetime.strptime(match.group(2), '%d-%m-%Y').date()
+                        return ('range', start_date, end_date)
+                    except ValueError:
+                        pass
+                else:  # Single date
+                    try:
+                        date_obj = datetime.strptime(match.group(1), '%d-%m-%Y').date()
+                        return ('single', date_obj)
+                    except ValueError:
+                        pass
+        
+        return None
+    
+    def matches_search(self, obj, search_text):
+        """Check if object matches search criteria - override in subclasses for specific logic"""
+        if not search_text:
+            return True
+        
+        search_lower = search_text.lower()
+        searchable_fields = self.get_searchable_fields()
+        
+        # Check each searchable field
+        for field in searchable_fields:
+            try:
+                value = obj.get_value(field)
+                if value and search_lower in str(value).lower():
+                    return True
+            except:
+                pass
+        
+        return False
+    
+    def sort_items(self, items, order_option):
+        """Sort items based on order option - override in subclasses for specific logic"""
+        if not order_option or order_option == "Default":
+            return items
+        
+        # Parse sort option (format: "Field ↑" or "Field ↓")
+        if " ↑" in order_option:
+            field = order_option.replace(" ↑", "").lower().replace(" ", "_")
+            reverse = False
+        elif " ↓" in order_option:
+            field = order_option.replace(" ↓", "").lower().replace(" ", "_")
+            reverse = True
+        else:
+            return items
+        
+        try:
+            # Sort based on field type
+            if field in ['price', 'unit_price', 'sale_price', 'quantity', 'total', 'subtotal']:
+                items.sort(key=lambda x: float(x.get_value(field) or 0), reverse=reverse)
+            elif field == 'date':
+                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value(field)), reverse=reverse)
+            else:
+                items.sort(key=lambda x: str(x.get_value(field) or "").lower(), reverse=reverse)
+        except Exception as e:
+            print(f"Error sorting by {field}: {e}")
+        
+        return items
+    
+    def format_date_display(self, date_value):
+        """Format date for display as dd-mm-yyyy"""
+        if not date_value:
+            return ""
+        
+        try:
+            # Try different input formats and convert to dd-mm-yyyy
+            input_formats = ['%Y-%m-%d', '%d-%m-%Y', '%d/%m/%Y', '%Y/%m/%d']
+            
+            for fmt in input_formats:
+                try:
+                    date_obj = datetime.strptime(str(date_value), fmt)
+                    return date_obj.strftime('%d-%m-%Y')
+                except ValueError:
+                    continue
+            
+            # If no format matches, return as-is
+            return str(date_value)
+        except:
+            return str(date_value)
+    
+    def parse_date_for_sorting(self, date_value):
+        """Parse date value for sorting"""
+        if not date_value:
+            return datetime.min
+        
+        try:
+            # Try different date formats
+            formats = ['%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y']
+            for fmt in formats:
+                try:
+                    return datetime.strptime(str(date_value), fmt)
+                except ValueError:
+                    continue
+            return datetime.min
+        except:
+            return datetime.min
+    
+    def filter_table(self):
+        """Filter and sort table based on search and order criteria"""
+        if not self.all_items:
+            return
+        
+        search_text = self.search_bar.text().strip()
+        order_option = self.order_combo.currentText()
+        
+        # Filter items
+        filtered = [item for item in self.all_items if self.matches_search(item, search_text)]
+        
+        # Sort items
+        filtered = self.sort_items(filtered, order_option)
+        
+        # Update table
+        self.populate_table_with_items(filtered)
+    
+    def populate_table_with_items(self, items):
+        """Populate table with given items"""
+        self.table.setRowCount(len(items))
+        
+        for row, obj in enumerate(items):
+            try:
+                # Set table data
+                for col, column_key in enumerate(self.table_columns):
+                    self.set_table_cell(row, col, column_key, obj)
+            except Exception as e:
+                print(f"Error processing {self.section} row {row}: {e}")
+                # Fallback: show basic data
+                for col, column_key in enumerate(self.table_columns):
+                    try:
+                        value = obj.get_value(column_key) if hasattr(obj, 'get_value') else ""
+                        item = QTableWidgetItem(str(value))
+                        item.setData(Qt.UserRole, value)
+                        item.setData(Qt.UserRole + 1, obj.id if hasattr(obj, 'id') else 0)
+                        self.table.setItem(row, col, item)
+                    except:
+                        item = QTableWidgetItem("Error")
+                        self.table.setItem(row, col, item)
     
     def get_preview_category(self):
         """Override in subclasses to specify preview category"""
@@ -466,6 +672,37 @@ class BaseTab(QWidget):
             }
             QLabel {
                 color: #E0E0E0;
+            }
+            QComboBox {
+                background-color: #2D2D30;
+                color: #E0E0E0;
+                border: 1px solid #3E3E42;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QComboBox::drop-down {
+                border: none;
+                width: 20px;
+            }
+            QComboBox::down-arrow {
+                border: none;
+                width: 10px;
+                height: 10px;
+            }
+            QComboBox QAbstractItemView {
+                background-color: #2D2D30;
+                color: #E0E0E0;
+                selection-background-color: #2196F3;
+            }
+            QLineEdit {
+                background-color: #2D2D30;
+                color: #E0E0E0;
+                border: 1px solid #3E3E42;
+                padding: 5px;
+                border-radius: 3px;
+            }
+            QLineEdit:focus {
+                border: 2px solid #2196F3;
             }
             QTableWidget {
                 background-color: #2D2D30;

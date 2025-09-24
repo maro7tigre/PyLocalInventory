@@ -1,6 +1,5 @@
 """
-Operations Table Widget - Minimal changes to preserve working functionality
-Only fix the consistency issues, keep the working logic intact
+Operations Table Widget - Clean architecture with proper separation of concerns
 """
 from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy)
@@ -9,52 +8,20 @@ from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.parameters_widgets import ButtonWidget
 
 
-class OperationsTableWidget(QWidget):
-    """Simple operations table - UI only, database handles CRUD"""
+class TableDataManager:
+    """Handles data operations and validation"""
     
-    items_changed = Signal()
-    
-    def __init__(self, item_class, parent_operation=None, database=None, columns=None, parent=None):
-        super().__init__(parent)
-        
+    def __init__(self, item_class, database):
         self.item_class = item_class
-        self.parent_operation = parent_operation
         self.database = database
-        self.table_columns = columns or []
-        self._updating_table = False  # Flag to prevent recursion
         
-        # Setup the UI
-        self.setup_ui()
-        
-        # Load and display existing items if we have a parent operation with ID
-        self.refresh_table()
+        # Get column definitions from item class
+        temp_item = item_class(0, database)
+        self.table_columns = temp_item.get_visible_parameters("table") if hasattr(temp_item, 'get_visible_parameters') else []
+        self.parameter_definitions = temp_item.parameters if hasattr(temp_item, 'parameters') else {}
     
-    def setup_ui(self):
-        """Setup simple table interface - keep original"""
-        layout = QVBoxLayout(self)
-        layout.setContentsMargins(0, 0, 0, 0)
-        layout.setSpacing(0)
-        
-        # Create table widget
-        self.table = QTableWidget()
-        self.setup_table()
-        
-        # Set proper size policies
-        self.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        self.table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
-        
-        # Enable native scrolling
-        self.table.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        self.table.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
-        
-        layout.addWidget(self.table)
-        self.setLayout(layout)
-    
-    def setup_table(self):
-        """Setup table columns and properties - keep original logic"""
-        self.table.setColumnCount(len(self.table_columns))
-        
-        # Create display headers
+    def get_column_headers(self):
+        """Get display headers for table columns"""
         headers = []
         for param_key in self.table_columns:
             if param_key == 'product_preview':
@@ -64,318 +31,349 @@ class OperationsTableWidget(QWidget):
             elif param_key == 'delete_action':
                 headers.append('Delete')
             else:
-                # Use parameter display name if available
                 temp_obj = self.item_class(0, self.database)
                 if hasattr(temp_obj, 'get_display_name'):
                     headers.append(temp_obj.get_display_name(param_key))
                 else:
                     headers.append(param_key.replace('_', ' ').title())
-        
-        self.table.setHorizontalHeaderLabels(headers)
-        
-        # Table properties
-        self.table.verticalHeader().setVisible(False)
-        self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
-        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
-        
-        # Set row height to exactly match preview image size
-        self.table.verticalHeader().setDefaultSectionSize(45)
-        
-        # Set column widths - fixed width for preview and delete columns
-        header = self.table.horizontalHeader()
-        for i, param_key in enumerate(self.table_columns):
-            if param_key == 'product_preview':
-                self.table.setColumnWidth(i, 70)
-                header.setSectionResizeMode(i, QHeaderView.Fixed)
-            elif param_key == 'delete_action':
-                self.table.setColumnWidth(i, 50)
-                header.setSectionResizeMode(i, QHeaderView.Fixed)
-            else:
-                header.setSectionResizeMode(i, QHeaderView.Stretch)
-        
-        # Connect item change signals
-        self.table.itemChanged.connect(self.on_item_changed)
-        
-        # Apply minimal dark theme
-        self.apply_table_theme()
+        return headers
     
-    def refresh_table(self):
-        """Refresh table by loading items from database"""
-        self.table.setRowCount(0)
-        
-        # Load existing items from database if we have a parent operation
-        if (self.parent_operation and hasattr(self.parent_operation, 'id') and 
-            self.parent_operation.id and self.database):
+    def load_items_from_operation(self, parent_operation):
+        """Load existing items from parent operation"""
+        if not parent_operation or not hasattr(parent_operation, 'id') or not parent_operation.id:
+            return []
             
-            try:
-                # Get existing items directly from database
-                if hasattr(self.parent_operation, 'get_sales_items'):
-                    existing_items = self.parent_operation.get_sales_items()
-                elif hasattr(self.parent_operation, 'get_import_items'):  
-                    existing_items = self.parent_operation.get_import_items()
-                else:
-                    existing_items = []
-                
-                # Add rows for existing items
-                for item in existing_items:
-                    self.add_item_row(item)
-                    
-            except Exception as e:
-                print(f"Error loading existing items: {e}")
-        
-        # Always ensure we have exactly one empty row at the end
-        self.ensure_single_empty_row()
+        try:
+            if hasattr(parent_operation, 'get_sales_items'):
+                return parent_operation.get_sales_items()
+            elif hasattr(parent_operation, 'get_import_items'):
+                return parent_operation.get_import_items()
+        except Exception as e:
+            print(f"Error loading items from operation: {e}")
+        return []
     
-    def add_item_row(self, item):
-        """Add a row for an existing item"""
-        row = self.table.rowCount()
-        self.table.setRowCount(row + 1)
+    def extract_row_data(self, table, row):
+        """Extract data from a table row"""
+        row_data = {}
         
         for col, param_key in enumerate(self.table_columns):
-            if param_key == 'delete_action':
-                # Add delete button
-                delete_btn = self.create_delete_button(row)
-                container = QWidget()
-                container_layout = QHBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.addStretch()
-                container_layout.addWidget(delete_btn)
-                container_layout.addStretch()
-                self.table.setCellWidget(row, col, container)
+            if param_key in ['delete_action', 'product_preview', 'subtotal']:
+                continue
                 
-            elif param_key == 'product_preview':
-                # Add preview widget
-                preview_widget = PreviewWidget(45, "product")
-                preview_widget.setFixedSize(45, 45)
-                
-                # Set preview image if available
-                preview_path = item.get_product_preview() if hasattr(item, 'get_product_preview') else None
-                if preview_path:
-                    preview_widget.set_image_path(preview_path)
-                
-                container = QWidget()
-                container_layout = QHBoxLayout(container)
-                container_layout.setContentsMargins(0, 0, 0, 0)
-                container_layout.addStretch()
-                container_layout.addWidget(preview_widget)
-                container_layout.addStretch()
-                self.table.setCellWidget(row, col, container)
-                
-            elif param_key == 'product_name':
-                # Add autocomplete widget with current value
-                autocomplete_widget = self.create_product_autocomplete_widget(row)
-                current_name = item.get_product_name() if hasattr(item, 'get_product_name') else ""
-                if hasattr(autocomplete_widget, 'setText'):
-                    autocomplete_widget.setText(current_name)
-                self.table.setCellWidget(row, col, autocomplete_widget)
-                
-            else:
-                # Add regular cell with item value
-                value = item.get_value(param_key) if hasattr(item, 'get_value') else ""
-                cell_item = QTableWidgetItem(str(value))
-                
-                # Make subtotal read-only
-                if param_key == 'subtotal':
-                    cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-                
-                self.table.setItem(row, col, cell_item)
-    
-    def ensure_single_empty_row(self):
-        """Ensure there's exactly one empty row at the bottom"""
-        if self._updating_table:
-            return
-        
-        # Remove any extra empty rows, keep only one at the end
-        rows_to_remove = []
-        empty_row_count = 0
-        
-        for row in range(self.table.rowCount() - 1, -1, -1):  # Go backwards
-            if self.is_row_empty(row):
-                empty_row_count += 1
-                if empty_row_count > 1:  # Keep only one empty row
-                    rows_to_remove.append(row)
-        
-        # Remove extra empty rows
-        for row in rows_to_remove:
-            self.table.removeRow(row)
-        
-        # If no empty row exists, add one
-        if empty_row_count == 0:
-            self.add_empty_row()
-    
-    def add_empty_row(self):
-        """Add a new empty row - keep original logic"""
-        if self._updating_table:
-            return
-        
-        self._updating_table = True
-        try:
-            row = self.table.rowCount()
-            self.table.setRowCount(row + 1)
+            value = self._get_cell_value(table, row, col)
             
-            for col, param_key in enumerate(self.table_columns):
-                if param_key == 'delete_action':
-                    delete_btn = self.create_delete_button(row)
-                    container = QWidget()
-                    container_layout = QHBoxLayout(container)
-                    container_layout.setContentsMargins(0, 0, 0, 0)
-                    container_layout.addStretch()
-                    container_layout.addWidget(delete_btn)
-                    container_layout.addStretch()
-                    self.table.setCellWidget(row, col, container)
-                    
-                elif param_key == 'product_preview':
-                    preview_widget = PreviewWidget(45, "product")
-                    preview_widget.setFixedSize(45, 45)
-                    container = QWidget()
-                    container_layout = QHBoxLayout(container)
-                    container_layout.setContentsMargins(0, 0, 0, 0)
-                    container_layout.addStretch()
-                    container_layout.addWidget(preview_widget)
-                    container_layout.addStretch()
-                    self.table.setCellWidget(row, col, container)
-                    
-                elif param_key == 'product_name':
-                    autocomplete_widget = self.create_product_autocomplete_widget(row)
-                    self.table.setCellWidget(row, col, autocomplete_widget)
-                    
-                elif param_key == 'quantity':
-                    temp_item = self.item_class(0, self.database)
-                    default_qty = temp_item.parameters.get('quantity', {}).get('default', 1)
-                    self.table.setItem(row, col, QTableWidgetItem(str(default_qty)))
-                    
-                else:
-                    self.table.setItem(row, col, QTableWidgetItem(""))
-        finally:
-            self._updating_table = False
+            # Skip placeholder text
+            if param_key == 'product_name' and value and value.lower() == 'product name':
+                continue
+                
+            if value:
+                row_data[param_key] = self._convert_value_type(param_key, value)
+        
+        return row_data
     
-    def create_delete_button(self, row):
-        """Create a delete button for a specific row"""
-        button_param = {
-            'text': '🗑️',
-            'color': 'red', 
-            'size': 30
-        }
+    def _get_cell_value(self, table, row, col):
+        """Get value from table cell (widget or item)"""
+        widget = table.cellWidget(row, col)
+        if widget and hasattr(widget, 'text'):
+            return widget.text().strip()
+        
+        cell_item = table.item(row, col)
+        if cell_item:
+            return cell_item.text().strip()
+        
+        return ""
+    
+    def _convert_value_type(self, param_key, value):
+        """Convert value to proper type based on parameter definition"""
+        param_info = self.parameter_definitions.get(param_key, {})
+        param_type = param_info.get('type', 'string')
+        
+        if param_type == 'int':
+            try:
+                return int(value) if value else 0
+            except ValueError:
+                return 0
+        elif param_type == 'float':
+            try:
+                return float(value) if value else 0.0
+            except ValueError:
+                return 0.0
+        
+        return value
+
+
+class TableRowFactory:
+    """Creates and manages table row widgets"""
+    
+    def __init__(self, data_manager, delete_callback):
+        self.data_manager = data_manager
+        self.delete_callback = delete_callback
+    
+    def create_data_row(self, table, row, item):
+        """Create a row with existing item data"""
+        for col, param_key in enumerate(self.data_manager.table_columns):
+            self._create_cell(table, row, col, param_key, item)
+    
+    def create_empty_row(self, table, row):
+        """Create an empty row for new data entry"""
+        for col, param_key in enumerate(self.data_manager.table_columns):
+            self._create_cell(table, row, col, param_key, None)
+    
+    def _create_cell(self, table, row, col, param_key, item=None):
+        """Create individual cell based on parameter type"""
+        if param_key == 'delete_action':
+            self._create_delete_button_cell(table, row, col)
+        elif param_key == 'product_preview':
+            self._create_preview_cell(table, row, col, item)
+        elif param_key == 'product_name':
+            self._create_autocomplete_cell(table, row, col, item)
+        else:
+            self._create_regular_cell(table, row, col, param_key, item)
+    
+    def _create_delete_button_cell(self, table, row, col):
+        """Create delete button cell"""
+        button_param = {'text': '🗑️', 'color': 'red', 'size': 30}
         delete_btn = ButtonWidget(button_param)
-        delete_btn.clicked.connect(lambda: self.delete_row(row))
-        return delete_btn
+        delete_btn.setProperty('row', row)  # Store row for callback
+        delete_btn.clicked.connect(lambda: self.delete_callback(row))
+        
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch()
+        layout.addWidget(delete_btn)
+        layout.addStretch()
+        
+        table.setCellWidget(row, col, container)
     
-    def create_product_autocomplete_widget(self, row):
-        """Create an autocomplete widget for product names"""
+    def _create_preview_cell(self, table, row, col, item):
+        """Create preview image cell"""
+        preview_widget = PreviewWidget(45, "product")
+        preview_widget.setFixedSize(45, 45)
+        
+        # Set preview image if available
+        if item:
+            preview_path = item.get_product_preview() if hasattr(item, 'get_product_preview') else None
+            if preview_path:
+                preview_widget.set_image_path(preview_path)
+        
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch()
+        layout.addWidget(preview_widget)
+        layout.addStretch()
+        
+        table.setCellWidget(row, col, container)
+    
+    def _create_autocomplete_cell(self, table, row, col, item):
+        """Create autocomplete cell for product names"""
         from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
         
         # Get product options
-        temp_item = self.item_class(0, self.database)
+        temp_item = self.data_manager.item_class(0, self.data_manager.database)
         product_options_method = temp_item.parameters.get('product_name', {}).get('options')
         
         autocomplete = AutoCompleteLineEdit(options=product_options_method)
-        # Visual placeholder only; QLineEdit.placeholderText doesn't affect .text()
-        try:
-            autocomplete.setPlaceholderText("Product name")
-        except Exception:
-            pass
-        autocomplete.textChanged.connect(lambda text, r=row: self.handle_product_name_change(r, text))
-        autocomplete.editingFinished.connect(lambda r=row: self.handle_product_selection_finished(r))
+        autocomplete.setPlaceholderText("Product name")
+        autocomplete.setProperty('row', row)  # Store row for callbacks
         
-        return autocomplete
+        # Set current value if item provided
+        if item:
+            current_name = item.get_product_name() if hasattr(item, 'get_product_name') else ""
+            autocomplete.setText(current_name)
+        
+        table.setCellWidget(row, col, autocomplete)
     
-    def get_row_product_name(self, row):
-        """Get product name from a specific row"""
-        if 'product_name' in self.table_columns:
-            col = self.table_columns.index('product_name')
+    def _create_regular_cell(self, table, row, col, param_key, item):
+        """Create regular text cell"""
+        value = ""
+        if item and hasattr(item, 'get_value'):
+            value = str(item.get_value(param_key) or "")
+        elif param_key == 'quantity':
+            # Set default quantity for empty rows
+            temp_item = self.data_manager.item_class(0, self.data_manager.database)
+            default_qty = temp_item.parameters.get('quantity', {}).get('default', 1)
+            value = str(default_qty) if not item else value
+        
+        cell_item = QTableWidgetItem(value)
+        
+        # Make subtotal read-only
+        if param_key == 'subtotal':
+            cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
+        
+        table.setItem(row, col, cell_item)
+
+
+class EmptyRowManager:
+    """Manages the single empty row at the bottom"""
+    
+    def __init__(self, table, row_factory):
+        self.table = table
+        self.row_factory = row_factory
+    
+    def ensure_single_empty_row(self):
+        """Ensure exactly one empty row exists at the bottom"""
+        # Remove all empty rows
+        self._remove_all_empty_rows()
+        
+        # Add one empty row at the end
+        self._add_empty_row()
+    
+    def _remove_all_empty_rows(self):
+        """Remove all empty rows from table"""
+        rows_to_remove = []
+        
+        for row in range(self.table.rowCount() - 1, -1, -1):
+            if self._is_row_empty(row):
+                rows_to_remove.append(row)
+        
+        for row in rows_to_remove:
+            self.table.removeRow(row)
+    
+    def _add_empty_row(self):
+        """Add empty row at the end"""
+        row = self.table.rowCount()
+        self.table.setRowCount(row + 1)
+        self.row_factory.create_empty_row(self.table, row)
+    
+    def _is_row_empty(self, row):
+        """Check if row is empty"""
+        # Check product name first (most important)
+        product_name = self._get_product_name(row)
+        if product_name:
+            return False
+        
+        # Check other meaningful fields
+        for col in range(self.table.columnCount()):
+            if col >= len(self.row_factory.data_manager.table_columns):
+                continue
+                
+            param_key = self.row_factory.data_manager.table_columns[col]
+            
+            if param_key in ['delete_action', 'product_preview', 'subtotal', 'quantity']:
+                continue
+            
+            cell_item = self.table.item(row, col)
+            if cell_item and cell_item.text().strip():
+                return False
+        
+        return True
+    
+    def _get_product_name(self, row):
+        """Get product name from row"""
+        try:
+            col = self.row_factory.data_manager.table_columns.index('product_name')
             widget = self.table.cellWidget(row, col)
             if widget and hasattr(widget, 'text'):
                 return widget.text().strip()
-            item = self.table.item(row, col)
-            if item:
-                return item.text().strip()
-        return ''
+        except (ValueError, AttributeError):
+            pass
+        return ""
+
+
+class TableEventHandler:
+    """Handles all table events and interactions"""
     
-    def is_row_empty(self, row):
-        """Check if a row is empty or only has default values"""
-        # Get product name - this is the most important field
-        product_name = self.get_row_product_name(row)
-        if product_name:
-            return False
-            
-        # Check other meaningful fields
-        for col in range(self.table.columnCount()):
-            param_key = self.table_columns[col] if col < len(self.table_columns) else ''
-            
-            # Skip certain columns
-            if param_key in ['delete_action', 'product_preview', 'subtotal', 'quantity']:
-                continue
-                
-            item = self.table.item(row, col)
-            if item and item.text().strip():
-                return False
-                
+    def __init__(self, table, data_manager, empty_row_manager, items_changed_callback):
+        self.table = table
+        self.data_manager = data_manager
+        self.empty_row_manager = empty_row_manager
+        self.items_changed_callback = items_changed_callback
+        self._updating = False
+    
+    def setup_event_connections(self):
+        """Setup event connections"""
+        self.table.itemChanged.connect(self._on_item_changed)
+        
+        # Connect autocomplete widgets
+        for row in range(self.table.rowCount()):
+            self._connect_row_widgets(row)
+    
+    def _connect_row_widgets(self, row):
+        """Connect widgets in a specific row"""
+        try:
+            col = self.data_manager.table_columns.index('product_name')
             widget = self.table.cellWidget(row, col)
-            if widget and hasattr(widget, 'text') and widget.text().strip():
-                return False
-                
-        return True
+            if widget and hasattr(widget, 'textChanged'):
+                widget.textChanged.connect(lambda text, r=row: self._on_product_name_changed(r, text))
+            if widget and hasattr(widget, 'editingFinished'):
+                widget.editingFinished.connect(lambda r=row: self._on_product_selection_finished(r))
+        except (ValueError, AttributeError):
+            pass
     
-    def on_item_changed(self, item):
-        """Handle when a table item is changed"""
-        if self._updating_table:
+    def _on_item_changed(self, item):
+        """Handle item changes"""
+        if self._updating:
             return
         
         row = item.row()
         col = item.column()
         
-        if col < len(self.table_columns):
-            param_key = self.table_columns[col]
-            new_value = item.text()
+        if col < len(self.data_manager.table_columns):
+            param_key = self.data_manager.table_columns[col]
             
-            if param_key == 'product_name' and new_value.strip():
-                self.handle_product_selection(row, new_value.strip())
-            elif param_key in ['quantity', 'unit_price']:
-                self.update_row_subtotal(row)
+            if param_key in ['quantity', 'unit_price']:
+                self._update_row_subtotal(row)
         
-        # If this was the empty row and now has content, ensure we have exactly one empty row
-        if not self.is_row_empty(row):
-            self.ensure_single_empty_row()
+        # Ensure empty row management
+        if not self.empty_row_manager._is_row_empty(row):
+            self.empty_row_manager.ensure_single_empty_row()
+            self._reconnect_all_widgets()
         
-        self.items_changed.emit()
+        self.items_changed_callback()
     
-    def handle_product_name_change(self, row, text):
-        """Handle product name text change"""
-        if self._updating_table:
+    def _on_product_name_changed(self, row, text):
+        """Handle product name text changes"""
+        if self._updating:
             return
         
-        if 'product_name' in self.table_columns:
-            col = self.table_columns.index('product_name')
+        # Update corresponding table item
+        try:
+            col = self.data_manager.table_columns.index('product_name')
             item = self.table.item(row, col)
             if not item:
                 item = QTableWidgetItem()
                 self.table.setItem(row, col, item)
-            self.table.itemChanged.disconnect()
+            
+            self._updating = True
             item.setText(text)
-            self.table.itemChanged.connect(self.on_item_changed)
+            self._updating = False
+        except (ValueError, IndexError):
+            pass
     
-    def handle_product_selection_finished(self, row):
-        """Handle when product selection is finished"""
-        if 'product_name' in self.table_columns:
-            col = self.table_columns.index('product_name')
-            widget = self.table.cellWidget(row, col)
-            if widget and hasattr(widget, 'text'):
-                product_name = widget.text().strip()
-                if product_name:
-                    self.handle_product_selection(row, product_name)
-                    self.ensure_single_empty_row()
-                    self.items_changed.emit()
+    def _on_product_selection_finished(self, row):
+        """Handle when product selection is completed"""
+        product_name = self.empty_row_manager._get_product_name(row)
+        if product_name:
+            self._handle_product_selection(row, product_name)
+            self.empty_row_manager.ensure_single_empty_row()
+            self._reconnect_all_widgets()
+            self.items_changed_callback()
     
-    def handle_product_selection(self, row, product_name):
-        """Handle product selection and auto-fill - keep original logic"""
-        temp_item = self.item_class(0, self.database)
+    def _handle_product_selection(self, row, product_name):
+        """Handle product selection and auto-fill"""
+        temp_item = self.data_manager.item_class(0, self.data_manager.database)
         temp_item.set_value('product_name', product_name)
         
-        # Set quantity to 1 if empty
-        if 'quantity' in self.table_columns:
-            qty_col = self.table_columns.index('quantity')
-            qty_item = self.table.item(row, qty_col)
+        # Auto-fill quantity if empty
+        self._auto_fill_quantity(row)
+        
+        # Auto-fill unit price
+        self._auto_fill_unit_price(row, temp_item)
+        
+        # Update preview
+        self._update_preview(row, temp_item)
+        
+        # Update subtotal
+        self._update_row_subtotal(row)
+    
+    def _auto_fill_quantity(self, row):
+        """Auto-fill quantity with default value"""
+        try:
+            col = self.data_manager.table_columns.index('quantity')
+            qty_item = self.table.item(row, col)
+            
             current_qty = 0
             if qty_item and qty_item.text().strip():
                 try:
@@ -386,155 +384,201 @@ class OperationsTableWidget(QWidget):
             if current_qty == 0:
                 if not qty_item:
                     qty_item = QTableWidgetItem()
-                    self.table.setItem(row, qty_col, qty_item)
+                    self.table.setItem(row, col, qty_item)
                 qty_item.setText("1")
-        
-        # Update unit_price
-        if 'unit_price' in self.table_columns:
-            price_col = self.table_columns.index('unit_price')
+        except ValueError:
+            pass
+    
+    def _auto_fill_unit_price(self, row, temp_item):
+        """Auto-fill unit price from product data"""
+        try:
+            col = self.data_manager.table_columns.index('unit_price')
             unit_price = temp_item.get_value('unit_price')
+            
             if unit_price is not None:
-                price_item = self.table.item(row, price_col)
+                price_item = self.table.item(row, col)
                 if not price_item:
                     price_item = QTableWidgetItem()
-                    self.table.setItem(row, price_col, price_item)
+                    self.table.setItem(row, col, price_item)
                 price_item.setText(str(unit_price))
-        
-        # Update preview
-        if 'product_preview' in self.table_columns:
-            preview_col = self.table_columns.index('product_preview')
+        except ValueError:
+            pass
+    
+    def _update_preview(self, row, temp_item):
+        """Update preview image"""
+        try:
+            col = self.data_manager.table_columns.index('product_preview')
             if hasattr(temp_item, 'get_product_preview'):
                 preview_path = temp_item.get_product_preview()
-                container_widget = self.table.cellWidget(row, preview_col)
+                container_widget = self.table.cellWidget(row, col)
                 if container_widget:
                     for child in container_widget.findChildren(PreviewWidget):
                         if preview_path:
                             child.set_image_path(preview_path)
                         break
-        
-        self.update_row_subtotal(row)
+        except ValueError:
+            pass
     
-    def update_row_subtotal(self, row):
-        """Update the subtotal for a specific row"""
-        if 'quantity' in self.table_columns and 'unit_price' in self.table_columns and 'subtotal' in self.table_columns:
-            qty_col = self.table_columns.index('quantity')
-            price_col = self.table_columns.index('unit_price')
-            subtotal_col = self.table_columns.index('subtotal')
+    def _update_row_subtotal(self, row):
+        """Update subtotal for a row"""
+        try:
+            qty_col = self.data_manager.table_columns.index('quantity')
+            price_col = self.data_manager.table_columns.index('unit_price')
+            subtotal_col = self.data_manager.table_columns.index('subtotal')
             
             qty_item = self.table.item(row, qty_col)
             price_item = self.table.item(row, price_col)
             
-            try:
-                quantity = float(qty_item.text()) if qty_item and qty_item.text().strip() else 0.0
-                unit_price = float(price_item.text()) if price_item and price_item.text().strip() else 0.0
-                subtotal = quantity * unit_price
-                
-                subtotal_item = self.table.item(row, subtotal_col)
-                if not subtotal_item:
-                    subtotal_item = QTableWidgetItem()
-                    self.table.setItem(row, subtotal_col, subtotal_item)
-                subtotal_item.setText(f"{subtotal:.2f}")
-                
-            except (ValueError, AttributeError):
-                pass
-    
-    def delete_row(self, row):
-        """Delete a specific row from UI"""
-        if row < self.table.rowCount():
-            self.table.removeRow(row)
-            self.update_delete_buttons()
+            quantity = float(qty_item.text()) if qty_item and qty_item.text().strip() else 0.0
+            unit_price = float(price_item.text()) if price_item and price_item.text().strip() else 0.0
+            subtotal = quantity * unit_price
             
-            # Ensure we always have exactly one empty row at the end
-            self.ensure_single_empty_row()
-                
-            self.items_changed.emit()
+            subtotal_item = self.table.item(row, subtotal_col)
+            if not subtotal_item:
+                subtotal_item = QTableWidgetItem()
+                self.table.setItem(row, subtotal_col, subtotal_item)
+                subtotal_item.setFlags(subtotal_item.flags() & ~Qt.ItemIsEditable)
+            
+            subtotal_item.setText(f"{subtotal:.2f}")
+            
+        except (ValueError, AttributeError, IndexError):
+            pass
     
-    def update_delete_buttons(self):
-        """Update delete button connections after row changes"""
+    def _reconnect_all_widgets(self):
+        """Reconnect all widget events after table changes"""
         for row in range(self.table.rowCount()):
-            for col, param_key in enumerate(self.table_columns):
-                if param_key == 'delete_action':
-                    container_widget = self.table.cellWidget(row, col)
-                    if container_widget:
-                        for child in container_widget.findChildren(ButtonWidget):
-                            child.clicked.disconnect()
-                            child.clicked.connect(lambda r=row: self.delete_row(r))
-                            break
+            self._connect_row_widgets(row)
+
+
+class OperationsTableWidget(QWidget):
+    """Clean operations table with proper separation of concerns"""
+    
+    items_changed = Signal()
+    
+    def __init__(self, item_class, parent_operation=None, database=None, columns=None, parent=None):
+        super().__init__(parent)
+        
+        # Core components
+        self.data_manager = TableDataManager(item_class, database)
+        self.parent_operation = parent_operation
+        
+        # Override columns if provided
+        if columns:
+            self.data_manager.table_columns = columns
+        
+        # Setup UI
+        self._setup_ui()
+        
+        # Create managers
+        self.row_factory = TableRowFactory(self.data_manager, self._delete_row)
+        self.empty_row_manager = EmptyRowManager(self.table, self.row_factory)
+        self.event_handler = TableEventHandler(self.table, self.data_manager, 
+                                             self.empty_row_manager, self._on_items_changed)
+        
+        # Load data
+        self.refresh_table()
+    
+    def _setup_ui(self):
+        """Setup user interface"""
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.table = QTableWidget()
+        self._configure_table()
+        
+        layout.addWidget(self.table)
+    
+    def _configure_table(self):
+        """Configure table properties"""
+        # Set columns
+        headers = self.data_manager.get_column_headers()
+        self.table.setColumnCount(len(headers))
+        self.table.setHorizontalHeaderLabels(headers)
+        
+        # Table properties
+        self.table.verticalHeader().setVisible(False)
+        self.table.setAlternatingRowColors(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
+        self.table.verticalHeader().setDefaultSectionSize(45)
+        
+        # Column widths
+        header = self.table.horizontalHeader()
+        for i, param_key in enumerate(self.data_manager.table_columns):
+            if param_key == 'product_preview':
+                self.table.setColumnWidth(i, 70)
+                header.setSectionResizeMode(i, QHeaderView.Fixed)
+            elif param_key == 'delete_action':
+                self.table.setColumnWidth(i, 50)
+                header.setSectionResizeMode(i, QHeaderView.Fixed)
+            else:
+                header.setSectionResizeMode(i, QHeaderView.Stretch)
+        
+        # Styling
+        self._apply_theme()
+    
+    def refresh_table(self):
+        """Refresh table data"""
+        self.table.setRowCount(0)
+        
+        # Load existing items
+        items = self.data_manager.load_items_from_operation(self.parent_operation)
+        for item in items:
+            row = self.table.rowCount()
+            self.table.setRowCount(row + 1)
+            self.row_factory.create_data_row(self.table, row, item)
+        
+        # Ensure empty row
+        self.empty_row_manager.ensure_single_empty_row()
+        
+        # Setup events
+        self.event_handler.setup_event_connections()
     
     def get_current_table_data(self):
-        """Get all non-empty rows from the table as simple data dictionaries"""
+        """Get all non-empty rows as data dictionaries"""
         items_data = []
         
         for row in range(self.table.rowCount()):
-            if not self.is_row_empty(row):
-                row_data = {}
-                
-                # Extract data from each column
-                for col, param_key in enumerate(self.table_columns):
-                    if param_key in ['delete_action', 'product_preview', 'subtotal']:
-                        continue
-                        
-                    # Get value from table cell
-                    value = None
-                    widget = self.table.cellWidget(row, col)
-                    if widget and hasattr(widget, 'text'):
-                        value = widget.text().strip()
-                    else:
-                        cell_item = self.table.item(row, col)
-                        if cell_item:
-                            value = cell_item.text().strip()
-                    
-                    # Ignore visual placeholder text for product_name
-                    if param_key == 'product_name' and value and value.lower() == 'product name':
-                        value = None
-
-                    if value:
-                        # Convert to proper type
-                        temp_item = self.item_class(0, self.database)
-                        param_info = temp_item.parameters.get(param_key, {})
-                        param_type = param_info.get('type', 'string')
-                        
-                        if param_type == 'int':
-                            try:
-                                value = int(value) if value else 0
-                            except ValueError:
-                                value = 0
-                        elif param_type == 'float':
-                            try:
-                                value = float(value) if value else 0.0
-                            except ValueError:
-                                value = 0.0
-                        
-                        row_data[param_key] = value
-                
-                # Only add rows that have meaningful data (at least product_name)
+            if not self.empty_row_manager._is_row_empty(row):
+                row_data = self.data_manager.extract_row_data(self.table, row)
                 if row_data.get('product_name'):
                     items_data.append(row_data)
         
         return items_data
     
     def get_items_data(self):
-        """Compatibility method for base operation dialog - returns item objects"""
+        """Get items as object instances (compatibility method)"""
         items = []
         items_data = self.get_current_table_data()
         
         for item_data in items_data:
-            # Create item object and populate it
-            item = self.item_class(0, self.database)
+            item = self.data_manager.item_class(0, self.data_manager.database)
             for key, value in item_data.items():
                 item.set_value(key, value)
-            # Skip items with invalid or unknown product (no product_id resolved)
+            
+            # Only include items with valid product_id
             try:
-                if item.get_value('product_id'):
+                if hasattr(item, 'get_value') and item.get_value('product_id'):
                     items.append(item)
             except Exception:
-                # If item doesn't expose product_id, keep it to avoid accidental drops
-                items.append(item)
-            
+                items.append(item)  # Include if we can't check product_id
+        
         return items
     
-    def apply_table_theme(self):
-        """Apply minimal dark theme styling"""
+    def _delete_row(self, row):
+        """Delete a specific row"""
+        if row < self.table.rowCount():
+            self.table.removeRow(row)
+            self.empty_row_manager.ensure_single_empty_row()
+            self.event_handler._reconnect_all_widgets()
+            self._on_items_changed()
+    
+    def _on_items_changed(self):
+        """Handle items changed event"""
+        self.items_changed.emit()
+    
+    def _apply_theme(self):
+        """Apply styling"""
         self.table.setStyleSheet("""
             QHeaderView::section {
                 background-color: #404040;

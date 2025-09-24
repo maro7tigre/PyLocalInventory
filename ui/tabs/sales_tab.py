@@ -84,8 +84,8 @@ class SalesTab(BaseTab):
                     break
         
         if controls_layout:
-            from ui.widgets.themed_widgets import BlueButton
-            self.reports_btn = BlueButton("Reports")
+            from ui.widgets.themed_widgets import OrangeButton
+            self.reports_btn = OrangeButton("📊 Reports")
             self.reports_btn.clicked.connect(self.show_reports)
             # Insert before the last item (which should be the refresh button)
             controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)

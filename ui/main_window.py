@@ -195,12 +195,12 @@ class MainWindow(ThemedMainWindow):
         tab_widget = QTabWidget()
         
         # Add Home tab
-        tab_widget.addTab(HomeTab(self.database), "Home")
+        tab_widget.addTab(HomeTab(self.database), "🏠 Home")
         
         # Add all entity tabs - now all using BaseTab for consistency
         try:
             products_tab = ProductsTab(self.database, self)
-            tab_widget.addTab(products_tab, "Products")
+            tab_widget.addTab(products_tab, "📦 Products")
             print("✓ Added Products tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Products tab: {e}")
@@ -208,7 +208,7 @@ class MainWindow(ThemedMainWindow):
         
         try:
             clients_tab = ClientsTab(self.database, self)
-            tab_widget.addTab(clients_tab, "Clients")
+            tab_widget.addTab(clients_tab, "👥 Clients")
             print("✓ Added Clients tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Clients tab: {e}")
@@ -216,7 +216,7 @@ class MainWindow(ThemedMainWindow):
         
         try:
             suppliers_tab = SuppliersTab(self.database, self)
-            tab_widget.addTab(suppliers_tab, "Suppliers")
+            tab_widget.addTab(suppliers_tab, "🏭 Suppliers")
             print("✓ Added Suppliers tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Suppliers tab: {e}")
@@ -225,7 +225,7 @@ class MainWindow(ThemedMainWindow):
         try:
             # Sales tab now uses BaseTab with BaseOperationDialog - unified experience!
             sales_tab = SalesTab(self.database, self)
-            tab_widget.addTab(sales_tab, "Sales")
+            tab_widget.addTab(sales_tab, "💰 Sales")
             print("✓ Added Sales tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Sales tab: {e}")
@@ -234,13 +234,13 @@ class MainWindow(ThemedMainWindow):
         try:
             # Imports tab now uses BaseTab with BaseOperationDialog - unified experience!
             imports_tab = ImportsTab(self.database, self)
-            tab_widget.addTab(imports_tab, "Imports")
+            tab_widget.addTab(imports_tab, "📥 Imports")
             print("✓ Added Imports tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Imports tab: {e}")
             self.add_error_tab(tab_widget, "Imports", e)
         
-        tab_widget.addTab(LogTab(self.database), "Log")
+        tab_widget.addTab(LogTab(self.database), "📋 Log")
         
         self.main_layout.addWidget(tab_widget)
         

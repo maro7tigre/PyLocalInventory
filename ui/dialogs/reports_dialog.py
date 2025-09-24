@@ -334,21 +334,81 @@ class ReportsDialog(QDialog):
         return template_content
     
     def _html_to_pdf(self, html_content, output_path):
-        """Convert HTML to PDF - simplified version"""
+        """Convert HTML to PDF with full CSS support"""
         try:
             # Create a temporary HTML file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
                 temp_html.write(html_content)
                 temp_html_path = temp_html.name
             
-            # Try weasyprint first
+            # Try playwright first (best CSS support)
+            try:
+                from playwright.sync_api import sync_playwright
+                print("DEBUG: Using Playwright for PDF generation")
+                
+                with sync_playwright() as p:
+                    browser = p.chromium.launch(headless=True)
+                    page = browser.new_page()
+                    page.set_content(html_content, wait_until='networkidle')
+                    
+                    # Configure PDF options for A4 size with proper margins and page breaks
+                    pdf_options = {
+                        'path': output_path,
+                        'format': 'A4',
+                        'margin': {
+                            'top': '0.5in',
+                            'bottom': '0.5in', 
+                            'left': '0.5in',
+                            'right': '0.5in'
+                        },
+                        'print_background': True,
+                        'prefer_css_page_size': False,
+                        'width': '8.27in',  # A4 width
+                        'height': '11.69in'  # A4 height
+                    }
+                    
+                    page.pdf(**pdf_options)
+                    browser.close()
+                    
+                os.unlink(temp_html_path)
+                print(f"DEBUG: Successfully generated PDF with Playwright: {output_path}")
+                return output_path
+            except ImportError:
+                print("DEBUG: Playwright not available")
+                pass
+            except Exception as e:
+                print(f"DEBUG: Playwright failed: {e}")
+            
+            # Try xhtml2pdf as fallback (limited CSS support)
+            try:
+                from xhtml2pdf import pisa
+                print("DEBUG: Using xhtml2pdf for PDF generation")
+                
+                with open(output_path, "wb") as result_file:
+                    # Convert HTML to PDF
+                    pisa_status = pisa.CreatePDF(html_content, dest=result_file)
+                    
+                    if not pisa_status.err:
+                        os.unlink(temp_html_path)
+                        print(f"DEBUG: Successfully generated PDF with xhtml2pdf: {output_path}")
+                        return output_path
+                    else:
+                        print(f"DEBUG: xhtml2pdf reported errors: {pisa_status.err}")
+                        
+            except ImportError:
+                print("DEBUG: xhtml2pdf not available")
+                pass
+            except Exception as e:
+                print(f"DEBUG: xhtml2pdf failed: {e}")
+            
+            # Try weasyprint third
             try:
                 import weasyprint
                 print("DEBUG: Using WeasyPrint for PDF generation")
                 html = weasyprint.HTML(string=html_content)
                 html.write_pdf(output_path)
                 os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF: {output_path}")
+                print(f"DEBUG: Successfully generated PDF with WeasyPrint: {output_path}")
                 return output_path
             except ImportError:
                 print("DEBUG: WeasyPrint not available")
@@ -356,11 +416,21 @@ class ReportsDialog(QDialog):
             except Exception as e:
                 print(f"DEBUG: WeasyPrint failed: {e}")
             
-            # Try pdfkit as fallback
+            # Try pdfkit as last resort
             try:
                 import pdfkit
                 print("DEBUG: Using PDFKit for PDF generation")
-                pdfkit.from_string(html_content, output_path)
+                # Configure pdfkit options for better compatibility
+                options = {
+                    'page-size': 'A4',
+                    'margin-top': '0.75in',
+                    'margin-right': '0.75in',
+                    'margin-bottom': '0.75in',
+                    'margin-left': '0.75in',
+                    'encoding': "UTF-8",
+                    'no-outline': None
+                }
+                pdfkit.from_string(html_content, output_path, options=options)
                 os.unlink(temp_html_path)
                 print(f"DEBUG: Successfully generated PDF with PDFKit: {output_path}")
                 return output_path

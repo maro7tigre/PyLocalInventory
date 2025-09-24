@@ -1,5 +1,6 @@
 """
-Base Tab Class - Reduces repetition across different entity tabs
+Base Tab Class - Enhanced to better support operations
+Unified table experience for all entities (Products, Clients, Suppliers, Sales, Imports)
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
@@ -72,7 +73,7 @@ class BaseTableDelegate(QStyledItemDelegate):
 
 
 class BaseTab(QWidget):
-    """Base tab with editable table - inherit from this for specific entity tabs"""
+    """Base tab with editable table - unified for all entities including operations"""
     
     def __init__(self, object_class, dialog_class, database=None, parent=None):
         super().__init__(parent)
@@ -309,12 +310,8 @@ class BaseTab(QWidget):
     def update_cell_in_database(self, row, col, new_value):
         """Update database when cell is edited"""
         try:
-            # Get object ID
-            item = self.table.item(row, col)
-            if not item:
-                return
-            
-            obj_id = item.data(Qt.UserRole + 1)
+            # Get object ID - enhanced for better reliability
+            obj_id = self.get_object_id_from_row(row)
             if not obj_id:
                 return
             
@@ -324,6 +321,8 @@ class BaseTab(QWidget):
             data = {column_key: new_value}
             if self.database.update_item(obj_id, data, self.section):
                 print(f"Updated {column_key} to '{new_value}' for {self.section} {obj_id}")
+                # Refresh only the specific row to show calculated field updates
+                self.refresh_table()
             else:
                 QMessageBox.warning(self, "Error", f"Failed to update {column_key}")
                 # Revert the change
@@ -334,21 +333,40 @@ class BaseTab(QWidget):
             QMessageBox.critical(self, "Error", f"Database update failed: {e}")
             self.refresh_table()
     
+    def get_object_id_from_row(self, row):
+        """Get object ID from any cell in the row - enhanced method"""
+        # Try to get ID from stored UserRole data
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if item:
+                obj_id = item.data(Qt.UserRole + 1)
+                if obj_id and obj_id > 0:
+                    return int(obj_id)
+        
+        # Fallback: try to find ID column
+        if 'id' in self.table_columns:
+            id_col = self.table_columns.index('id')
+            item = self.table.item(row, id_col)
+            if item:
+                try:
+                    return int(item.text())
+                except ValueError:
+                    pass
+        
+        # Last resort: try first column if it looks like an ID
+        first_item = self.table.item(row, 0)
+        if first_item and first_item.text().isdigit():
+            return int(first_item.text())
+        
+        return None
+    
     def get_selected_id(self):
         """Get ID of selected item"""
         row = self.table.currentRow()
         if row == -1:
             return None
         
-        # Get ID from any cell in the row that has it stored
-        for col in range(self.table.columnCount()):
-            item = self.table.item(row, col)
-            if item:
-                obj_id = item.data(Qt.UserRole + 1)
-                if obj_id:
-                    return int(obj_id)
-        
-        return None
+        return self.get_object_id_from_row(row)
     
     def add_item(self):
         """Add new item"""

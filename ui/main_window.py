@@ -1,5 +1,6 @@
 """
-Main window - Updated with all tabs
+Main window - Updated with unified tabs approach
+All tabs now use consistent BaseTab experience
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
@@ -185,7 +186,7 @@ class MainWindow(ThemedMainWindow):
         self.main_layout.addWidget(password_widget)
     
     def setup_main_tabs(self):
-        """Show main application tabs"""
+        """Show main application tabs - all using unified BaseTab approach"""
         # Connect to database with current profile
         if not self.database.connect():
             self.show_database_error()
@@ -193,98 +194,51 @@ class MainWindow(ThemedMainWindow):
         
         tab_widget = QTabWidget()
         
-        # Add tabs manually
+        # Add Home tab
         tab_widget.addTab(HomeTab(self.database), "Home")
         
-        # Add Products tab
+        # Add all entity tabs - now all using BaseTab for consistency
         try:
             products_tab = ProductsTab(self.database, self)
             tab_widget.addTab(products_tab, "Products")
-            print("✓ Added Products tab successfully")
+            print("✓ Added Products tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Products tab: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Add error placeholder
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_label = QLabel(f"Products tab error: {str(e)}")
-            error_label.setStyleSheet("color: red; padding: 20px;")
-            error_layout.addWidget(error_label)
-            tab_widget.addTab(error_widget, "Products (Error)")
+            self.add_error_tab(tab_widget, "Products", e)
         
-        # Add Clients tab
         try:
             clients_tab = ClientsTab(self.database, self)
             tab_widget.addTab(clients_tab, "Clients")
-            print("✓ Added Clients tab successfully")
+            print("✓ Added Clients tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Clients tab: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Add error placeholder
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_label = QLabel(f"Clients tab error: {str(e)}")
-            error_label.setStyleSheet("color: red; padding: 20px;")
-            error_layout.addWidget(error_label)
-            tab_widget.addTab(error_widget, "Clients (Error)")
+            self.add_error_tab(tab_widget, "Clients", e)
         
-        # Add Suppliers tab
         try:
             suppliers_tab = SuppliersTab(self.database, self)
             tab_widget.addTab(suppliers_tab, "Suppliers")
-            print("✓ Added Suppliers tab successfully")
+            print("✓ Added Suppliers tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Suppliers tab: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Add error placeholder
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_label = QLabel(f"Suppliers tab error: {str(e)}")
-            error_label.setStyleSheet("color: red; padding: 20px;")
-            error_layout.addWidget(error_label)
-            tab_widget.addTab(error_widget, "Suppliers (Error)")
+            self.add_error_tab(tab_widget, "Suppliers", e)
         
-        # Add Sales tab
         try:
-            sales_tab = SalesTab(self.database)
+            # Sales tab now uses BaseTab with BaseOperationDialog - unified experience!
+            sales_tab = SalesTab(self.database, self)
             tab_widget.addTab(sales_tab, "Sales")
-            print("✓ Added Sales tab successfully")
+            print("✓ Added Sales tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Sales tab: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Add error placeholder
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_label = QLabel(f"Sales tab error: {str(e)}")
-            error_label.setStyleSheet("color: red; padding: 20px;")
-            error_layout.addWidget(error_label)
-            tab_widget.addTab(error_widget, "Sales (Error)")
+            self.add_error_tab(tab_widget, "Sales", e)
         
-        # Add Imports tab
         try:
-            imports_tab = ImportsTab(self.database)
+            # Imports tab now uses BaseTab with BaseOperationDialog - unified experience!
+            imports_tab = ImportsTab(self.database, self)
             tab_widget.addTab(imports_tab, "Imports")
-            print("✓ Added Imports tab successfully")
+            print("✓ Added Imports tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Imports tab: {e}")
-            import traceback
-            traceback.print_exc()
-            
-            # Add error placeholder
-            error_widget = QWidget()
-            error_layout = QVBoxLayout(error_widget)
-            error_label = QLabel(f"Imports tab error: {str(e)}")
-            error_label.setStyleSheet("color: red; padding: 20px;")
-            error_layout.addWidget(error_label)
-            tab_widget.addTab(error_widget, "Imports (Error)")
+            self.add_error_tab(tab_widget, "Imports", e)
         
         tab_widget.addTab(LogTab(self.database), "Log")
         
@@ -294,12 +248,23 @@ class MainWindow(ThemedMainWindow):
         print(f"\n📊 Database Status:")
         print(f"   • Connected: {self.database.conn is not None}")
         print(f"   • Registered classes: {len(self.database.registered_classes)}")
+        print(f"   • Unified Experience: ✓ All tabs now use BaseTab")
+        print(f"   • Operations: Sales & Imports use BaseOperationDialog")
         for section_name in self.database.registered_classes.keys():
             try:
                 items_count = len(self.database.get_items(section_name))
                 print(f"   • {section_name}: {items_count} items")
             except Exception as e:
                 print(f"   • {section_name}: error getting items ({e})")
+    
+    def add_error_tab(self, tab_widget, tab_name, error):
+        """Add error placeholder tab"""
+        error_widget = QWidget()
+        error_layout = QVBoxLayout(error_widget)
+        error_label = QLabel(f"{tab_name} tab error: {str(error)}")
+        error_label.setStyleSheet("color: red; padding: 20px;")
+        error_layout.addWidget(error_label)
+        tab_widget.addTab(error_widget, f"{tab_name} (Error)")
     
     def show_database_error(self):
         """Show database connection error"""

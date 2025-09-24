@@ -380,7 +380,7 @@ class ImportEditDialog(QDialog):
             return False
     
     def save_changes(self):
-        """Save import changes to database"""
+        """Save import changes to database using simple approach"""
         # Validate data first
         errors = self.validate_data()
         if errors:
@@ -394,31 +394,35 @@ class ImportEditDialog(QDialog):
                 self.import_obj.set_value(param_key, value)
             
             # Save import to database first
-            import_data = self.import_obj.get_value(destination="database")
-            
             if self.import_id:
                 # Update existing import
-                success = self.database.update_item(self.import_id, import_data, "Imports")
+                success = self.import_obj.save_to_database()
                 action = "updated"
             else:
                 # Add new import and get the new ID
-                new_id = self.database.add_item(import_data, "Imports")
-                if new_id:
-                    self.import_id = new_id
-                    self.import_obj.id = new_id
-                    self.import_obj.set_value('id', new_id)
-                    success = True
+                success = self.import_obj.save_to_database()
+                if success:
+                    self.import_id = self.import_obj.id
                     action = "created"
-                else:
-                    success = False
             
             if success:
-                # Save all import items
+                # Simple approach: Clear all existing items and add current ones
+                operation_id = self.import_obj.id
+                
+                # Delete all existing import items for this operation
+                if hasattr(self.import_obj, 'get_import_items'):
+                    existing_items = self.import_obj.get_import_items()
+                    for item in existing_items:
+                        if hasattr(item, 'id') and item.id:
+                            self.database.delete_item(item.id, "Import_Items")
+                
+                # Add all current table items
+                current_data = self.import_items_table.get_current_table_data()
                 items_saved = 0
-                for item in self.import_items_table.get_items_data():
-                    # Ensure the item has the correct import_id
-                    item.set_value('import_id', self.import_obj.id)
-                    if item.save_to_database():
+                
+                for item_data in current_data:
+                    item_data['import_id'] = operation_id
+                    if self.database.add_item(item_data, "Import_Items"):
                         items_saved += 1
                 
                 QMessageBox.information(self, "Success", 

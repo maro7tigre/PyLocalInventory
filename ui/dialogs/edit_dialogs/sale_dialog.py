@@ -380,7 +380,7 @@ class SaleEditDialog(QDialog):
             return False
     
     def save_changes(self):
-        """Save sale changes to database"""
+        """Save sale changes to database using simple approach"""
         # Validate data first
         errors = self.validate_data()
         if errors:
@@ -394,31 +394,35 @@ class SaleEditDialog(QDialog):
                 self.sale_obj.set_value(param_key, value)
             
             # Save sale to database first
-            sale_data = self.sale_obj.get_value(destination="database")
-            
             if self.sale_id:
                 # Update existing sale
-                success = self.database.update_item(self.sale_id, sale_data, "Sales")
+                success = self.sale_obj.save_to_database()
                 action = "updated"
             else:
                 # Add new sale and get the new ID
-                new_id = self.database.add_item(sale_data, "Sales")
-                if new_id:
-                    self.sale_id = new_id
-                    self.sale_obj.id = new_id
-                    self.sale_obj.set_value('id', new_id)
-                    success = True
+                success = self.sale_obj.save_to_database()
+                if success:
+                    self.sale_id = self.sale_obj.id
                     action = "created"
-                else:
-                    success = False
             
             if success:
-                # Save all sales items
+                # Simple approach: Clear all existing items and add current ones
+                operation_id = self.sale_obj.id
+                
+                # Delete all existing sales items for this operation
+                if hasattr(self.sale_obj, 'get_sales_items'):
+                    existing_items = self.sale_obj.get_sales_items()
+                    for item in existing_items:
+                        if hasattr(item, 'id') and item.id:
+                            self.database.delete_item(item.id, "Sales_Items")
+                
+                # Add all current table items
+                current_data = self.sales_items_table.get_current_table_data()
                 items_saved = 0
-                for item in self.sales_items_table.get_items_data():
-                    # Ensure the item has the correct sales_id
-                    item.set_value('sales_id', self.sale_obj.id)
-                    if item.save_to_database():
+                
+                for item_data in current_data:
+                    item_data['sales_id'] = operation_id
+                    if self.database.add_item(item_data, "Sales_Items"):
                         items_saved += 1
                 
                 QMessageBox.information(self, "Success", 

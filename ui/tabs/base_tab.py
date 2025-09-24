@@ -5,9 +5,9 @@ Unified table experience for all entities (Products, Clients, Suppliers, Sales, 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
                                QMessageBox, QPushButton, QAbstractItemView,
-                               QStyledItemDelegate, QLineEdit)
+                               QStyledItemDelegate, QLineEdit, QAbstractItemDelegate)
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
@@ -49,6 +49,27 @@ class BaseTableDelegate(QStyledItemDelegate):
         else:
             # Regular line edit for other editable columns
             editor = QLineEdit(parent)
+
+        # Make selection/Enter immediately commit and close the editor
+        editor._ac_committed = False  # type: ignore[attr-defined]
+
+        def commit_and_close():
+            if getattr(editor, "_ac_committed", False):
+                return
+            editor._ac_committed = True  # type: ignore[attr-defined]
+            self.commitData.emit(editor)
+            self.closeEditor.emit(editor, QAbstractItemDelegate.NoHint)
+
+        # Connect both completer activation and Enter key
+        try:
+            if hasattr(editor, "completer") and editor.completer:
+                editor.completer.activated.connect(lambda *_: QTimer.singleShot(0, commit_and_close))
+        except Exception:
+            pass
+        try:
+            editor.returnPressed.connect(commit_and_close)
+        except Exception:
+            pass
         
         return editor
     

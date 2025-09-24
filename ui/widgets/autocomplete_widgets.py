@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import (QApplication, QLineEdit, QCompleter, QVBoxLayout, 
                                QWidget, QLabel, QTableWidget, QStyledItemDelegate, 
                                QTableWidgetItem, QHBoxLayout)
-from PySide6.QtCore import Qt, QStringListModel
+from PySide6.QtCore import Qt, QStringListModel, QTimer
 
 
 class AutoCompleteLineEdit(QLineEdit):
@@ -57,12 +57,23 @@ class AutoCompleteLineEdit(QLineEdit):
             self.completer.setCompletionMode(QCompleter.PopupCompletion)
             self.completer.setFilterMode(Qt.MatchContains)
             self.completer.activated.connect(self._on_completion_selected)
+            # Use highlighted signal for mouse clicks (more reliable than activated)
+            self.completer.highlighted.connect(self._on_completion_highlighted)
             self.setCompleter(self.completer)
     
     def _on_completion_selected(self, text):
         """Handle when user selects from completion dropdown"""
         self.setText(text)
-        self.editingFinished.emit()  # Trigger the edit finished signal
+        # Hide the completer popup first
+        if self.completer:
+            self.completer.popup().hide()
+        # Then clear focus to commit the edit
+        QTimer.singleShot(0, self.clearFocus)
+    
+    def _on_completion_highlighted(self, text):
+        """Handle when user highlights an item in completion dropdown"""
+        # Directly trigger selection when highlighted (this covers mouse clicks)
+        self._on_completion_selected(text)
     
     def _calculate_suggestions(self, text):
         """Calculate suggestions with scoring system"""
@@ -224,81 +235,3 @@ class AutoCompleteTableWidget(QTableWidget):
         
         # No options available
         return []
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    
-    # Demo setup
-    window = QWidget()
-    layout = QVBoxLayout(window)
-    
-    # Create table with autocomplete
-    table = AutoCompleteTableWidget(4, 3)
-    table.setHorizontalHeaderLabels(["Material", "Color", "Size"])
-    
-    # Set column options (all cells in column will use these)
-    table.set_column_options(0, [  # Material column
-        "wood", "metal", "plastic", "glass", "ceramic",
-        "wooden table", "metal chair", "plastic box"
-    ])
-    
-    table.set_column_options(1, [  # Color column
-        "white", "black", "brown", "red", "blue", "green",
-        "dark brown", "light blue", "bright red"
-    ])
-    
-    table.set_column_options(2, [  # Size column
-        "small", "medium", "large", "extra large",
-        "very small", "medium size", "large box"
-    ])
-    
-    # Set specific cell options (overrides column options)
-    table.set_cell_options(0, 0, [  # First cell special options
-        "premium wood", "exotic wood", "hardwood",
-        "softwood", "wooden premium", "wood premium"
-    ])
-    
-    # Set row options (for demonstration)
-    table.set_row_options(3, [  # Last row special options
-        "custom option", "special item", "unique choice",
-        "custom special", "special custom"
-    ])
-    
-    # Add some sample data
-    sample_data = [
-        ["wood", "brown", "large"],
-        ["metal", "black", "small"],
-        ["plastic", "white", "medium"],
-        ["", "", ""]  # Empty row for testing
-    ]
-    
-    for row, row_data in enumerate(sample_data):
-        for col, value in enumerate(row_data):
-            if value:
-                item = QTableWidgetItem(value)
-                table.setItem(row, col, item)
-    
-    # Demo UI
-    layout.addWidget(QLabel("AutoComplete Table Demo"))
-    layout.addWidget(QLabel("• Double-click cells to edit with autocomplete"))
-    layout.addWidget(QLabel("• Material column: try 'wood' or 'metal'"))
-    layout.addWidget(QLabel("• Color column: try 'dar' → 'dark brown'"))
-    layout.addWidget(QLabel("• First cell has special options: try 'premium'"))
-    layout.addWidget(QLabel("• Last row has custom options: try 'custom'"))
-    layout.addWidget(table)
-    
-    # Add a regular lineedit for comparison
-    comparison_layout = QHBoxLayout()
-    comparison_layout.addWidget(QLabel("Compare with LineEdit:"))
-    line_edit = AutoCompleteLineEdit()
-    line_edit.options = ["wood", "metal", "wooden table", "metal chair"]
-    line_edit._setup_completer()
-    comparison_layout.addWidget(line_edit)
-    layout.addLayout(comparison_layout)
-    
-    window.setWindowTitle("AutoComplete Table Demo")
-    window.resize(600, 400)
-    window.show()
-    
-    sys.exit(app.exec())

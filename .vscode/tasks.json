@@ -1,0 +1,83 @@
+{
+	"version": "2.0.0",
+	"tasks": [
+		{
+			"label": "Run app (quick check)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (check devis again)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (gap tighten)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (paginate devis)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (paginate tuned)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (pagination more rows + wider totals)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		}
+	]
+}

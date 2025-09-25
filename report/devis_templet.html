@@ -2,7 +2,7 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-  <title>devis</title>
+  <title>Devis</title>
   <style>
     body {
       font-family: Arial, sans-serif;
@@ -23,12 +23,12 @@
     header {
       display: flex;
       justify-content: space-between;
-      align-items: flex-start;
+      align-items: stretch;
       margin-bottom: 15px;
     }
 
     .logo {
-      width: 50%;
+      width: 55%;
     }
 
     .logo-placeholder {
@@ -46,11 +46,9 @@
       font-weight: bold;
     }
 
-    .doc-info {
-      width: 40%;
-      border: 1px solid #000;
-      padding: 5px;
-    }
+    .right-pane { width: 40%; display: flex; flex-direction: column; gap: 8px; }
+
+    .doc-info { border: 1px solid #000; padding: 6px; }
 
     .doc-info h2 {
       text-align: center;
@@ -69,27 +67,17 @@
       font-size: 11px;
     }
 
-    .client-info {
-      margin-bottom: 15px;
-    }
-
-    .client-info table {
-      width: 100%;
-      border-collapse: collapse;
-    }
-
-    .client-info td {
-      padding: 4px;
-    }
+    .client-box { border: 1px solid #000; padding: 6px; min-height: 56px; display: flex; align-items: center; }
+    .client-box .label { font-weight: bold; margin-right: 8px; }
 
     .label {
       width: 25%;
       font-weight: bold;
     }
 
-    .items {
-      margin-bottom: 15px;
-    }
+  .items { margin-bottom: 4px; }
+  .items-block { margin-bottom: 4px; }
+  .items-block.page-break { page-break-after: always; break-after: page; }
 
     .items table {
       width: 100%;
@@ -104,6 +92,8 @@
       font-size: 11px;
       background-color: #f2f2f2;
     }
+    .items thead th:nth-child(3),
+    .items thead th:nth-child(4) { text-align: right; }
 
     .items td {
       border-left: 1px solid #000;
@@ -115,17 +105,15 @@
       font-size: 11px;
       vertical-align: top;
     }
+    .items tbody td:nth-child(3),
+    .items tbody td:nth-child(4) { text-align: right; }
 
     /* Add border only to last row */
     .items tr:last-child td {
       border-bottom: 1px solid #000;
     }
 
-    /* Add flexible spacer after items */
-    .spacer {
-      flex-grow: 1;
-      min-height: 200px;
-    }
+  /* spacer removed to reduce gap between table and totals */
 
     /* Page break handling */
     .items tr {
@@ -144,19 +132,16 @@
       }
     }
 
-    footer {
-      width: 40%;
-      margin-left: auto;
-    }
+    footer { margin-top: 6px; }
+    .totals { width: 100%; display: flex; justify-content: flex-end; }
+  .totals-grid { width: 55%; border-collapse: collapse; }
+    .totals-grid th, .totals-grid td { border: 1px solid #000; padding: 6px 8px; font-size: 11px; }
+    .totals-grid th { background: #f2f2f2; text-align: left; }
+    .totals-grid td { text-align: right; }
+    .note { margin-top: 4px; font-size: 10px; text-align: right; }
 
-    footer table {
-      width: 100%;
-    }
-
-    footer td {
-      padding: 4px;
-      font-size: 11px;
-    }
+    /* Filler rows so the items box can visually reach the footer */
+  .items tr.filler td { height: 14px; }
   </style>
 </head>
 <body>
@@ -171,75 +156,51 @@
           N° TVA : {{ company_tva }}
         </p>
       </div>
-      <div class="doc-info">
-        <h2>Devis</h2>
-        <table>
-          <tr>
-            <td>Date</td>
-            <td>{{ date }}</td>
-          </tr>
-          <tr>
-            <td>Réf. document</td>
-            <td>{{ document_ref }}</td>
-          </tr>
-        </table>
+      <div class="right-pane">
+        <div class="doc-info">
+          <h2>Devis</h2>
+          <table>
+            <tr>
+              <td>Réf. document</td>
+              <td>{{ document_ref }}</td>
+            </tr>
+            <tr>
+              <td>Date</td>
+              <td>{{ date }}</td>
+            </tr>
+          </table>
+        </div>
+        <div class="client-box">
+          <span class="label">Client :</span>
+          <span>{{ client_name }}</span>
+        </div>
       </div>
     </header>
 
-    <section class="client-info">
-      <table>
-        <tr>
-          <td class="label">Client :</td>
-          <td class="value">{{ client_name }}</td>
-        </tr>
-        <tr>
-          <td class="label">Adresse :</td>
-          <td class="value">{{ client_address }}</td>
-        </tr>
-        <tr>
-          <td class="label">Votre commercial :</td>
-          <td class="value">{{ commercial }}</td>
-        </tr>
-      </table>
-    </section>
-
     <section class="items">
-      <table>
-        <thead>
-          <tr>
-            <th>Désignation</th>
-            <th>Qté</th>
-            <th>P.U HT</th>
-            <th>Total HT</th>
-          </tr>
-        </thead>
-        <tbody>
-          {{ items }}
-        </tbody>
-      </table>
+      {{ items }}
     </section>
 
-    <div class="spacer"></div>
+    
 
     <footer>
-      <table>
+      <div class="totals">
+      <table class="totals-grid">
         <tr>
-          <td>Total Remise :</td>
+          <th>Total Remise</th>
+          <th>Total HT</th>
+          <th>Total Règle</th>
+          <th>Net à payer</th>
+        </tr>
+        <tr>
           <td>{{ total_remise }}</td>
-        </tr>
-        <tr>
-          <td>Total HT :</td>
           <td>{{ total_ht }}</td>
-        </tr>
-        <tr>
-          <td>Total Règle :</td>
           <td>{{ total_regle }}</td>
-        </tr>
-        <tr>
-          <td><strong>Net à payer :</strong></td>
           <td><strong>{{ net_a_payer }}</strong></td>
         </tr>
       </table>
+      </div>
+      <div class="note">TVA non applicable - article 293 B du CGI</div>
     </footer>
   </div>
 </body>

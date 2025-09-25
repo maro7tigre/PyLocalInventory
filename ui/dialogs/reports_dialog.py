@@ -175,16 +175,24 @@ class ReportsDialog(QDialog):
             template_content = f.read()
         
         # Get sales data
-        sales_data = self._extract_sales_data()
+        sales_data = self._extract_sales_data(report_type)
         
         # Replace placeholders
         html_content = self._replace_placeholders(template_content, sales_data)
         
         return html_content
     
-    def _extract_sales_data(self):
+    def _extract_sales_data(self, report_type: str):
         """Extract data from sales object"""
         try:
+            def _fmt_fr(value: float) -> str:
+                try:
+                    s = f"{float(value):,.2f}"
+                    # Convert 1,234.56 -> 1.234,56
+                    return s.replace(',', 'X').replace('.', ',').replace('X', '.')
+                except Exception:
+                    return str(value)
+
             # Get profile data
             profile = self.profile_manager.selected_profile
             company_name = profile.get_value("company name") or "Your Company"
@@ -231,6 +239,7 @@ class ReportsDialog(QDialog):
                     except Exception as e:
                         print(f"DEBUG: Error loading sales items: {e}")
             
+            devis_rows = []  # rows for devis full-table rendering
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
                 total_ht = 0
@@ -260,17 +269,39 @@ class ReportsDialog(QDialog):
                     total_quantity += int(quantity) if quantity else 0
                     total_ht += float(subtotal) if subtotal else 0
                     
-                    items_html += f"""
-                    <tr>
-                        <td style="text-align: left">{product_name}</td>
-                        <td>{quantity}</td>
-                        <td>{unit_price:.2f}€</td>
-                        <td>{subtotal:.2f}€</td>
-                    </tr>
-                    """
+                    row_html = (
+                        f"<tr>"
+                        f"<td style=\"text-align: left\">{product_name}</td>"
+                        f"<td>{quantity}</td>"
+                        f"<td>{_fmt_fr(unit_price)}</td>"
+                        f"<td>{_fmt_fr(subtotal)}</td>"
+                        f"</tr>"
+                    )
+                    # For BDL or legacy simple replacement
+                    items_html += row_html + "\n"
+                    # For Devis paginated tables
+                    devis_rows.append(row_html)
+                # Add filler rows to visually fill the table area to the footer
+                try:
+                    current_rows = len(self.sales_obj.items)
+                    # Target rows per page tuned for current CSS; adjust if needed
+                    target_rows = 22
+                    filler_needed = max(0, target_rows - current_rows)
+                    for _ in range(filler_needed):
+                        items_html += """
+                        <tr class=\"filler\">
+                            <td style=\"text-align: left\">&nbsp;</td>
+                            <td>&nbsp;</td>
+                            <td>&nbsp;</td>
+                            <td>&nbsp;</td>
+                        </tr>
+                        """
+                except Exception:
+                    pass
             else:
                 print("DEBUG: No sales items found")
                 items_html = '<tr><td colspan="4">No items found for this sale</td></tr>'
+                devis_rows = []
                 total_ht = 0
             
             # Calculate financial totals for devis
@@ -278,6 +309,63 @@ class ReportsDialog(QDialog):
             total_regle = 0   # Amount already paid (could be from payments table if exists)
             net_a_payer = total_ht - total_remise - total_regle
             
+            # Build paginated items for devis template if requested
+            devis_items_html = ""
+            if report_type == 'devis':
+                # Row capacities (calibrated):
+                # - single page (header+table+totals) => base-2
+                # - first of multi (header+table)     => base+1
+                # - middle pages (table only)         => base+10
+                # - last page (table+totals)          => base-4
+                BASE = 18
+                rows_one_page = 20                # single page needs more rows
+                rows_first_multi = 23             # first page of multi needs more rows
+                rows_middle = 32                  # middle pages a bit more
+                rows_last = 22                    # last page a lot more rows before totals
+
+                total_rows = len(devis_rows)
+                if total_rows == 0:
+                    # Render a single empty table with one filler row so borders appear
+                    pages = [(0, rows_one_page)]
+                elif total_rows <= rows_one_page:
+                    pages = [(total_rows, rows_one_page)]
+                else:
+                    remaining = total_rows
+                    pages = []
+                    # First page (no bottom yet)
+                    take = min(remaining, rows_first_multi)
+                    pages.append((take, rows_first_multi))
+                    remaining -= take
+                    # Middle pages
+                    while remaining > rows_last:
+                        take = min(remaining - rows_last, rows_middle)
+                        pages.append((take, rows_middle))
+                        remaining -= take
+                    # Last page
+                    pages.append((remaining, rows_last))
+
+                # Build HTML tables with page breaks
+                cursor = 0
+                for idx, (take, capacity) in enumerate(pages):
+                    page_rows = devis_rows[cursor:cursor + take]
+                    cursor += take
+                    fillers = max(0, capacity - len(page_rows))
+                    block_class = "items-block page-break" if idx < len(pages) - 1 else "items-block"
+                    table_html = [f'<div class="{block_class}">']
+                    table_html.append('<table>')
+                    table_html.append('<thead><tr>'
+                                      '<th>Désignation</th>'
+                                      '<th>Qté</th>'
+                                      '<th>P.U HT</th>'
+                                      '<th>Total HT</th>'
+                                      '</tr></thead>')
+                    table_html.append('<tbody>')
+                    table_html.extend(page_rows)
+                    for _ in range(fillers):
+                        table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
+                    table_html.append('</tbody></table></div>')
+                    devis_items_html += "".join(table_html)
+
             return {
                 'company_name': company_name,
                 'company_phone': company_phone,
@@ -288,12 +376,12 @@ class ReportsDialog(QDialog):
                 'client_name': client_name,
                 'client_address': company_address,  # Use company address as fallback
                 'commercial': "Sales Team",         # Default commercial
-                'items': items_html,
+                'items': devis_items_html if report_type == 'devis' else items_html,
                 # New financial fields for devis
-                'total_remise': f"{total_remise:.2f}€",
-                'total_ht': f"{total_ht:.2f}€",
-                'total_regle': f"{total_regle:.2f}€",
-                'net_a_payer': f"{net_a_payer:.2f}€",
+                'total_remise': _fmt_fr(total_remise),
+                'total_ht': _fmt_fr(total_ht),
+                'total_regle': _fmt_fr(total_regle),
+                'net_a_payer': _fmt_fr(net_a_payer),
                 # Keep old fields for BDL template compatibility
                 'total_commande': str(total_quantity),
                 'total_livre': str(total_quantity),
@@ -315,10 +403,10 @@ class ReportsDialog(QDialog):
                 'commercial': 'Sales Team',
                 'items': '<tr><td colspan="4">No items found</td></tr>',
                 # Financial fields for devis
-                'total_remise': '0.00€',
-                'total_ht': '0.00€',
-                'total_regle': '0.00€',
-                'net_a_payer': '0.00€',
+                'total_remise': '0,00',
+                'total_ht': '0,00',
+                'total_regle': '0,00',
+                'net_a_payer': '0,00',
                 # Old fields for BDL compatibility
                 'total_commande': '0',
                 'total_livre': '0',

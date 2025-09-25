@@ -216,9 +216,16 @@ class BaseTab(QWidget):
             return
 
         try:
+            print(f"🔄 Refreshing {self.section} table...")
+            
+            # Clear table first
+            self.table.setRowCount(0)
+            
             # Get items from database
             items_data = self.database.get_items(self.section)
             self.all_items = []
+            
+            print(f"📦 Found {len(items_data)} items in database for {self.section}")
 
             for item_data in items_data:
                 # Create object instance to get calculated values
@@ -245,11 +252,15 @@ class BaseTab(QWidget):
                     print(f"Error processing {self.section} item: {e}")
                     continue
 
+            print(f"✓ Loaded {len(self.all_items)} objects for {self.section}")
+            
             # Update search options
             self.search_bar.update_options(self.get_search_options())
 
-            # Apply current filter
+            # Apply current filter and repopulate table
             self.filter_table()
+            
+            print(f"✓ {self.section} table refresh complete")
 
         except Exception as e:
             print(f"Error refreshing {self.section} table: {e}")
@@ -680,10 +691,13 @@ class BaseTab(QWidget):
         if reply == QMessageBox.Yes:
             try:
                 if self.database.delete_item(obj_id, self.section):
+                    # Force refresh table to show updated data
                     self.refresh_table()
+                    print(f"✓ Deleted {self.section[:-1].lower()} '{item_name}' and refreshed table")
                 else:
-                    QMessageBox.critical(self, "Error", f"Failed to delete '{item_name}'")
+                    QMessageBox.critical(self, "Error", f"Failed to delete '{item_name}'")  
             except Exception as e:
+                print(f"Error deleting {self.section[:-1].lower()}: {e}")
                 QMessageBox.critical(self, "Error", f"Error deleting {self.section[:-1].lower()}: {e}")
     
     def apply_theme(self):

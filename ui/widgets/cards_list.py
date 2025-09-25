@@ -27,7 +27,7 @@ class BaseCardsList(QWidget):
         pass
     
     def load_cards(self):
-        """Load available cards - load from parent's profile manager"""
+        """Load available cards - load from parent's profile manager or backup manager"""
         # Clear existing cards
         for card in list(self.cards.values()):
             self.remove_card_from_layout(card)
@@ -43,13 +43,23 @@ class BaseCardsList(QWidget):
         if self.add_available:
             self.create_add_card()
         
-        # Load actual profile data if we have a profiles dialog parent
+        # Load data based on category
         if hasattr(self.parent_dialog, 'profile_manager') and self.category == "profiles":
+            # Load profile data
             for profile_name, profile in self.parent_dialog.profile_manager.available_profiles.items():
                 self.create_card(
                     label_text=profile_name,
                     card_id=profile_name,
                     preview_path=profile.preview_path if hasattr(profile, 'preview_path') else None
+                )
+        elif hasattr(self.parent_dialog, 'get_available_backups') and self.category == "backups":
+            # Load backup data
+            backups = self.parent_dialog.get_available_backups()
+            for backup_name, backup_info in backups.items():
+                self.create_card(
+                    label_text=backup_name,
+                    card_id=backup_name,
+                    preview_path=None  # Backups don't have preview images
                 )
         else:
             # Fallback to example data for other categories

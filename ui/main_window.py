@@ -3,7 +3,7 @@ Main window - Updated with unified tabs approach
 All tabs now use consistent BaseTab experience
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QTabWidget, QMenuBar, QMenu)
+                             QTabWidget, QMenuBar, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup
 
@@ -370,6 +370,12 @@ class MainWindow(ThemedMainWindow):
     
     def open_backups_dialog(self):
         """Open backups management dialog"""
+        # Check if profile is selected before opening backups
+        if not self.profile_manager or not self.profile_manager.selected_profile:
+            QMessageBox.warning(self, "No Profile Selected", 
+                              "Please select a profile before accessing backups.")
+            return
+            
         dialog = BackupsDialog(self)
         dialog.exec()
     
@@ -381,6 +387,24 @@ class MainWindow(ThemedMainWindow):
         # Clear saved profile
         self.settings.setValue("selected_profile", "")
         self.refresh_app()
+        
+    def refresh_all_tabs(self):
+        """Refresh all tabs after database changes (e.g., backup restore)"""
+        try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                # Refresh all tabs that have refresh methods
+                for i in range(self.tab_widget.count()):
+                    tab_widget = self.tab_widget.widget(i)
+                    if hasattr(tab_widget, 'refresh_on_tab_switch'):
+                        try:
+                            tab_widget.refresh_on_tab_switch()
+                            print(f"✓ Refreshed tab {i}: {self.tab_widget.tabText(i)}")
+                        except Exception as e:
+                            print(f"✗ Error refreshing tab {i}: {e}")
+                
+                print("✓ All tabs refreshed after backup restore")
+        except Exception as e:
+            print(f"Error during tab refresh: {e}")
     
     def on_tab_changed(self, index):
         """Handle tab change to refresh data in the newly selected tab"""

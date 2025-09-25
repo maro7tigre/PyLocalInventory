@@ -205,17 +205,17 @@ class BaseTab(QWidget):
         if not self.database:
             QMessageBox.warning(self, "Error", "No database connection")
             return
-        
+
         try:
             # Get items from database
             items_data = self.database.get_items(self.section)
             self.all_items = []
-            
+
             for item_data in items_data:
                 # Create object instance to get calculated values
                 try:
                     obj = self.object_class(item_data.get('ID', 0), self.database)
-                    
+
                     # Load data from database
                     for key, value in item_data.items():
                         if key in obj.parameters and not obj.is_parameter_calculated(key):
@@ -223,28 +223,39 @@ class BaseTab(QWidget):
                             param_key = key
                             if key == 'ID':
                                 param_key = 'id'
-                            
+
                             try:
                                 if param_key in obj.parameters:
                                     obj.set_value(param_key, value)
                             except (KeyError, ValueError):
                                 pass  # Skip invalid parameters
-                    
+
                     self.all_items.append(obj)
-                
+
                 except Exception as e:
                     print(f"Error processing {self.section} item: {e}")
                     continue
-            
+
             # Update search options
             self.search_bar.update_options(self.get_search_options())
-            
+
             # Apply current filter
             self.filter_table()
-        
+
         except Exception as e:
             print(f"Error refreshing {self.section} table: {e}")
             QMessageBox.critical(self, "Error", f"Failed to refresh {self.section}: {e}")
+    
+    def refresh_on_tab_switch(self):
+        """Refresh data when tab becomes visible - lighter refresh for better performance"""
+        try:
+            # Only refresh if database is connected
+            if self.database and hasattr(self.database, 'conn') and self.database.conn:
+                # Refresh table to get latest data including quantity updates from operations
+                self.refresh_table()
+                print(f"✓ Refreshed {self.section} tab data")
+        except Exception as e:
+            print(f"Error refreshing {self.section} tab on switch: {e}")
     
     def set_table_cell(self, row, col, column_key, obj):
         """Set table cell value based on parameter type"""

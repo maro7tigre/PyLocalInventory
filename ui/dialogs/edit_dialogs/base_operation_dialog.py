@@ -107,6 +107,21 @@ class BaseOperationDialog(QDialog):
             )
             
             self.parameter_widgets[param_key] = widget
+
+            # If this is the TVA field, refresh totals live when it changes
+            if param_key == 'tva':
+                # NumericWidget holds a Q(S)pinBox in `.spinbox`
+                spin = getattr(widget, 'spinbox', None)
+                if spin is not None:
+                    try:
+                        spin.valueChanged.connect(self.update_totals)
+                    except Exception:
+                        pass
+                    # Also connect editingFinished to catch manual text edits
+                    try:
+                        spin.editingFinished.connect(self.update_totals)
+                    except Exception:
+                        pass
             
             # Add to form
             display_name = self.operation_obj.get_display_name(param_key)

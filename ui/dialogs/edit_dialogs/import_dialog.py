@@ -127,6 +127,10 @@ class ImportEditDialog(QDialog):
             
             self.parameter_widgets[param_key] = widget
             
+            # Connect TVA widget to update totals when value changes
+            if param_key == 'tva' and hasattr(widget, 'spinbox'):
+                widget.spinbox.valueChanged.connect(self.update_totals)
+            
             # Get display name
             display_name = self.import_obj.get_display_name(param_key)
             

@@ -194,6 +194,12 @@ class MainWindow(ThemedMainWindow):
         
         tab_widget = QTabWidget()
         
+        # Connect tab change signal to refresh the newly selected tab
+        tab_widget.currentChanged.connect(self.on_tab_changed)
+        
+        # Store reference to tab widget for later access
+        self.tab_widget = tab_widget
+        
         # Add Home tab
         tab_widget.addTab(HomeTab(self.database), "🏠 Home")
         
@@ -315,3 +321,16 @@ class MainWindow(ThemedMainWindow):
         # Clear saved profile
         self.settings.setValue("selected_profile", "")
         self.refresh_app()
+    
+    def on_tab_changed(self, index):
+        """Handle tab change to refresh data in the newly selected tab"""
+        try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                current_widget = self.tab_widget.widget(index)
+                
+                # Check if the current widget has a refresh_on_tab_switch method (BaseTab instances)
+                if hasattr(current_widget, 'refresh_on_tab_switch'):
+                    current_widget.refresh_on_tab_switch()
+                
+        except Exception as e:
+            print(f"Error refreshing tab on switch: {e}")

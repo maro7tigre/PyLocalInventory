@@ -24,6 +24,7 @@ class ProfilesDialog(QDialog):
         self.right_enabled = False
         self.is_editing_existing = False
         self.edit_mode = None  # None, 'new', 'edit', 'duplicate'
+        self.source_profile_name = None  # Track source profile for duplication
         
         # Initialize right panel components
         self.image_path = ""
@@ -545,13 +546,41 @@ class ProfilesDialog(QDialog):
                 self.profile_manager.selected_profile = profile
                 
             elif self.edit_mode == 'duplicate':
-                profile = self.profile_manager.create_profile(profile_data, image_to_use)
-                
-                # Copy password from source if available
-                time.sleep(0.1)
-                if self.current_profile and self.current_profile.encrypted_phrase:
-                    profile.encrypted_phrase = self.current_profile.encrypted_phrase
+                # Use proper duplication method that copies database tables
+                if self.source_profile_name:
+                    profile = self.profile_manager.duplicate_profile(self.source_profile_name, profile_data['name'])
+                    
+                    # Update any modified parameter values from the UI
+                    for key, value in profile_data.items():
+                        if key != 'name':  # name is already set by duplicate_profile
+                            profile.set_value(key, value)
+                    
+                    # Handle image if changed
+                    if image_to_use:
+                        profile_dir = os.path.dirname(profile.config_path)
+                        preview_dest = os.path.join(profile_dir, "preview.png")
+                        self.safe_copy_image(image_to_use, preview_dest)
+                        profile.preview_path = preview_dest
+                    
+                    # IMPORTANT: Set new password for duplicate profile
+                    password = self.password_edit.text()
+                    if password:  # If new password is provided
+                        time.sleep(0.1)
+                        from core.password import PasswordManager
+                        password_manager = PasswordManager(self.profile_manager)
+                        profile.encrypted_phrase = password_manager.encrypt_data(
+                            password_manager.validation_phrase, password)
+                    else:
+                        # If no new password provided, use the source profile's password
+                        if self.source_profile_name in self.profile_manager.available_profiles:
+                            source_profile = self.profile_manager.available_profiles[self.source_profile_name]
+                            profile.encrypted_phrase = source_profile.encrypted_phrase
+                    
+                    # Save the updated profile
                     profile.save_to_config()
+                else:
+                    # Fallback to regular creation if source profile not found
+                    profile = self.profile_manager.create_profile(profile_data, image_to_use)
                 
                 # Select the newly created profile
                 self.profile_manager.selected_profile = profile
@@ -563,6 +592,7 @@ class ProfilesDialog(QDialog):
             # Refresh the profiles list
             self.refresh_profiles_list()
             self.enable_right_layout(False)
+            self.source_profile_name = None  # Reset source profile name
             
             # Auto-select the saved profile
             if self.edit_mode in ['new', 'duplicate']:
@@ -577,6 +607,7 @@ class ProfilesDialog(QDialog):
         """Cancel current profile editing"""
         self.enable_right_layout(False)
         self.edit_mode = None
+        self.source_profile_name = None  # Reset source profile name
         # Reset image paths
         self.image_path = ""
         self.original_image_path = ""
@@ -652,12 +683,18 @@ class ProfilesDialog(QDialog):
         if card_id in self.profile_manager.available_profiles:
             source_profile = self.profile_manager.available_profiles[card_id]
             self.edit_mode = 'duplicate'
+            self.source_profile_name = source_profile.name  # Store source profile name
             
             # Create a copy with modified name
             duplicate_profile = ProfileClass(f"{source_profile.name}_copy")
             for key, param in source_profile.parameters.items():
                 duplicate_profile.parameters[key]["value"] = param["value"]
             duplicate_profile.preview_path = source_profile.preview_path
+            
+            # IMPORTANT: DO NOT copy the encrypted phrase for UI display
+            # This allows password fields to be enabled for setting a new password
+            # The encrypted phrase will be copied later in duplicate_profile() if no new password is set
+            duplicate_profile.encrypted_phrase = None
             
             # Unselect any currently selected card
             self.cards_list.select_card(None)

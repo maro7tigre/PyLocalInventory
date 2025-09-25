@@ -5,6 +5,7 @@ import os
 import json
 import shutil
 import time
+import sqlite3
 
 class ProfileManager:
     def __init__(self):
@@ -171,8 +172,24 @@ class ProfileManager:
         source_dir = os.path.dirname(source_profile.config_path)
         new_dir = os.path.join(self.profiles_path, new_name)
         
-        # Copy entire profile directory
-        shutil.copytree(source_dir, new_dir)
+        # Create new profile directory structure (selective copying)
+        os.makedirs(new_dir, exist_ok=True)
+        
+        # Copy config.json
+        source_config = os.path.join(source_dir, "config.json")
+        if os.path.exists(source_config):
+            shutil.copy2(source_config, os.path.join(new_dir, "config.json"))
+        
+        # Copy preview.png if it exists
+        source_preview = os.path.join(source_dir, "preview.png")
+        if os.path.exists(source_preview):
+            shutil.copy2(source_preview, os.path.join(new_dir, "preview.png"))
+        
+        # Copy images folder if it exists (but not backups)
+        source_images = os.path.join(source_dir, "images")
+        if os.path.exists(source_images):
+            dest_images = os.path.join(new_dir, "images")
+            shutil.copytree(source_images, dest_images)
         
         # Create new profile instance
         new_profile = ProfileClass(new_name)
@@ -183,11 +200,10 @@ class ProfileManager:
         # Load and update the config
         new_profile.load_config_data()
         
-        # Rename database file if it exists
-        old_db = os.path.join(new_dir, f"{source_name}.db")
-        new_db = new_profile.database_path
-        if os.path.exists(old_db):
-            os.rename(old_db, new_db)
+        # Copy and modify database (only specific tables)
+        source_db = os.path.join(source_dir, f"{source_name}.db")
+        if os.path.exists(source_db):
+            self._copy_database_tables(source_db, new_profile.database_path)
         
         # Save updated config
         new_profile.save_to_config()
@@ -196,6 +212,77 @@ class ProfileManager:
         self.available_profiles[new_name] = new_profile
         
         return new_profile
+    
+    def _copy_database_tables(self, source_db_path, dest_db_path):
+        """Copy only specific tables from source database to destination"""
+        import sqlite3
+        
+        # Tables to copy (only base data, not operations)
+        tables_to_copy = ['Products', 'Clients', 'Suppliers']
+        
+        try:
+            # Connect to source database
+            source_conn = sqlite3.connect(source_db_path)
+            source_cursor = source_conn.cursor()
+            
+            # Connect to destination database (create if doesn't exist)
+            dest_conn = sqlite3.connect(dest_db_path)
+            dest_cursor = dest_conn.cursor()
+            
+            for table_name in tables_to_copy:
+                try:
+                    # Check if table exists in source
+                    source_cursor.execute(
+                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
+                        (table_name,)
+                    )
+                    if not source_cursor.fetchone():
+                        continue  # Skip if table doesn't exist
+                    
+                    # Get table structure
+                    source_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
+                    table_sql = source_cursor.fetchone()
+                    if table_sql:
+                        # Create table in destination
+                        dest_cursor.execute(table_sql[0])
+                    
+                    # Copy data
+                    source_cursor.execute(f"SELECT * FROM {table_name}")
+                    rows = source_cursor.fetchall()
+                    
+                    if rows:
+                        # Get column count
+                        source_cursor.execute(f"PRAGMA table_info({table_name})")
+                        columns_info = source_cursor.fetchall()
+                        column_count = len(columns_info)
+                        
+                        # Prepare insert statement
+                        placeholders = ','.join(['?' for _ in range(column_count)])
+                        insert_sql = f"INSERT INTO {table_name} VALUES ({placeholders})"
+                        
+                        # Insert all rows
+                        dest_cursor.executemany(insert_sql, rows)
+                        print(f"✓ Copied {len(rows)} records from {table_name}")
+                    
+                except Exception as e:
+                    print(f"✗ Error copying table {table_name}: {e}")
+                    continue
+            
+            # Commit changes and close connections
+            dest_conn.commit()
+            source_conn.close()
+            dest_conn.close()
+            
+            print(f"✓ Database tables copied successfully to {dest_db_path}")
+            
+        except Exception as e:
+            print(f"✗ Error copying database: {e}")
+            # Create empty database if copy failed
+            try:
+                conn = sqlite3.connect(dest_db_path)
+                conn.close()
+            except:
+                pass
     
     
 class ProfileClass:

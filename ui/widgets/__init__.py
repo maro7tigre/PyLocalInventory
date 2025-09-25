@@ -7,8 +7,8 @@ Reusable widget components for PyLocalInventory.
 # Import all themed widgets
 from .themed_widgets import *
 
-# Import simple utility widgets  
-from .simple_widgets import *
+# Import simple utility widgets - currently empty, consider removing if unused
+# from .simple_widgets import *
 
 # Import selectable widgets (our new "lego pieces")
 from .card_widgets import *
@@ -24,7 +24,7 @@ __all__ = [
     'ThemedSpinBox', 'ThemedGroupBox', 'ThemedScrollArea', 'ThemedSplitter',
     'ThemedCheckBox', 'ThemedRadioButton', 'ThemedListWidget',
     
-    # Simple widgets
+    # Simple widgets - empty for now
     
     # Selectable widgets
     'ClickableCard', 'SquareCard',

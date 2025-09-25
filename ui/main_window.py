@@ -2,12 +2,12 @@
 Main window - Updated with unified tabs approach
 All tabs now use consistent BaseTab experience
 """
-from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
-                             QTabWidget, QMenuBar, QMenu, QMessageBox)
+from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
+                             QTabWidget, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QSettings
 from PySide6.QtGui import QAction, QActionGroup
 
-from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLineEdit
+from ui.widgets.themed_widgets import ThemedMainWindow
 from ui.widgets.welcome_widget import WelcomeWidget
 from ui.widgets.password_widget import PasswordWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog

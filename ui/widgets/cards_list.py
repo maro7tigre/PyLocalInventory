@@ -1,8 +1,7 @@
-from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea, QApplication, QMainWindow
+from PySide6.QtWidgets import QWidget, QHBoxLayout, QVBoxLayout, QScrollArea
 from PySide6.QtCore import Qt, QTimer
 from .card_widgets import SquareCard
 import uuid
-import sys
 
 
 class BaseCardsList(QWidget):
@@ -318,20 +317,3 @@ class GridCardsList(QScrollArea):
     def __getattr__(self, name):
         """Delegate attribute access to the internal cards list"""
         return getattr(self.cards_list, name)
-
-
-if __name__ == "__main__":
-    app = QApplication(sys.argv)
-    
-    # Create main window
-    window = QMainWindow()
-    window.setWindowTitle("Card Lists Demo")
-    window.resize(800, 600)
-    
-    # Choose which layout to test - change this line to switch layouts
-    scroll_area = HorizontalCardsList(category="individual")  # or VerticalCardsList() or GridCardsList()
-    
-    window.setCentralWidget(scroll_area)
-    window.show()
-    
-    sys.exit(app.exec())

@@ -77,7 +77,7 @@ class ClientClass(BaseClass):
             },
             "preview_image": {
                 "value": None,
-                "display_name": {"en": "Client Image", "fr": "Image du Client", "es": "Imagen del Cliente"},
+                "display_name": {"en": "Image", "fr": "Image", "es": "Imagen"},
                 "required": False,
                 "default": None,
                 "options": [],

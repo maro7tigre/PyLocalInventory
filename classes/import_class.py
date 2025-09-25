@@ -53,7 +53,7 @@ class ImportClass(BaseClass):
                 "value": 0.0,
                 "display_name": {"en": "VAT %", "fr": "TVA %", "es": "IVA %"},
                 "required": False,
-                "default": 0.0,
+                "default": 20.0,
                 "options": [],
                 "type": "float",
                 "min": 0.0,

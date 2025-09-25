@@ -69,7 +69,7 @@ class SupplierClass(BaseClass):
             },
             "preview_image": {
                 "value": None,
-                "display_name": {"en": "Supplier Logo", "fr": "Logo du Fournisseur", "es": "Logo del Proveedor"},
+                "display_name": {"en": "Logo", "fr": "Logo", "es": "Logo"},
                 "required": False,
                 "default": None,
                 "options": [],

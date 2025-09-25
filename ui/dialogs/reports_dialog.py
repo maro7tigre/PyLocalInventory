@@ -12,6 +12,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import BlueButton, RedButton
+import base64
 
 
 class ReportsDialog(QDialog):
@@ -198,7 +199,26 @@ class ReportsDialog(QDialog):
             company_name = profile.get_value("company name") or "Your Company"
             company_phone = profile.get_value("phone") or ""
             company_address = profile.get_value("address") or ""
-            
+
+            # Build logo block from profile preview if available
+            logo_block = '<div class="logo-placeholder">LOGO</div>'
+            try:
+                preview_path = getattr(profile, 'preview_path', None)
+                if preview_path and os.path.exists(preview_path):
+                    # Read and encode image as base64 data URI (supports png/jpg)
+                    ext = os.path.splitext(preview_path)[1].lower()
+                    mime = 'image/png' if ext in ['.png'] else ('image/jpeg' if ext in ['.jpg', '.jpeg'] else 'image/png')
+                    with open(preview_path, 'rb') as img_f:
+                        b64 = base64.b64encode(img_f.read()).decode('ascii')
+                    # Constrain displayed logo size via inline style to fit header nicely
+                    logo_block = (
+                        f'<img src="data:{mime};base64,{b64}" '
+                        f'style="max-width: 200px; max-height: 80px; object-fit: contain; display: block; margin-bottom: 4px;" />'
+                    )
+            except Exception as _e:
+                # Fallback to placeholder on any issue
+                logo_block = '<div class="logo-placeholder">LOGO</div>'
+
             # Extract sales data
             client_username = self.sales_obj.get_value('client_username') or ""
             client_name = self.sales_obj.get_value('client_name') or ""
@@ -319,8 +339,8 @@ class ReportsDialog(QDialog):
                 # - middle pages (table only)         => base+10
                 # - last page (table+totals)          => base-4
                 BASE = 18
-                rows_one_page = 23                # single page needs more rows
-                rows_first_multi = 26             # first page of multi needs more rows
+                rows_one_page = 22                # single page needs more rows
+                rows_first_multi = 25             # first page of multi needs more rows
                 rows_middle = 30                  # middle pages a bit more
                 rows_last = 30                    # last page a lot more rows before totals
 
@@ -475,9 +495,10 @@ class ReportsDialog(QDialog):
                 # BDL specific fields
                 'total_commande': str(total_qte_commandee),
                 'total_livre': str(total_qte_livree),
-                'reste_a_livrer': str(reste_a_livrer)
+                'reste_a_livrer': str(reste_a_livrer),
+                # Logo block
+                'logo_block': logo_block
             }
-            
         except Exception as e:
             print(f"Error extracting sales data: {e}")
             # Return default data structure
@@ -500,7 +521,8 @@ class ReportsDialog(QDialog):
                 # BDL specific fields
                 'total_commande': '0',
                 'total_livre': '0',
-                'reste_a_livrer': '0'
+                'reste_a_livrer': '0',
+                'logo_block': '<div class="logo-placeholder">LOGO</div>'
             }
     
     def _replace_placeholders(self, template_content, data):

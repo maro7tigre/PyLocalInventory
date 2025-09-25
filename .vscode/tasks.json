@@ -78,6 +78,32 @@
 				"$python"
 			],
 			"group": "build"
+		},
+		{
+			"label": "Run app (pagination distribution fix)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
+		},
+		{
+			"label": "Run app (pagination distribution fix)",
+			"type": "shell",
+			"command": "C:/Users/marou/Documents/Github/PyLocalInventory/.venv/Scripts/python.exe",
+			"args": [
+				"c:\\Users\\marou\\Documents\\Github\\PyLocalInventory\\main.py"
+			],
+			"isBackground": false,
+			"problemMatcher": [
+				"$python"
+			],
+			"group": "build"
 		}
 	]
 }

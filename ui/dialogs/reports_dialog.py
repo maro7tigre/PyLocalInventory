@@ -320,7 +320,7 @@ class ReportsDialog(QDialog):
                 BASE = 18
                 rows_one_page = 23                # single page needs more rows
                 rows_first_multi = 26             # first page of multi needs more rows
-                rows_middle = 32                  # middle pages a bit more
+                rows_middle = 30                  # middle pages a bit more
                 rows_last = 30                    # last page a lot more rows before totals
 
                 total_rows = len(devis_rows)
@@ -338,7 +338,7 @@ class ReportsDialog(QDialog):
                     remaining -= take
                     # Middle pages
                     while remaining > rows_last:
-                        take = min(remaining - rows_last, rows_middle)
+                        take = min(remaining, rows_middle)
                         pages.append((take, rows_middle))
                         remaining -= take
                     # Last page

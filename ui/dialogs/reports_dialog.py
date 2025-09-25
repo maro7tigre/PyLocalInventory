@@ -311,6 +311,7 @@ class ReportsDialog(QDialog):
             
             # Build paginated items for devis template if requested
             devis_items_html = ""
+            bdl_items_html = ""
             if report_type == 'devis':
                 # Row capacities (calibrated):
                 # - single page (header+table+totals) => base-2
@@ -366,6 +367,95 @@ class ReportsDialog(QDialog):
                     table_html.append('</tbody></table></div>')
                     devis_items_html += "".join(table_html)
 
+            elif report_type == 'bdl':
+                # Build BDL rows with different columns
+                bdl_rows = []
+                if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
+                    for item in self.sales_obj.items:
+                        product_name = item.get_value('product_name') or ""
+                        
+                        # If product_name is empty, try to get it from product_id
+                        if not product_name:
+                            product_id = item.get_value('product_id')
+                            if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                                try:
+                                    # Get product name from Products table
+                                    product_data = self.sales_obj.database.cursor.execute(
+                                        "SELECT name FROM Products WHERE ID = ?", (product_id,)
+                                    ).fetchone()
+                                    if product_data:
+                                        product_name = product_data[0]
+                                except Exception as e:
+                                    print(f"DEBUG: Error getting product name: {e}")
+                        
+                        quantity = item.get_value('quantity') or 0
+                        # For BDL, assume all ordered quantity is delivered (can be modified later)
+                        qte_commandee = quantity
+                        qte_livree = quantity  # Could be different in a real scenario
+                        
+                        row_html = (
+                            f"<tr>"
+                            f"<td style=\"text-align: left\">{product_name}</td>"
+                            f"<td>{qte_commandee}</td>"
+                            f"<td>{qte_livree}</td>"
+                            f"</tr>"
+                        )
+                        bdl_rows.append(row_html)
+                
+                # Same pagination logic as devis but with different column headers
+                total_rows = len(bdl_rows)
+                if total_rows == 0:
+                    pages = [(0, 23)]
+                elif total_rows <= 23:
+                    pages = [(total_rows, 23)]
+                else:
+                    remaining = total_rows
+                    pages = []
+                    # First page
+                    take = min(remaining, 26)
+                    pages.append((take, 26))
+                    remaining -= take
+                    # Middle pages
+                    while remaining > 30:
+                        take = min(remaining, 30)
+                        pages.append((take, 30))
+                        remaining -= take
+                    # Last page
+                    pages.append((remaining, 30))
+
+                # Build HTML tables with page breaks for BDL
+                cursor = 0
+                for idx, (take, capacity) in enumerate(pages):
+                    page_rows = bdl_rows[cursor:cursor + take]
+                    cursor += take
+                    fillers = max(0, capacity - len(page_rows))
+                    block_class = "items-block page-break" if idx < len(pages) - 1 else "items-block"
+                    table_html = [f'<div class="{block_class}">']
+                    table_html.append('<table>')
+                    table_html.append('<thead><tr>'
+                                      '<th>Désignation</th>'
+                                      '<th>Qté Commandée</th>'
+                                      '<th>Qté Livrée</th>'
+                                      '</tr></thead>')
+                    table_html.append('<tbody>')
+                    table_html.extend(page_rows)
+                    for _ in range(fillers):
+                        table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
+                    table_html.append('</tbody></table></div>')
+                    bdl_items_html += "".join(table_html)
+
+            # Calculate BDL totals
+            total_qte_commandee = 0
+            total_qte_livree = 0
+            if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
+                for item in self.sales_obj.items:
+                    quantity = item.get_value('quantity') or 0
+                    total_qte_commandee += int(quantity) if quantity else 0
+                    # For now, assume all ordered quantity is delivered
+                    total_qte_livree += int(quantity) if quantity else 0
+            
+            reste_a_livrer = total_qte_commandee - total_qte_livree
+
             return {
                 'company_name': company_name,
                 'company_phone': company_phone,
@@ -376,16 +466,16 @@ class ReportsDialog(QDialog):
                 'client_name': client_name,
                 'client_address': company_address,  # Use company address as fallback
                 'commercial': "Sales Team",         # Default commercial
-                'items': devis_items_html if report_type == 'devis' else items_html,
+                'items': bdl_items_html if report_type == 'bdl' else (devis_items_html if report_type == 'devis' else items_html),
                 # New financial fields for devis
                 'total_remise': _fmt_fr(total_remise),
                 'total_ht': _fmt_fr(total_ht),
                 'total_regle': _fmt_fr(total_regle),
                 'net_a_payer': _fmt_fr(net_a_payer),
-                # Keep old fields for BDL template compatibility
-                'total_commande': str(total_quantity),
-                'total_livre': str(total_quantity),
-                'reste_a_livrer': "0"
+                # BDL specific fields
+                'total_commande': str(total_qte_commandee),
+                'total_livre': str(total_qte_livree),
+                'reste_a_livrer': str(reste_a_livrer)
             }
             
         except Exception as e:
@@ -407,7 +497,7 @@ class ReportsDialog(QDialog):
                 'total_ht': '0,00',
                 'total_regle': '0,00',
                 'net_a_payer': '0,00',
-                # Old fields for BDL compatibility
+                # BDL specific fields
                 'total_commande': '0',
                 'total_livre': '0',
                 'reste_a_livrer': '0'

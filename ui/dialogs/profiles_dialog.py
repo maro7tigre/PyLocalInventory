@@ -701,7 +701,11 @@ class ProfilesDialog(QDialog):
             self.profiles_path = parent.profiles_path
         else:
             self.profiles_path = "./profiles"
-        self.language = "en"
+        # Use parent's language if available
+        if hasattr(parent, 'language') and parent.language:
+            self.language = parent.language
+        else:
+            self.language = "en"
         
     def save_config(self):
         """Save current configuration to file"""

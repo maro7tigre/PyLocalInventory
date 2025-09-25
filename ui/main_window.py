@@ -5,7 +5,7 @@ All tabs now use consistent BaseTab experience
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                              QTabWidget, QMenuBar, QMenu)
 from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction
+from PySide6.QtGui import QAction, QActionGroup
 
 from ui.widgets.themed_widgets import ThemedMainWindow, GreenButton, ColoredLineEdit
 from ui.widgets.welcome_widget import WelcomeWidget
@@ -52,6 +52,8 @@ class MainWindow(ThemedMainWindow):
         
         # Initialize database system
         self.database = Database(self.profile_manager)
+        # Propagate current language to database for display name resolution
+        self.database.language = getattr(self, 'language', 'en')
         
         # Register parameter classes manually
         self.register_parameter_classes()
@@ -86,6 +88,9 @@ class MainWindow(ThemedMainWindow):
         # Load profiles path (default to ./profiles)
         profiles_path = self.settings.value("profiles_path", "./profiles")
         self.profiles_path = profiles_path
+
+        # Load language (default to 'en')
+        self.language = self.settings.value("language", "en")
     
     def load_saved_profile(self):
         """Load the last selected profile from config"""
@@ -114,6 +119,9 @@ class MainWindow(ThemedMainWindow):
             self.settings.setValue("selected_profile", self.profile_manager.selected_profile.name)
         else:
             self.settings.setValue("selected_profile", "")
+
+        # Save language selection
+        self.settings.setValue("language", getattr(self, 'language', 'en'))
     
     def closeEvent(self, event):
         """Handle application close event"""
@@ -135,11 +143,60 @@ class MainWindow(ThemedMainWindow):
         backups_action = QAction("Backups", self)
         backups_action.triggered.connect(self.open_backups_dialog)
         menubar.addAction(backups_action)
+
+        # Language selector menu (between Backups and Log Out)
+        lang_menu = QMenu("Language", self)
+
+        # Create an exclusive action group for languages
+        lang_group = QActionGroup(self)
+        lang_group.setExclusive(True)
+
+        # Supported languages and labels
+        languages = {
+            'en': 'English',
+            'fr': 'Français',
+            'es': 'Español',
+        }
+
+        # Build language actions
+        self._lang_actions = {}
+        current_lang = getattr(self, 'language', 'en')
+        for code, label in languages.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(code == current_lang)
+            action.triggered.connect(lambda checked, c=code: self.change_language(c))
+            lang_group.addAction(action)
+            lang_menu.addAction(action)
+            self._lang_actions[code] = action
+
+        menubar.addMenu(lang_menu)
         
         # Log out menu action
         logout_action = QAction("Log Out", self)
         logout_action.triggered.connect(self.logout)
         menubar.addAction(logout_action)
+
+    def change_language(self, code: str):
+        """Set UI language preference and persist with app config on close."""
+        # Update in-memory language
+        self.language = code
+        # Propagate to database so BaseClass.get_display_name picks it up
+        if hasattr(self, 'database') and self.database:
+            self.database.language = code
+        
+        # Reflect the selection in the menu if actions exist
+        if hasattr(self, '_lang_actions') and code in self._lang_actions:
+            for c, act in self._lang_actions.items():
+                act.setChecked(c == code)
+        
+        # Rebuild main content to refresh labels/display names in the chosen language
+        try:
+            self.refresh_app()
+        except Exception as e:
+            print(f"Error refreshing UI after language change: {e}")
+        
+        print(f"🌐 Language set to: {code}")
     
     def setup_main_widget(self):
         """Initialize main widget container"""

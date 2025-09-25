@@ -13,6 +13,8 @@ class Database:
         self.registered_classes = {}  # section_name -> class
         self.conn = None
         self.cursor = None
+        # Current UI language; allows parameter classes to localize display names
+        self.language = 'en'
         
     def register_class(self, cls):
         """Register a parameter class with the database"""

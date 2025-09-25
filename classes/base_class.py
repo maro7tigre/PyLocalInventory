@@ -92,11 +92,20 @@ class BaseClass:
             except (KeyError, ValueError) as e:
                 print(f"Warning: Could not set {key}={value}: {e}")
     
-    def get_display_name(self, param_key, language='en'):
-        """Get localized display name for parameter"""
+    def get_display_name(self, param_key, language=None):
+        """Get localized display name for parameter.
+        If language is not provided, try to read it from attached database; fallback to 'en'.
+        """
         if param_key not in self.parameters:
             return param_key
         
+        # Resolve language preference
+        if language is None:
+            try:
+                language = getattr(self.database, 'language', 'en') if self.database else 'en'
+            except Exception:
+                language = 'en'
+
         display_names = self.parameters[param_key].get('display_name', {})
         return display_names.get(language, display_names.get('en', param_key))
     

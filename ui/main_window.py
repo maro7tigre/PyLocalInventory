@@ -247,7 +247,10 @@ class MainWindow(ThemedMainWindow):
             self.add_error_tab(tab_widget, "Imports", e)
         
         tab_widget.addTab(LogTab(self.database), "📋 Log")
-        
+
+        # Style change: increase tab title font size (fixed)
+        tab_widget.setStyleSheet("QTabBar::tab { font-size: 18px; }")
+
         self.main_layout.addWidget(tab_widget)
         
         # Debug info

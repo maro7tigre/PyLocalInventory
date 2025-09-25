@@ -98,7 +98,7 @@ class ImportClass(BaseClass):
                 "method": self.get_supplier_name
             },
             "supplier_preview": {
-                "display_name": {"en": "Supplier Preview", "fr": "Aperçu Fournisseur", "es": "Vista Previa Proveedor"},
+                "display_name": {"en": "Image", "fr": "Image", "es": "Imagen"},
                 "required": False,
                 "type": "image",
                 "method": self.get_supplier_preview

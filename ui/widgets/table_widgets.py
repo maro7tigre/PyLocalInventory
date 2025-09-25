@@ -46,7 +46,8 @@ class ParameterTableWidget(QWidget):
         header_layout = QHBoxLayout()
         
         title = QLabel(f"{self.section} Management")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
+        # Fixed larger title font size via stylesheet
+        title.setStyleSheet("font-size: 21px; font-weight: bold;")
         header_layout.addWidget(title)
         header_layout.addStretch()
         
@@ -69,7 +70,7 @@ class ParameterTableWidget(QWidget):
         
         layout.addLayout(header_layout)
         
-        # Table setup
+    # Table setup
         self.table = QTableWidget()
         self.setup_table()
         layout.addWidget(self.table)
@@ -90,6 +91,10 @@ class ParameterTableWidget(QWidget):
                 headers.append(param_key)
         
         self.table.setHorizontalHeaderLabels(headers)
+        
+        # Style: larger header font via stylesheet
+        header = self.table.horizontalHeader()
+        header.setStyleSheet("QHeaderView::section { font-size: 18px; }")
         
         # Table properties
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -275,6 +280,7 @@ class ParameterTableWidget(QWidget):
                 color: #E0E0E0;
                 border: 1px solid #3E3E42;
                 alternate-background-color: #252526;
+                font-size: 18px; /* larger cell font */
             }
             QTableWidget::item:selected {
                 background-color: #3E3E42;
@@ -284,8 +290,10 @@ class ParameterTableWidget(QWidget):
                 color: #CCCCCC;
                 padding: 5px;
                 border: none;
+                font-size: 20px; /* larger header font */
             }
         """)
+        # Note: Operations table uses its own widget and stylesheet; unchanged.
 
 
 # Convenience wrapper for products

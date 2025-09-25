@@ -87,6 +87,9 @@ class SalesTab(BaseTab):
             from ui.widgets.themed_widgets import OrangeButton
             self.reports_btn = OrangeButton("📊 Reports")
             self.reports_btn.clicked.connect(self.show_reports)
+            self.reports_btn.setStyleSheet(self.reports_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+            self.reports_btn.setMinimumHeight(20)
+            
             # Insert before the last item (which should be the refresh button)
             controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)
     

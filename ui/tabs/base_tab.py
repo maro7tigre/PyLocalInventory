@@ -103,9 +103,9 @@ class BaseTab(QWidget):
         layout = QVBoxLayout(self)
         layout.setContentsMargins(10, 10, 10, 10)
         
-        # Title label
+        # Title label (larger)
         title = QLabel(f"{self.section} Management")
-        title.setFont(QFont("Arial", 16, QFont.Bold))
+        title.setStyleSheet("font-size: 28px; font-weight: bold;")
         layout.addWidget(title)
         
         # Search and controls layout
@@ -129,18 +129,27 @@ class BaseTab(QWidget):
         entity_name = self.section[:-1] if self.section.endswith('s') else self.section
         
         self.add_btn = BlueButton(f"Add {entity_name}")
+        # Increase size only for toolbar buttons next to search bar
+        self.add_btn.setStyleSheet(self.add_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+        self.add_btn.setMinimumHeight(20)
         self.add_btn.clicked.connect(self.add_item)
         controls_layout.addWidget(self.add_btn)
         
         self.edit_btn = BlueButton(f"Edit {entity_name}")
+        self.edit_btn.setStyleSheet(self.edit_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+        self.edit_btn.setMinimumHeight(20)
         self.edit_btn.clicked.connect(self.edit_item)
         controls_layout.addWidget(self.edit_btn)
         
         self.delete_btn = RedButton(f"Delete {entity_name}")
+        self.delete_btn.setStyleSheet(self.delete_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+        self.delete_btn.setMinimumHeight(20)
         self.delete_btn.clicked.connect(self.delete_item)
         controls_layout.addWidget(self.delete_btn)
         
         self.refresh_btn = GreenButton("Refresh")
+        self.refresh_btn.setStyleSheet(self.refresh_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+        self.refresh_btn.setMinimumHeight(20)
         self.refresh_btn.clicked.connect(self.refresh_table)
         controls_layout.addWidget(self.refresh_btn)
         
@@ -693,6 +702,7 @@ class BaseTab(QWidget):
                 border: 1px solid #3E3E42;
                 padding: 5px;
                 border-radius: 3px;
+                font-size: 16px; /* larger order selector font */
             }
             QComboBox::drop-down {
                 border: none;
@@ -707,6 +717,7 @@ class BaseTab(QWidget):
                 background-color: #2D2D30;
                 color: #E0E0E0;
                 selection-background-color: #2196F3;
+                font-size: 16px; /* larger dropdown items */
             }
             QLineEdit {
                 background-color: #2D2D30;
@@ -714,6 +725,7 @@ class BaseTab(QWidget):
                 border: 1px solid #3E3E42;
                 padding: 5px;
                 border-radius: 3px;
+                font-size: 16px; /* larger search bar font */
             }
             QLineEdit:focus {
                 border: 2px solid #2196F3;
@@ -725,6 +737,7 @@ class BaseTab(QWidget):
                 border: 1px solid #3E3E42;
                 alternate-background-color: #252526;
                 selection-background-color: transparent;
+                font-size: 16px; /* larger cell font */
             }
             QTableWidget::item:selected {
                 background-color: #2D2D30;
@@ -739,5 +752,6 @@ class BaseTab(QWidget):
                 color: #CCCCCC;
                 padding: 5px;
                 border: none;
+                font-size: 16px; /* larger header font */
             }
         """)

@@ -318,10 +318,10 @@ class ReportsDialog(QDialog):
                 # - middle pages (table only)         => base+10
                 # - last page (table+totals)          => base-4
                 BASE = 18
-                rows_one_page = 22                # single page
-                rows_first_multi = 25             # first page of multi
-                rows_middle = 32                  # middle pages (full)
-                rows_last = 18                    # keep last smaller so middle stays full
+                rows_one_page = 23                # single page needs more rows
+                rows_first_multi = 26             # first page of multi needs more rows
+                rows_middle = 32                  # middle pages a bit more
+                rows_last = 30                    # last page a lot more rows before totals
 
                 total_rows = len(devis_rows)
                 if total_rows == 0:

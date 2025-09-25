@@ -149,9 +149,10 @@ class QuickActionCard(QFrame):
         super().mousePressEvent(event)
 
 class HomeTab(QWidget):
-    def __init__(self, database=None):
+    def __init__(self, database=None, language: str = 'en'):
         super().__init__()
         self.database = database
+        self.language = (language or 'en').lower()
         self.stat_cards = {}
         self.charts = {}
         self.refresh_timer = QTimer()
@@ -159,6 +160,96 @@ class HomeTab(QWidget):
         self.refresh_timer.start(30000)  # Refresh every 30 seconds
         self.setup_ui()
         self.refresh_statistics()
+
+    def _t(self):
+        """Lightweight translations for Home tab UI strings."""
+        l = self.language if self.language in ('en', 'fr', 'es') else 'en'
+        texts = {
+            'charts': {
+                'en': "📊 Visual Analytics",
+                'fr': "📊 Analyses visuelles",
+                'es': "📊 Análisis visual",
+            },
+            'low_stock_title': {
+                'en': "📦 Low Stock Alert",
+                'fr': "📦 Alerte de stock faible",
+                'es': "📦 Alerta de bajo stock",
+            },
+            'low_stock_products_with': {
+                'en': "Products with stock ≤ {threshold}:",
+                'fr': "Produits avec stock ≤ {threshold} :",
+                'es': "Productos con stock ≤ {threshold}:",
+            },
+            'low_stock_ok': {
+                'en': "✅ All products have sufficient stock",
+                'fr': "✅ Tous les produits ont un stock suffisant",
+                'es': "✅ Todos los productos tienen stock suficiente",
+            },
+            'monthly_title': {
+                'en': "Monthly Financial Overview",
+                'fr': "Aperçu financier mensuel",
+                'es': "Resumen financiero mensual",
+            },
+            'sales': {'en': 'Sales', 'fr': 'Ventes', 'es': 'Ventas'},
+            'imports': {'en': 'Imports', 'fr': 'Importations', 'es': 'Importaciones'},
+            'imports_cost': {
+                'en': 'Imports (Cost)', 'fr': 'Importations (Coût)', 'es': 'Importaciones (Costo)'
+            },
+            'profit': {'en': 'Profit', 'fr': 'Profit', 'es': 'Beneficio'},
+            'quick_actions': {
+                'en': '⚡ Quick Actions',
+                'fr': '⚡ Actions rapides',
+                'es': '⚡ Acciones rápidas',
+            },
+            'qa_new_sale_t': {
+                'en': 'New Sale', 'fr': 'Nouvelle vente', 'es': 'Nueva venta'
+            },
+            'qa_new_sale_s': {
+                'en': 'Record a new sales transaction',
+                'fr': 'Enregistrer une nouvelle vente',
+                'es': 'Registrar una nueva venta',
+            },
+            'qa_new_import_t': {
+                'en': 'New Import', 'fr': 'Nouvelle importation', 'es': 'Nueva importación'
+            },
+            'qa_new_import_s': {
+                'en': 'Add new import operation',
+                'fr': 'Ajouter une nouvelle importation',
+                'es': 'Agregar nueva importación',
+            },
+            'qa_view_sales_t': {
+                'en': 'View Sales', 'fr': 'Voir les ventes', 'es': 'Ver ventas'
+            },
+            'qa_view_sales_s': {
+                'en': 'Switch to sales management',
+                'fr': 'Passer à la gestion des ventes',
+                'es': 'Ir a gestión de ventas',
+            },
+            'qa_view_imports_t': {
+                'en': 'View Imports', 'fr': 'Voir les importations', 'es': 'Ver importaciones'
+            },
+            'qa_view_imports_s': {
+                'en': 'Switch to imports management',
+                'fr': "Passer à la gestion des importations",
+                'es': 'Ir a gestión de importaciones',
+            },
+            'recent_activity': {
+                'en': '🕒 Recent Activity', 'fr': '🕒 Activité récente', 'es': '🕒 Actividad reciente'
+            },
+            'no_recent_activity': {
+                'en': 'No recent activity', 'fr': 'Aucune activité récente', 'es': 'Sin actividad reciente'
+            },
+            'out': {'en': 'OUT', 'fr': 'RUPTURE', 'es': 'AGOTADO'},
+        }
+
+        def tr(key, **kwargs):
+            val = texts.get(key, {}).get(l, '')
+            try:
+                return val.format(**kwargs)
+            except Exception:
+                return val
+
+        return tr
     
     def setup_ui(self):
         """Setup the beautiful home dashboard interface"""
@@ -281,7 +372,8 @@ class HomeTab(QWidget):
     
     def create_charts_section(self, parent_layout):
         """Create the charts section"""
-        charts_label = QLabel("📊 Visual Analytics")
+        _ = self._t()
+        charts_label = QLabel(_("charts"))
         charts_label.setStyleSheet("""
             QLabel {
                 color: #ffffff; 
@@ -307,7 +399,8 @@ class HomeTab(QWidget):
     def create_monthly_comparison_chart(self, parent_layout):
         """Create monthly sales vs imports comparison chart with profit line"""
         chart = QChart()
-        chart.setTitle("Monthly Financial Overview")
+        _ = self._t()
+        chart.setTitle(_("monthly_title"))
         chart.setTitleBrush(QBrush(QColor("#ffffff")))
         try:
             title_font = QFont()
@@ -321,12 +414,13 @@ class HomeTab(QWidget):
         # Create bar series
         bar_series = QBarSeries()
         
-        sales_set = QBarSet("Sales")
-        imports_set = QBarSet("Imports (Cost)")
+        _ = self._t()
+        sales_set = QBarSet(_("sales"))
+        imports_set = QBarSet(_("imports_cost"))
         
         # Create line series for profit
         profit_series = QLineSeries()
-        profit_series.setName("Profit")
+        profit_series.setName(_("profit"))
         
         # Get last 6 months data
         months = []
@@ -435,7 +529,8 @@ class HomeTab(QWidget):
         layout.setSpacing(8)
         
         # Title
-        title_label = QLabel("📦 Low Stock Alert")
+        _ = self._t()
+        title_label = QLabel(_("low_stock_title"))
         title_label.setStyleSheet("""
             QLabel {
                 color: #f44336;
@@ -449,7 +544,7 @@ class HomeTab(QWidget):
         
         # Threshold info
         threshold = 5  # You can adjust this later
-        info_label = QLabel(f"Products with stock ≤ {threshold}:")
+        info_label = QLabel(_("low_stock_products_with", threshold=threshold))
         info_label.setStyleSheet("""
             QLabel {
                 color: #cccccc;
@@ -477,7 +572,7 @@ class HomeTab(QWidget):
         low_stock_products = self.get_low_stock_products(threshold)
         
         if not low_stock_products:
-            no_issues = QLabel("✅ All products have sufficient stock")
+            no_issues = QLabel(self._t()("low_stock_ok"))
             no_issues.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 8px;")
             no_issues.setAlignment(Qt.AlignCenter)
             products_layout.addWidget(no_issues)
@@ -494,7 +589,8 @@ class HomeTab(QWidget):
     
     def create_quick_actions_section(self, parent_layout):
         """Create quick action buttons section"""
-        actions_label = QLabel("⚡ Quick Actions")
+        _ = self._t()
+        actions_label = QLabel(_("quick_actions"))
         actions_label.setStyleSheet("""
             QLabel {
                 color: #ffffff; 
@@ -511,10 +607,10 @@ class HomeTab(QWidget):
         
         # Create quick action cards
         actions = [
-            ("New Sale", "Record a new sales transaction", "new_sale", "💰", "#4CAF50"),
-            ("New Import", "Add new import operation", "new_import", "📥", "#2196F3"),
-            ("View Sales", "Switch to sales management", "view_sales", "🛒", "#FF9800"),
-            ("View Imports", "Switch to imports management", "view_imports", "📦", "#9C27B0")
+            (_("qa_new_sale_t"), _("qa_new_sale_s"), "new_sale", "💰", "#4CAF50"),
+            (_("qa_new_import_t"), _("qa_new_import_s"), "new_import", "📥", "#2196F3"),
+            (_("qa_view_sales_t"), _("qa_view_sales_s"), "view_sales", "🛒", "#FF9800"),
+            (_("qa_view_imports_t"), _("qa_view_imports_s"), "view_imports", "📦", "#9C27B0"),
         ]
         
         row, col = 0, 0
@@ -531,7 +627,8 @@ class HomeTab(QWidget):
     
     def create_recent_activity_section(self, parent_layout):
         """Create recent activity section"""
-        activity_label = QLabel("🕒 Recent Activity")
+        _ = self._t()
+        activity_label = QLabel(_("recent_activity"))
         activity_label.setStyleSheet("""
             QLabel {
                 color: #ffffff; 
@@ -561,7 +658,7 @@ class HomeTab(QWidget):
         recent_activities = self.get_recent_activities()
         
         if not recent_activities:
-            no_activity = QLabel("No recent activity")
+            no_activity = QLabel(self._t()("no_recent_activity"))
             no_activity.setStyleSheet("color: #888888; font-size: 14px; text-align: center;")
             no_activity.setAlignment(Qt.AlignCenter)
             activity_layout.addWidget(no_activity)
@@ -781,7 +878,7 @@ class HomeTab(QWidget):
         stock = product['stock']
         if stock <= 0:
             stock_color = "#f44336"  # Red for out of stock
-            stock_text = "OUT"
+            stock_text = self._t()("out")
         elif stock <= 2:
             stock_color = "#FF5722"  # Dark orange for critical
             stock_text = str(stock)

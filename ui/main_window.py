@@ -18,7 +18,7 @@ from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
 from ui.tabs.imports_tab import ImportsTab
-from ui.tabs.log_tab import LogTab
+# from ui.tabs.log_tab import LogTab  # Hidden per request
 
 from classes.product_class import ProductClass
 from classes.client_class import ClientClass
@@ -256,14 +256,17 @@ class MainWindow(ThemedMainWindow):
         
         # Store reference to tab widget for later access
         self.tab_widget = tab_widget
-        
+
+        # Resolve localized tab labels
+        labels = self._get_tab_labels(getattr(self, 'language', 'en'))
+
         # Add Home tab
-        tab_widget.addTab(HomeTab(self.database), "🏠 Home")
+        tab_widget.addTab(HomeTab(self.database, language=getattr(self, 'language', 'en')), labels['home'])
         
         # Add all entity tabs - now all using BaseTab for consistency
         try:
             products_tab = ProductsTab(self.database, self)
-            tab_widget.addTab(products_tab, "📦 Products")
+            tab_widget.addTab(products_tab, labels['products'])
             print("✓ Added Products tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Products tab: {e}")
@@ -271,7 +274,7 @@ class MainWindow(ThemedMainWindow):
         
         try:
             clients_tab = ClientsTab(self.database, self)
-            tab_widget.addTab(clients_tab, "👥 Clients")
+            tab_widget.addTab(clients_tab, labels['clients'])
             print("✓ Added Clients tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Clients tab: {e}")
@@ -279,7 +282,7 @@ class MainWindow(ThemedMainWindow):
         
         try:
             suppliers_tab = SuppliersTab(self.database, self)
-            tab_widget.addTab(suppliers_tab, "🏭 Suppliers")
+            tab_widget.addTab(suppliers_tab, labels['suppliers'])
             print("✓ Added Suppliers tab (BaseTab)")
         except Exception as e:
             print(f"✗ Error adding Suppliers tab: {e}")
@@ -288,7 +291,7 @@ class MainWindow(ThemedMainWindow):
         try:
             # Sales tab now uses BaseTab with BaseOperationDialog - unified experience!
             sales_tab = SalesTab(self.database, self)
-            tab_widget.addTab(sales_tab, "💰 Sales")
+            tab_widget.addTab(sales_tab, labels['sales'])
             print("✓ Added Sales tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Sales tab: {e}")
@@ -297,13 +300,14 @@ class MainWindow(ThemedMainWindow):
         try:
             # Imports tab now uses BaseTab with BaseOperationDialog - unified experience!
             imports_tab = ImportsTab(self.database, self)
-            tab_widget.addTab(imports_tab, "📥 Imports")
+            tab_widget.addTab(imports_tab, labels['imports'])
             print("✓ Added Imports tab (BaseTab + BaseOperationDialog)")
         except Exception as e:
             print(f"✗ Error adding Imports tab: {e}")
             self.add_error_tab(tab_widget, "Imports", e)
         
-        tab_widget.addTab(LogTab(self.database), "📋 Log")
+    # Hidden per request: Log tab
+    # tab_widget.addTab(LogTab(self.database), labels['log'])
 
         # Style change: increase tab title font size (fixed)
         tab_widget.setStyleSheet("QTabBar::tab { font-size: 18px; }")
@@ -322,6 +326,44 @@ class MainWindow(ThemedMainWindow):
                 print(f"   • {section_name}: {items_count} items")
             except Exception as e:
                 print(f"   • {section_name}: error getting items ({e})")
+
+    def _get_tab_labels(self, lang: str):
+        """Return localized tab labels including emojis."""
+        # Normalize
+        l = (lang or 'en').lower()
+        if l not in ('en', 'fr', 'es'):
+            l = 'en'
+
+        if l == 'fr':
+            return {
+                'home': "🏠 Accueil",
+                'products': "📦 Produits",
+                'clients': "👥 Clients",
+                'suppliers': "🏭 Fournisseurs",
+                'sales': "💰 Ventes",
+                'imports': "📥 Importations",
+                'log': "📋 Journal",
+            }
+        if l == 'es':
+            return {
+                'home': "🏠 Inicio",
+                'products': "📦 Productos",
+                'clients': "👥 Clientes",
+                'suppliers': "🏭 Proveedores",
+                'sales': "💰 Ventas",
+                'imports': "📥 Importaciones",
+                'log': "📋 Registro",
+            }
+        # default English
+        return {
+            'home': "🏠 Home",
+            'products': "📦 Products",
+            'clients': "👥 Clients",
+            'suppliers': "🏭 Suppliers",
+            'sales': "💰 Sales",
+            'imports': "📥 Imports",
+            'log': "📋 Log",
+        }
     
     def add_error_tab(self, tab_widget, tab_name, error):
         """Add error placeholder tab"""

@@ -28,21 +28,8 @@ class ImportEditDialog(BaseOperationDialog):
     
     def validate_data(self):
         """Import-specific validation"""
-        errors = super().validate_data()
-        
-        # Additional import validation
-        supplier_username = None
-        for param_key, widget in self.parameter_widgets.items():
-            if param_key == 'supplier_username':
-                from ui.widgets.parameters_widgets import ParameterWidgetFactory
-                supplier_username = ParameterWidgetFactory.get_widget_value(widget)
-                break
-        
-        # Validate supplier exists
-        if supplier_username and not self._validate_supplier_exists(supplier_username):
-            errors.append(f"Supplier username '{supplier_username}' does not exist")
-        
-        return errors
+        # Only base validation; existence handled in auto-create workflow
+        return super().validate_data()
     
     def _validate_supplier_exists(self, username):
         """Check if supplier username exists in database"""

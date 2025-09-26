@@ -275,10 +275,16 @@ class BaseOperationDialog(QDialog):
                     display_name = self.operation_obj.get_display_name(param_key)
                     errors.append(f"{display_name} is required")
         
-        # Check if we have items
-        items = self.items_table.get_items_data()
-        if not items:
-            errors.append("Please add at least one item")
+        # Check if we have at least one entered row (even if product not yet created)
+        try:
+            raw_rows = self.items_table.get_current_table_data()
+            if not raw_rows:
+                errors.append("Please add at least one item")
+        except Exception:
+            # Fallback to old behavior
+            items = self.items_table.get_items_data()
+            if not items:
+                errors.append("Please add at least one item")
         
         return errors
     
@@ -289,6 +295,16 @@ class BaseOperationDialog(QDialog):
         if errors:
             QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
+
+        # Check for missing related entities (client/supplier, products) and offer creation
+        if not self._handle_missing_references():
+            return  # User cancelled
+
+        # Force a totals recalculation now that rows are finalized / products possibly created
+        try:
+            self.update_totals()
+        except Exception:
+            pass
         
         try:
             # Update operation object
@@ -318,8 +334,41 @@ class BaseOperationDialog(QDialog):
                             self.database.delete_item(item.id, "Import_Items")
                 
                 # Recreate items from the table using item classes (ensures product_name -> product_id mapping)
+                # First collect items (may still lack product_id if something failed)
+                items_objects = self.items_table.get_items_data()
+
+                # Recalculate subtotal widgets before saving items (ensures UI shows accurate totals)
+                try:
+                    self.update_totals()
+                except Exception:
+                    pass
+
+                # Attempt final resolution for any missing product_ids
+                unresolved_names = []
+                for itm in items_objects:
+                    try:
+                        if hasattr(itm, 'get_value') and not itm.get_value('product_id'):
+                            pname = itm.get_value('product_name') or "(unknown)"
+                            # Try resolve again from DB (in case created just now)
+                            if self.database and hasattr(self.database, 'cursor') and self.database.cursor:
+                                try:
+                                    self.database.cursor.execute("SELECT ID FROM Products WHERE name = ?", (pname,))
+                                    res = self.database.cursor.fetchone()
+                                    if res and res[0]:
+                                        itm.set_value('product_id', res[0])
+                                except Exception:
+                                    pass
+                            if not itm.get_value('product_id'):
+                                unresolved_names.append(pname)
+                    except Exception:
+                        pass
+
+                if unresolved_names:
+                    QMessageBox.critical(self, "Error", "Could not resolve product IDs for: " + ", ".join(unresolved_names) + "\nAborting save.")
+                    return
+
                 items_saved = 0
-                for item in self.items_table.get_items_data():
+                for item in items_objects:
                     if self.operation_obj.section == "Sales":
                         item.set_value('sales_id', operation_id)
                     elif self.operation_obj.section == "Imports":
@@ -350,3 +399,137 @@ class BaseOperationDialog(QDialog):
                 color: #ffffff;
             }
         """)
+
+    # -------------------- Missing References Handling -------------------- #
+    def _handle_missing_references(self):
+        """Detect missing client/supplier or products and prompt user to create them.
+
+        Returns True if it's OK to proceed with saving (after creating if user agreed),
+        False if the user cancelled.
+        """
+        try:
+            if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+                return True  # Can't verify without DB
+
+            missing_clients = []
+            missing_suppliers = []
+            missing_products = []
+
+            # Determine operation type
+            op_section = getattr(self.operation_obj, 'section', '')
+
+            # Check main entity username
+            if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
+                client_username = self._safe_widget_value('client_username')
+                if client_username and not self._entity_exists('Clients', client_username):
+                    missing_clients.append(client_username)
+            elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
+                supplier_username = self._safe_widget_value('supplier_username')
+                if supplier_username and not self._entity_exists('Suppliers', supplier_username):
+                    missing_suppliers.append(supplier_username)
+
+            # Check products from items table (only those not already present)
+            try:
+                raw_names = self.items_table.get_all_entered_product_names()
+                for product_name in raw_names:
+                    if product_name and not self._product_exists(product_name):
+                        if product_name not in missing_products:
+                            missing_products.append(product_name)
+            except Exception as e:
+                print(f"Error collecting raw product names: {e}")
+
+            if not (missing_clients or missing_suppliers or missing_products):
+                return True  # Nothing missing
+
+            # Build message
+            msg_lines = ["Some referenced entries do not exist:"]
+            if missing_clients:
+                msg_lines.append(f" - Clients: {', '.join(missing_clients)}")
+            if missing_suppliers:
+                msg_lines.append(f" - Suppliers: {', '.join(missing_suppliers)}")
+            if missing_products:
+                msg_lines.append(f" - Products: {', '.join(missing_products)}")
+            msg_lines.append("")
+            msg_lines.append("Click 'Create & Continue' to auto-create them now, or 'Cancel' to go back and edit.")
+
+            from PySide6.QtWidgets import QMessageBox
+            box = QMessageBox(self)
+            box.setIcon(QMessageBox.Warning)
+            box.setWindowTitle("Missing References")
+            box.setText("\n".join(msg_lines))
+            create_btn = box.addButton("Create & Continue", QMessageBox.AcceptRole)
+            box.addButton(QMessageBox.Cancel)
+            box.exec()
+
+            if box.clickedButton() != create_btn:
+                return False  # User cancelled
+
+            # Create missing ones
+            for username in missing_clients:
+                self._create_client(username)
+            for username in missing_suppliers:
+                self._create_supplier(username)
+            for product_name in missing_products:
+                self._create_product(product_name)
+
+            # Refresh autocomplete / dependent recalculated fields
+            return True
+        except Exception as e:
+            print(f"Error handling missing references: {e}")
+            return True  # Fail-open so user can still save
+
+    def _safe_widget_value(self, key):
+        from ui.widgets.parameters_widgets import ParameterWidgetFactory
+        try:
+            return ParameterWidgetFactory.get_widget_value(self.parameter_widgets.get(key))
+        except Exception:
+            return None
+
+    def _entity_exists(self, table, username):
+        try:
+            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE username = ?", (username,))
+            res = self.database.cursor.fetchone()
+            return res and res[0] > 0
+        except Exception as e:
+            print(f"Error checking existence in {table}: {e}")
+            return True  # Avoid blocking
+
+    def _product_exists(self, name):
+        try:
+            self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = ?", (name,))
+            res = self.database.cursor.fetchone()
+            return res and res[0] > 0
+        except Exception as e:
+            print(f"Error checking product existence: {e}")
+            return True
+
+    def _create_client(self, username):
+        try:
+            from classes.client_class import ClientClass
+            client = ClientClass(0, self.database)
+            client.set_value('username', username)
+            client.set_value('name', username)
+            # client_type now optional; keep default
+            client.save_to_database()
+        except Exception as e:
+            print(f"Error auto-creating client '{username}': {e}")
+
+    def _create_supplier(self, username):
+        try:
+            from classes.supplier_class import SupplierClass
+            supplier = SupplierClass(0, self.database)
+            supplier.set_value('username', username)
+            supplier.set_value('name', username)
+            supplier.save_to_database()
+        except Exception as e:
+            print(f"Error auto-creating supplier '{username}': {e}")
+
+    def _create_product(self, name):
+        try:
+            from classes.product_class import ProductClass
+            product = ProductClass(0, self.database)
+            product.set_value('name', name)
+            product.set_value('username', name)
+            product.save_to_database()
+        except Exception as e:
+            print(f"Error auto-creating product '{name}': {e}")

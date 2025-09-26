@@ -38,7 +38,8 @@ class ClientClass(BaseClass):
             "client_type": {
                 "value": "individual",
                 "display_name": {"en": "Client Type", "fr": "Type de Client", "es": "Tipo de Cliente"},
-                "required": True,
+                # Made optional (user request: remove type of client from being required)
+                "required": False,
                 "default": "individual",
                 "options": ["individual", "company"],
                 "type": "string"

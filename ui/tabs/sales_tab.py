@@ -28,21 +28,8 @@ class SalesEditDialog(BaseOperationDialog):
     
     def validate_data(self):
         """Sales-specific validation"""
-        errors = super().validate_data()
-        
-        # Additional sales validation
-        client_username = None
-        for param_key, widget in self.parameter_widgets.items():
-            if param_key == 'client_username':
-                from ui.widgets.parameters_widgets import ParameterWidgetFactory
-                client_username = ParameterWidgetFactory.get_widget_value(widget)
-                break
-        
-        # Validate client exists
-        if client_username and not self._validate_client_exists(client_username):
-            errors.append(f"Client username '{client_username}' does not exist")
-        
-        return errors
+        # Keep only base validation; existence check handled in auto-create workflow
+        return super().validate_data()
     
     def _validate_client_exists(self, username):
         """Check if client username exists in database"""

@@ -57,6 +57,7 @@ class TableDataManager:
         row_data = {}
         
         for col, param_key in enumerate(self.table_columns):
+            # Skip non-data / calculated columns
             if param_key in ['delete_action', 'product_preview', 'subtotal']:
                 continue
                 
@@ -68,6 +69,17 @@ class TableDataManager:
                 
             if value:
                 row_data[param_key] = self._convert_value_type(param_key, value)
+
+        # If we have product_name but no quantity yet, set default 1 (so later logic can proceed)
+        if 'product_name' in row_data and 'quantity' not in row_data:
+            try:
+                default_qty = self.parameter_definitions.get('quantity', {}).get('default', 1)
+                row_data['quantity'] = default_qty
+            except Exception:
+                row_data['quantity'] = 1
+        # If unit_price absent, default to 0.0 (it may be filled later)
+        if 'product_name' in row_data and 'unit_price' not in row_data:
+            row_data['unit_price'] = 0.0
         
         return row_data
     
@@ -545,6 +557,26 @@ class OperationsTableWidget(QWidget):
                     items_data.append(row_data)
         
         return items_data
+
+    def get_all_entered_product_names(self):
+        """Return every product_name typed by user (even if product does not exist yet).
+        Excludes the final empty row."""
+        names = []
+        try:
+            product_col = self.data_manager.table_columns.index('product_name')
+        except ValueError:
+            return names
+        last_row_index = self.table.rowCount() - 1  # usually the empty row
+        for row in range(self.table.rowCount()):
+            # Skip clearly empty rows
+            if row == last_row_index and self.empty_row_manager._is_row_empty(row):
+                continue
+            widget = self.table.cellWidget(row, product_col)
+            if widget and hasattr(widget, 'text'):
+                text = widget.text().strip()
+                if text and text.lower() != 'product name':
+                    names.append(text)
+        return names
     
     def get_items_data(self):
         """Get items as object instances (compatibility method)"""
@@ -554,14 +586,29 @@ class OperationsTableWidget(QWidget):
         for item_data in items_data:
             item = self.data_manager.item_class(0, self.data_manager.database)
             for key, value in item_data.items():
-                item.set_value(key, value)
-            
-            # Only include items with valid product_id
-            try:
-                if hasattr(item, 'get_value') and item.get_value('product_id'):
-                    items.append(item)
-            except Exception:
-                items.append(item)  # Include if we can't check product_id
+                # Do not attempt to set calculated parameters like subtotal
+                try:
+                    if hasattr(item, 'is_parameter_calculated') and item.is_parameter_calculated(key):
+                        continue
+                except Exception:
+                    pass
+                try:
+                    item.set_value(key, value)
+                except Exception:
+                    # Ignore invalid sets (e.g., calculated)
+                    pass
+            # Attempt resolution (non-fatal if fails); include regardless for later handling
+            if hasattr(item, 'get_value') and not item.get_value('product_id'):
+                try:
+                    if self.data_manager.database and hasattr(self.data_manager.database, 'cursor'):
+                        self.data_manager.database.cursor.execute(
+                            "SELECT ID FROM Products WHERE name = ?", (item.get_value('product_name'),))
+                        res = self.data_manager.database.cursor.fetchone()
+                        if res and res[0]:
+                            item.set_value('product_id', res[0])
+                except Exception:
+                    pass
+            items.append(item)
         
         return items
     

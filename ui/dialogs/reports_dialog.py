@@ -199,6 +199,7 @@ class ReportsDialog(QDialog):
             company_name = profile.get_value("company name") or "Your Company"
             company_phone = profile.get_value("phone") or ""
             company_address = profile.get_value("address") or ""
+            company_email = profile.get_value("email") or ""
 
             # Build logo block from profile preview if available
             logo_block = '<div class="logo-placeholder">LOGO</div>'
@@ -479,6 +480,8 @@ class ReportsDialog(QDialog):
             return {
                 'company_name': company_name,
                 'company_phone': company_phone,
+                'company_address': company_address,
+                'company_email': company_email,
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
                 'date': date,

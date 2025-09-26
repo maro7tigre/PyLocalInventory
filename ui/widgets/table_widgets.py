@@ -95,18 +95,20 @@ class ParameterTableWidget(QWidget):
         # Style: larger header font via stylesheet
         header = self.table.horizontalHeader()
         header.setStyleSheet("QHeaderView::section { font-size: 18px; }")
-        
+
         # Table properties
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        
-        # Hide ID column if present
-        if 'id' in self.table_columns:
-            id_index = self.table_columns.index('id')
-            self.table.setColumnHidden(id_index, True)
+
+        # Column sizing: give 'id' a fixed width of 100px, others stretch
+        for idx, param_key in enumerate(self.table_columns):
+            if param_key == 'id':
+                header.setSectionResizeMode(idx, QHeaderView.Fixed)
+                self.table.setColumnWidth(idx, 100)
+            else:
+                header.setSectionResizeMode(idx, QHeaderView.Stretch)
     
     def refresh_table(self):
         """Refresh table data from database"""
@@ -169,6 +171,10 @@ class ParameterTableWidget(QWidget):
                 formatted_value = str(value) if value is not None else ""
                 item = QTableWidgetItem(formatted_value)
                 item.setData(Qt.UserRole, value)  # Store raw value
+                # Make ID column read-only and centered
+                if param_key == 'id':
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                    item.setTextAlignment(Qt.AlignCenter)
                 self.table.setItem(row, col, item)
         
         except Exception as e:

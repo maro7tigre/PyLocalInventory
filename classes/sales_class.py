@@ -15,7 +15,7 @@ class SalesClass(BaseClass):
         self.parameters = {
             "id": {
                 "value": id,
-                "display_name": {"en": "Sales ID", "fr": "ID de Vente", "es": "ID de Venta"},
+                "display_name": {"en": "ID", "fr": "ID", "es": "ID"},
                 "required": False,
                 "default": 0,
                 "options": [],

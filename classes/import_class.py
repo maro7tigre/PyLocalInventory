@@ -14,7 +14,7 @@ class ImportClass(BaseClass):
         self.parameters = {
             "id": {
                 "value": id,
-                "display_name": {"en": "Import ID", "fr": "ID d'Import", "es": "ID de Importación"},
+                "display_name": {"en": "ID", "fr": "ID", "es": "ID"},
                 "required": False,
                 "default": 0,
                 "options": [],

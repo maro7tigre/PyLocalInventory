@@ -24,7 +24,7 @@ class ProductClass(BaseClass):
                 "display_name": {"en": "Product Name", "fr": "Nom du Produit", "es": "Nombre del Producto"},
                 "required": True,
                 "default": "",
-                "options": ["iron", "wood", "wool", "steel", "aluminum", "plastic"],
+                "options": [],
                 "type": "string"
             },
             "username": {

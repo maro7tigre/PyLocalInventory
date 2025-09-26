@@ -179,26 +179,31 @@ class BaseTab(QWidget):
                 headers.append(column_key)
         
         self.table.setHorizontalHeaderLabels(headers)
-        
+
         # Table properties
-        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        header = self.table.horizontalHeader()
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
-        
+
         # Set row height to accommodate images
         self.table.verticalHeader().setDefaultSectionSize(70)
-        
+
         # Set custom delegate for editing
         self.delegate = BaseTableDelegate(self)
         self.table.setItemDelegate(self.delegate)
-        
-        # Set specific column widths for image columns
+
+        # Set specific column widths (ID fixed at 100px, image/preview 80px, others stretch)
         for i, column_key in enumerate(self.table_columns):
-            if 'image' in column_key or 'preview' in column_key:
-                self.table.horizontalHeader().setSectionResizeMode(i, QHeaderView.Fixed)
-                self.table.setColumnWidth(i, 80)  # Fixed width for image column
+            if column_key == 'id':
+                header.setSectionResizeMode(i, QHeaderView.Fixed)
+                self.table.setColumnWidth(i, 80)
+            elif 'image' in column_key or 'preview' in column_key:
+                header.setSectionResizeMode(i, QHeaderView.Fixed)
+                self.table.setColumnWidth(i, 80)
+            else:
+                header.setSectionResizeMode(i, QHeaderView.Stretch)
     
     def is_column_editable(self, column_key):
         """Check if column is editable (has 'w' permission)"""

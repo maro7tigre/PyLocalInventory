@@ -252,7 +252,9 @@ class BaseTab(QWidget):
                                 pass  # Skip invalid parameters
 
                     self.all_items.append(obj)
-                    # After loading raw DB values, let operation classes sync external snapshots (client/supplier rename)
+                    # For operations (Sales / Imports), refresh external snapshots so renamed
+                    # client/supplier names appear without manual reopen. This will persist
+                    # only if name actually changed (handled inside method).
                     try:
                         if hasattr(obj, 'refresh_external_snapshots'):
                             obj.refresh_external_snapshots()

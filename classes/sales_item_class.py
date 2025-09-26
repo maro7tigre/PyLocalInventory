@@ -122,16 +122,13 @@ class SalesItemClass(BaseClass):
         }
     
     def get_product_options(self):
-        """Get list of available product names for autocomplete"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+        """Return product names for autocomplete (non-empty)."""
+        if not (self.database and getattr(self.database, 'cursor', None)):
             return []
-        
         try:
             self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL AND name != '' ORDER BY name")
-            results = self.database.cursor.fetchall()
-            return [row[0] for row in results if row[0]]
-        except Exception as e:
-            print(f"Error getting product name options: {e}")
+            return [r[0] for r in self.database.cursor.fetchall() if r[0]]
+        except Exception:
             return []
     
     def get_product_name(self):
@@ -262,19 +259,6 @@ class SalesItemClass(BaseClass):
             return self.get_product_options()
         return self.parameters.get(param_key, {}).get('options', [])
     
-    def get_product_options(self):
-        """Get list of available product names for autocomplete"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return []
-        
-        try:
-            self.database.cursor.execute("SELECT name FROM Products ORDER BY name")
-            results = self.database.cursor.fetchall()
-            return [row[0] for row in results if row[0]]
-        except Exception as e:
-            print(f"Error getting product options: {e}")
-            return []
-    
     def get_product_data_by_name(self, product_name):
         """Get product data by name including ID and sale price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
@@ -298,10 +282,8 @@ class SalesItemClass(BaseClass):
             return None
     
     def update_product_selection(self, product_name):
-        """Update product selection and auto-fill price and preview - DEPRECATED, use set_value instead"""
-        # This method is kept for backward compatibility but should not be used
-        # Use set_value('product_name', name) instead
-        pass
+        """Deprecated: retained for backward compatibility; no action."""
+        return None
         
     def save_to_database(self):
         """Save sales item to database"""

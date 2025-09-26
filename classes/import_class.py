@@ -226,7 +226,7 @@ class ImportClass(BaseClass):
         try:
             uname = self.get_value('supplier_username')
             if not uname:
-                super().set_value('supplier_id', 0)
+                super().set_value('supplier_id', None)
                 super().set_value('supplier_name', '')
                 return
             self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = ?", (uname,))
@@ -239,7 +239,7 @@ class ImportClass(BaseClass):
                     super().set_value('supplier_name', new_name)
                 super().set_value('supplier_id', sid)
             else:
-                super().set_value('supplier_id', 0)
+                super().set_value('supplier_id', None)
                 if not (self.get_value('supplier_name') or '').strip():
                     super().set_value('supplier_name', uname)
         except Exception as e:

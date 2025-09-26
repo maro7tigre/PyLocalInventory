@@ -66,6 +66,10 @@ class Database:
             
             # Create tables for all registered classes
             self._create_all_tables()
+
+            # Ensure meta/migrations and run one-time tasks
+            self._ensure_meta_table()
+            self._run_one_time_migrations()
             
             print(f"✓ Connected to database: {db_path}")
             return True
@@ -207,12 +211,7 @@ class Database:
                             print(f"⚠️ Could not add column {col} to {table}: {e_add}")
             except Exception as e_tab:
                 print(f"⚠️ Snapshot column check failed for {table}: {e_tab}")
-        # After columns ensured, relax legacy product_id foreign keys if still present
-        try:
-            self._relax_legacy_item_product_fk('Sales_Items', 'sales_id')
-            self._relax_legacy_item_product_fk('Import_Items', 'import_id')
-        except Exception as e_relax:
-            print(f"⚠️ Could not relax legacy product FK constraints: {e_relax}")
+        # Legacy FK relaxation now handled in one-time migrations
 
     def _relax_legacy_item_product_fk(self, table_name, op_fk_col):
         """Rebuild legacy item table if it still enforces a foreign key on product_id.
@@ -270,6 +269,65 @@ class Database:
         except Exception as e_rebuild:
             self.conn.rollback()
             print(f"✗ Failed rebuilding {table_name} to relax product_id FK: {e_rebuild}")
+
+    # ---------------- Migration & Meta Helpers -----------------
+    def _ensure_meta_table(self):
+        try:
+            self.cursor.execute("CREATE TABLE IF NOT EXISTS Meta (key TEXT PRIMARY KEY, value TEXT)")
+            self.conn.commit()
+        except Exception as e:
+            print(f"Warning: could not create Meta table: {e}")
+
+    def _get_meta(self, key, default=None):
+        try:
+            self.cursor.execute("SELECT value FROM Meta WHERE key=?", (key,))
+            row = self.cursor.fetchone()
+            return row[0] if row else default
+        except Exception:
+            return default
+
+    def _set_meta(self, key, value):
+        try:
+            self.cursor.execute("INSERT INTO Meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+            self.conn.commit()
+        except Exception as e:
+            print(f"Warning: could not set meta {key}: {e}")
+
+    def _run_one_time_migrations(self):
+        """Run gated migrations using Meta flags so they execute only once per database."""
+        # 1) Relax product_id FK if not already done
+        if self._get_meta('fk_relaxed', '0') != '1':
+            try:
+                self._relax_legacy_item_product_fk('Sales_Items', 'sales_id')
+                self._relax_legacy_item_product_fk('Import_Items', 'import_id')
+                self._set_meta('fk_relaxed', '1')
+            except Exception as e:
+                print(f"Migration fk_relaxed failed: {e}")
+
+        # 2) Backfill missing product_name where product_id still exists
+        if self._get_meta('backfill_product_name_done', '0') != '1':
+            try:
+                # Sales_Items
+                self.cursor.execute("""
+                    UPDATE Sales_Items
+                    SET product_name = (
+                        SELECT name FROM Products p WHERE p.ID = Sales_Items.product_id
+                    )
+                    WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
+                """)
+                # Import_Items
+                self.cursor.execute("""
+                    UPDATE Import_Items
+                    SET product_name = (
+                        SELECT name FROM Products p WHERE p.ID = Import_Items.product_id
+                    )
+                    WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
+                """)
+                self.conn.commit()
+                self._set_meta('backfill_product_name_done', '1')
+                print("✓ Backfilled missing product_name snapshots where possible")
+            except Exception as e:
+                print(f"Backfill product_name migration failed: {e}")
     
     def save(self, obj):
         """Save any parameter object to database"""

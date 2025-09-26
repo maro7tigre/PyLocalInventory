@@ -229,7 +229,7 @@ class SalesClass(BaseClass):
             username = self.get_value('client_username')
             if not username:
                 # No username: clear id & name
-                super().set_value('client_id', 0)
+                super().set_value('client_id', None)
                 super().set_value('client_name', '')
                 return
             self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = ?", (username,))
@@ -243,7 +243,7 @@ class SalesClass(BaseClass):
                 super().set_value('client_id', cid)
             else:
                 # Client deleted/missing: keep existing snapshot (historical)
-                super().set_value('client_id', 0)
+                super().set_value('client_id', None)
                 if not (self.get_value('client_name') or '').strip():
                     # If we have no stored snapshot yet, fallback to username once
                     super().set_value('client_name', username)

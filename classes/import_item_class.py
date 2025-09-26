@@ -113,16 +113,13 @@ class ImportItemClass(BaseClass):
         }
     
     def get_product_options(self):
-        """Get list of available product names for autocomplete"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+        """Return non-empty product names for autocomplete."""
+        if not (self.database and getattr(self.database, 'cursor', None)):
             return []
-        
         try:
             self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL AND name != '' ORDER BY name")
-            results = self.database.cursor.fetchall()
-            return [row[0] for row in results if row[0]]
-        except Exception as e:
-            print(f"Error getting product name options: {e}")
+            return [r[0] for r in self.database.cursor.fetchall() if r[0]]
+        except Exception:
             return []
     
     def get_product_data_by_name(self, product_name):
@@ -225,19 +222,6 @@ class ImportItemClass(BaseClass):
             return self.get_product_options()
         return self.parameters.get(param_key, {}).get('options', [])
     
-    def get_product_options(self):
-        """Get list of available product names for autocomplete"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return []
-        
-        try:
-            self.database.cursor.execute("SELECT name FROM Products ORDER BY name")
-            results = self.database.cursor.fetchall()
-            return [row[0] for row in results if row[0]]
-        except Exception as e:
-            print(f"Error getting product options: {e}")
-            return []
-    
     def get_product_data(self, product_name):
         """Get product data by name including ID and unit price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
@@ -258,10 +242,8 @@ class ImportItemClass(BaseClass):
             return None
     
     def update_product_selection(self, product_name):
-        """Update product_id and unit_price when product_name changes - DEPRECATED, use set_value instead"""
-        # This method is kept for backward compatibility but should not be used
-        # Use set_value('product_name', name) instead
-        pass
+        """Deprecated: no-op kept for backward compatibility."""
+        return None
     
     def set_value(self, param_key, value, destination="internal"):
         """Override to handle product_name updates and connected parameters (snapshot model) with nullable product_id."""

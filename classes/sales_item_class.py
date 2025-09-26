@@ -31,7 +31,7 @@ class SalesItemClass(BaseClass):
             "product_id": {
                 "value": product_id,
                 "display_name": {"en": "Product ID", "fr": "ID Produit", "es": "ID Producto"},
-                "required": True,
+                "required": False,  # allow NULL when product not yet created (Ignore path)
                 "default": 0,
                 "options": [],
                 "type": "int"
@@ -107,6 +107,7 @@ class SalesItemClass(BaseClass):
             "database": {
                 "sales_id": "rw",
                 "product_id": "rw",
+                "product_name": "rw",  # snapshot of name at time of operation
                 "quantity": "rw",
                 "unit_price": "rw"
                 # Calculated and image parameters not stored in database
@@ -134,20 +135,34 @@ class SalesItemClass(BaseClass):
             return []
     
     def get_product_name(self):
-        """Get the name of the associated product"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Product {self.get_value('product_id')}"
-        
+        """Return snapshot product_name; if product_id valid, try live name; fallback to snapshot.
+        This preserves entered names for unknown/deleted products.
+        """
+        snapshot = self.parameters.get('product_name', {}).get('value', '') or ''
+        product_id = None
         try:
             product_id = self.get_value('product_id')
-            if not product_id:
-                return ""
+        except Exception:
+            pass
+        if not product_id:
+            return snapshot
+        if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
+            return snapshot or f"Product {product_id}"
+        try:
             self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else f"Product {product_id}"
+            row = self.database.cursor.fetchone()
+            if row and row[0]:
+                # If DB name differs from snapshot (product renamed), update snapshot silently
+                if row[0] != snapshot:
+                    try:
+                        self.parameters['product_name']['value'] = row[0]
+                    except Exception:
+                        pass
+                return row[0]
+            return snapshot or f"Product {product_id}"
         except Exception as e:
             print(f"Error getting product name: {e}")
-            return f"Product {self.get_value('product_id')}"
+            return snapshot or f"Product {product_id}"
     
     def get_product_preview(self):
         """Get the preview image path of the associated product"""
@@ -191,20 +206,46 @@ class SalesItemClass(BaseClass):
         """Override set_value to handle product selection updates and connected parameters"""
         # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:
-            product_data = self.get_product_data_by_name(value.strip())
+            name_clean = value.strip()
+            product_data = self.get_product_data_by_name(name_clean)
+            # Always store the typed name as snapshot even if product not found
+            try:
+                super().set_value('product_name', name_clean)
+            except Exception:
+                pass
             if product_data:
-                # Set the product_id first
-                super().set_value('product_id', product_data['id'])
-                
-                # Set quantity to 1 if not already set or is 0
+                try:
+                    super().set_value('product_id', product_data['id'])
+                except Exception:
+                    pass
+                # Auto defaults
                 current_quantity = self.get_value('quantity') or 0
                 if current_quantity == 0:
-                    super().set_value('quantity', 1)
-                
-                # Update price only if current price is 0 or not set
+                    try:
+                        super().set_value('quantity', 1)
+                    except Exception:
+                        pass
                 current_price = self.get_value('unit_price') or 0.0
                 if current_price == 0.0:
-                    super().set_value('unit_price', product_data['sale_price'])
+                    try:
+                        super().set_value('unit_price', product_data['sale_price'])
+                    except Exception:
+                        pass
+            else:
+                # Unknown product: leave product_id unset (NULL) for snapshot-only save
+                try:
+                    if self.get_value('product_id') == 0:
+                        # Clear to None so DB stores NULL instead of 0 (avoids FK issues)
+                        self.parameters['product_id']['value'] = None
+                except Exception:
+                    pass
+                # Quantity default if absent
+                current_quantity = self.get_value('quantity') or 0
+                if current_quantity == 0:
+                    try:
+                        super().set_value('quantity', 1)
+                    except Exception:
+                        pass
             return
         
         # Call parent set_value for other parameters

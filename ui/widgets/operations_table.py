@@ -585,8 +585,16 @@ class OperationsTableWidget(QWidget):
         
         for item_data in items_data:
             item = self.data_manager.item_class(0, self.data_manager.database)
+            # Set product_name first to trigger snapshot logic in item class
+            if 'product_name' in item_data:
+                try:
+                    item.set_value('product_name', item_data['product_name'])
+                except Exception:
+                    pass
+            # Set remaining fields except product_name
             for key, value in item_data.items():
-                # Do not attempt to set calculated parameters like subtotal
+                if key == 'product_name':
+                    continue
                 try:
                     if hasattr(item, 'is_parameter_calculated') and item.is_parameter_calculated(key):
                         continue
@@ -595,7 +603,6 @@ class OperationsTableWidget(QWidget):
                 try:
                     item.set_value(key, value)
                 except Exception:
-                    # Ignore invalid sets (e.g., calculated)
                     pass
             # Attempt resolution (non-fatal if fails); include regardless for later handling
             if hasattr(item, 'get_value') and not item.get_value('product_id'):

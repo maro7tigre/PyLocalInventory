@@ -297,7 +297,8 @@ class BaseOperationDialog(QDialog):
             return
 
         # Check for missing related entities (client/supplier, products) and offer creation
-        if not self._handle_missing_references():
+        proceed, allow_unresolved = self._handle_missing_references()
+        if not proceed:
             return  # User cancelled
 
         # Force a totals recalculation now that rows are finalized / products possibly created
@@ -307,10 +308,20 @@ class BaseOperationDialog(QDialog):
             pass
         
         try:
-            # Update operation object
+            # Update operation object (ensure snapshot name fields captured from widgets if present)
             for param_key, widget in self.parameter_widgets.items():
                 value = ParameterWidgetFactory.get_widget_value(widget)
                 self.operation_obj.set_value(param_key, value)
+            # For snapshots: if client_name/supplier_name empty set from username
+            try:
+                if getattr(self.operation_obj, 'section', '') == 'Sales':
+                    if not self.operation_obj.get_value('client_name') and self.operation_obj.get_value('client_username'):
+                        self.operation_obj.set_value('client_name', self.operation_obj.get_value('client_username'))
+                elif getattr(self.operation_obj, 'section', '') == 'Imports':
+                    if not self.operation_obj.get_value('supplier_name') and self.operation_obj.get_value('supplier_username'):
+                        self.operation_obj.set_value('supplier_name', self.operation_obj.get_value('supplier_username'))
+            except Exception:
+                pass
             
             # Save operation to database first (ensures ID exists)
             success = self.operation_obj.save_to_database()
@@ -363,7 +374,7 @@ class BaseOperationDialog(QDialog):
                     except Exception:
                         pass
 
-                if unresolved_names:
+                if unresolved_names and not allow_unresolved:
                     QMessageBox.critical(self, "Error", "Could not resolve product IDs for: " + ", ".join(unresolved_names) + "\nAborting save.")
                     return
 
@@ -409,7 +420,7 @@ class BaseOperationDialog(QDialog):
         """
         try:
             if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-                return True  # Can't verify without DB
+                return True, True  # Can't verify without DB
 
             missing_clients = []
             missing_suppliers = []
@@ -439,7 +450,7 @@ class BaseOperationDialog(QDialog):
                 print(f"Error collecting raw product names: {e}")
 
             if not (missing_clients or missing_suppliers or missing_products):
-                return True  # Nothing missing
+                return True, True  # Nothing missing
 
             # Build message
             msg_lines = ["Some referenced entries do not exist:"]
@@ -450,7 +461,10 @@ class BaseOperationDialog(QDialog):
             if missing_products:
                 msg_lines.append(f" - Products: {', '.join(missing_products)}")
             msg_lines.append("")
-            msg_lines.append("Click 'Create & Continue' to auto-create them now, or 'Cancel' to go back and edit.")
+            msg_lines.append("Choose an action:")
+            msg_lines.append(" - Create & Continue: auto-create missing entries")
+            msg_lines.append(" - Ignore: continue without creating (snapshots stored)")
+            msg_lines.append(" - Cancel: go back and edit")
 
             from PySide6.QtWidgets import QMessageBox
             box = QMessageBox(self)
@@ -458,25 +472,42 @@ class BaseOperationDialog(QDialog):
             box.setWindowTitle("Missing References")
             box.setText("\n".join(msg_lines))
             create_btn = box.addButton("Create & Continue", QMessageBox.AcceptRole)
+            ignore_btn = box.addButton("Ignore", QMessageBox.DestructiveRole)
             box.addButton(QMessageBox.Cancel)
             box.exec()
 
-            if box.clickedButton() != create_btn:
-                return False  # User cancelled
+            clicked = box.clickedButton()
+            if clicked == create_btn:
+                # Create missing ones
+                for username in missing_clients:
+                    self._create_client(username)
+                for username in missing_suppliers:
+                    self._create_supplier(username)
+                for product_name in missing_products:
+                    self._create_product(product_name)
+            elif clicked == ignore_btn:
+                # Ensure snapshots for client/supplier name reflect entered username (even if entity absent)
+                try:
+                    if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
+                        uname = self._safe_widget_value('client_username')
+                        # set client_name parameter value directly on operation object
+                        self.operation_obj.set_value('client_name', uname)
+                    elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
+                        uname = self._safe_widget_value('supplier_username')
+                        self.operation_obj.set_value('supplier_name', uname)
+                except Exception as e:
+                    print(f"Error setting snapshot names on ignore: {e}")
+                # For products, product_name already captured in item rows; nothing extra needed
+                # Allow unresolved product IDs (they stay NULL) -> second flag True
+                return True, True
+            else:
+                return False, False  # Cancel
 
-            # Create missing ones
-            for username in missing_clients:
-                self._create_client(username)
-            for username in missing_suppliers:
-                self._create_supplier(username)
-            for product_name in missing_products:
-                self._create_product(product_name)
-
-            # Refresh autocomplete / dependent recalculated fields
-            return True
+            # After creation path: unresolved not allowed (we created them)
+            return True, True
         except Exception as e:
             print(f"Error handling missing references: {e}")
-            return True  # Fail-open so user can still save
+            return True, True  # Fail-open so user can still save
 
     def _safe_widget_value(self, key):
         from ui.widgets.parameters_widgets import ParameterWidgetFactory

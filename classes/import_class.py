@@ -29,17 +29,18 @@ class ImportClass(BaseClass):
                 "autocomplete": True,
                 "options": self.get_supplier_username_options
             },
+            # Snapshot copies instead of calculated methods
             "supplier_id": {
                 "display_name": {"en": "Supplier ID", "fr": "ID Fournisseur", "es": "ID Proveedor"},
                 "required": False,
-                "type": "int",
-                "method": self.get_supplier_id
+                "type": "int"
             },
             "supplier_name": {
-                "display_name": {"en": "Supplier Name", "fr": "Nom du Fournisseur", "es": "Nombre del Proveedor"},
+                "value": "",
+                "display_name": {"en": "Supplier Name", "fr": "Nom du Fournisseur", "es": "Nombre del Fournisseur"},
                 "required": False,
-                "type": "string",
-                "method": self.get_supplier_name
+                "default": "",
+                "type": "string"
             },
             "date": {
                 "value": "",
@@ -91,12 +92,6 @@ class ImportClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_total_price
             },
-            "supplier_name": {
-                "display_name": {"en": "Supplier Name", "fr": "Nom du Fournisseur", "es": "Nombre del Proveedor"},
-                "required": False,
-                "type": "string",
-                "method": self.get_supplier_name
-            },
             "supplier_preview": {
                 "display_name": {"en": "Image", "fr": "Image", "es": "Imagen"},
                 "required": False,
@@ -125,6 +120,7 @@ class ImportClass(BaseClass):
             },
             "database": {
                 "supplier_username": "rw",
+                "supplier_name": "rw",
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw"
@@ -223,37 +219,31 @@ class ImportClass(BaseClass):
             print(f"Error getting supplier username options: {e}")
             return []
     
-    def get_supplier_id(self):
-        """Get the ID of the supplier by username"""
+    def _refresh_supplier_snapshot(self):
+        """Refresh supplier snapshot with rename-awareness (same rules as clients)."""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return 0
-        
+            return
         try:
-            supplier_username = self.get_value('supplier_username')
-            if not supplier_username:
-                return 0
-            self.database.cursor.execute("SELECT ID FROM Suppliers WHERE username = ?", (supplier_username,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else 0
+            uname = self.get_value('supplier_username')
+            if not uname:
+                super().set_value('supplier_id', 0)
+                super().set_value('supplier_name', '')
+                return
+            self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = ?", (uname,))
+            res = self.database.cursor.fetchone()
+            if res:
+                sid, sname = res
+                current_snapshot = self.get_value('supplier_name')
+                new_name = sname or uname
+                if current_snapshot != new_name:
+                    super().set_value('supplier_name', new_name)
+                super().set_value('supplier_id', sid)
+            else:
+                super().set_value('supplier_id', 0)
+                if not (self.get_value('supplier_name') or '').strip():
+                    super().set_value('supplier_name', uname)
         except Exception as e:
-            print(f"Error getting supplier ID: {e}")
-            return 0
-    
-    def get_supplier_name(self):
-        """Get the name of the associated supplier"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Supplier {self.get_value('supplier_username')}"
-        
-        try:
-            supplier_username = self.get_value('supplier_username')
-            if not supplier_username:
-                return ""
-            self.database.cursor.execute("SELECT name FROM Suppliers WHERE username = ?", (supplier_username,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else f"Supplier {supplier_username}"
-        except Exception as e:
-            print(f"Error getting supplier name: {e}")
-            return f"Supplier {self.get_value('supplier_username')}"
+            print(f"Error refreshing supplier snapshot: {e}")
     
     def get_supplier_preview(self):
         """Get the preview image path of the associated supplier"""
@@ -277,9 +267,8 @@ class ImportClass(BaseClass):
         super().set_value(param_key, value)
         
         # Handle connected parameters for supplier_username
-        if param_key == 'supplier_username' and value:
-            # This will trigger recalculation of supplier_id and supplier_name
-            pass
+        if param_key == 'supplier_username':
+            self._refresh_supplier_snapshot()
     
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for supplier_username"""
@@ -306,6 +295,8 @@ class ImportClass(BaseClass):
             return False
         
         try:
+            # Refresh snapshot before persisting (captures renamed suppliers)
+            self._refresh_supplier_snapshot()
             # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):
@@ -330,3 +321,14 @@ class ImportClass(BaseClass):
         except Exception as e:
             print(f"Error saving import operation: {e}")
             return False
+
+    def refresh_external_snapshots(self):
+        """Hook for external refresh (e.g., table listing) to sync supplier name if renamed."""
+        before = self.get_value('supplier_name')
+        self._refresh_supplier_snapshot()
+        after = self.get_value('supplier_name')
+        if after != before and self.database and self.id:
+            try:
+                self.database.update_item(self.id, {'supplier_name': after}, 'Imports')
+            except Exception as e:
+                print(f"Warning: could not persist updated supplier_name snapshot for import {self.id}: {e}")

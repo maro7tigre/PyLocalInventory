@@ -39,7 +39,7 @@ class ImportItemClass(BaseClass):
             "product_id": {
                 "value": product_id,
                 "display_name": {"en": "Product ID", "fr": "ID Produit", "es": "ID Producto"},
-                "required": True,
+                "required": False,  # allow NULL for ignored new products
                 "default": 0,
                 "options": [],
                 "type": "int"
@@ -100,6 +100,7 @@ class ImportItemClass(BaseClass):
             "database": {
                 "import_id": "rw",
                 "product_id": "rw", 
+                "product_name": "rw",
                 "quantity": "rw",
                 "unit_price": "rw"
             },
@@ -178,18 +179,31 @@ class ImportItemClass(BaseClass):
         return quantity * unit_price
     
     def get_product_name(self):
-        """Get the name of the associated product"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Product {self.get_value('product_id')}"
-        
+        """Return stored snapshot product_name; try live name if product_id valid; fallback to snapshot."""
+        snapshot = self.parameters.get('product_name', {}).get('value', '') or ''
+        product_id = None
         try:
             product_id = self.get_value('product_id')
+        except Exception:
+            pass
+        if not product_id:
+            return snapshot
+        if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
+            return snapshot or f"Product {product_id}"
+        try:
             self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else f"Product {product_id}"
+            row = self.database.cursor.fetchone()
+            if row and row[0]:
+                if row[0] != snapshot:
+                    try:
+                        self.parameters['product_name']['value'] = row[0]
+                    except Exception:
+                        pass
+                return row[0]
+            return snapshot or f"Product {product_id}"
         except Exception as e:
             print(f"Error getting product name: {e}")
-            return f"Product {self.get_value('product_id')}"
+            return snapshot or f"Product {product_id}"
     
     def get_product_preview(self):
         """Get the preview image path of the associated product"""
@@ -250,32 +264,48 @@ class ImportItemClass(BaseClass):
         pass
     
     def set_value(self, param_key, value, destination="internal"):
-        """Override to handle product_name updates and connected parameters"""
-        # For product_name, we need to find the product and set connected parameters
+        """Override to handle product_name updates and connected parameters (snapshot model) with nullable product_id."""
         if param_key == 'product_name' and value:
-            product_data = self.get_product_data(value.strip())
+            name_clean = value.strip()
+            # Always store typed product name snapshot
+            try:
+                super().set_value('product_name', name_clean)
+            except Exception:
+                pass
+            product_data = self.get_product_data(name_clean)
             if product_data:
-                # Set the product_id first
-                super().set_value('product_id', product_data['id'])
-                
-                # Set quantity to 1 if not already set or is 0
+                try:
+                    super().set_value('product_id', product_data['id'])
+                except Exception:
+                    pass
                 current_quantity = self.get_value('quantity') or 0
                 if current_quantity == 0:
-                    super().set_value('quantity', 1)
-                
-                # Update price only if current price is 0 or not set
+                    try:
+                        super().set_value('quantity', 1)
+                    except Exception:
+                        pass
                 current_price = self.get_value('unit_price') or 0.0
                 if current_price == 0.0:
-                    super().set_value('unit_price', product_data['price'])
+                    try:
+                        super().set_value('unit_price', product_data['price'])
+                    except Exception:
+                        pass
+            else:
+                # Unknown product: clear product_id so DB stores NULL rather than 0
+                try:
+                    self.parameters['product_id']['value'] = None
+                except Exception:
+                    pass
+                current_quantity = self.get_value('quantity') or 0
+                if current_quantity == 0:
+                    try:
+                        super().set_value('quantity', 1)
+                    except Exception:
+                        pass
             return
-        
-        # Call parent's set_value without destination parameter
+
+        # Fallback to parent for other params
         super().set_value(param_key, value)
-        
-        # Handle quantity or unit_price changes to update subtotal
-        if param_key in ['quantity', 'unit_price']:
-            # Subtotal will be recalculated automatically via the method
-            pass
         
     def save_to_database(self):
         """Save import item to database"""

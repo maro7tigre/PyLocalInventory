@@ -30,17 +30,18 @@ class SalesClass(BaseClass):
                 "autocomplete": True,
                 "options": self.get_client_username_options
             },
+            # Stored snapshot values (no longer calculated) so operations keep historical names
             "client_id": {
                 "display_name": {"en": "Client ID", "fr": "ID Client", "es": "ID Cliente"},
                 "required": False,
-                "type": "int",
-                "method": self.get_client_id
+                "type": "int"  # not stored currently but may be populated dynamically
             },
             "client_name": {
+                "value": "",
                 "display_name": {"en": "Client Name", "fr": "Nom Client", "es": "Nombre Cliente"},
                 "required": False,
-                "type": "string",
-                "method": self.get_client_name
+                "default": "",
+                "type": "string"  # will be set when username changes
             },
             "date": {
                 "value": "",
@@ -115,6 +116,7 @@ class SalesClass(BaseClass):
             },
             "database": {
                 "client_username": "rw",
+                "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw"
@@ -213,37 +215,40 @@ class SalesClass(BaseClass):
             print(f"Error getting client username options: {e}")
             return []
     
-    def get_client_id(self):
-        """Get the ID of the client by username"""
+    def _refresh_client_snapshot(self):
+        """Refresh snapshot.
+        Rules:
+          - If username exists in Clients table: always sync id + latest name (or fallback to username).
+          - If username NOT found: preserve existing stored client_name snapshot (do NOT overwrite it), only zero client_id.
+          - If snapshot empty while username present but missing: set snapshot to username once.
+        This lets operations show updated names when clients are renamed, while keeping historical name if client deleted.
+        """
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return 0
-        
+            return
         try:
-            client_username = self.get_value('client_username')
-            if not client_username:
-                return 0
-            self.database.cursor.execute("SELECT ID FROM Clients WHERE username = ?", (client_username,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else 0
+            username = self.get_value('client_username')
+            if not username:
+                # No username: clear id & name
+                super().set_value('client_id', 0)
+                super().set_value('client_name', '')
+                return
+            self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = ?", (username,))
+            res = self.database.cursor.fetchone()
+            if res:
+                cid, cname = res
+                current_snapshot = self.get_value('client_name')
+                # Update if different
+                if current_snapshot != (cname or username):
+                    super().set_value('client_name', cname or username)
+                super().set_value('client_id', cid)
+            else:
+                # Client deleted/missing: keep existing snapshot (historical)
+                super().set_value('client_id', 0)
+                if not (self.get_value('client_name') or '').strip():
+                    # If we have no stored snapshot yet, fallback to username once
+                    super().set_value('client_name', username)
         except Exception as e:
-            print(f"Error getting client ID: {e}")
-            return 0
-    
-    def get_client_name(self):
-        """Get the name of the associated client"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return f"Client {self.get_value('client_username')}"
-        
-        try:
-            client_username = self.get_value('client_username')
-            if not client_username:
-                return ""
-            self.database.cursor.execute("SELECT name FROM Clients WHERE username = ?", (client_username,))
-            result = self.database.cursor.fetchone()
-            return result[0] if result else f"Client {client_username}"
-        except Exception as e:
-            print(f"Error getting client name: {e}")
-            return f"Client {self.get_value('client_username')}"
+            print(f"Error refreshing client snapshot: {e}")
     
     def set_value(self, param_key, value):
         """Override set_value to handle connected parameters"""
@@ -251,9 +256,9 @@ class SalesClass(BaseClass):
         super().set_value(param_key, value)
         
         # Handle connected parameters for client_username
-        if param_key == 'client_username' and value:
-            # This will trigger recalculation of client_id and client_name
-            pass
+        if param_key == 'client_username':
+            # Update snapshot fields
+            self._refresh_client_snapshot()
     
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for client_username"""
@@ -280,6 +285,8 @@ class SalesClass(BaseClass):
             return False
         
         try:
+            # Always refresh snapshot before persisting (captures renamed clients)
+            self._refresh_client_snapshot()
             # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):
@@ -304,3 +311,16 @@ class SalesClass(BaseClass):
         except Exception as e:
             print(f"Error saving sales operation: {e}")
             return False
+
+    def refresh_external_snapshots(self):
+        """Hook called externally (e.g., on table refresh) to ensure client name stays in sync.
+        If the client username still exists and its name changed, update snapshot & persist silently.
+        """
+        before = self.get_value('client_name')
+        self._refresh_client_snapshot()
+        after = self.get_value('client_name')
+        if after != before and self.database and self.id:
+            try:
+                self.database.update_item(self.id, {'client_name': after}, 'Sales')
+            except Exception as e:
+                print(f"Warning: could not persist updated client_name snapshot for sale {self.id}: {e}")

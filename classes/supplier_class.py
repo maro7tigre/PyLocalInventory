@@ -83,8 +83,8 @@ class SupplierClass(BaseClass):
             "table": {
                 "id": "r",
                 "preview_image": "r",
-                "username": "rw",
-                "name": "rw"
+                "username": "r",
+                "name": "r"
             },
             "dialog": {
                 "username": "rw",

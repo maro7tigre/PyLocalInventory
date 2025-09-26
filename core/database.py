@@ -113,14 +113,8 @@ class Database:
                     
                     # Add foreign key constraints for ID fields
                     if param_key.endswith('_id') and param_key != 'id':
-                        # Determine referenced table based on naming convention
-                        if param_key == 'client_id':
-                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Clients'(ID)")
-                        elif param_key == 'supplier_id':
-                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Suppliers'(ID)")
-                        elif param_key == 'product_id':
-                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Products'(ID)")
-                        elif param_key == 'sales_id':
+                        # Only enforce cascading on child item links; allow deletion of base entities freely
+                        if param_key == 'sales_id':
                             foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Sales'(ID) ON DELETE CASCADE")
                         elif param_key == 'import_id':
                             foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Imports'(ID) ON DELETE CASCADE")
@@ -129,15 +123,40 @@ class Database:
             all_constraints = columns + foreign_keys
             constraints_str = ",\n    ".join(all_constraints)
             
-            # Create table
+            # Create table if not exists
             sql = f"""
                 CREATE TABLE IF NOT EXISTS '{section_name}' (
                     {constraints_str}
                 )
             """
-            
             self.cursor.execute(sql)
             self.conn.commit()
+
+            # --- Migration: ensure all expected columns exist (add missing) ---
+            try:
+                self.cursor.execute(f"PRAGMA table_info('{section_name}')")
+                existing_cols = {row[1] for row in self.cursor.fetchall()}
+                for param_key in db_params:
+                    if param_key in temp_obj.parameters and param_key not in existing_cols:
+                        pinfo = temp_obj.parameters[param_key]
+                        if temp_obj.is_parameter_calculated(param_key):
+                            continue
+                        ptype = pinfo.get('type', 'string')
+                        if ptype == 'int':
+                            sql_type = 'INTEGER'
+                        elif ptype == 'float':
+                            sql_type = 'REAL'
+                        else:
+                            sql_type = 'TEXT'
+                        try:
+                            self.cursor.execute(f"ALTER TABLE '{section_name}' ADD COLUMN '{param_key}' {sql_type}")
+                            self.conn.commit()
+                            print(f"✓ Added missing column '{param_key}' to {section_name}")
+                        except Exception as mig_e:
+                            print(f"⚠️ Failed adding column {param_key} to {section_name}: {mig_e}")
+            except Exception as e_cols:
+                print(f"⚠️ Column migration check failed for {section_name}: {e_cols}")
+
             print(f"✓ Created/verified table: {section_name}")
             
         except Exception as e:
@@ -162,6 +181,95 @@ class Database:
         for section_name, cls in self.registered_classes.items():
             if section_name not in creation_order:
                 self._create_table_for_class(cls, section_name)
+
+        # Ensure new snapshot columns exist (idempotent)
+        self._ensure_additional_columns()
+
+    def _ensure_additional_columns(self):
+        """Ensure newly introduced snapshot columns exist in existing databases."""
+        required = {
+            'Sales': {'client_name': 'TEXT'},
+            'Imports': {'supplier_name': 'TEXT'},
+            'Sales_Items': {'product_name': 'TEXT'},
+            'Import_Items': {'product_name': 'TEXT'}
+        }
+        for table, cols in required.items():
+            try:
+                self.cursor.execute(f"PRAGMA table_info('{table}')")
+                existing = {r[1] for r in self.cursor.fetchall()}
+                for col, ctype in cols.items():
+                    if col not in existing:
+                        try:
+                            self.cursor.execute(f"ALTER TABLE '{table}' ADD COLUMN '{col}' {ctype}")
+                            self.conn.commit()
+                            print(f"✓ Added missing column '{col}' to {table}")
+                        except Exception as e_add:
+                            print(f"⚠️ Could not add column {col} to {table}: {e_add}")
+            except Exception as e_tab:
+                print(f"⚠️ Snapshot column check failed for {table}: {e_tab}")
+        # After columns ensured, relax legacy product_id foreign keys if still present
+        try:
+            self._relax_legacy_item_product_fk('Sales_Items', 'sales_id')
+            self._relax_legacy_item_product_fk('Import_Items', 'import_id')
+        except Exception as e_relax:
+            print(f"⚠️ Could not relax legacy product FK constraints: {e_relax}")
+
+    def _relax_legacy_item_product_fk(self, table_name, op_fk_col):
+        """Rebuild legacy item table if it still enforces a foreign key on product_id.
+        Keeps existing data. Leaves only the operation FK (cascade) and drops product_id FK.
+        Safe & idempotent: checks if product_id FK exists first.
+        """
+        # Detect existing foreign keys
+        self.cursor.execute(f"PRAGMA foreign_key_list('{table_name}')")
+        fk_rows = self.cursor.fetchall()
+        has_product_fk = any(r[3] == 'product_id' for r in fk_rows)  # r[3] = from column
+        if not has_product_fk:
+            return  # already relaxed
+        print(f"↺ Rebuilding {table_name} to drop product_id foreign key constraint…")
+        # Get existing columns
+        self.cursor.execute(f"PRAGMA table_info('{table_name}')")
+        cols_info = self.cursor.fetchall()
+        col_names = [c[1] for c in cols_info]
+        # Build column definitions preserving types (except we re-spec with generic mapping)
+        def map_type(t):
+            t_low = (t or '').lower()
+            if 'int' in t_low:
+                return 'INTEGER'
+            if 'real' in t_low or 'floa' in t_low or 'doub' in t_low:
+                return 'REAL'
+            return 'TEXT'
+        columns_def = []
+        for c in cols_info:
+            name = c[1]
+            if name == 'ID':
+                columns_def.append('ID INTEGER PRIMARY KEY AUTOINCREMENT')
+            else:
+                columns_def.append(f"'{name}' {map_type(c[2])}")
+        # We will add only the operation foreign key
+        if op_fk_col in col_names:
+            if table_name == 'Sales_Items':
+                columns_def.append(f"FOREIGN KEY ('{op_fk_col}') REFERENCES 'Sales'(ID) ON DELETE CASCADE")
+            elif table_name == 'Import_Items':
+                columns_def.append(f"FOREIGN KEY ('{op_fk_col}') REFERENCES 'Imports'(ID) ON DELETE CASCADE")
+        # Drop any leftover temp table from previous failed attempt
+        try:
+            self.cursor.execute(f"DROP TABLE IF EXISTS '{table_name}_new'")
+        except Exception:
+            pass
+        create_sql = f"CREATE TABLE '{table_name}_new' (\n    " + ",\n    ".join(columns_def) + "\n)"
+        try:
+            self.cursor.execute(create_sql)
+            # Copy data (product_id values copied as-is; SQLite will accept NULL or orphan integers now)
+            cols_joined_insert = ", ".join(col_names)  # no quoting needed
+            cols_joined_select = ", ".join(col_names)
+            self.cursor.execute(f"INSERT INTO '{table_name}_new' ({cols_joined_insert}) SELECT {cols_joined_select} FROM '{table_name}'")
+            self.cursor.execute(f"DROP TABLE '{table_name}'")
+            self.cursor.execute(f"ALTER TABLE '{table_name}_new' RENAME TO '{table_name}'")
+            self.conn.commit()
+            print(f"✓ Relaxed product_id FK on {table_name}")
+        except Exception as e_rebuild:
+            self.conn.rollback()
+            print(f"✗ Failed rebuilding {table_name} to relax product_id FK: {e_rebuild}")
     
     def save(self, obj):
         """Save any parameter object to database"""
@@ -248,7 +356,17 @@ class Database:
                 temp_obj = cls(0, None)
                 section_name = temp_obj.section
             
-            # Delete from database (foreign key constraints will handle cascading)
+            # Pre-delete handling for base entities referenced by items
+            try:
+                if section_name == 'Products':
+                    # Nullify references in item tables to allow deletion while keeping name snapshots
+                    self.cursor.execute("UPDATE 'Sales_Items' SET product_id = NULL WHERE product_id = ?", (obj_id,))
+                    self.cursor.execute("UPDATE 'Import_Items' SET product_id = NULL WHERE product_id = ?", (obj_id,))
+                # (Clients/Suppliers not stored via *_id in operations currently)
+            except Exception as pre_e:
+                print(f"Warning: pre-delete reference cleanup failed: {pre_e}")
+
+            # Delete from database (foreign key constraints will handle cascading for child ops)
             self.cursor.execute(f"DELETE FROM '{section_name}' WHERE ID = ?", (obj_id,))
             
             # Commit transaction
@@ -449,6 +567,13 @@ class Database:
             return False
         
         try:
+            # Pre-clean references if deleting a product
+            if section == 'Products':
+                try:
+                    self.cursor.execute("UPDATE 'Sales_Items' SET product_id = NULL WHERE product_id = ?", (item_id,))
+                    self.cursor.execute("UPDATE 'Import_Items' SET product_id = NULL WHERE product_id = ?", (item_id,))
+                except Exception as e_clean:
+                    print(f"Warning: could not nullify product references before deletion: {e_clean}")
             self.cursor.execute(f"DELETE FROM '{section}' WHERE ID = ?", (item_id,))
             self.conn.commit()
             return self.cursor.rowcount > 0

@@ -96,8 +96,8 @@ class ProductClass(BaseClass):
             "table": {
                 "id": "r",
                 "preview_image": "r",
-                "username": "rw",
-                "name": "rw",
+                "username": "r",
+                "name": "r",
                 "sale_price": "r", 
                 "quantity": "r",
                 "category": "r"

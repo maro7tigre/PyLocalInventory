@@ -252,6 +252,12 @@ class BaseTab(QWidget):
                                 pass  # Skip invalid parameters
 
                     self.all_items.append(obj)
+                    # After loading raw DB values, let operation classes sync external snapshots (client/supplier rename)
+                    try:
+                        if hasattr(obj, 'refresh_external_snapshots'):
+                            obj.refresh_external_snapshots()
+                    except Exception as snap_e:
+                        print(f"Snapshot refresh skipped for {self.section} ID {obj.id}: {snap_e}")
 
                 except Exception as e:
                     print(f"Error processing {self.section} item: {e}")

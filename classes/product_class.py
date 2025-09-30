@@ -83,6 +83,16 @@ class ProductClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "stock_alert": {
+                "value": 0,
+                "display_name": {"en": "Stock Alert", "fr": "Alerte Stock", "es": "Alerta de Stock"},
+                "required": False,
+                "default": 0,
+                "options": [],
+                "type": "int",
+                "min": 0,
+                "max": 999999
+            },
             "quantity": {
                 "display_name": {"en": "Stock Quantity", "fr": "Quantité en Stock", "es": "Cantidad en Stock"},
                 "required": False,
@@ -109,7 +119,8 @@ class ProductClass(BaseClass):
                 "sale_price": "rw",
                 "preview_image": "rw",
                 "category": "rw",
-                "description": "rw"
+                "description": "rw",
+                "stock_alert": "rw"
             },
             "database": {
                 "username": "rw",
@@ -118,7 +129,8 @@ class ProductClass(BaseClass):
                 "sale_price": "rw",
                 "preview_image": "rw",
                 "category": "rw",
-                "description": "rw"
+                "description": "rw",
+                "stock_alert": "rw"
                 # Note: quantity is calculated and not stored in database
                 # Note: id is handled automatically by database
             },
@@ -189,8 +201,13 @@ class ProductClass(BaseClass):
         return ((sale_price - unit_price) / unit_price) * 100
     
     def is_low_stock(self, threshold=5):
-        """Check if product is low on stock"""
-        return self.get_value('quantity') <= threshold
+        """Check if product is low on stock using per-product alert if set.
+        If stock_alert > 0, use that. Otherwise fall back to provided threshold (legacy)."""
+        quantity = self.get_value('quantity') or 0
+        alert = self.get_value('stock_alert') or 0
+        if alert and alert > 0:
+            return quantity <= alert
+        return quantity <= threshold
     
     def get_total_value(self):
         """Get total inventory value (quantity * unit_price)"""

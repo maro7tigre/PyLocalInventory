@@ -176,9 +176,9 @@ class HomeTab(QWidget):
                 'es': "📦 Alerta de bajo stock",
             },
             'low_stock_products_with': {
-                'en': "Products with stock ≤ {threshold}:",
-                'fr': "Produits avec stock ≤ {threshold} :",
-                'es': "Productos con stock ≤ {threshold}:",
+                'en': "Products at or below alert level:",
+                'fr': "Produits au niveau d'alerte ou en dessous :",
+                'es': "Productos en o por debajo del nivel de alerta:",
             },
             'low_stock_ok': {
                 'en': "✅ All products have sufficient stock",
@@ -514,8 +514,8 @@ class HomeTab(QWidget):
         parent_layout.addWidget(chart_view)
     
     def create_low_stock_section(self, parent_layout):
-        """Create low stock products section with ordered list"""
-        # Simplified container to avoid widget-in-widget styling layers
+        """Create low stock products section with ordered list (with scroll support)."""
+        # Container
         container = QWidget()
         container.setObjectName("lowStockContainer")
         container.setStyleSheet(
@@ -523,11 +523,11 @@ class HomeTab(QWidget):
         )
         container.setMinimumHeight(300)
         container.setMaximumWidth(400)
-        
+
         layout = QVBoxLayout(container)
         layout.setContentsMargins(16, 16, 16, 16)
         layout.setSpacing(8)
-        
+
         # Title
         _ = self._t()
         title_label = QLabel(_("low_stock_title"))
@@ -541,10 +541,9 @@ class HomeTab(QWidget):
             }
         """)
         layout.addWidget(title_label)
-        
-        # Threshold info
-        threshold = 5  # You can adjust this later
-        info_label = QLabel(_("low_stock_products_with", threshold=threshold))
+
+        # Info label
+        info_label = QLabel(_("low_stock_products_with"))
         info_label.setStyleSheet("""
             QLabel {
                 color: #cccccc;
@@ -554,38 +553,57 @@ class HomeTab(QWidget):
             }
         """)
         layout.addWidget(info_label)
-        
-        # Scroll area for products list
+
+        # Scroll area
         scroll_area = QScrollArea()
         scroll_area.setWidgetResizable(True)
         scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
         scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         scroll_area.setStyleSheet("QScrollArea { border: none; background: transparent; }")
-        
+        scroll_area.setFixedHeight(220)
+
         # Products list widget
         products_widget = QWidget()
         products_layout = QVBoxLayout(products_widget)
         products_layout.setContentsMargins(0, 0, 0, 0)
         products_layout.setSpacing(6)
-        
-        # Get low stock products
-        low_stock_products = self.get_low_stock_products(threshold)
-        
+
+        # Store references for dynamic refresh
+        self.low_stock_products_layout = products_layout
+        self.low_stock_container = container
+        self.low_stock_scroll_area = scroll_area
+
+        # Populate
+        self._populate_low_stock_products()
+        scroll_area.setWidget(products_widget)
+        layout.addWidget(scroll_area)
+        parent_layout.addWidget(container)
+
+    def _populate_low_stock_products(self):
+        """Internal helper to (re)populate low stock products list."""
+        if not hasattr(self, 'low_stock_products_layout'):
+            return
+        layout = self.low_stock_products_layout
+        # Clear existing widgets
+        # Remove all items
+        for i in reversed(range(layout.count())):
+            item = layout.itemAt(i)
+            w = item.widget()
+            if w is not None:
+                w.setParent(None)
+            layout.removeItem(item)
+        # Rebuild
+        low_stock_products = self.get_low_stock_products()
         if not low_stock_products:
             no_issues = QLabel(self._t()("low_stock_ok"))
             no_issues.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 8px;")
             no_issues.setAlignment(Qt.AlignCenter)
-            products_layout.addWidget(no_issues)
+            layout.addWidget(no_issues)
         else:
             for product in low_stock_products:
                 product_item = self.create_low_stock_item(product)
-                products_layout.addWidget(product_item)
-        
-        products_layout.addStretch()
-        scroll_area.setWidget(products_widget)
-        layout.addWidget(scroll_area)
-        
-        parent_layout.addWidget(container)
+                layout.addWidget(product_item)
+        layout.addStretch()
     
     def create_quick_actions_section(self, parent_layout):
         """Create quick action buttons section"""
@@ -736,7 +754,9 @@ class HomeTab(QWidget):
             # Low stock items
             low_stock_count = self.get_low_stock_count()
             if 'low_stock' in self.stat_cards:
-                self.stat_cards['low_stock'].update_value(low_stock_count, "Items below 5")
+                self.stat_cards['low_stock'].update_value(low_stock_count, "At/Below alert")
+            # Refresh the detailed list
+            self._populate_low_stock_products()
             
             # Clients count
             clients_count = self.get_table_count('Clients')
@@ -799,51 +819,67 @@ class HomeTab(QWidget):
             return 0
     
     def get_low_stock_count(self):
-        """Get count of products with stock below 5"""
+        """Get count of products whose quantity is <= their stock_alert (if set >0) or <=5 legacy fallback.
+        stock_alert default is 0 (disabled). If all stock_alert are 0 we maintain legacy <=5 behavior.
+        """
         if not self.database or not self.database.cursor:
             return 0
         
         try:
-            # This is a simplified version - in reality you'd calculate based on imports/sales
+            self._ensure_stock_alert_column()
+            # Quantity calculation subquery reused
+            # Condition: if stock_alert > 0 then qty <= stock_alert else qty <= 5
             query = """
-                SELECT COUNT(*) FROM Products p
-                WHERE (
-                    COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID),0) -
-                    COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')),0)
-                ) < 5
+                SELECT COUNT(*) FROM (
+                    SELECT p.ID,
+                        (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID),0) -
+                         COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')),0)) as qty,
+                        COALESCE(p.stock_alert,0) as alert
+                    FROM Products p
+                ) t
+                WHERE (CASE WHEN alert > 0 THEN qty <= alert ELSE qty <= 5 END)
             """
             self.database.cursor.execute(query)
-            result = self.database.cursor.fetchone()
-            return int(result[0]) if result else 0
+            row = self.database.cursor.fetchone()
+            return int(row[0]) if row else 0
         except Exception as e:
             print(f"Error getting low stock count: {e}")
             return 0
     
-    def get_low_stock_products(self, threshold=5):
-        """Get products with stock below threshold, ordered by quantity (lowest first)"""
+    def get_low_stock_products(self, threshold=None):
+        """Get products whose quantity is <= per-product stock_alert if set, otherwise <=5 legacy.
+        Ordered by quantity ascending, then by name. Limit 50 for display.
+        """
         if not self.database or not self.database.cursor:
             return []
         
         try:
+            self._ensure_stock_alert_column()
+            # We ignore the passed threshold now (kept for backward compatibility)
             query = """
-                SELECT p.name, p.username,
-                    (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
-                     - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) as stock_level
-                FROM Products p
-                WHERE (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
-                     - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) <= ?
-                ORDER BY stock_level ASC, p.name ASC
-                LIMIT 15
+                SELECT * FROM (
+                    SELECT p.name AS name, p.username AS username,
+                        (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
+                         - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID 
+                                     WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) AS stock_level,
+                        COALESCE(p.stock_alert,0) AS alert
+                    FROM Products p
+                ) t
+                WHERE (CASE WHEN alert > 0 THEN stock_level <= alert ELSE stock_level <= 5 END)
+                ORDER BY stock_level ASC, name ASC
+                LIMIT 50
             """
-            self.database.cursor.execute(query, (threshold,))
+            self.database.cursor.execute(query)
             results = self.database.cursor.fetchall()
             
             products = []
-            for name, username, stock_level in results:
+            for row in results:
+                name, username, stock_level, alert = row
                 products.append({
                     'name': name or username or 'Unknown Product',
                     'username': username or '',
-                    'stock': int(stock_level)
+                    'stock': int(stock_level),
+                    'alert': int(alert or 0)
                 })
             
             return products
@@ -851,6 +887,17 @@ class HomeTab(QWidget):
         except Exception as e:
             print(f"Error getting low stock products: {e}")
             return []
+
+    def _ensure_stock_alert_column(self):
+        """Ensure Products table has stock_alert column (runtime safety if app updated while DB open)."""
+        try:
+            self.database.cursor.execute("PRAGMA table_info('Products')")
+            cols = {r[1] for r in self.database.cursor.fetchall()}
+            if 'stock_alert' not in cols:
+                self.database.cursor.execute("ALTER TABLE 'Products' ADD COLUMN 'stock_alert' INTEGER")
+                self.database.conn.commit()
+        except Exception:
+            pass
     
     def create_low_stock_item(self, product):
         """Create a single low stock product item"""
@@ -1006,4 +1053,6 @@ class HomeTab(QWidget):
     def refresh_on_tab_switch(self):
         """Called when this tab becomes active - refresh all data"""
         self.refresh_statistics()
+        # Ensure list is in sync when user returns
+        self._populate_low_stock_products()
         print("✓ Home tab refreshed on switch")

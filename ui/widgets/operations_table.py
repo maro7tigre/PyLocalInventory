@@ -2,9 +2,11 @@
 Operations Table Widget - Clean architecture with proper separation of concerns
 """
 from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
-                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy)
+                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit, QStyledItemDelegate)
+from PySide6.QtGui import QColor, QBrush
 from PySide6.QtCore import Qt, Signal
 from ui.widgets.preview_widget import PreviewWidget
+from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
 
 
@@ -452,6 +454,9 @@ class TableEventHandler:
                 subtotal_item.setFlags(subtotal_item.flags() & ~Qt.ItemIsEditable)
             
             subtotal_item.setText(f"{subtotal:.2f}")
+
+            # After updating subtotal, validate stock and style quantity cell if exceeded
+            self._validate_stock(row)
             
         except (ValueError, AttributeError, IndexError):
             pass
@@ -460,6 +465,128 @@ class TableEventHandler:
         """Reconnect all widget events after table changes"""
         for row in range(self.table.rowCount()):
             self._connect_row_widgets(row)
+
+    # --- Stock validation & styling -------------------------------------------------
+    def get_row_stock_state(self, row):
+        """Return (requested_qty, stock_available, exceeded, product_name) or None if cannot evaluate."""
+        db = getattr(self.data_manager, 'database', None)
+        if not db or not hasattr(db, 'cursor'):
+            return None
+        try:
+            product_col = self.data_manager.table_columns.index('product_name')
+            qty_col = self.data_manager.table_columns.index('quantity')
+        except ValueError:
+            return None
+        product_widget = self.table.cellWidget(row, product_col)
+        product_name = product_widget.text().strip() if product_widget and hasattr(product_widget, 'text') else ''
+        if not product_name:
+            return None
+        qty_item = self.table.item(row, qty_col)
+        if not qty_item:
+            return None
+        try:
+            requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+        except ValueError:
+            requested_qty = 0
+        # Product ID
+        product_id = None
+        try:
+            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
+            res = db.cursor.fetchone()
+            if res and res[0]:
+                product_id = res[0]
+        except Exception:
+            product_id = None
+        if not product_id:
+            return (requested_qty, None, False, product_name)
+        try:
+            product_obj = ProductClass(product_id, db)
+            stock_available = product_obj.calculate_quantity()
+        except Exception:
+            stock_available = None
+        if stock_available is None:
+            return (requested_qty, None, False, product_name)
+        exceeded = requested_qty > stock_available
+        return (requested_qty, stock_available, exceeded, product_name)
+
+    def _validate_stock(self, row):
+        state = self.get_row_stock_state(row)
+        if not state:
+            return
+        requested, available, exceeded, _ = state
+        try:
+            qty_col = self.data_manager.table_columns.index('quantity')
+        except ValueError:
+            return
+        qty_item = self.table.item(row, qty_col)
+        if not qty_item:
+            return
+        if available is None:
+            self._clear_quantity_style(qty_item)
+            return
+        if exceeded:
+            self._apply_exceeded_style(qty_item, requested, available)
+        else:
+            self._clear_quantity_style(qty_item)
+
+    def _apply_exceeded_style(self, qty_item: QTableWidgetItem, requested, available):
+        """Apply red highlighting indicating quantity exceeds stock."""
+        if not qty_item:
+            return
+        qty_item.setBackground(QBrush(QColor("#6e1d1d")))  # Dark red background
+        qty_item.setForeground(QBrush(QColor("#ffffff")))  # White text
+        # Store tooltip with info
+        qty_item.setToolTip(f"Requested {requested} exceeds available stock {available}")
+
+    def _clear_quantity_style(self, qty_item: QTableWidgetItem):
+        """Clear custom styling on quantity cell (restore defaults)."""
+        if not qty_item:
+            return
+        qty_item.setBackground(QBrush())
+        qty_item.setForeground(QBrush())
+        qty_item.setToolTip("")
+
+    def validate_all_rows(self):
+        for row in range(self.table.rowCount()):
+            # Skip final empty row
+            self._validate_stock(row)
+
+
+class QuantityDelegate(QStyledItemDelegate):
+    """Custom delegate to style quantity editor (QLineEdit) while editing."""
+    def __init__(self, event_handler: TableEventHandler, parent=None):
+        super().__init__(parent)
+        self.event_handler = event_handler
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        row = index.row()
+        self._apply_style(editor, row)
+        editor.textChanged.connect(lambda _t, r=row, e=editor: self._apply_style(e, r))
+        return editor
+
+    def setEditorData(self, editor, index):
+        value = index.model().data(index, Qt.EditRole)
+        editor.setText(str(value) if value is not None else "")
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, editor.text(), Qt.EditRole)
+        # After committing, trigger validation so cell styling updates
+        self.event_handler._validate_stock(index.row())
+
+    def _apply_style(self, editor: QLineEdit, row: int):
+        state = self.event_handler.get_row_stock_state(row)
+        exceeded = False
+        if state:
+            requested, available, exceeded, _ = state
+        if exceeded:
+            editor.setStyleSheet("QLineEdit{border:2px solid #f44336; background:#6e1d1d; color:#ffffff; border-radius:4px;}")
+            if state and state[1] is not None:
+                editor.setToolTip(f"Requested {state[0]} exceeds available stock {state[1]}")
+        else:
+            # Neutral style (inherit theme but ensure visible border)
+            editor.setStyleSheet("QLineEdit{border:1px solid #555555; background:#2e2e2e; color:#ffffff; border-radius:4px;}")
+            editor.setToolTip("")
 
 
 class OperationsTableWidget(QWidget):
@@ -489,6 +616,8 @@ class OperationsTableWidget(QWidget):
         
         # Load data
         self.refresh_table()
+        # Install delegates after initial setup
+        self._install_delegates()
     
     def _setup_ui(self):
         """Setup user interface"""
@@ -545,6 +674,17 @@ class OperationsTableWidget(QWidget):
         
         # Setup events
         self.event_handler.setup_event_connections()
+        # Initial validation so existing rows show state immediately
+        self.event_handler.validate_all_rows()
+
+    def _install_delegates(self):
+        """Install custom delegates (quantity styling)."""
+        try:
+            qty_col = self.data_manager.table_columns.index('quantity')
+        except ValueError:
+            return
+        delegate = QuantityDelegate(self.event_handler, self.table)
+        self.table.setItemDelegateForColumn(qty_col, delegate)
     
     def get_current_table_data(self):
         """Get all non-empty rows as data dictionaries"""

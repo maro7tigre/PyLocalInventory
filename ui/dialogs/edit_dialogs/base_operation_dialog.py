@@ -146,7 +146,8 @@ class BaseOperationDialog(QDialog):
             parent_operation=self.operation_obj,
             database=self.database,
             columns=self.get_item_columns(),
-            parent=self
+            parent=self,
+            highlight_stock_exceed=(getattr(self.operation_obj, 'section', '') == 'Sales')
         )
         
         # Set size policies for proper resizing

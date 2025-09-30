@@ -154,7 +154,8 @@ class SaleEditDialog(QDialog):
             parent_operation=self.sale_obj,
             database=self.database,
             columns=['product_preview', 'product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
-            parent=self
+            parent=self,
+            highlight_stock_exceed=True
         )
         
         # Connect table changes to update totals

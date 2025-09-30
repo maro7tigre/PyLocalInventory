@@ -154,7 +154,8 @@ class ImportEditDialog(QDialog):
             parent_operation=self.import_obj,
             database=self.database,
             columns=['product_preview', 'product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
-            parent=self
+            parent=self,
+            highlight_stock_exceed=False
         )
         
         # Connect table changes to update totals

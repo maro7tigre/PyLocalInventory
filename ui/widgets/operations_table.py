@@ -329,6 +329,9 @@ class TableEventHandler:
             
             if param_key in ['quantity', 'unit_price']:
                 self._update_row_subtotal(row)
+                # Trigger immediate validation for quantity changes
+                if param_key == 'quantity':
+                    self._validate_stock(row)
         
         # Ensure empty row management
         if not self.empty_row_manager._is_row_empty(row):
@@ -481,13 +484,51 @@ class TableEventHandler:
         product_name = product_widget.text().strip() if product_widget and hasattr(product_widget, 'text') else ''
         if not product_name:
             return None
-        qty_item = self.table.item(row, qty_col)
-        if not qty_item:
-            return None
+        
+        # Get quantity from either active editor or cell item
+        requested_qty = 0
         try:
-            requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
-        except ValueError:
-            requested_qty = 0
+            # Check if there's an active editor for this row
+            qty_delegate = self.table.itemDelegateForColumn(qty_col)
+            if (hasattr(qty_delegate, 'active_editors') and 
+                row in qty_delegate.active_editors):
+                # Use editor text for real-time evaluation
+                editor = qty_delegate.active_editors[row]
+                requested_qty = float(editor.text()) if editor.text().strip() else 0
+            else:
+                # Use cell item text
+                qty_item = self.table.item(row, qty_col)
+                if qty_item:
+                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+        except (ValueError, AttributeError):
+            # Fallback to cell item if editor access fails
+            try:
+                qty_item = self.table.item(row, qty_col)
+                if qty_item:
+                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+            except ValueError:
+                requested_qty = 0
+        
+        # Product ID lookup
+        product_id = None
+        try:
+            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
+            res = db.cursor.fetchone()
+            if res and res[0]:
+                product_id = res[0]
+        except Exception:
+            product_id = None
+        if not product_id:
+            return (requested_qty, None, False, product_name)
+        try:
+            product_obj = ProductClass(product_id, db)
+            stock_available = product_obj.calculate_quantity()
+        except Exception:
+            stock_available = None
+        if stock_available is None:
+            return (requested_qty, None, False, product_name)
+        exceeded = requested_qty > stock_available
+        return (requested_qty, stock_available, exceeded, product_name)
         # Product ID
         product_id = None
         try:
@@ -518,6 +559,17 @@ class TableEventHandler:
             qty_col = self.data_manager.table_columns.index('quantity')
         except ValueError:
             return
+        
+        # Check if this cell is currently being edited
+        qty_delegate = self.table.itemDelegateForColumn(qty_col)
+        is_being_edited = (hasattr(qty_delegate, 'active_editors') and 
+                          row in qty_delegate.active_editors)
+        
+        if is_being_edited:
+            # Don't modify the cell item while editing - styling handled by delegate
+            return
+            
+        # Only update cell styling when not actively editing
         qty_item = self.table.item(row, qty_col)
         if not qty_item:
             return
@@ -557,13 +609,22 @@ class QuantityDelegate(QStyledItemDelegate):
     def __init__(self, event_handler: TableEventHandler, parent=None):
         super().__init__(parent)
         self.event_handler = event_handler
+        self.active_editors = {}  # Track active editors by row
 
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
         row = index.row()
+        self.active_editors[row] = editor  # Store reference
         self._apply_style(editor, row)
+        # Connect textChanged for real-time styling only
         editor.textChanged.connect(lambda _t, r=row, e=editor: self._apply_style(e, r))
         return editor
+
+    def destroyEditor(self, editor, index):
+        row = index.row()
+        if row in self.active_editors:
+            del self.active_editors[row]  # Clean up reference
+        super().destroyEditor(editor, index)
 
     def setEditorData(self, editor, index):
         value = index.model().data(index, Qt.EditRole)
@@ -572,7 +633,10 @@ class QuantityDelegate(QStyledItemDelegate):
     def setModelData(self, editor, model, index):
         model.setData(index, editor.text(), Qt.EditRole)
         # After committing, trigger validation so cell styling updates
-        self.event_handler._validate_stock(index.row())
+        row = index.row()
+        # Small delay to ensure the editor is fully closed before validation
+        from PySide6.QtCore import QTimer
+        QTimer.singleShot(50, lambda: self.event_handler._validate_stock(row))
 
     def _apply_style(self, editor: QLineEdit, row: int):
         state = self.event_handler.get_row_stock_state(row)
@@ -590,12 +654,21 @@ class QuantityDelegate(QStyledItemDelegate):
 
 
 class OperationsTableWidget(QWidget):
-    """Clean operations table with proper separation of concerns"""
+    """Clean operations table with proper separation of concerns
+
+    Added feature toggle: highlight_stock_exceed
+    When True, quantity cells & editors turn red if requested quantity exceeds available stock.
+    When False, no stock lookup nor styling occurs (performance friendly for imports).
+    """
     
     items_changed = Signal()
     
-    def __init__(self, item_class, parent_operation=None, database=None, columns=None, parent=None):
+    def __init__(self, item_class, parent_operation=None, database=None, columns=None, parent=None,
+                 highlight_stock_exceed=False):
         super().__init__(parent)
+        
+        # Feature flags
+        self.highlight_stock_exceed = highlight_stock_exceed
         
         # Core components
         self.data_manager = TableDataManager(item_class, database)
@@ -614,10 +687,17 @@ class OperationsTableWidget(QWidget):
         self.event_handler = TableEventHandler(self.table, self.data_manager, 
                                              self.empty_row_manager, self._on_items_changed)
         
+        # If highlighting disabled, monkey patch validator methods to no-op for simplicity
+        if not self.highlight_stock_exceed:
+            # Replace validate calls with stubs
+            self.event_handler._validate_stock = lambda *_args, **_kw: None  # type: ignore
+            self.event_handler.validate_all_rows = lambda: None  # type: ignore
+        
         # Load data
         self.refresh_table()
-        # Install delegates after initial setup
-        self._install_delegates()
+        # Install delegates after initial setup (only if highlighting enabled)
+        if self.highlight_stock_exceed:
+            self._install_delegates()
     
     def _setup_ui(self):
         """Setup user interface"""
@@ -674,8 +754,9 @@ class OperationsTableWidget(QWidget):
         
         # Setup events
         self.event_handler.setup_event_connections()
-        # Initial validation so existing rows show state immediately
-        self.event_handler.validate_all_rows()
+        # Initial validation so existing rows show state immediately (only if enabled)
+        if self.highlight_stock_exceed:
+            self.event_handler.validate_all_rows()
 
     def _install_delegates(self):
         """Install custom delegates (quantity styling)."""

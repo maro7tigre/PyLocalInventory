@@ -2,7 +2,7 @@
 Profile management dialog - create, delete, and switch between user profiles
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QFileDialog, QScrollArea,
-                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton, QMessageBox)
+                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton, QMessageBox, QTextEdit)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 import os
@@ -249,7 +249,12 @@ class ProfilesDialog(QDialog):
         for param_key in self.empty_profile.available_parameters["dialog"]:
             display_name = self.empty_profile.get_display_name(param_key, self.language)
             self.scroll_layout.addWidget(QLabel(f"{display_name}:"))
-            edit = QLineEdit()
+            if param_key == "report footer":
+                edit = QTextEdit()
+                edit.setFixedHeight(100)
+                edit.setStyleSheet("QTextEdit { background-color: #404040; border: 1px solid #555555; color: #ffffff; }")
+            else:
+                edit = QLineEdit()
             self.parameter_edits[param_key] = edit
             self.scroll_layout.addWidget(edit)
         
@@ -361,11 +366,18 @@ class ProfilesDialog(QDialog):
         # Update parameter fields
         for param_key, edit in self.parameter_edits.items():
             current_value = profile.get_value(param_key)
-            if current_value is None:
-                default_value = profile.get_parameter_info(param_key, "default")
-                edit.setText(default_value if default_value else "")
+            if hasattr(edit, 'setPlainText'):
+                if current_value is None:
+                    default_value = profile.get_parameter_info(param_key, "default") or ""
+                    edit.setPlainText(default_value)
+                else:
+                    edit.setPlainText(current_value)
             else:
-                edit.setText(current_value)
+                if current_value is None:
+                    default_value = profile.get_parameter_info(param_key, "default")
+                    edit.setText(default_value if default_value else "")
+                else:
+                    edit.setText(current_value)
         
         # Enable/disable password fields based on encrypted_phrase
         password_enabled = profile.encrypted_phrase is None and self.right_enabled
@@ -515,7 +527,10 @@ class ProfilesDialog(QDialog):
             # Collect profile data
             profile_data = {'name': name}
             for param_key, edit in self.parameter_edits.items():
-                profile_data[param_key] = edit.text().strip()
+                if hasattr(edit, 'toPlainText'):
+                    profile_data[param_key] = edit.toPlainText().strip()
+                else:
+                    profile_data[param_key] = edit.text().strip()
             
             # Handle image copying based on edit mode
             image_to_use = None

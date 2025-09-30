@@ -211,6 +211,7 @@ class ReportsDialog(QDialog):
             company_phone = profile.get_value("phone") or ""
             company_address = profile.get_value("address") or ""
             company_email = profile.get_value("email") or ""
+            report_footer = profile.get_value("report footer") or ""
 
             # Build logo block from profile preview if available
             logo_block = '<div class="logo-placeholder">LOGO</div>'
@@ -354,10 +355,10 @@ class ReportsDialog(QDialog):
                 # - middle pages (table only)         => base+10
                 # - last page (table+totals)          => base-4
                 BASE = 18
-                rows_one_page = 22                # single page needs more rows
+                rows_one_page = 21                # single page needs more rows
                 rows_first_multi = 25             # first page of multi needs more rows
-                rows_middle = 30                  # middle pages a bit more
-                rows_last = 30                    # last page a lot more rows before totals
+                rows_middle = 29                  # middle pages a bit more
+                rows_last = 29                    # last page a lot more rows before totals
 
                 total_rows = len(devis_rows)
                 if total_rows == 0:
@@ -412,6 +413,7 @@ class ReportsDialog(QDialog):
                 'company_phone': company_phone,
                 'company_address': company_address,
                 'company_email': company_email,
+                'report_footer': report_footer.replace('\n', '<br/>'),
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
                 'date': date,
@@ -438,6 +440,7 @@ class ReportsDialog(QDialog):
             return {
                 'company_name': 'Your Company',
                 'company_phone': '',
+                'report_footer': '',
                 'company_siret': '',
                 'company_tva': '',
                 'date': datetime.now().strftime("%d-%m-%Y"),

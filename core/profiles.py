@@ -296,10 +296,13 @@ class ProfileClass:
             "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
             "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": False, "default": "", "options": [], "type": "string"},
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
-            "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"}
+            "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"},
+            # Multiline footer text that will appear centered at the bottom of the last report page
+            "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"}
         }
         self.available_parameters = {
-            "dialog" : ["company name", "address", "email", "phone"],
+            # Order determines display order in dialog
+            "dialog" : ["company name", "address", "email", "phone", "report footer"],
             "table" : ["company name"]
         }
         

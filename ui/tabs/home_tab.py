@@ -722,12 +722,22 @@ class HomeTab(QWidget):
         item_layout = QHBoxLayout(item_frame)
         item_layout.setContentsMargins(12, 8, 12, 8)
         
-        # Activity type icon
-        icon = "💰" if activity['type'] == 'Sales' else "📥"
-        icon_label = QLabel(icon)
-        icon_label.setStyleSheet("font-size: 16px;")
-        icon_label.setFixedWidth(30)
-        item_layout.addWidget(icon_label)
+        # Activity type badge
+        _ = self._t()
+        if activity['type'] == 'Sales':
+            badge_text = _("sales")
+            badge_color = "#4CAF50"
+        else:
+            badge_text = _("imports")
+            badge_color = "#2196F3"
+
+        badge_label = QLabel(str(badge_text).upper())
+        badge_label.setStyleSheet(
+            f"color: {badge_color}; font-size: 11px; font-weight: bold;"
+        )
+        badge_label.setMinimumWidth(60)
+        badge_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        item_layout.addWidget(badge_label)
         
         # Description
         desc_label = QLabel(activity['description'])

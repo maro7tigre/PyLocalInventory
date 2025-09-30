@@ -110,16 +110,21 @@ class BaseOperationDialog(QDialog):
 
             # If this is the TVA field, refresh totals live when it changes
             if param_key == 'tva':
-                # NumericWidget holds a Q(S)pinBox in `.spinbox`
+                # Support legacy numeric spinbox AND new checkbox-based bool widget
                 spin = getattr(widget, 'spinbox', None)
                 if spin is not None:
                     try:
-                        spin.valueChanged.connect(self.update_totals)
+                        spin.valueChanged.connect(lambda _val: self.update_totals())
                     except Exception:
                         pass
-                    # Also connect editingFinished to catch manual text edits
                     try:
                         spin.editingFinished.connect(self.update_totals)
+                    except Exception:
+                        pass
+                checkbox = getattr(widget, 'checkbox', None)
+                if checkbox is not None:
+                    try:
+                        checkbox.stateChanged.connect(lambda _state: self.update_totals())
                     except Exception:
                         pass
             
@@ -246,9 +251,12 @@ class BaseOperationDialog(QDialog):
             # Get VAT percentage
             vat_percent = 0
             if 'tva' in self.parameter_widgets:
-                vat_percent = ParameterWidgetFactory.get_widget_value(
-                    self.parameter_widgets['tva']
-                ) or 0
+                try:
+                    vat_percent = float(
+                        ParameterWidgetFactory.get_widget_value(self.parameter_widgets['tva']) or 0
+                    )
+                except Exception:
+                    vat_percent = 0
             
             # Calculate totals
             vat_amount = subtotal * (vat_percent / 100)

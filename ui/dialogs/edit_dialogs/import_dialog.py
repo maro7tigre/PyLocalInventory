@@ -40,11 +40,7 @@ class ImportEditDialog(QDialog):
             'supplier_username': {
                 'autocomplete': True
             },
-            'tva': {
-                'minimum': 0.0,
-                'maximum': 100.0,
-                'unit': '%'
-            }
+            # TVA now checkbox
         }
         
         # Initialize QDialog directly, not BaseEditDialog to avoid layout conflicts
@@ -128,8 +124,11 @@ class ImportEditDialog(QDialog):
             self.parameter_widgets[param_key] = widget
             
             # Connect TVA widget to update totals when value changes
-            if param_key == 'tva' and hasattr(widget, 'spinbox'):
-                widget.spinbox.valueChanged.connect(self.update_totals)
+            if param_key == 'tva':
+                if hasattr(widget, 'spinbox'):
+                    widget.spinbox.valueChanged.connect(lambda _val: self.update_totals())
+                if hasattr(widget, 'checkbox'):
+                    widget.checkbox.stateChanged.connect(lambda _state: self.update_totals())
             
             # Get display name
             display_name = self.import_obj.get_display_name(param_key)
@@ -321,7 +320,10 @@ class ImportEditDialog(QDialog):
             # Get VAT percentage from the tva parameter widget
             vat_percent = 0
             if 'tva' in self.parameter_widgets:
-                vat_percent = self.get_widget_value(self.parameter_widgets['tva']) or 0
+                try:
+                    vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
+                except Exception:
+                    vat_percent = 0
             
             # Calculate VAT amount
             vat_amount = subtotal * (vat_percent / 100)

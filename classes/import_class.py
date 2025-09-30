@@ -50,15 +50,15 @@ class ImportClass(BaseClass):
                 "options": [],
                 "type": "date"
             },
+            # TVA now a checkbox: unchecked=0%, checked=20%
             "tva": {
-                "value": 0.0,
-                "display_name": {"en": "VAT %", "fr": "TVA %", "es": "IVA %"},
+                "value": 20.0,
+                "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
                 "required": False,
                 "default": 20.0,
-                "options": [],
-                "type": "float",
-                "min": 0.0,
-                "max": 100.0
+                "type": "bool",
+                "true_value": 20.0,
+                "false_value": 0.0
             },
             "notes": {
                 "value": "",

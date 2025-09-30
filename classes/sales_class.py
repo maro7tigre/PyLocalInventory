@@ -68,15 +68,16 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "date"  # NEW: Using date type instead of string
             },
+            # TVA now handled as a simple checkbox: unchecked = 0%, checked = 20%
+            # Keeps database storage numeric (0 or 20) while UX is a single toggle
             "tva": {
-                "value": 0.0,
-                "display_name": {"en": "VAT %", "fr": "TVA %", "es": "IVA %"},
+                "value": 20.0,  # default active (was previously conceptually 20)
+                "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
                 "required": False,
                 "default": 20.0,
-                "options": [],
-                "type": "float",
-                "min": 0.0,
-                "max": 100.0
+                "type": "bool",  # custom widget mapped to numeric percent
+                "true_value": 20.0,
+                "false_value": 0.0
             },
             "notes": {
                 "value": "",

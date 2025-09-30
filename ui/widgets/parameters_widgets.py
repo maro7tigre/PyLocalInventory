@@ -5,7 +5,7 @@ import os
 from datetime import datetime
 from PySide6.QtWidgets import (QLineEdit, QSpinBox, QDoubleSpinBox, QWidget, 
                                QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
-                               QFileDialog, QMessageBox, QDateEdit)
+                               QFileDialog, QMessageBox, QDateEdit, QCheckBox)
 from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QPixmap
 
@@ -449,6 +449,25 @@ class ParameterWidgetFactory:
         
         if param_type in ['int', 'float']:
             return NumericWidget(param_info, editable)
+        elif param_type == 'bool':
+            # Checkbox that maps to true_value / false_value
+            class BoolWidget(QWidget):
+                def __init__(self, pinfo, editable=True):
+                    super().__init__()
+                    self.pinfo = pinfo
+                    layout = QHBoxLayout(self)
+                    layout.setContentsMargins(0,0,0,0)
+                    self.checkbox = QCheckBox()
+                    self.checkbox.setEnabled(editable)
+                    layout.addWidget(self.checkbox)
+                    layout.addStretch()
+                def value(self):
+                    return self.pinfo.get('true_value', 1 if True else 0) if self.checkbox.isChecked() else self.pinfo.get('false_value', 0)
+                def setValue(self, value):
+                    true_val = self.pinfo.get('true_value', 1)
+                    # Consider any value equal to true_val as checked
+                    self.checkbox.setChecked(value == true_val)
+            return BoolWidget(param_info, editable)
         elif param_type == 'image':
             return ImageWidget(param_info, editable, profile_images_dir)
         elif param_type == 'date':
@@ -468,6 +487,9 @@ class ParameterWidgetFactory:
     def get_widget_value(widget):
         """Get value from any parameter widget"""
         if isinstance(widget, NumericWidget):
+            return widget.value()
+        # Bool widget check by duck-typing (has checkbox attribute)
+        if hasattr(widget, 'checkbox') and isinstance(widget.checkbox, QCheckBox):
             return widget.value()
         elif isinstance(widget, StringWidget):
             return widget.text()
@@ -490,6 +512,9 @@ class ParameterWidgetFactory:
         """Set value on any parameter widget"""
         if isinstance(widget, NumericWidget):
             widget.setValue(value)
+        elif hasattr(widget, 'checkbox') and isinstance(widget.checkbox, QCheckBox):
+            if hasattr(widget, 'setValue'):
+                widget.setValue(value)
         elif isinstance(widget, StringWidget):
             widget.setText(value)
         elif isinstance(widget, ImageWidget):

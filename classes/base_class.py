@@ -77,6 +77,26 @@ class BaseClass:
         
         elif param_type == 'string' and value is not None:
             value = str(value)
+        elif param_type == 'bool':
+            # Accept bool, int, float (non-zero= True), or existing mapped value
+            true_val = param_info.get('true_value', 1)
+            false_val = param_info.get('false_value', 0)
+            if isinstance(value, str):
+                val_lower = value.strip().lower()
+                if val_lower in ['1', 'true', 'yes', 'on', 'y']:
+                    value = true_val
+                elif val_lower in ['0', 'false', 'no', 'off', 'n', '']:
+                    value = false_val
+                else:
+                    # Try numeric parse
+                    try:
+                        value = true_val if float(value) != 0 else false_val
+                    except Exception:
+                        value = false_val
+            elif isinstance(value, (int, float)):
+                value = true_val if float(value) != 0 else false_val
+            elif isinstance(value, bool):
+                value = true_val if value else false_val
         
         # Set the value
         self.parameters[param_key]["value"] = value

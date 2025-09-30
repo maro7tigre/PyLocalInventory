@@ -49,14 +49,13 @@ class ReportsDialog(QDialog):
         
         # Report type buttons
         buttons_layout = QHBoxLayout()
-        
         self.devis_btn = BlueButton("Devis")
         self.devis_btn.clicked.connect(lambda: self.generate_report("devis"))
         buttons_layout.addWidget(self.devis_btn)
-        
-        self.bdl_btn = BlueButton("Bon de Livraison")
-        self.bdl_btn.clicked.connect(lambda: self.generate_report("bdl"))
-        buttons_layout.addWidget(self.bdl_btn)
+
+        self.facture_btn = BlueButton("Facture")
+        self.facture_btn.clicked.connect(lambda: self.generate_report("facture"))
+        buttons_layout.addWidget(self.facture_btn)
         
         layout.addLayout(buttons_layout)
         
@@ -85,9 +84,15 @@ class ReportsDialog(QDialog):
     def generate_report(self, report_type):
         """Generate report of specified type"""
         try:
+            # Gate facture generation to confirmed sales
+            if report_type == 'facture':
+                state = self.sales_obj.get_value('state') if self.sales_obj else None
+                if state != 'confirmed':
+                    QMessageBox.warning(self, "Not Confirmed", "You can only generate a facture for a confirmed sale.")
+                    return
             # Disable buttons during generation
             self.devis_btn.setEnabled(False)
-            self.bdl_btn.setEnabled(False)
+            self.facture_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             
             # Show progress
@@ -99,7 +104,7 @@ class ReportsDialog(QDialog):
             # Restore cursor and enable buttons
             QApplication.restoreOverrideCursor()
             self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
+            self.facture_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
             
             # Handle success - show message but don't close dialog
@@ -114,7 +119,7 @@ class ReportsDialog(QDialog):
         except Exception as e:
             QApplication.restoreOverrideCursor()
             self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
+            self.facture_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
             QMessageBox.critical(self, "Error", f"Failed to generate report:\n{str(e)}")
     
@@ -166,7 +171,9 @@ class ReportsDialog(QDialog):
     def _generate_html_content(self, report_type):
         """Generate HTML content based on report type"""
         # Get template path
-        template_path = os.path.join("report", f"{report_type}_templet.html")
+        # Map facture to devis template (same layout with label replacement)
+        mapped = 'devis' if report_type == 'facture' else report_type
+        template_path = os.path.join("report", f"{mapped}_templet.html")
         
         if not os.path.exists(template_path):
             raise Exception(f"Template file not found: {template_path}")
@@ -180,6 +187,10 @@ class ReportsDialog(QDialog):
         
         # Replace placeholders
         html_content = self._replace_placeholders(template_content, sales_data)
+        # If facture, replace visible title text
+        if report_type == 'facture':
+            html_content = html_content.replace('<h2>Devis</h2>', '<h2>Facture</h2>')
+            html_content = html_content.replace('<title>Devis</title>', '<title>Facture</title>')
         
         return html_content
     
@@ -228,7 +239,11 @@ class ReportsDialog(QDialog):
             
             # Generate document reference
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
-            doc_ref = f"DOC-{sales_id:06d}"
+            facture_number = self.sales_obj.get_value('facture_number') or None
+            if report_type == 'facture' and facture_number:
+                doc_ref = f"FAC-{int(facture_number):06d}"
+            else:
+                doc_ref = f"DOC-{sales_id:06d}"
             
             # Get sales items - ensure they are loaded from database
             items_html = ""
@@ -260,7 +275,7 @@ class ReportsDialog(QDialog):
                     except Exception as e:
                         print(f"DEBUG: Error loading sales items: {e}")
             
-            devis_rows = []  # rows for devis full-table rendering
+            devis_rows = []  # rows for devis/facture full-table rendering
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
                 total_ht = 0
@@ -332,8 +347,7 @@ class ReportsDialog(QDialog):
             
             # Build paginated items for devis template if requested
             devis_items_html = ""
-            bdl_items_html = ""
-            if report_type == 'devis':
+            if report_type in ('devis', 'facture'):
                 # Row capacities (calibrated):
                 # - single page (header+table+totals) => base-2
                 # - first of multi (header+table)     => base+1
@@ -388,94 +402,10 @@ class ReportsDialog(QDialog):
                     table_html.append('</tbody></table></div>')
                     devis_items_html += "".join(table_html)
 
-            elif report_type == 'bdl':
-                # Build BDL rows with different columns
-                bdl_rows = []
-                if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
-                    for item in self.sales_obj.items:
-                        product_name = item.get_value('product_name') or ""
-                        
-                        # If product_name is empty, try to get it from product_id
-                        if not product_name:
-                            product_id = item.get_value('product_id')
-                            if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
-                                try:
-                                    # Get product name from Products table
-                                    product_data = self.sales_obj.database.cursor.execute(
-                                        "SELECT name FROM Products WHERE ID = ?", (product_id,)
-                                    ).fetchone()
-                                    if product_data:
-                                        product_name = product_data[0]
-                                except Exception as e:
-                                    print(f"DEBUG: Error getting product name: {e}")
-                        
-                        quantity = item.get_value('quantity') or 0
-                        # For BDL, assume all ordered quantity is delivered (can be modified later)
-                        qte_commandee = quantity
-                        qte_livree = quantity  # Could be different in a real scenario
-                        
-                        row_html = (
-                            f"<tr>"
-                            f"<td style=\"text-align: left\">{product_name}</td>"
-                            f"<td>{qte_commandee}</td>"
-                            f"<td>{qte_livree}</td>"
-                            f"</tr>"
-                        )
-                        bdl_rows.append(row_html)
-                
-                # Same pagination logic as devis but with different column headers
-                total_rows = len(bdl_rows)
-                if total_rows == 0:
-                    pages = [(0, 23)]
-                elif total_rows <= 23:
-                    pages = [(total_rows, 23)]
-                else:
-                    remaining = total_rows
-                    pages = []
-                    # First page
-                    take = min(remaining, 26)
-                    pages.append((take, 26))
-                    remaining -= take
-                    # Middle pages
-                    while remaining > 30:
-                        take = min(remaining, 30)
-                        pages.append((take, 30))
-                        remaining -= take
-                    # Last page
-                    pages.append((remaining, 30))
-
-                # Build HTML tables with page breaks for BDL
-                cursor = 0
-                for idx, (take, capacity) in enumerate(pages):
-                    page_rows = bdl_rows[cursor:cursor + take]
-                    cursor += take
-                    fillers = max(0, capacity - len(page_rows))
-                    block_class = "items-block page-break" if idx < len(pages) - 1 else "items-block"
-                    table_html = [f'<div class="{block_class}">']
-                    table_html.append('<table>')
-                    table_html.append('<thead><tr>'
-                                      '<th>Désignation</th>'
-                                      '<th>Qté Commandée</th>'
-                                      '<th>Qté Livrée</th>'
-                                      '</tr></thead>')
-                    table_html.append('<tbody>')
-                    table_html.extend(page_rows)
-                    for _ in range(fillers):
-                        table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
-                    table_html.append('</tbody></table></div>')
-                    bdl_items_html += "".join(table_html)
-
-            # Calculate BDL totals
+            # No separate BDL logic anymore
             total_qte_commandee = 0
             total_qte_livree = 0
-            if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
-                for item in self.sales_obj.items:
-                    quantity = item.get_value('quantity') or 0
-                    total_qte_commandee += int(quantity) if quantity else 0
-                    # For now, assume all ordered quantity is delivered
-                    total_qte_livree += int(quantity) if quantity else 0
-            
-            reste_a_livrer = total_qte_commandee - total_qte_livree
+            reste_a_livrer = 0
 
             return {
                 'company_name': company_name,
@@ -489,7 +419,7 @@ class ReportsDialog(QDialog):
                 'client_name': client_name,
                 'client_address': company_address,  # Use company address as fallback
                 'commercial': "Sales Team",         # Default commercial
-                'items': bdl_items_html if report_type == 'bdl' else (devis_items_html if report_type == 'devis' else items_html),
+                'items': (devis_items_html if report_type in ('devis','facture') else items_html),
                 # New financial fields for devis
                 'total_remise': _fmt_fr(total_remise),
                 'total_ht': _fmt_fr(total_ht),
@@ -689,9 +619,9 @@ class ReportsDialog(QDialog):
         """Handle report generation error"""
         QApplication.restoreOverrideCursor()
         self.devis_btn.setEnabled(True)
-        self.bdl_btn.setEnabled(True)
+        if hasattr(self, 'facture_btn'):
+            self.facture_btn.setEnabled(True)
         self.cancel_btn.setEnabled(True)
-        
         QMessageBox.critical(self, "Error", f"Failed to generate report:\n{error_message}")
     
     def open_pdf(self, pdf_path):

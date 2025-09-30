@@ -760,12 +760,12 @@ class HomeTab(QWidget):
         
         try:
             if table_name == 'Sales':
-                # Calculate total from Sales_Items for sales in this month
+                # Calculate total from Sales_Items for sales in this month (exclude on_hold)
                 query = """
                     SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
                     FROM Sales s
                     JOIN Sales_Items si ON s.ID = si.sales_id
-                    WHERE strftime('%Y', s.date) = ? AND strftime('%m', s.date) = ?
+                    WHERE s.state != 'on_hold' AND strftime('%Y', s.date) = ? AND strftime('%m', s.date) = ?
                 """
             elif table_name == 'Imports':
                 # Calculate total from Import_Items for imports in this month
@@ -808,10 +808,8 @@ class HomeTab(QWidget):
             query = """
                 SELECT COUNT(*) FROM Products p
                 WHERE (
-                    SELECT COALESCE(SUM(ii.quantity), 0) - COALESCE(SUM(si.quantity), 0)
-                    FROM Import_Items ii
-                    LEFT JOIN Sales_Items si ON ii.product_id = si.product_id
-                    WHERE ii.product_id = p.ID
+                    COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID),0) -
+                    COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')),0)
                 ) < 5
             """
             self.database.cursor.execute(query)
@@ -829,17 +827,11 @@ class HomeTab(QWidget):
         try:
             query = """
                 SELECT p.name, p.username,
-                    (COALESCE(
-                        (SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0
-                    ) - COALESCE(
-                        (SELECT SUM(si.quantity) FROM Sales_Items si WHERE si.product_id = p.ID), 0
-                    )) as stock_level
+                    (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
+                     - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) as stock_level
                 FROM Products p
-                WHERE (COALESCE(
-                        (SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0
-                    ) - COALESCE(
-                        (SELECT SUM(si.quantity) FROM Sales_Items si WHERE si.product_id = p.ID), 0
-                    )) <= ?
+                WHERE (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
+                     - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) <= ?
                 ORDER BY stock_level ASC, p.name ASC
                 LIMIT 15
             """
@@ -908,6 +900,7 @@ class HomeTab(QWidget):
                     'Sale to ' || s.client_username as description
                 FROM Sales s
                 LEFT JOIN Sales_Items si ON s.ID = si.sales_id
+                WHERE s.state IS NULL OR s.state != 'on_hold'
                 GROUP BY s.ID, s.date, s.client_username, s.tva
                 ORDER BY s.date DESC, s.ID DESC 
                 LIMIT 5

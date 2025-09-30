@@ -1,0 +1,79 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Facture</title>
+  <style>
+    body { font-family: Arial, sans-serif; font-size: 12px; margin: 20px; min-height: calc(100vh - 40px); display: flex; flex-direction: column; }
+    .document { padding: 15px; height: 100%; display: flex; flex-direction: column; }
+    header { display: flex; justify-content: space-between; align-items: stretch; margin-bottom: 15px; }
+    .logo { width: 55%; }
+    .logo-placeholder { width: 100px; height: 40px; border: 1px solid #000; display: flex; justify-content: center; align-items: center; margin-bottom: 4px; font-size: 10px; }
+    .company { font-weight: bold; }
+    .company-info { font-size: 11px; line-height: 1.25; max-width: 300px; }
+    .company-info .company-address { white-space: normal; }
+    .right-pane { width: 40%; display: flex; flex-direction: column; gap: 8px; }
+    .doc-info { border: 1px solid #000; padding: 6px; }
+    .doc-info h2 { text-align: center; margin: 4px 0 8px 0; font-size: 14px; }
+    .doc-info table { width: 100%; border-collapse: collapse; }
+    .doc-info td { border: 1px solid #000; padding: 4px; font-size: 11px; }
+    .client-box { border: 1px solid #000; padding: 10px; min-height: 56px; display: flex; align-items: center; justify-content: center; }
+    .client-box .client-name { font-weight: bold; font-size: 16px; }
+    .label { width: 25%; font-weight: bold; }
+    .items { margin-bottom: 4px; }
+    .items-block { margin-bottom: 4px; }
+    .items-block.page-break { page-break-after: always; break-after: page; }
+    .items table { width: 100%; border-collapse: collapse; margin-bottom: 0; }
+    .items th { border: 1px solid #000; padding: 8px; text-align: center; font-size: 11px; background-color: #f2f2f2; }
+    .items thead th:nth-child(3), .items thead th:nth-child(4) { text-align: right; }
+    .items td { border-left: 1px solid #000; border-right: 1px solid #000; border-top: none; border-bottom: none; padding: 8px; text-align: center; font-size: 11px; vertical-align: top; }
+    .items tbody td:nth-child(3), .items tbody td:nth-child(4) { text-align: right; }
+    .items tr:last-child td { border-bottom: 1px solid #000; }
+    .items tr { page-break-inside: avoid; }
+    @media print { body { min-height: auto; } .document { height: auto; } .spacer { min-height: 100px; } }
+    footer { margin-top: 6px; }
+    .totals { width: 100%; display: flex; justify-content: flex-end; }
+    .totals-grid { width: 55%; border-collapse: collapse; }
+    .totals-grid th, .totals-grid td { border: 1px solid #000; padding: 6px 8px; font-size: 11px; }
+    .totals-grid th { background: #f2f2f2; text-align: left; }
+    .totals-grid td { text-align: right; }
+    .note { margin-top: 4px; font-size: 10px; text-align: right; }
+    .items tr.filler td { height: 14px; }
+  </style>
+</head>
+<body>
+  <div class="document">
+    <header>
+      <div class="logo">
+        {{ logo_block }}
+        <p class="company">{{ company_name }}</p>
+        <div class="company-info">
+          <div class="company-address">{{ company_address }}</div>
+          <div>Tel: {{ company_phone }}</div>
+          <div>Email: {{ company_email }}</div>
+        </div>
+      </div>
+      <div class="right-pane">
+        <div class="doc-info">
+          <h2>Facture</h2>
+          <table>
+            <tr><td>Réf. document</td><td>{{ document_ref }}</td></tr>
+            <tr><td>Date</td><td>{{ date }}</td></tr>
+          </table>
+        </div>
+        <div class="client-box"><span class="client-name">{{ client_name }}</span></div>
+      </div>
+    </header>
+    <section class="items">{{ items }}</section>
+    <footer>
+      <div class="totals">
+        <table class="totals-grid">
+          <tr><th>Total Remise</th><th>Total HT</th><th>Total Règle</th><th>Net à payer</th></tr>
+          <tr><td>{{ total_remise }}</td><td>{{ total_ht }}</td><td>{{ total_regle }}</td><td><strong>{{ net_a_payer }}</strong></td></tr>
+        </table>
+      </div>
+      <div class="note">TVA non applicable - article 293 B du CGI</div>
+    </footer>
+  </div>
+</body>
+</html>

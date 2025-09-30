@@ -3,6 +3,7 @@ Sales tab - Updated to use unified BaseTab approach
 Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
+from PySide6.QtCore import Qt, QPoint
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
@@ -50,6 +51,7 @@ class SalesTab(BaseTab):
     
     def __init__(self, database=None, parent=None):
         super().__init__(SalesClass, SalesEditDialog, database, parent)
+        self._ensure_new_columns_order()
     
     def setup_ui(self):
         """Override setup_ui to add reports button"""
@@ -228,6 +230,144 @@ class SalesTab(BaseTab):
             print(f"Error sorting sales: {e}")
         
         return items
+
+    # ------------- New columns injection and custom cell rendering -------------
+    def _ensure_new_columns_order(self):
+        """Ensure facture_number and state appear after ID for existing DBs."""
+        try:
+            needed = []
+            if 'id' in self.table_columns:
+                needed.append('id')
+            if 'facture_number' in self.object_class(0, self.database).parameters:
+                if 'facture_number' not in self.table_columns:
+                    self.table_columns.insert(1, 'facture_number')
+                needed.append('facture_number')
+            if 'state' in self.object_class(0, self.database).parameters:
+                if 'state' not in self.table_columns:
+                    self.table_columns.insert(2 if 'facture_number' in self.table_columns else 1, 'state')
+                needed.append('state')
+            # Rebuild headers if order changed
+            temp_obj = self.object_class(0, self.database)
+            headers = []
+            for key in self.table_columns:
+                headers.append(temp_obj.get_display_name(key) if key in temp_obj.parameters else key)
+            self.table.setColumnCount(len(self.table_columns))
+            self.table.setHorizontalHeaderLabels(headers)
+        except Exception as e:
+            print(f"Error ensuring sales columns order: {e}")
+
+    def populate_table_with_items(self, items):
+        """Populate table with custom state button rendering."""
+        self.table.setRowCount(len(items))
+        for row, obj in enumerate(items):
+            try:
+                for col, column_key in enumerate(self.table_columns):
+                    if column_key == 'state':
+                        self._set_state_cell(row, col, obj)
+                    else:
+                        self.set_table_cell(row, col, column_key, obj)
+            except Exception as e:
+                print(f"Error processing Sales row {row}: {e}")
+        self.table.resizeRowsToContents()
+
+    def _set_state_cell(self, row, col, obj):
+        from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
+        state = obj.get_value('state') or 'pending'
+        colors = {
+            'on_hold': ('On Hold', '#757575'),
+            'pending': ('Pending', '#FF9800'),
+            'confirmed': ('Confirmed', '#4CAF50')
+        }
+        label, color = colors.get(state, ('Pending', '#FF9800'))
+        btn = QPushButton(label)
+        btn.setStyleSheet(f"QPushButton {{ background:{color}; color:#fff; border:none; border-radius:6px; padding:4px 10px; }}")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(lambda _=None, o=obj, b=btn: self._open_state_popup(o, b))
+
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(0,0,0,0)
+        lay.addWidget(btn)
+        self.table.setCellWidget(row, col, container)
+
+    def _open_state_popup(self, obj, anchor):
+        """Open a small popup dialog with state choices."""
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QSizePolicy, QLabel, QFrame
+        # Close previous
+        if hasattr(self, '_state_popup') and self._state_popup:
+            try:
+                self._state_popup.close()
+            except Exception:
+                pass
+        popup = QDialog(self)
+        popup.setWindowFlags(Qt.Popup | Qt.FramelessWindowHint)
+        popup.setAttribute(Qt.WA_TranslucentBackground, False)
+        popup.setModal(False)
+        popup.setObjectName('statePopup')
+
+        layout = QVBoxLayout(popup)
+        layout.setContentsMargins(12,12,12,12)
+        layout.setSpacing(8)
+
+        styles = {
+            'on_hold': ('On Hold', '#757575'),
+            'pending': ('Pending', '#FF9800'),
+            'confirmed': ('Confirmed', '#4CAF50')
+        }
+        current = obj.get_value('state') or 'pending'
+        for key, (text, color) in styles.items():
+            btn = QPushButton(text)
+            sel_border = '3px solid #FFFFFF' if key == current else '1px solid #1e1e1e'
+            btn.setStyleSheet(
+                f"QPushButton {{ background:{color}; color:#fff; border:{sel_border}; border-radius:6px; padding:8px 12px; font-weight:bold; }}"
+                f"QPushButton:hover {{ filter: brightness(110%); }}"
+            )
+            btn.setCursor(Qt.PointingHandCursor)
+            btn.clicked.connect(lambda _=None, k=key: self._select_state_from_popup(popup, obj, k))
+            layout.addWidget(btn)
+
+        # Separator
+        line = QFrame()
+        line.setFrameShape(QFrame.HLine)
+        line.setStyleSheet('color:#555;')
+        layout.addWidget(line)
+
+        cancel_btn = QPushButton('Cancel')
+        cancel_btn.setStyleSheet("QPushButton { background:#E53935; color:#fff; border:none; border-radius:6px; padding:8px 12px; }"
+                                "QPushButton:hover { background:#EF5350; }")
+        cancel_btn.setCursor(Qt.PointingHandCursor)
+        cancel_btn.clicked.connect(popup.close)
+        cancel_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
+        layout.addWidget(cancel_btn)
+
+        popup.setStyleSheet("#statePopup { background:#2f2f2f; border:2px solid #444; border-radius:10px; }")
+        self._state_popup = popup
+        # Position near anchor
+        global_pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
+        popup.move(global_pos + QPoint(0, 6))
+        popup.show()
+
+    def _select_state_from_popup(self, popup, obj, new_state):
+        try:
+            popup.close()
+        except Exception:
+            pass
+        self._change_sale_state(obj, new_state)
+
+    def _change_sale_state(self, obj, new_state):
+        if not self.database:
+            return
+        try:
+            obj.set_value('state', new_state)
+            payload = {'state': new_state}
+            if new_state == 'confirmed':
+                obj._ensure_facture_number()
+                payload['facture_number'] = obj.get_value('facture_number')
+            self.database.update_item(obj.id, payload, 'Sales')
+            # Refresh to reflect button style & facture number
+            self.refresh_table()
+        except Exception as e:
+            print(f"Error updating sale state: {e}")
     
     def show_reports(self):
         """Show reports dialog for selected sales record"""

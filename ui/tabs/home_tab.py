@@ -668,25 +668,43 @@ class HomeTab(QWidget):
                 padding: 16px;
             }
         """)
-        activity_frame.setFixedHeight(200)
+        activity_frame.setFixedHeight(400)
         
         activity_layout = QVBoxLayout(activity_frame)
+        self.recent_activity_layout = activity_layout
+        self.recent_activity_frame = activity_frame
         
-        # Recent transactions
+        self._populate_recent_activities()
+        parent_layout.addWidget(activity_frame)
+
+    def _populate_recent_activities(self):
+        """Rebuild the recent activities list UI."""
+        layout = getattr(self, 'recent_activity_layout', None)
+        if layout is None:
+            return
+
+        # Clear existing widgets/items
+        while layout.count():
+            item = layout.takeAt(0)
+            if not item:
+                continue
+            widget = item.widget()
+            if widget:
+                widget.setParent(None)
+
         recent_activities = self.get_recent_activities()
-        
+
         if not recent_activities:
             no_activity = QLabel(self._t()("no_recent_activity"))
             no_activity.setStyleSheet("color: #888888; font-size: 14px; text-align: center;")
             no_activity.setAlignment(Qt.AlignCenter)
-            activity_layout.addWidget(no_activity)
+            layout.addWidget(no_activity)
         else:
-            for activity in recent_activities[:5]:  # Show last 5 activities
+            for activity in recent_activities:
                 activity_widget = self.create_activity_item(activity)
-                activity_layout.addWidget(activity_widget)
-        
-        activity_layout.addStretch()
-        parent_layout.addWidget(activity_frame)
+                layout.addWidget(activity_widget)
+
+        layout.addStretch()
     
     def create_activity_item(self, activity):
         """Create a single activity item widget"""
@@ -757,6 +775,7 @@ class HomeTab(QWidget):
                 self.stat_cards['low_stock'].update_value(low_stock_count, "At/Below alert")
             # Refresh the detailed list
             self._populate_low_stock_products()
+            self._populate_recent_activities()
             
             # Clients count
             clients_count = self.get_table_count('Clients')
@@ -988,7 +1007,7 @@ class HomeTab(QWidget):
             # Sort all activities by date (most recent first)
             activities.sort(key=lambda x: x['date'], reverse=True)
             
-            return activities[:10]  # Return top 10 most recent
+            return activities[:5]  # Return top 5 most recent
             
         except Exception as e:
             print(f"Error getting recent activities: {e}")
@@ -1055,4 +1074,5 @@ class HomeTab(QWidget):
         self.refresh_statistics()
         # Ensure list is in sync when user returns
         self._populate_low_stock_products()
+        self._populate_recent_activities()
         print("✓ Home tab refreshed on switch")

@@ -192,7 +192,7 @@ class Database:
     def _ensure_additional_columns(self):
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
-            'Sales': {'client_name': 'TEXT', 'state': 'TEXT', 'facture_number': 'INTEGER'},
+            'Sales': {'client_name': 'TEXT', 'state': 'TEXT'},
             'Imports': {'supplier_name': 'TEXT'},
             'Sales_Items': {'product_name': 'TEXT'},
             'Import_Items': {'product_name': 'TEXT'}

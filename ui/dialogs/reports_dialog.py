@@ -53,9 +53,9 @@ class ReportsDialog(QDialog):
         self.devis_btn.clicked.connect(lambda: self.generate_report("devis"))
         buttons_layout.addWidget(self.devis_btn)
 
-        self.facture_btn = BlueButton("Facture")
-        self.facture_btn.clicked.connect(lambda: self.generate_report("facture"))
-        buttons_layout.addWidget(self.facture_btn)
+        self.bdl_btn = BlueButton("Bon de livraison")
+        self.bdl_btn.clicked.connect(lambda: self.generate_report("bdl"))
+        buttons_layout.addWidget(self.bdl_btn)
         
         layout.addLayout(buttons_layout)
         
@@ -84,15 +84,9 @@ class ReportsDialog(QDialog):
     def generate_report(self, report_type):
         """Generate report of specified type"""
         try:
-            # Gate facture generation to confirmed sales
-            if report_type == 'facture':
-                state = self.sales_obj.get_value('state') if self.sales_obj else None
-                if state != 'confirmed':
-                    QMessageBox.warning(self, "Not Confirmed", "You can only generate a facture for a confirmed sale.")
-                    return
             # Disable buttons during generation
             self.devis_btn.setEnabled(False)
-            self.facture_btn.setEnabled(False)
+            self.bdl_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             
             # Show progress
@@ -104,7 +98,7 @@ class ReportsDialog(QDialog):
             # Restore cursor and enable buttons
             QApplication.restoreOverrideCursor()
             self.devis_btn.setEnabled(True)
-            self.facture_btn.setEnabled(True)
+            self.bdl_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
             
             # Handle success - show message but don't close dialog
@@ -119,7 +113,7 @@ class ReportsDialog(QDialog):
         except Exception as e:
             QApplication.restoreOverrideCursor()
             self.devis_btn.setEnabled(True)
-            self.facture_btn.setEnabled(True)
+            self.bdl_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
             QMessageBox.critical(self, "Error", f"Failed to generate report:\n{str(e)}")
     
@@ -171,9 +165,9 @@ class ReportsDialog(QDialog):
     def _generate_html_content(self, report_type):
         """Generate HTML content based on report type"""
         # Get template path
-        # Map facture to devis template (same layout with label replacement)
-        mapped = 'devis' if report_type == 'facture' else report_type
-        template_path = os.path.join("report", f"{mapped}_templet.html")
+        # Map bdl to bdl_templet.html, keep devis as is
+        mapped = 'bdl_templet' if report_type == 'bdl' else report_type
+        template_path = os.path.join("report", f"{mapped}.html")
         
         if not os.path.exists(template_path):
             raise Exception(f"Template file not found: {template_path}")
@@ -187,10 +181,6 @@ class ReportsDialog(QDialog):
         
         # Replace placeholders
         html_content = self._replace_placeholders(template_content, sales_data)
-        # If facture, replace visible title text
-        if report_type == 'facture':
-            html_content = html_content.replace('<h2>Devis</h2>', '<h2>Facture</h2>')
-            html_content = html_content.replace('<title>Devis</title>', '<title>Facture</title>')
         
         return html_content
     
@@ -240,11 +230,7 @@ class ReportsDialog(QDialog):
             
             # Generate document reference
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
-            facture_number = self.sales_obj.get_value('facture_number') or None
-            if report_type == 'facture' and facture_number:
-                doc_ref = f"FAC-{int(facture_number):06d}"
-            else:
-                doc_ref = f"DOC-{sales_id:06d}"
+            doc_ref = f"DOC-{sales_id:06d}"
             
             # Get sales items - ensure they are loaded from database
             items_html = ""
@@ -346,9 +332,10 @@ class ReportsDialog(QDialog):
             total_regle = 0   # Amount already paid (could be from payments table if exists)
             net_a_payer = total_ht - total_remise - total_regle
             
-            # Build paginated items for devis template if requested
-            devis_items_html = ""
-            if report_type in ('devis', 'facture'):
+            # Build items HTML based on report type
+            if report_type == 'devis':
+                # For devis, use the paginated logic
+                devis_items_html = ""
                 # Row capacities (calibrated):
                 # - single page (header+table+totals) => base-2
                 # - first of multi (header+table)     => base+1
@@ -402,6 +389,10 @@ class ReportsDialog(QDialog):
                         table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
                     table_html.append('</tbody></table></div>')
                     devis_items_html += "".join(table_html)
+                items_final = devis_items_html
+            else:
+                # For BDL, use simple table format (items_html already includes proper table structure)
+                items_final = items_html
 
             # No separate BDL logic anymore
             total_qte_commandee = 0
@@ -421,7 +412,7 @@ class ReportsDialog(QDialog):
                 'client_name': client_name,
                 'client_address': company_address,  # Use company address as fallback
                 'commercial': "Sales Team",         # Default commercial
-                'items': (devis_items_html if report_type in ('devis','facture') else items_html),
+                'items': items_final,
                 # New financial fields for devis
                 'total_remise': _fmt_fr(total_remise),
                 'total_ht': _fmt_fr(total_ht),
@@ -622,8 +613,8 @@ class ReportsDialog(QDialog):
         """Handle report generation error"""
         QApplication.restoreOverrideCursor()
         self.devis_btn.setEnabled(True)
-        if hasattr(self, 'facture_btn'):
-            self.facture_btn.setEnabled(True)
+        if hasattr(self, 'bdl_btn'):
+            self.bdl_btn.setEnabled(True)
         self.cancel_btn.setEnabled(True)
         QMessageBox.critical(self, "Error", f"Failed to generate report:\n{error_message}")
     

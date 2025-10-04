@@ -233,18 +233,14 @@ class SalesTab(BaseTab):
 
     # ------------- New columns injection and custom cell rendering -------------
     def _ensure_new_columns_order(self):
-        """Ensure facture_number and state appear after ID for existing DBs."""
+        """Ensure state appears after ID for existing DBs."""
         try:
             needed = []
             if 'id' in self.table_columns:
                 needed.append('id')
-            if 'facture_number' in self.object_class(0, self.database).parameters:
-                if 'facture_number' not in self.table_columns:
-                    self.table_columns.insert(1, 'facture_number')
-                needed.append('facture_number')
             if 'state' in self.object_class(0, self.database).parameters:
                 if 'state' not in self.table_columns:
-                    self.table_columns.insert(2 if 'facture_number' in self.table_columns else 1, 'state')
+                    self.table_columns.insert(1, 'state')
                 needed.append('state')
             # Rebuild headers if order changed
             temp_obj = self.object_class(0, self.database)
@@ -360,11 +356,8 @@ class SalesTab(BaseTab):
         try:
             obj.set_value('state', new_state)
             payload = {'state': new_state}
-            if new_state == 'confirmed':
-                obj._ensure_facture_number()
-                payload['facture_number'] = obj.get_value('facture_number')
             self.database.update_item(obj.id, payload, 'Sales')
-            # Refresh to reflect button style & facture number
+            # Refresh to reflect button style
             self.refresh_table()
         except Exception as e:
             print(f"Error updating sale state: {e}")

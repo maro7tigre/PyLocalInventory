@@ -21,14 +21,7 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
-            # New: sequential facture/invoice number (assigned only when confirmed)
-            "facture_number": {
-                "value": None,
-                "display_name": {"en": "Facture #", "fr": "Facture #", "es": "Factura #"},
-                "required": False,
-                "default": None,
-                "type": "int"
-            },
+
             # New: workflow state of the sale
             "state": {
                 "value": "pending",  # default when created
@@ -119,7 +112,6 @@ class SalesClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "facture_number": "r",
                 "state": "r",
                 "client_username": "r",
                 "client_name": "r",
@@ -135,7 +127,6 @@ class SalesClass(BaseClass):
                 "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {
-                "facture_number": "rw",
                 "state": "rw",
                 "client_username": "rw",
                 "client_name": "rw",  # snapshot
@@ -146,7 +137,6 @@ class SalesClass(BaseClass):
             },
             "report": {
                 "id": "r",
-                "facture_number": "r",
                 "state": "r",
                 "client_id": "r",
                 "date": "r",
@@ -286,13 +276,7 @@ class SalesClass(BaseClass):
         if param_key == 'client_username':
             # Update snapshot fields
             self._refresh_client_snapshot()
-        if param_key == 'state':
-            # When transitioning to confirmed ensure facture number exists
-            try:
-                if value == 'confirmed':
-                    self._ensure_facture_number()
-            except Exception as e:
-                print(f"Error ensuring facture number: {e}")
+
     
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for client_username"""
@@ -324,9 +308,7 @@ class SalesClass(BaseClass):
             # Ensure state default
             if not self.get_value('state'):
                 super().set_value('state', 'pending')
-            # If already confirmed, ensure facture number assigned
-            if self.get_value('state') == 'confirmed':
-                self._ensure_facture_number()
+
             # Get data for database destination  
             data = {}
             for param_key in self.get_visible_parameters("database"):
@@ -365,26 +347,3 @@ class SalesClass(BaseClass):
             except Exception as e:
                 print(f"Warning: could not persist updated client_name snapshot for sale {self.id}: {e}")
 
-    # ---------------- New helpers for state & facture sequence -----------------
-    def _ensure_facture_number(self):
-        """Assign a sequential facture (invoice) number if sale confirmed and none exists.
-        Sequence is independent from sale ID and only counts confirmed sales.
-        """
-        try:
-            if not self.database or not self.database.cursor:
-                return
-            current = self.get_value('facture_number')
-            if current and int(current) > 0:
-                return  # already assigned
-            # Compute next sequence: max over confirmed sales
-            self.database.cursor.execute("SELECT COALESCE(MAX(facture_number), 0) + 1 FROM Sales WHERE state = 'confirmed' AND facture_number IS NOT NULL")
-            next_num_row = self.database.cursor.fetchone()
-            next_num = int(next_num_row[0]) if next_num_row and next_num_row[0] else 1
-            super().set_value('facture_number', next_num)
-            if self.id:
-                try:
-                    self.database.update_item(self.id, {'facture_number': next_num}, 'Sales')
-                except Exception as e_upd:
-                    print(f"Warning: could not persist facture_number for sale {self.id}: {e_upd}")
-        except Exception as e:
-            print(f"Error assigning facture number: {e}")

@@ -34,6 +34,10 @@ class ProfileManager:
             return
         
         for item in os.listdir(self.profiles_path):
+            # Skip the deleted directory
+            if item == "deleted":
+                continue
+                
             profile_dir = os.path.join(self.profiles_path, item)
             config_path = os.path.join(profile_dir, "config.json")
             
@@ -136,16 +140,38 @@ class ProfileManager:
         profile.save_to_config()
     
     def delete_profile(self, profile_name):
-        """Delete existing profile"""
+        """Move profile to deleted directory except reports which are permanently deleted"""
         if profile_name not in self.available_profiles:
             return False
         
         profile = self.available_profiles[profile_name]
         profile_dir = os.path.dirname(profile.config_path)
         
-        # Remove from filesystem
+        # Handle reports directory - delete permanently since they're temporary
+        reports_dir = os.path.join(profile_dir, "reports")
+        if os.path.exists(reports_dir):
+            try:
+                shutil.rmtree(reports_dir)
+                print(f"Reports directory permanently deleted for profile '{profile_name}'")
+            except Exception as e:
+                print(f"Warning: Could not delete reports directory: {e}")
+        
+        # Create deleted directory if it doesn't exist
+        deleted_dir = os.path.join(self.profiles_path, "deleted")
+        os.makedirs(deleted_dir, exist_ok=True)
+        
+        # Generate unique name for deleted profile
+        deleted_name = self._generate_deleted_profile_name(profile_name, deleted_dir)
+        deleted_profile_path = os.path.join(deleted_dir, deleted_name)
+        
+        # Move profile directory to deleted directory
         if os.path.exists(profile_dir):
-            shutil.rmtree(profile_dir)
+            try:
+                shutil.move(profile_dir, deleted_profile_path)
+                print(f"Profile '{profile_name}' moved to deleted/{deleted_name}")
+            except Exception as e:
+                print(f"Error moving profile to deleted directory: {e}")
+                return False
         
         # Remove from memory
         del self.available_profiles[profile_name]
@@ -155,6 +181,28 @@ class ProfileManager:
             self.selected_profile = None
         
         return True
+    
+    def _generate_deleted_profile_name(self, original_name, deleted_dir):
+        """Generate unique name for deleted profile: originalname_deletiondate_number"""
+        from datetime import datetime
+        
+        # Get current date in YYYY-MM-DD format
+        deletion_date = datetime.now().strftime("%Y-%m-%d")
+        
+        # Start with base name
+        base_name = f"{original_name}_{deletion_date}"
+        
+        # Check if base name already exists, if not return it
+        if not os.path.exists(os.path.join(deleted_dir, base_name)):
+            return base_name
+        
+        # If base name exists, add incrementing number
+        counter = 1
+        while True:
+            candidate_name = f"{base_name}_{counter}"
+            if not os.path.exists(os.path.join(deleted_dir, candidate_name)):
+                return candidate_name
+            counter += 1
     
     def list_profiles(self):
         """Get list of available profiles"""

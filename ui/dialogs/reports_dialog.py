@@ -151,23 +151,24 @@ class ReportsDialog(QDialog):
         return actual_output_path
     
     def _cleanup_old_reports(self, reports_dir):
-        """Delete reports older than 2 days"""
-        cutoff_date = datetime.now() - timedelta(days=2)
+        """Delete reports older than 48 hours"""
+        cutoff_date = datetime.now() - timedelta(hours=48)
         
-        for pdf_file in glob.glob(os.path.join(reports_dir, "*.pdf")):
-            try:
-                file_mtime = datetime.fromtimestamp(os.path.getmtime(pdf_file))
-                if file_mtime < cutoff_date:
-                    os.remove(pdf_file)
-            except Exception as e:
-                print(f"Error deleting old report {pdf_file}: {e}")
+        # Clean up both PDF and HTML reports (fallback reports)
+        for pattern in ["*.pdf", "*.html"]:
+            for report_file in glob.glob(os.path.join(reports_dir, pattern)):
+                try:
+                    file_mtime = datetime.fromtimestamp(os.path.getmtime(report_file))
+                    if file_mtime < cutoff_date:
+                        os.remove(report_file)
+                        print(f"Cleaned up old report: {os.path.basename(report_file)}")
+                except Exception as e:
+                    print(f"Error deleting old report {report_file}: {e}")
     
     def _generate_html_content(self, report_type):
         """Generate HTML content based on report type"""
-        # Get template path
-        # Map bdl to bdl_templet.html, keep devis as is
-        mapped = 'bdl_templet' if report_type == 'bdl' else report_type
-        template_path = os.path.join("report", f"{mapped}.html")
+        # Get template path - all templates have _templet suffix
+        template_path = os.path.join("report", f"{report_type}_templet.html")
         
         if not os.path.exists(template_path):
             raise Exception(f"Template file not found: {template_path}")

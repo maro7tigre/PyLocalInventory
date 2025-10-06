@@ -333,8 +333,10 @@ class ReportsDialog(QDialog):
             total_regle = 0   # Amount already paid (could be from payments table if exists)
             net_a_payer = total_ht - total_remise - total_regle
             
-            # Calculate TVA and Total TTC for BDL
-            tva_rate = 0.20  # 20% VAT rate (standard in France)
+            # Calculate TVA and Total TTC based on sales record
+            # Get the TVA percentage from the sales object (0 or 20)
+            tva_percent = self.sales_obj.get_value('tva') or 0
+            tva_rate = tva_percent / 100.0  # Convert percentage to decimal
             tva_amount = total_ht * tva_rate
             total_ttc = total_ht + tva_amount
             

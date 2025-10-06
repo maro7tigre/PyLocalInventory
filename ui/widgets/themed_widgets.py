@@ -404,3 +404,7 @@ class PasswordInputWidget(QWidget):
     
     def returnPressed(self):
         return self.password_input.returnPressed
+    
+    def setEnabled(self, enabled):
+        self.password_input.setEnabled(enabled)
+        self.toggle_button.setEnabled(enabled)

@@ -9,7 +9,7 @@ import os
 import time
 import shutil
 
-from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
+from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton, PasswordInputWidget
 from ui.widgets.cards_list import GridCardsList
 from core.profiles import ProfileClass, ProfileManager
 
@@ -260,13 +260,11 @@ class ProfilesDialog(QDialog):
         
         # Password fields
         self.scroll_layout.addWidget(QLabel("Password:"))
-        self.password_edit = QLineEdit()
-        self.password_edit.setEchoMode(QLineEdit.Password)
+        self.password_edit = PasswordInputWidget()
         self.scroll_layout.addWidget(self.password_edit)
         
         self.scroll_layout.addWidget(QLabel("Confirm Password:"))
-        self.confirm_password_edit = QLineEdit()
-        self.confirm_password_edit.setEchoMode(QLineEdit.Password)
+        self.confirm_password_edit = PasswordInputWidget()
         self.scroll_layout.addWidget(self.confirm_password_edit)
         
         self.scroll_layout.addStretch()

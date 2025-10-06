@@ -333,6 +333,11 @@ class ReportsDialog(QDialog):
             total_regle = 0   # Amount already paid (could be from payments table if exists)
             net_a_payer = total_ht - total_remise - total_regle
             
+            # Calculate TVA and Total TTC for BDL
+            tva_rate = 0.20  # 20% VAT rate (standard in France)
+            tva_amount = total_ht * tva_rate
+            total_ttc = total_ht + tva_amount
+            
             # Build items HTML based on report type
             if report_type == 'devis':
                 # For devis, use the paginated logic
@@ -419,10 +424,9 @@ class ReportsDialog(QDialog):
                 'total_ht': _fmt_fr(total_ht),
                 'total_regle': _fmt_fr(total_regle),
                 'net_a_payer': _fmt_fr(net_a_payer),
-                # BDL specific fields
-                'total_commande': str(total_qte_commandee),
-                'total_livre': str(total_qte_livree),
-                'reste_a_livrer': str(reste_a_livrer),
+                # BDL specific pricing fields
+                'tva': _fmt_fr(tva_amount),
+                'total_ttc': _fmt_fr(total_ttc),
                 # Logo block
                 'logo_block': logo_block
             }
@@ -446,10 +450,9 @@ class ReportsDialog(QDialog):
                 'total_ht': '0,00',
                 'total_regle': '0,00',
                 'net_a_payer': '0,00',
-                # BDL specific fields
-                'total_commande': '0',
-                'total_livre': '0',
-                'reste_a_livrer': '0',
+                # BDL specific pricing fields
+                'tva': '0,00',
+                'total_ttc': '0,00',
                 'logo_block': '<div class="logo-placeholder">LOGO</div>'
             }
     

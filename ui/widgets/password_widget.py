@@ -4,7 +4,7 @@ Password Widget - Displays password entry screen for selected profile
 from PySide6.QtWidgets import QWidget, QVBoxLayout, QHBoxLayout, QLabel, QPushButton
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtGui import QFont
-from ui.widgets.themed_widgets import GreenButton, ColoredLineEdit
+from ui.widgets.themed_widgets import GreenButton, ColoredLineEdit, PasswordInputWidget
 from ui.widgets.preview_widget import PreviewWidget
 
 
@@ -110,12 +110,11 @@ class PasswordWidget(QWidget):
         form_layout.addWidget(password_label)
         
         # Password input - full width within form
-        self.password_input = ColoredLineEdit()
-        self.password_input.setEchoMode(ColoredLineEdit.Password)
+        self.password_input = PasswordInputWidget()
         self.password_input.setObjectName("password_input")
         self.password_input.setPlaceholderText("Enter your password...")
-        self.password_input.returnPressed.connect(self._submit_password)
-        self.password_input.textChanged.connect(self._reset_password_styling)
+        self.password_input.returnPressed().connect(self._submit_password)
+        self.password_input.textChanged().connect(self._reset_password_styling)
         form_layout.addWidget(self.password_input)
         
         # Confirm button - full width within form
@@ -219,24 +218,8 @@ class PasswordWidget(QWidget):
                 margin-bottom: 5px;
             }
             
-            QLineEdit#password_input {
-                font-size: 16px;
-                padding: 15px 20px;
-                min-height: 20px;
-                border-radius: 8px;
-                background-color: #3c3c3c;
-                border: 2px solid #ffffff;
-                color: #ffffff;
-            }
-            
-            QLineEdit#password_input:focus {
-                border-color: #2196F3;
-                background-color: #404040;
-            }
-            
-            QLineEdit#password_input::placeholder {
-                color: #888888;
-                font-style: italic;
+            PasswordInputWidget#password_input {
+                min-height: 45px;
             }
             
             QPushButton#confirm_btn {

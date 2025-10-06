@@ -1,4 +1,4 @@
-from PySide6.QtWidgets import QMainWindow, QPushButton, QLineEdit, QLabel
+from PySide6.QtWidgets import QMainWindow, QPushButton, QLineEdit, QLabel, QWidget, QHBoxLayout
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QFont
 
@@ -258,3 +258,149 @@ class ThemedLabel(QLabel):
                 background-color: transparent;
             }
         """)
+
+# MARK: Password Input with Toggle
+class PasswordInputWidget(QWidget):
+    def __init__(self, border_color="#ffffff", parent=None):
+        super().__init__(parent)
+        self.default_color = border_color
+        self.setup_ui()
+        
+    def setup_ui(self):
+        """Setup the password input with toggle button"""
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.setSpacing(0)
+        
+        # Password input
+        self.password_input = QLineEdit()
+        self.password_input.setEchoMode(QLineEdit.Password)
+        
+        # Toggle button
+        self.toggle_button = QPushButton("🔒")
+        self.toggle_button.setFixedSize(45, 45)  # Square button
+        self.toggle_button.clicked.connect(self.toggle_visibility)
+        
+        layout.addWidget(self.password_input)
+        layout.addWidget(self.toggle_button)
+        
+        self.apply_styles()
+    
+    def toggle_visibility(self):
+        """Toggle password visibility"""
+        if self.password_input.echoMode() == QLineEdit.Password:
+            self.password_input.setEchoMode(QLineEdit.Normal)
+            self.toggle_button.setText("👀")
+        else:
+            self.password_input.setEchoMode(QLineEdit.Password)
+            self.toggle_button.setText("🔒")
+    
+    def apply_styles(self):
+        """Apply styles to make input and button look like one widget"""
+        self.password_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: #3c3c3c;
+                color: #ffffff;
+                border: 2px solid {self.default_color};
+                border-right: none;
+                padding: 8px;
+                border-radius: 4px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                font-size: 14px;
+                min-height: 29px;
+            }}
+            QLineEdit:focus {{
+                border-color: #2196F3;
+                border-right: none;
+            }}
+        """)
+        
+        self.toggle_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 2px solid {self.default_color};
+                border-left: none;
+                border-radius: 4px;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                font-size: 16px;
+                min-height: 29px;
+                max-height: 45px;
+            }}
+            QPushButton:hover {{
+                background-color: #4a4a4a;
+            }}
+            QPushButton:pressed {{
+                background-color: #555555;
+            }}
+        """)
+    
+    def set_border_color(self, color):
+        """Change border color of the input widget"""
+        self.password_input.setStyleSheet(f"""
+            QLineEdit {{
+                background-color: #3c3c3c;
+                color: #ffffff;
+                border: 2px solid {color};
+                border-right: none;
+                padding: 8px;
+                border-radius: 4px;
+                border-top-right-radius: 0px;
+                border-bottom-right-radius: 0px;
+                font-size: 14px;
+                min-height: 29px;
+            }}
+            QLineEdit:focus {{
+                border-color: #2196F3;
+                border-right: none;
+            }}
+        """)
+        
+        self.toggle_button.setStyleSheet(f"""
+            QPushButton {{
+                background-color: #3c3c3c;
+                color: #cccccc;
+                border: 2px solid {color};
+                border-left: none;
+                border-radius: 4px;
+                border-top-left-radius: 0px;
+                border-bottom-left-radius: 0px;
+                font-size: 16px;
+                min-height: 29px;
+                max-height: 45px;
+            }}
+            QPushButton:hover {{
+                background-color: #4a4a4a;
+            }}
+            QPushButton:pressed {{
+                background-color: #555555;
+            }}
+        """)
+    
+    def reset_border_color(self):
+        """Reset border to default color"""
+        self.set_border_color(self.default_color)
+    
+    # Proxy methods to make it work like a QLineEdit
+    def text(self):
+        return self.password_input.text()
+    
+    def setText(self, text):
+        self.password_input.setText(text)
+    
+    def setPlaceholderText(self, text):
+        self.password_input.setPlaceholderText(text)
+    
+    def setFocus(self):
+        self.password_input.setFocus()
+    
+    def selectAll(self):
+        self.password_input.selectAll()
+    
+    def textChanged(self):
+        return self.password_input.textChanged
+    
+    def returnPressed(self):
+        return self.password_input.returnPressed

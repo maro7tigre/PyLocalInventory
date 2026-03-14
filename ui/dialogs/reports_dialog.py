@@ -4,6 +4,7 @@ Reports Dialog - For selecting report type and generating PDF reports
 import os
 import sys
 import glob
+import socket
 import subprocess
 import tempfile
 import shutil
@@ -124,7 +125,9 @@ class ReportsDialog(QDialog):
             raise Exception("No profile selected")
         
         profile_path = os.path.dirname(self.profile_manager.selected_profile.config_path)
-        reports_dir = os.path.join(profile_path, "reports")
+        # Per-machine subfolder so each user on the LAN has their own reports directory
+        machine_name = socket.gethostname()
+        reports_dir = os.path.join(profile_path, "reports", machine_name)
         
         # Create reports directory if it doesn't exist
         os.makedirs(reports_dir, exist_ok=True)

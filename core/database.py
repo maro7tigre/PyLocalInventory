@@ -60,9 +60,13 @@ class Database:
             # Connect to database
             self.conn = sqlite3.connect(db_path)
             self.cursor = self.conn.cursor()
-            
+
             # Enable foreign key support in SQLite
             self.cursor.execute("PRAGMA foreign_keys = ON")
+            # WAL mode: allows concurrent reads alongside one writer (safe on network shares)
+            self.conn.execute("PRAGMA journal_mode=WAL")
+            # Wait up to 5 s when the DB is locked instead of failing immediately
+            self.conn.execute("PRAGMA busy_timeout=5000")
             
             # Create tables for all registered classes
             self._create_all_tables()
@@ -294,9 +298,50 @@ class Database:
             print(f"Warning: could not set meta {key}: {e}")
 
     def _run_one_time_migrations(self):
-        """Run gated migrations using Meta flags so they execute only once per database."""
+        """Run gated migrations using Meta flags so they execute only once per database.
+
+        Multi-instance safety: an exclusive SQLite lock is acquired before checking flags
+        so that only one app instance can run migrations at a time. The second instance
+        waits (covered by busy_timeout=5000) then re-checks — finding flags already set
+        and skipping without doing any work.
+        """
+        # Fast path: if both flags are already set, nothing to do (no lock needed)
+        if (self._get_meta('fk_relaxed', '0') == '1' and
+                self._get_meta('backfill_product_name_done', '0') == '1'):
+            return
+
+        # Acquire exclusive lock — serializes concurrent migration attempts
+        try:
+            self.cursor.execute("BEGIN EXCLUSIVE")
+        except Exception as e:
+            print(f"Migration: could not acquire exclusive lock ({e}), skipping this session")
+            return
+
+        # Re-read flags inside the lock (another instance may have finished while we waited)
+        try:
+            self.cursor.execute(
+                "SELECT key, value FROM Meta WHERE key IN ('fk_relaxed','backfill_product_name_done')"
+            )
+            flags = {row[0]: row[1] for row in self.cursor.fetchall()}
+        except Exception as e:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            print(f"Migration: could not read Meta flags: {e}")
+            return
+
+        fk_done = flags.get('fk_relaxed', '0') == '1'
+        backfill_done = flags.get('backfill_product_name_done', '0') == '1'
+
+        # Release exclusive lock before FK rebuild (it manages its own transactions)
+        try:
+            self.conn.commit()
+        except Exception:
+            pass
+
         # 1) Relax product_id FK if not already done
-        if self._get_meta('fk_relaxed', '0') != '1':
+        if not fk_done:
             try:
                 self._relax_legacy_item_product_fk('Sales_Items', 'sales_id')
                 self._relax_legacy_item_product_fk('Import_Items', 'import_id')
@@ -305,9 +350,8 @@ class Database:
                 print(f"Migration fk_relaxed failed: {e}")
 
         # 2) Backfill missing product_name where product_id still exists
-        if self._get_meta('backfill_product_name_done', '0') != '1':
+        if not backfill_done:
             try:
-                # Sales_Items
                 self.cursor.execute("""
                     UPDATE Sales_Items
                     SET product_name = (
@@ -315,7 +359,6 @@ class Database:
                     )
                     WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
                 """)
-                # Import_Items
                 self.cursor.execute("""
                     UPDATE Import_Items
                     SET product_name = (

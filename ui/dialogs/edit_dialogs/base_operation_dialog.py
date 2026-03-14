@@ -387,6 +387,23 @@ class BaseOperationDialog(QDialog):
                     QMessageBox.critical(self, "Error", "Could not resolve product IDs for: " + ", ".join(unresolved_names) + "\nAborting save.")
                     return
 
+                # Stock validation for sales (skip on_hold — those don't deduct stock)
+                if self.operation_obj.section == 'Sales':
+                    sale_state = self.operation_obj.get_value('state') or 'pending'
+                    if sale_state != 'on_hold':
+                        stock_errors = self._validate_stock(items_objects)
+                        if stock_errors:
+                            reply = QMessageBox.warning(
+                                self, "Insufficient Stock",
+                                "Not enough stock for:\n\n" +
+                                "\n".join(f"  \u2022 {e}" for e in stock_errors) +
+                                "\n\nSave anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
+
                 items_saved = 0
                 for item in items_objects:
                     if self.operation_obj.section == "Sales":
@@ -517,6 +534,51 @@ class BaseOperationDialog(QDialog):
         except Exception as e:
             print(f"Error handling missing references: {e}")
             return True, True  # Fail-open so user can still save
+
+    def _validate_stock(self, items_objects):
+        """Return a list of error strings for any sale item that exceeds available stock.
+
+        Excludes the current sale's own existing items from the deduction so that editing
+        a sale and changing quantities is checked correctly (not double-counted).
+        """
+        errors = []
+        current_sale_id = self.operation_id or 0
+        cursor = self.database.cursor
+        for item in items_objects:
+            try:
+                product_id = item.get_value('product_id')
+                if not product_id:
+                    continue
+                product_name = item.get_value('product_name') or f"ID {product_id}"
+                new_qty = float(item.get_value('quantity') or 0)
+                if new_qty <= 0:
+                    continue
+
+                cursor.execute(
+                    "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = ?",
+                    (product_id,)
+                )
+                total_imports = cursor.fetchone()[0] or 0
+
+                # Exclude the current sale so editing doesn't double-count its own items
+                cursor.execute("""
+                    SELECT COALESCE(SUM(si.quantity), 0)
+                    FROM Sales_Items si
+                    JOIN Sales s ON si.sales_id = s.ID
+                    WHERE si.product_id = ?
+                      AND (s.state IS NULL OR s.state != 'on_hold')
+                      AND si.sales_id != ?
+                """, (product_id, current_sale_id))
+                sold_elsewhere = cursor.fetchone()[0] or 0
+
+                available = total_imports - sold_elsewhere
+                if new_qty > available:
+                    errors.append(
+                        f"'{product_name}': need {int(new_qty)}, only {max(0, int(available))} available"
+                    )
+            except Exception as e:
+                print(f"Stock check error: {e}")
+        return errors
 
     def _safe_widget_value(self, key):
         from ui.widgets.parameters_widgets import ParameterWidgetFactory

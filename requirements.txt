@@ -1,0 +1,10 @@
+# Core
+PySide6
+cryptography
+
+# PDF generation (fallback chain — only one is required)
+# See README or notes below for extra setup steps per library
+playwright       # Option 1 — best quality (requires: playwright install chromium)
+xhtml2pdf        # Option 2 — pure Python, no extra steps
+weasyprint       # Option 3 — requires GTK+ runtime on Windows
+pdfkit           # Option 4 — requires wkhtmltopdf binary installed on Windows

@@ -91,6 +91,29 @@ class MainWindow(ThemedMainWindow):
 
         # Load language (default to 'en')
         self.language = self.settings.value("language", "en")
+
+        # Load warning toggles (default True = warnings enabled)
+        def _bool(val, default=True):
+            if val is None:
+                return default
+            if isinstance(val, bool):
+                return val
+            return str(val).lower() not in ('false', '0', 'no')
+
+        self.warn_missing_client   = _bool(self.settings.value("warn_missing_client"))
+        self.warn_missing_supplier = _bool(self.settings.value("warn_missing_supplier"))
+        self.warn_missing_product  = _bool(self.settings.value("warn_missing_product"))
+        self.warn_insufficient_stock = _bool(self.settings.value("warn_insufficient_stock"))
+
+        # Load tab visibility (default True = tab visible)
+        self.tab_visibility = {
+            'home':      _bool(self.settings.value("tab_visible/home")),
+            'products':  _bool(self.settings.value("tab_visible/products")),
+            'clients':   _bool(self.settings.value("tab_visible/clients")),
+            'suppliers': _bool(self.settings.value("tab_visible/suppliers")),
+            'sales':     _bool(self.settings.value("tab_visible/sales")),
+            'imports':   _bool(self.settings.value("tab_visible/imports")),
+        }
     
     def load_saved_profile(self):
         """Load the last selected profile from config"""
@@ -122,6 +145,16 @@ class MainWindow(ThemedMainWindow):
 
         # Save language selection
         self.settings.setValue("language", getattr(self, 'language', 'en'))
+
+        # Save warning toggles
+        self.settings.setValue("warn_missing_client",   self.warn_missing_client)
+        self.settings.setValue("warn_missing_supplier", self.warn_missing_supplier)
+        self.settings.setValue("warn_missing_product",  self.warn_missing_product)
+        self.settings.setValue("warn_insufficient_stock", self.warn_insufficient_stock)
+
+        # Save tab visibility
+        for key, visible in self.tab_visibility.items():
+            self.settings.setValue(f"tab_visible/{key}", visible)
     
     def closeEvent(self, event):
         """Handle application close event"""
@@ -171,7 +204,69 @@ class MainWindow(ThemedMainWindow):
             self._lang_actions[code] = action
 
         menubar.addMenu(lang_menu)
-        
+
+        # ── View menu ──────────────────────────────────────────────────────────
+        view_menu = QMenu("View", self)
+
+        # Tab visibility sub-menu
+        tabs_menu = QMenu("Tabs", self)
+        tab_labels_en = {
+            'home':      "🏠 Home",
+            'products':  "📦 Products",
+            'clients':   "👥 Clients",
+            'suppliers': "🏭 Suppliers",
+            'sales':     "💰 Sales",
+            'imports':   "📥 Imports",
+        }
+        self._tab_visibility_actions = {}
+        for key, label in tab_labels_en.items():
+            action = QAction(label, self)
+            action.setCheckable(True)
+            action.setChecked(self.tab_visibility.get(key, True))
+            action.triggered.connect(lambda checked, k=key: self._toggle_tab_visible(k, checked))
+            tabs_menu.addAction(action)
+            self._tab_visibility_actions[key] = action
+        view_menu.addMenu(tabs_menu)
+
+        view_menu.addSeparator()
+
+        # Warnings sub-menu
+        warnings_menu = QMenu("Warnings", self)
+
+        self._warn_client_action = QAction("Unregistered Client", self)
+        self._warn_client_action.setCheckable(True)
+        self._warn_client_action.setChecked(self.warn_missing_client)
+        self._warn_client_action.triggered.connect(
+            lambda checked: self._toggle_warning('missing_client', checked))
+        warnings_menu.addAction(self._warn_client_action)
+
+        self._warn_supplier_action = QAction("Unregistered Supplier", self)
+        self._warn_supplier_action.setCheckable(True)
+        self._warn_supplier_action.setChecked(self.warn_missing_supplier)
+        self._warn_supplier_action.triggered.connect(
+            lambda checked: self._toggle_warning('missing_supplier', checked))
+        warnings_menu.addAction(self._warn_supplier_action)
+
+        self._warn_product_action = QAction("Unregistered Product", self)
+        self._warn_product_action.setCheckable(True)
+        self._warn_product_action.setChecked(self.warn_missing_product)
+        self._warn_product_action.triggered.connect(
+            lambda checked: self._toggle_warning('missing_product', checked))
+        warnings_menu.addAction(self._warn_product_action)
+
+        warnings_menu.addSeparator()
+
+        self._warn_stock_action = QAction("Insufficient Stock", self)
+        self._warn_stock_action.setCheckable(True)
+        self._warn_stock_action.setChecked(self.warn_insufficient_stock)
+        self._warn_stock_action.triggered.connect(
+            lambda checked: self._toggle_warning('insufficient_stock', checked))
+        warnings_menu.addAction(self._warn_stock_action)
+
+        view_menu.addMenu(warnings_menu)
+        menubar.addMenu(view_menu)
+        # ───────────────────────────────────────────────────────────────────────
+
         # Log out menu action
         logout_action = QAction("Log Out", self)
         logout_action.triggered.connect(self.logout)
@@ -312,6 +407,20 @@ class MainWindow(ThemedMainWindow):
         # Style change: increase tab title font size (fixed)
         tab_widget.setStyleSheet("QTabBar::tab { font-size: 18px; }")
 
+        # Fixed key→index mapping (matches insertion order above)
+        self._tab_key_to_index = {
+            'home': 0, 'products': 1, 'clients': 2,
+            'suppliers': 3, 'sales': 4, 'imports': 5,
+        }
+
+        # Apply stored tab visibility
+        self._apply_tab_visibility()
+
+        # Sync home tab quick-action cards with current tab visibility
+        home_tab = tab_widget.widget(0)
+        if hasattr(home_tab, 'update_quick_actions_visibility'):
+            home_tab.update_quick_actions_visibility(self.tab_visibility)
+
         self.main_layout.addWidget(tab_widget)
         
         # Debug info
@@ -326,6 +435,43 @@ class MainWindow(ThemedMainWindow):
                 print(f"   • {section_name}: {items_count} items")
             except Exception as e:
                 print(f"   • {section_name}: error getting items ({e})")
+
+    # ──────────────────────────── View menu helpers ────────────────────────────
+
+    def _apply_tab_visibility(self):
+        """Apply self.tab_visibility to the current tab_widget."""
+        if not hasattr(self, 'tab_widget') or not self.tab_widget:
+            return
+        mapping = getattr(self, '_tab_key_to_index', {})
+        for key, index in mapping.items():
+            visible = self.tab_visibility.get(key, True)
+            self.tab_widget.setTabVisible(index, visible)
+
+    def _toggle_tab_visible(self, key: str, checked: bool):
+        """Called when a tab-visibility action is toggled."""
+        self.tab_visibility[key] = checked
+        self._apply_tab_visibility()
+        # Keep action in sync (Qt usually does this, but be explicit)
+        if hasattr(self, '_tab_visibility_actions') and key in self._tab_visibility_actions:
+            self._tab_visibility_actions[key].setChecked(checked)
+        # Sync home tab quick-action cards
+        if hasattr(self, 'tab_widget') and self.tab_widget:
+            home_tab = self.tab_widget.widget(0)
+            if hasattr(home_tab, 'update_quick_actions_visibility'):
+                home_tab.update_quick_actions_visibility(self.tab_visibility)
+
+    def _toggle_warning(self, warning_key: str, checked: bool):
+        """Called when a warning toggle action changes state."""
+        if warning_key == 'missing_client':
+            self.warn_missing_client = checked
+        elif warning_key == 'missing_supplier':
+            self.warn_missing_supplier = checked
+        elif warning_key == 'missing_product':
+            self.warn_missing_product = checked
+        elif warning_key == 'insufficient_stock':
+            self.warn_insufficient_stock = checked
+
+    # ───────────────────────────────────────────────────────────────────────────
 
     def _get_tab_labels(self, lang: str):
         """Return localized tab labels including emojis."""

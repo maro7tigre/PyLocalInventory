@@ -622,7 +622,15 @@ class HomeTab(QWidget):
         
         actions_container = QGridLayout()
         actions_container.setSpacing(16)
-        
+
+        # action_type → which tab key controls its visibility
+        _action_tab = {
+            'new_sale':    'sales',
+            'view_sales':  'sales',
+            'new_import':  'imports',
+            'view_imports': 'imports',
+        }
+
         # Create quick action cards
         actions = [
             (_("qa_new_sale_t"), _("qa_new_sale_s"), "new_sale", "💰", "#4CAF50"),
@@ -630,17 +638,23 @@ class HomeTab(QWidget):
             (_("qa_view_sales_t"), _("qa_view_sales_s"), "view_sales", "🛒", "#FF9800"),
             (_("qa_view_imports_t"), _("qa_view_imports_s"), "view_imports", "📦", "#9C27B0"),
         ]
-        
+
+        # Store cards so visibility can be updated later
+        self._quick_action_cards = {}  # action_type -> (card, tab_key)
+
         row, col = 0, 0
         for title, subtitle, action_type, icon, color in actions:
             card = QuickActionCard(title, subtitle, action_type, icon, color)
             card.clicked.connect(self.handle_quick_action)
+            tab_key = _action_tab.get(action_type)
+            if tab_key:
+                self._quick_action_cards[action_type] = (card, tab_key)
             actions_container.addWidget(card, row, col)
             col += 1
             if col >= 2:
                 col = 0
                 row += 1
-        
+
         parent_layout.addLayout(actions_container)
     
     def create_recent_activity_section(self, parent_layout):
@@ -1079,10 +1093,21 @@ class HomeTab(QWidget):
                 except Exception:
                     pass
     
+    def update_quick_actions_visibility(self, tab_visibility: dict):
+        """Show/hide quick-action cards based on which tabs are currently visible."""
+        for action_type, (card, tab_key) in getattr(self, '_quick_action_cards', {}).items():
+            card.setVisible(tab_visibility.get(tab_key, True))
+
     def refresh_on_tab_switch(self):
         """Called when this tab becomes active - refresh all data"""
         self.refresh_statistics()
         # Ensure list is in sync when user returns
         self._populate_low_stock_products()
         self._populate_recent_activities()
+        # Re-apply quick-actions visibility in case it changed while away
+        mw = self.parent()
+        while mw and not hasattr(mw, 'tab_visibility'):
+            mw = mw.parent() if callable(getattr(mw, 'parent', None)) else None
+        if mw:
+            self.update_quick_actions_visibility(mw.tab_visibility)
         print("✓ Home tab refreshed on switch")

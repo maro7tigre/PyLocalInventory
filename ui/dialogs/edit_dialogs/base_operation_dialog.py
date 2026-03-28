@@ -392,7 +392,9 @@ class BaseOperationDialog(QDialog):
                     sale_state = self.operation_obj.get_value('state') or 'pending'
                     if sale_state != 'on_hold':
                         stock_errors = self._validate_stock(items_objects)
-                        if stock_errors:
+                        mw = self._get_main_window()
+                        warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                        if stock_errors and warn_stock:
                             reply = QMessageBox.warning(
                                 self, "Insufficient Stock",
                                 "Not enough stock for:\n\n" +
@@ -437,6 +439,17 @@ class BaseOperationDialog(QDialog):
             }
         """)
 
+    # ────────────────── Warning-settings helpers ──────────────────────────── #
+
+    def _get_main_window(self):
+        """Walk up parent chain to find the MainWindow (has warn_* attributes)."""
+        p = self.parent()
+        while p is not None:
+            if hasattr(p, 'warn_missing_client'):
+                return p
+            p = p.parent() if callable(getattr(p, 'parent', None)) else None
+        return None
+
     # -------------------- Missing References Handling -------------------- #
     def _handle_missing_references(self):
         """Detect missing client/supplier or products and prompt user to create them.
@@ -448,6 +461,8 @@ class BaseOperationDialog(QDialog):
             if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
                 return True, True  # Can't verify without DB
 
+            mw = self._get_main_window()
+
             missing_clients = []
             missing_suppliers = []
             missing_products = []
@@ -455,25 +470,28 @@ class BaseOperationDialog(QDialog):
             # Determine operation type
             op_section = getattr(self.operation_obj, 'section', '')
 
-            # Check main entity username
+            # Check main entity username (respecting per-type warning flags)
             if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
-                client_username = self._safe_widget_value('client_username')
-                if client_username and not self._entity_exists('Clients', client_username):
-                    missing_clients.append(client_username)
+                if getattr(mw, 'warn_missing_client', True) if mw else True:
+                    client_username = self._safe_widget_value('client_username')
+                    if client_username and not self._entity_exists('Clients', client_username):
+                        missing_clients.append(client_username)
             elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
-                supplier_username = self._safe_widget_value('supplier_username')
-                if supplier_username and not self._entity_exists('Suppliers', supplier_username):
-                    missing_suppliers.append(supplier_username)
+                if getattr(mw, 'warn_missing_supplier', True) if mw else True:
+                    supplier_username = self._safe_widget_value('supplier_username')
+                    if supplier_username and not self._entity_exists('Suppliers', supplier_username):
+                        missing_suppliers.append(supplier_username)
 
             # Check products from items table (only those not already present)
-            try:
-                raw_names = self.items_table.get_all_entered_product_names()
-                for product_name in raw_names:
-                    if product_name and not self._product_exists(product_name):
-                        if product_name not in missing_products:
-                            missing_products.append(product_name)
-            except Exception as e:
-                print(f"Error collecting raw product names: {e}")
+            if getattr(mw, 'warn_missing_product', True) if mw else True:
+                try:
+                    raw_names = self.items_table.get_all_entered_product_names()
+                    for product_name in raw_names:
+                        if product_name and not self._product_exists(product_name):
+                            if product_name not in missing_products:
+                                missing_products.append(product_name)
+                except Exception as e:
+                    print(f"Error collecting raw product names: {e}")
 
             if not (missing_clients or missing_suppliers or missing_products):
                 return True, True  # Nothing missing

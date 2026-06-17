@@ -14,6 +14,7 @@ from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.tabs.home_tab import HomeTab
 from ui.tabs.products_tab import ProductsTab
+from ui.tabs.services_tab import ServicesTab
 from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
@@ -21,6 +22,7 @@ from ui.tabs.imports_tab import ImportsTab
 # from ui.tabs.log_tab import LogTab  # Hidden per request
 
 from classes.product_class import ProductClass
+from classes.service_class import ServiceClass
 from classes.client_class import ClientClass
 from classes.supplier_class import SupplierClass
 from classes.sales_class import SalesClass
@@ -69,6 +71,7 @@ class MainWindow(ThemedMainWindow):
         
         # Register all parameter classes
         self.database.register_class(ProductClass)
+        self.database.register_class(ServiceClass)
         self.database.register_class(ClientClass)
         self.database.register_class(SupplierClass)
         self.database.register_class(SalesClass)
@@ -109,6 +112,7 @@ class MainWindow(ThemedMainWindow):
         self.tab_visibility = {
             'home':      _bool(self.settings.value("tab_visible/home")),
             'products':  _bool(self.settings.value("tab_visible/products")),
+            'services':  _bool(self.settings.value("tab_visible/services")),
             'clients':   _bool(self.settings.value("tab_visible/clients")),
             'suppliers': _bool(self.settings.value("tab_visible/suppliers")),
             'sales':     _bool(self.settings.value("tab_visible/sales")),
@@ -213,6 +217,7 @@ class MainWindow(ThemedMainWindow):
         tab_labels_en = {
             'home':      "🏠 Home",
             'products':  "📦 Products",
+            'services':  "🛠️ Services",
             'clients':   "👥 Clients",
             'suppliers': "🏭 Suppliers",
             'sales':     "💰 Sales",
@@ -368,6 +373,14 @@ class MainWindow(ThemedMainWindow):
             self.add_error_tab(tab_widget, "Products", e)
         
         try:
+            services_tab = ServicesTab(self.database, self)
+            tab_widget.addTab(services_tab, labels['services'])
+            print("✓ Added Services tab (BaseTab)")
+        except Exception as e:
+            print(f"✗ Error adding Services tab: {e}")
+            self.add_error_tab(tab_widget, "Services", e)
+        
+        try:
             clients_tab = ClientsTab(self.database, self)
             tab_widget.addTab(clients_tab, labels['clients'])
             print("✓ Added Clients tab (BaseTab)")
@@ -409,8 +422,8 @@ class MainWindow(ThemedMainWindow):
 
         # Fixed key→index mapping (matches insertion order above)
         self._tab_key_to_index = {
-            'home': 0, 'products': 1, 'clients': 2,
-            'suppliers': 3, 'sales': 4, 'imports': 5,
+            'home': 0, 'products': 1, 'services': 2, 'clients': 3,
+            'suppliers': 4, 'sales': 5, 'imports': 6,
         }
 
         # Apply stored tab visibility
@@ -484,6 +497,7 @@ class MainWindow(ThemedMainWindow):
             return {
                 'home': "🏠 Accueil",
                 'products': "📦 Produits",
+                'services': "🛠️ Services",
                 'clients': "👥 Clients",
                 'suppliers': "🏭 Fournisseurs",
                 'sales': "💰 Ventes",
@@ -494,6 +508,7 @@ class MainWindow(ThemedMainWindow):
             return {
                 'home': "🏠 Inicio",
                 'products': "📦 Productos",
+                'services': "🛠️ Servicios",
                 'clients': "👥 Clientes",
                 'suppliers': "🏭 Proveedores",
                 'sales': "💰 Ventas",
@@ -504,6 +519,7 @@ class MainWindow(ThemedMainWindow):
         return {
             'home': "🏠 Home",
             'products': "📦 Products",
+            'services': "🛠️ Services",
             'clients': "👥 Clients",
             'suppliers': "🏭 Suppliers",
             'sales': "💰 Sales",

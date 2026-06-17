@@ -153,6 +153,8 @@ class BaseTab(QWidget):
         self.refresh_btn.clicked.connect(self.refresh_table)
         controls_layout.addWidget(self.refresh_btn)
         
+        self.add_additional_toolbar_buttons(controls_layout)
+        
         layout.addLayout(controls_layout)
         
         # Table setup
@@ -422,6 +424,10 @@ class BaseTab(QWidget):
     def get_searchable_fields(self):
         """Get fields that can be searched - override in subclasses"""
         return ['name', 'username']
+
+    def add_additional_toolbar_buttons(self, layout):
+        """Hook for subclasses to add extra toolbar buttons."""
+        pass
     
     def parse_date_search(self, search_text):
         """Parse date search queries like 'dd-mm-yyyy' or 'dd-mm-yyyy/dd-mm-yyyy'"""

@@ -10,6 +10,7 @@ Tab components for PyLocalInventory including:
 from .base_tab import BaseTab, BaseTableDelegate
 from .home_tab import HomeTab
 from .products_tab import ProductsTab
+from .services_tab import ServicesTab
 from .clients_tab import ClientsTab
 from .suppliers_tab import SuppliersTab
 from .sales_tab import SalesTab, SalesEditDialog
@@ -24,6 +25,7 @@ __all__ = [
     # Main tabs
     'HomeTab',
     'ProductsTab',
+    'ServicesTab',
     'ClientsTab', 
     'SuppliersTab',
     'SalesTab',

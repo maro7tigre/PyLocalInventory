@@ -77,7 +77,7 @@ class ProductEditDialog(BaseEditDialog):
         if sale_price is not None and sale_price < 0:
             errors.append("Sale price cannot be negative")
         
-        # Validate username uniqueness
+        # Validate username uniqueness (skip if empty — will default to product name on save)
         if username and not self.product.validate_username_uniqueness(username):
             errors.append(f"Username '{username}' already exists for another product")
         
@@ -116,8 +116,16 @@ class ProductEditDialog(BaseEditDialog):
             
             # Update product object with form data
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
+            form_values = {}
             for param_key, widget in self.parameter_widgets.items():
                 value = ParameterWidgetFactory.get_widget_value(widget)
+                form_values[param_key] = value
+
+            # Default username to product name if left empty
+            if not form_values.get('username'):
+                form_values['username'] = form_values.get('name') or self.product.get_value('name') or ''
+
+            for param_key, value in form_values.items():
                 self.product.set_value(param_key, value)
             
             # Save to database

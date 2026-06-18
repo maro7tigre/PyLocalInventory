@@ -97,6 +97,13 @@ class ImportClass(BaseClass):
                 "required": False,
                 "type": "image",
                 "method": self.get_supplier_preview
+            },
+            "details": {
+                "display_name": {"en": "Details", "fr": "Détails", "es": "Detalles"},
+                "required": False,
+                "text": "🔍",  # Magnifying glass emoji
+                "type": "button",
+                "size": 25
             }
         }
         
@@ -108,8 +115,8 @@ class ImportClass(BaseClass):
                 "supplier_username": "r",
                 "supplier_name": "r",
                 "date": "r",
-                "subtotal": "r",
-                "total_price": "r"
+                "total_price": "r",
+                "details": "r"
             },
             "dialog": {
                 "supplier_username": "rw",

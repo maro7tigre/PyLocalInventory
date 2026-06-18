@@ -150,11 +150,12 @@ class SaleEditDialog(QDialog):
         layout.addWidget(items_label)
         
         # Create sales items table (this will have internal scrolling)
+       
         self.sales_items_table = OperationsTableWidget(
             item_class=SalesItemClass,
             parent_operation=self.sale_obj,
             database=self.database,
-            columns=['product_preview', 'product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
+            columns=['product_preview', 'product_description','product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
             parent=self,
             highlight_stock_exceed=True
         )

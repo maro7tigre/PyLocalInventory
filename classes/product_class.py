@@ -98,7 +98,8 @@ class ProductClass(BaseClass):
                 "required": False,
                 "type": "int",
                 "method": self.calculate_quantity  # This makes it calculated
-            }
+            },
+            
         }
         
         # Define where parameters can be used and their permissions

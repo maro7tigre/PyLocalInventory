@@ -33,7 +33,7 @@ python main.py
 
 If no `requirements.txt` exists, minimal dependencies:
 ```bash
-pip install PySide6 cryptography
+
 ```
 
 When the app starts you'll see either:

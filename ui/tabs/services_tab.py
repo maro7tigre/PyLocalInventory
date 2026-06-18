@@ -5,7 +5,7 @@ from ui.tabs.base_tab import BaseTab
 from classes.service_class import ServiceClass
 from ui.dialogs.edit_dialogs.service_dialog import ServiceEditDialog
 from ui.widgets.themed_widgets import BlueButton, GreenButton
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QMessageBox, QHeaderView
 # haitam
 
 
@@ -22,30 +22,33 @@ class ServicesTab(BaseTab):
         if not self.all_items:
             return []
 
-        options = set()
-        for obj in self.all_items:
+        options = []
+        seen = set()
+        for obj in reversed(self.all_items):
             try:
                 code = obj.get_value('service_code') or ""
                 name = obj.get_value('name') or ""
-                if code:
-                    options.add(str(code))
-                if name:
-                    options.add(str(name))
+                for value in (code, name):
+                    if value:
+                        value_str = str(value)
+                        if value_str not in seen:
+                            seen.add(value_str)
+                            options.append(value_str)
             except Exception:
                 pass
 
-        return sorted(list(options))
+        return options
 
     def setup_order_options(self):
         self.order_combo.clear()
         self.order_combo.addItems([
             "Default",
+            "ID ↑",
+            "ID ↓",
             "Code ↑",
             "Code ↓",
             "Service Name ↑",
-            "Service Name ↓",
-            "Price ↑",
-            "Price ↓"
+            "Service Name ↓"
         ])
 
     def get_searchable_fields(self):
@@ -71,7 +74,11 @@ class ServicesTab(BaseTab):
             return items
 
         try:
-            if order_option == "Code ↑":
+            if order_option == "ID ↑":
+                items.sort(key=lambda x: x.id or 0)
+            elif order_option == "ID ↓":
+                items.sort(key=lambda x: x.id or 0, reverse=True)
+            elif order_option == "Code ↑":
                 items.sort(key=lambda x: str(x.get_value('service_code') or "").lower())
             elif order_option == "Code ↓":
                 items.sort(key=lambda x: str(x.get_value('service_code') or "").lower(), reverse=True)
@@ -79,10 +86,6 @@ class ServicesTab(BaseTab):
                 items.sort(key=lambda x: str(x.get_value('name') or "").lower())
             elif order_option == "Service Name ↓":
                 items.sort(key=lambda x: str(x.get_value('name') or "").lower(), reverse=True)
-            elif order_option == "Price ↑":
-                items.sort(key=lambda x: float(x.get_value('price') or 0))
-            elif order_option == "Price ↓":
-                items.sort(key=lambda x: float(x.get_value('price') or 0), reverse=True)
         except Exception as e:
             print(f"Error sorting services: {e}")
 
@@ -101,6 +104,17 @@ class ServicesTab(BaseTab):
 
     def export_services(self):
         QMessageBox.information(self, "Export Services", "Service export is not implemented yet. This placeholder button is ready for custom export logic.")
+
+    def setup_table(self):
+        super().setup_table()
+        try:
+            info_index = self.table_columns.index('information')
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(info_index, QHeaderView.Interactive)
+            self.table.setColumnWidth(info_index, 320)
+            self.table.setMinimumWidth(max(self.table.minimumWidth(), 320))
+        except ValueError:
+            pass
 
     def show_service_summary(self):
         total_services = len(self.all_items)

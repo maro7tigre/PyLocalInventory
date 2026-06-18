@@ -30,7 +30,7 @@ class ProductClass(BaseClass):
             "username": {
                 "value": "",
                 "display_name": {"en": "Username", "fr": "Nom d'utilisateur", "es": "Nombre de Usuario"},
-                "required": True,
+                "required": False,
                 "default": "",
                 "type": "string",
                 "autocomplete": True,
@@ -108,7 +108,7 @@ class ProductClass(BaseClass):
                 "id": "r",
                 "preview_image": "r",
                 "username": "r",
-                "name": "r",
+                "unit_price": "r",
                 "sale_price": "r", 
                 "quantity": "r",
                 "category": "r"

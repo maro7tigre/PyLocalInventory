@@ -11,6 +11,7 @@ from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+from ui.widgets.parameters_widgets import ButtonWidget
 from datetime import datetime
 import re
 
@@ -361,6 +362,21 @@ class BaseTab(QWidget):
                 
                 self.table.setItem(row, col, item)
             
+            elif param_type == 'button':
+                param_info = obj.parameters.get(column_key, {})
+                btn_widget = ButtonWidget(param_info)
+                obj_id = obj.id
+                btn_widget.clicked.connect(lambda oid=obj_id: self.details_callback(oid))
+
+                container = QWidget()
+                container_layout = QHBoxLayout(container)
+                container_layout.setContentsMargins(0, 0, 0, 0)
+                container_layout.addStretch()
+                container_layout.addWidget(btn_widget)
+                container_layout.addStretch()
+
+                self.table.setCellWidget(row, col, container)
+
             else:
                 # String and other types - handle date formatting
                 if column_key == 'date' and value:
@@ -427,6 +443,10 @@ class BaseTab(QWidget):
 
     def add_additional_toolbar_buttons(self, layout):
         """Hook for subclasses to add extra toolbar buttons."""
+        pass
+
+    def details_callback(self, obj_id):
+        """Called when a details button is clicked — override in subclasses."""
         pass
 
     def _create_details_button_cell(self, table, row, col):

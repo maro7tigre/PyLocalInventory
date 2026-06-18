@@ -101,9 +101,10 @@ class ImportClass(BaseClass):
             "details": {
                 "display_name": {"en": "Details", "fr": "Détails", "es": "Detalles"},
                 "required": False,
-                "text": "🔍",  # Magnifying glass emoji
+                "color": "blue",
+                "text": "👁️ View Details",
                 "type": "button",
-                "size": 25
+                "size": 30
             }
         }
         

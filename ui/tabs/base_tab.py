@@ -428,6 +428,22 @@ class BaseTab(QWidget):
     def add_additional_toolbar_buttons(self, layout):
         """Hook for subclasses to add extra toolbar buttons."""
         pass
+
+    def _create_details_button_cell(self, table, row, col):
+        """Create details button cell"""
+        button_param = {'text': '🔍', 'size': 30}
+        details_btn = ButtonWidget(button_param)
+        details_btn.setProperty('row', row)  # Store row for callback
+        details_btn.clicked.connect(lambda: self.details_callback(row))
+            
+        container = QWidget()
+        layout = QHBoxLayout(container)
+        layout.setContentsMargins(0, 0, 0, 0)
+        layout.addStretch()
+        layout.addWidget(details_btn)
+        layout.addStretch()
+            
+        table.setCellWidget(row, col, container)
     
     def parse_date_search(self, search_text):
         """Parse date search queries like 'dd-mm-yyyy' or 'dd-mm-yyyy/dd-mm-yyyy'"""

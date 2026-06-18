@@ -52,6 +52,12 @@ class SalesItemClass(BaseClass):
                 "preview_size": 50,
                 "method": self.get_product_preview
             },
+            "product_description":{
+                "display_name": {"en": "Description", "fr": "Description", "es": "Descripción"},
+                "required": False,
+                "type": "string",
+                "method": lambda: ""  # Placeholder for future description retrieval
+            },
             "quantity": {
                 "value": 1,
                 "display_name": {"en": "Quantity", "fr": "Quantité", "es": "Cantidad"},
@@ -92,6 +98,7 @@ class SalesItemClass(BaseClass):
             "table": {
                 "product_preview": "r",
                 "product_name": "rw",
+                "product_description": "rw",
                 "quantity": "rw", 
                 "unit_price": "rw",
                 "subtotal": "r",

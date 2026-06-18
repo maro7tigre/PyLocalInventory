@@ -232,7 +232,7 @@ class ButtonWidget(QWidget):
         button_size = param_info.get('size', 30)  # Default size
         
         self.button = QPushButton(button_text)
-        self.button.setFixedSize(button_size, button_size)
+        self.button.setFixedHeight(button_size)
         self.button.setEnabled(editable)
         self.button.clicked.connect(self.clicked.emit)
         

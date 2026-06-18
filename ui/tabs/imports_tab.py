@@ -173,6 +173,16 @@ class ImportsTab(BaseTab):
         
         return False
     
+    def details_callback(self, obj_id):
+        """Open the edit dialog for the selected import to view its details."""
+        try:
+            dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
+            if dialog.exec():
+                self.refresh_table()
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to open import details: {e}")
+
     def sort_items(self, items, order_option):
         """Sort imports based on order option"""
         if not order_option or order_option == "Default":

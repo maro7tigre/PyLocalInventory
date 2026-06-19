@@ -67,6 +67,15 @@ class SalesItemClass(BaseClass):
                 "type": "int",
                 "min": 1
             },
+            "production": {
+                "value": 0,
+                "display_name": {"en": "Production", "fr": "Production", "es": "Producción"},
+                "required": False,
+                "default": 0,
+                "options": [],
+                "type": "int",
+                "min": 0
+            },
             "unit_price": {
                 "value": 0.0,
                 "display_name": {"en": "Unit Price", "fr": "Prix Unitaire", "es": "Precio Unitario"},
@@ -116,8 +125,8 @@ class SalesItemClass(BaseClass):
                 "product_id": "rw",
                 "product_name": "rw",  # snapshot of name at time of operation
                 "quantity": "rw",
-                "unit_price": "rw"
-                # Calculated and image parameters not stored in database
+                "unit_price": "rw",
+                "production": "rw"
             },
             "report": {
                 "product_name": "r",

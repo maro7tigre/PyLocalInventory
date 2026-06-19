@@ -113,7 +113,6 @@ class SalesClass(BaseClass):
             "table": {
                 "id": "r",
                 "state": "r",
-                "client_username": "r",
                 "client_name": "r",
                 "date": "r",
                 "subtotal": "r",

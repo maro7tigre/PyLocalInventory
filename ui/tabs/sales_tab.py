@@ -197,13 +197,7 @@ class SalesTab(BaseTab):
                     break
         
         if controls_layout:
-            from ui.widgets.themed_widgets import OrangeButton, BlueButton
-
-            self.progress_btn = BlueButton("📦 Check Progress")
-            self.progress_btn.clicked.connect(self.show_order_progress)
-            self.progress_btn.setStyleSheet(self.progress_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
-            self.progress_btn.setMinimumHeight(20)
-            controls_layout.insertWidget(controls_layout.count() - 1, self.progress_btn)
+            from ui.widgets.themed_widgets import OrangeButton
 
             self.reports_btn = OrangeButton("📊 Reports")
             self.reports_btn.clicked.connect(self.show_reports)
@@ -361,13 +355,16 @@ class SalesTab(BaseTab):
         return items
 
     # ------------- New columns injection and custom cell rendering -------------
-    _VIRTUAL_COLUMN_HEADERS = {'progress': 'Progress'}
+    _VIRTUAL_COLUMN_HEADERS = {'check_progress': '', 'progress': 'Progress'}
 
     def _ensure_new_columns_order(self):
-        """Ensure state appears after ID and progress column exists."""
+        """Ensure state appears after ID, check_progress button is second, and progress column exists."""
         try:
             if 'state' not in self.table_columns:
                 self.table_columns.insert(1, 'state')
+            if 'check_progress' not in self.table_columns:
+                # Insert right after id (index 0), before state
+                self.table_columns.insert(1, 'check_progress')
             if 'progress' not in self.table_columns:
                 self.table_columns.append('progress')
 
@@ -382,6 +379,11 @@ class SalesTab(BaseTab):
                     headers.append(key.capitalize())
             self.table.setColumnCount(len(self.table_columns))
             self.table.setHorizontalHeaderLabels(headers)
+            # Fix the check_progress column to a narrow width
+            if 'check_progress' in self.table_columns:
+                cp_col = self.table_columns.index('check_progress')
+                self.table.setColumnWidth(cp_col, 50)
+                self.table.horizontalHeader().setSectionResizeMode(cp_col, QHeaderView.Fixed)
         except Exception as e:
             print(f"Error ensuring sales columns order: {e}")
 
@@ -391,7 +393,9 @@ class SalesTab(BaseTab):
         for row, obj in enumerate(items):
             try:
                 for col, column_key in enumerate(self.table_columns):
-                    if column_key == 'state':
+                    if column_key == 'check_progress':
+                        self._set_check_progress_cell(row, col, obj)
+                    elif column_key == 'state':
                         self._set_state_cell(row, col, obj)
                     elif column_key == 'progress':
                         self._set_progress_cell(row, col, obj)
@@ -400,6 +404,34 @@ class SalesTab(BaseTab):
             except Exception as e:
                 print(f"Error processing Sales row {row}: {e}")
         self.table.resizeRowsToContents()
+
+    def _set_check_progress_cell(self, row, col, obj):
+        from PySide6.QtWidgets import QPushButton
+        btn = QPushButton("📦")
+        btn.setToolTip("Check Progress")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:4px; padding:3px 8px; font-size:15px; }"
+            "QPushButton:hover { background:#1976D2; }"
+        )
+        btn.clicked.connect(lambda _=None, o=obj, r=row, c=col: (self.table.setCurrentCell(r, c), self._open_progress_for_sale(o)))
+
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.addWidget(btn)
+        self.table.setCellWidget(row, col, container)
+
+    def _open_progress_for_sale(self, obj):
+        try:
+            dialog = OrderProgressDialog(obj, self.database, self)
+            dialog.exec()
+            self.refresh_table()
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to open progress dialog:\n{e}")
+            import traceback
+            traceback.print_exc()
 
     def _set_state_cell(self, row, col, obj):
         from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
@@ -532,23 +564,15 @@ class SalesTab(BaseTab):
     def show_order_progress(self):
         """Show order production progress dialog for the selected sale."""
         from PySide6.QtWidgets import QMessageBox
-        try:
-            obj_id = self.get_selected_id()
-            if obj_id is None:
-                QMessageBox.warning(self, "No Selection", "Please select a sale to check progress.")
-                return
-            selected_sales = next((s for s in self.filtered_items if s.id == obj_id), None)
-            if selected_sales is None:
-                selected_sales = next((s for s in self.all_items if s.id == obj_id), None)
-            if selected_sales is None:
-                return
-            dialog = OrderProgressDialog(selected_sales, self.database, self)
-            dialog.exec()
-            self.refresh_table()
-        except Exception as e:
-            QMessageBox.critical(self, "Error", f"Failed to open progress dialog:\n{e}")
-            import traceback
-            traceback.print_exc()
+        obj_id = self.get_selected_id()
+        if obj_id is None:
+            QMessageBox.warning(self, "No Selection", "Please select a sale to check progress.")
+            return
+        obj = next((s for s in self.filtered_items if s.id == obj_id), None)
+        if obj is None:
+            obj = next((s for s in self.all_items if s.id == obj_id), None)
+        if obj:
+            self._open_progress_for_sale(obj)
 
     def show_reports(self):
         """Show reports dialog for selected sales record"""

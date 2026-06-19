@@ -24,6 +24,8 @@ from ui.tabs.reports_tab import ReportsTab
 
 from classes.product_class import ProductClass
 from classes.service_class import ServiceClass
+from classes.door_type_class import DoorTypeClass
+from classes.wood_type_class import WoodTypeClass
 from classes.client_class import ClientClass
 from classes.supplier_class import SupplierClass
 from classes.sales_class import SalesClass
@@ -74,6 +76,8 @@ class MainWindow(ThemedMainWindow):
         # Register all parameter classes
         self.database.register_class(ProductClass)
         self.database.register_class(ServiceClass)
+        self.database.register_class(DoorTypeClass)
+        self.database.register_class(WoodTypeClass)
         self.database.register_class(ClientClass)
         self.database.register_class(SupplierClass)
         self.database.register_class(SalesClass)

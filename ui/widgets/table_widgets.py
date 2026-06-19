@@ -157,6 +157,7 @@ class ParameterTableWidget(QWidget):
                 
                 item = QTableWidgetItem(formatted_value)
                 item.setData(Qt.UserRole, value)  # Store raw value
+                item.setData(Qt.UserRole + 1, obj.id)
                 self.table.setItem(row, col, item)
             
             elif param_type == 'int':
@@ -164,6 +165,7 @@ class ParameterTableWidget(QWidget):
                 formatted_value = str(int(value)) if value is not None else "0"
                 item = QTableWidgetItem(formatted_value)
                 item.setData(Qt.UserRole, value)  # Store raw value
+                item.setData(Qt.UserRole + 1, obj.id)
                 self.table.setItem(row, col, item)
             
             else:
@@ -171,6 +173,7 @@ class ParameterTableWidget(QWidget):
                 formatted_value = str(value) if value is not None else ""
                 item = QTableWidgetItem(formatted_value)
                 item.setData(Qt.UserRole, value)  # Store raw value
+                item.setData(Qt.UserRole + 1, obj.id)
                 # Make ID column read-only and centered
                 if param_key == 'id':
                     item.setFlags(item.flags() & ~Qt.ItemIsEditable)
@@ -187,20 +190,23 @@ class ParameterTableWidget(QWidget):
         if row == -1:
             return None
         
-        # Find ID column
-        if 'id' not in self.table_columns:
-            return None
+        # If ID column exists in visible columns, use it
+        if 'id' in self.table_columns:
+            id_col = self.table_columns.index('id')
+            item = self.table.item(row, id_col)
+            if item:
+                return int(item.data(Qt.UserRole) or item.text())
         
-        id_col = self.table_columns.index('id')
-        item = self.table.item(row, id_col)
-        
-        if item:
-            return int(item.data(Qt.UserRole) or item.text())
-        
-        # Fallback: try to get from first column if it's numeric
-        first_item = self.table.item(row, 0)
-        if first_item and first_item.text().isdigit():
-            return int(first_item.text())
+        # Otherwise, scan visible row cells for stored ID metadata
+        for col in range(self.table.columnCount()):
+            item = self.table.item(row, col)
+            if not item:
+                continue
+            id_value = item.data(Qt.UserRole + 1)
+            if isinstance(id_value, int) and id_value > 0:
+                return id_value
+            if item.text().isdigit():
+                return int(item.text())
         
         return None
     

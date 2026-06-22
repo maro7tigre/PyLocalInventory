@@ -58,6 +58,15 @@ class SalesItemClass(BaseClass):
                 "type": "string",
                 "method": lambda: ""  # Placeholder for future description retrieval
             },
+            "information": {
+                "value": "",
+                "display_name": {"en": "Information", "fr": "Information", "es": "Información"},
+                "required": False,
+                "default": "",
+                "type": "string",
+                "autocomplete": True,
+                "options": self.get_service_keyword_options
+            },
             "quantity": {
                 "value": 1,
                 "display_name": {"en": "Quantity", "fr": "Quantité", "es": "Cantidad"},
@@ -99,6 +108,7 @@ class SalesItemClass(BaseClass):
                 "product_preview": "r",
                 "product_name": "rw",
                 "product_description": "rw",
+                "information": "rw",
                 "quantity": "rw", 
                 "unit_price": "rw",
                 "subtotal": "r",
@@ -107,6 +117,7 @@ class SalesItemClass(BaseClass):
             "dialog": {
                 "product_name": "rw",
                 "product_preview": "r",
+                "information": "rw",
                 "quantity": "rw",
                 "unit_price": "rw"
                 # No delete button in dialog (use dialog's delete button instead)
@@ -115,12 +126,14 @@ class SalesItemClass(BaseClass):
                 "sales_id": "rw",
                 "product_id": "rw",
                 "product_name": "rw",  # snapshot of name at time of operation
+                "information": "rw",
                 "quantity": "rw",
                 "unit_price": "rw"
                 # Calculated and image parameters not stored in database
             },
             "report": {
                 "product_name": "r",
+                "information": "r",
                 "quantity": "r",
                 "unit_price": "r",
                 "subtotal": "r"
@@ -129,13 +142,56 @@ class SalesItemClass(BaseClass):
         }
     
     def get_product_options(self):
-        """Return product names for autocomplete (non-empty)."""
+        """Return product and service keywords for autocomplete (non-empty)."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
         try:
+            options = []
+            seen = set()
+
             self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL AND name != '' ORDER BY name")
-            return [r[0] for r in self.database.cursor.fetchall() if r[0]]
+            for row in self.database.cursor.fetchall():
+                value = row[0]
+                if value and value.lower() not in seen:
+                    seen.add(value.lower())
+                    options.append(value)
+
+            try:
+                self.database.cursor.execute(
+                    "SELECT name, keywords FROM Services WHERE name IS NOT NULL AND name != '' ORDER BY name"
+                )
+                for service_name, keywords in self.database.cursor.fetchall():
+                    for value in [service_name, *self._split_keywords(keywords or "")]:
+                        if value and value.lower() not in seen:
+                            seen.add(value.lower())
+                            options.append(value)
+            except Exception:
+                pass
+
+            return options
         except Exception:
+            return []
+
+    def get_service_keyword_options(self):
+        """Return service keywords for the line-item information autocomplete."""
+        if not (self.database and getattr(self.database, 'cursor', None)):
+            return []
+
+        try:
+            options = []
+            seen = set()
+            self.database.cursor.execute(
+                "SELECT keywords FROM Services WHERE keywords IS NOT NULL AND keywords != ''"
+            )
+            for (keywords,) in self.database.cursor.fetchall():
+                for keyword in self._split_keywords(keywords or ""):
+                    key = keyword.lower()
+                    if key not in seen:
+                        seen.add(key)
+                        options.append(keyword)
+            return options
+        except Exception as e:
+            print(f"Error getting service keyword options: {e}")
             return []
     
     def get_product_name(self):
@@ -212,6 +268,10 @@ class SalesItemClass(BaseClass):
         if param_key == 'product_name' and value:
             name_clean = value.strip()
             product_data = self.get_product_data_by_name(name_clean)
+            if not product_data:
+                service_name = self.get_service_name_by_keyword(name_clean)
+                if service_name:
+                    name_clean = service_name
             # Always store the typed name as snapshot even if product not found
             try:
                 super().set_value('product_name', name_clean)
@@ -264,6 +324,8 @@ class SalesItemClass(BaseClass):
         """Override to provide dynamic options for product_name"""
         if param_key == 'product_name':
             return self.get_product_options()
+        if param_key == 'information':
+            return self.get_service_keyword_options()
         return self.parameters.get(param_key, {}).get('options', [])
     
     def get_product_data_by_name(self, product_name):
@@ -287,6 +349,36 @@ class SalesItemClass(BaseClass):
         except Exception as e:
             print(f"Error getting product data for {product_name}: {e}")
             return None
+
+    def get_service_name_by_keyword(self, value):
+        """Resolve a service name from its name or one of its stored keywords."""
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return None
+
+        value_clean = (value or '').strip()
+        if not value_clean:
+            return None
+
+        try:
+            self.database.cursor.execute(
+                "SELECT name, keywords FROM Services WHERE name IS NOT NULL AND name != ''"
+            )
+            for service_name, keywords in self.database.cursor.fetchall():
+                candidates = [service_name, *self._split_keywords(keywords or "")]
+                if any(value_clean.lower() == str(candidate).strip().lower() for candidate in candidates if candidate):
+                    return service_name
+        except Exception as e:
+            print(f"Error resolving service keyword '{value_clean}': {e}")
+
+        return None
+
+    @staticmethod
+    def _split_keywords(value):
+        return [
+            part.strip()
+            for part in str(value).replace("\n", ",").split(",")
+            if part.strip()
+        ]
     
     def update_product_selection(self, product_name):
         """Deprecated: retained for backward compatibility; no action."""

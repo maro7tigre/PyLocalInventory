@@ -88,6 +88,12 @@ class SalesClass(BaseClass):
                 "item_class": SalesItemClass,  # Specify which item class to use
                 "parent_operation": self  # Reference to parent operation
             },
+            "information": {
+                "display_name": {"en": "Information", "fr": "Information", "es": "Información"},
+                "required": False,
+                "type": "string",
+                "method": self.get_sale_information
+            },
             "subtotal": {
                 "display_name": {"en": "Subtotal", "fr": "Sous-total", "es": "Subtotal"},
                 "required": False,
@@ -116,6 +122,7 @@ class SalesClass(BaseClass):
                 "client_username": "r",
                 "client_name": "r",
                 "date": "r",
+                "information": "r",
                 "subtotal": "r",
                 "total_price": "r"
             },
@@ -177,6 +184,21 @@ class SalesClass(BaseClass):
         """Calculate subtotal from all items"""
         items = self.get_sales_items()
         return sum(item.get_value('subtotal') or 0 for item in items)
+
+    def get_sale_information(self):
+        """Summarize item information values for display in the sales table."""
+        try:
+            values = []
+            seen = set()
+            for item in self.get_sales_items():
+                info = (item.get_value('information') or '').strip()
+                if info and info.lower() not in seen:
+                    seen.add(info.lower())
+                    values.append(info)
+            return ", ".join(values)
+        except Exception as e:
+            print(f"Error getting sale information for sales {self.id}: {e}")
+            return ""
     
     def calculate_total_tva(self):
         """Calculate total VAT amount"""

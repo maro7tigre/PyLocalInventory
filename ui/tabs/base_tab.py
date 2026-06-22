@@ -593,6 +593,7 @@ class BaseTab(QWidget):
         # Show newest matches first when search is active
         if search_text:
             filtered = list(reversed(filtered))
+        self.filtered_items = filtered
         self.populate_table_with_items(filtered)
     
     def populate_table_with_items(self, items):

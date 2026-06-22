@@ -4,6 +4,7 @@ Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
 from PySide6.QtCore import Qt, QPoint
+from PySide6.QtWidgets import QHeaderView
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
@@ -25,7 +26,7 @@ class SalesEditDialog(BaseOperationDialog):
     
     def get_item_columns(self):
         """Override to specify sales item columns"""
-        return ['product_preview', 'product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action']
+        return ['product_preview', 'product_name', 'information', 'quantity', 'unit_price', 'subtotal', 'delete_action']
     
     def validate_data(self):
         """Sales-specific validation"""
@@ -81,6 +82,17 @@ class SalesTab(BaseTab):
             
             # Insert before the last item (which should be the refresh button)
             controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)
+
+    def setup_table(self):
+        """Setup the sales table and give information more room."""
+        super().setup_table()
+        try:
+            info_index = self.table_columns.index('information')
+            header = self.table.horizontalHeader()
+            header.setSectionResizeMode(info_index, QHeaderView.Interactive)
+            self.table.setColumnWidth(info_index, 260)
+        except ValueError:
+            pass
     
     def get_preview_category(self):
         """Override to specify preview category for sales operations"""
@@ -97,12 +109,15 @@ class SalesTab(BaseTab):
                 # Add client usernames, client names, and products
                 client_username = obj.get_value('client_username')
                 client_name = obj.get_value('client_name')
+                information = obj.get_value('information')
                 date = obj.get_value('date')
                 
                 if client_username:
                     options.add(str(client_username))
                 if client_name:
                     options.add(str(client_name))
+                if information:
+                    options.add(str(information))
                 if date:
                     # Add formatted date
                     options.add(str(date))
@@ -138,7 +153,7 @@ class SalesTab(BaseTab):
     
     def get_searchable_fields(self):
         """Get fields that can be searched for sales"""
-        return ['client_username', 'client_name', 'date']
+        return ['client_username', 'client_name', 'information', 'date']
     
     def matches_search(self, obj, search_text):
         """Check if sales matches search criteria"""
@@ -156,9 +171,11 @@ class SalesTab(BaseTab):
         try:
             client_username = obj.get_value('client_username') or ""
             client_name = obj.get_value('client_name') or ""
+            information = obj.get_value('information') or ""
             
             if (search_lower in client_username.lower() or 
-                search_lower in client_name.lower()):
+                search_lower in client_name.lower() or
+                search_lower in information.lower()):
                 return True
             
             # Check products in sales items

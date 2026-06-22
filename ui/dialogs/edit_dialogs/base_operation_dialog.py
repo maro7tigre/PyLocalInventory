@@ -618,10 +618,30 @@ class BaseOperationDialog(QDialog):
         try:
             self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = ?", (name,))
             res = self.database.cursor.fetchone()
-            return res and res[0] > 0
+            if res and res[0] > 0:
+                return True
+
+            self.database.cursor.execute(
+                "SELECT name, keywords FROM Services WHERE name IS NOT NULL AND name != ''"
+            )
+            name_clean = (name or '').strip().lower()
+            for service_name, keywords in self.database.cursor.fetchall():
+                candidates = [service_name, *self._split_keywords(keywords or "")]
+                if any(name_clean == str(candidate).strip().lower() for candidate in candidates if candidate):
+                    return True
+
+            return False
         except Exception as e:
             print(f"Error checking product existence: {e}")
             return True
+
+    @staticmethod
+    def _split_keywords(value):
+        return [
+            part.strip()
+            for part in str(value).replace("\n", ",").split(",")
+            if part.strip()
+        ]
 
     def _create_client(self, username):
         try:

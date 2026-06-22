@@ -8,6 +8,7 @@ import socket
 import subprocess
 import tempfile
 import shutil
+import html
 from datetime import datetime, timedelta
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
@@ -272,6 +273,7 @@ class ReportsDialog(QDialog):
                 total_ht = 0
                 for item in self.sales_obj.items:
                     product_name = item.get_value('product_name') or ""
+                    item_information = item.get_value('information') or ""
                     
                     # If product_name is empty, try to get it from product_id
                     if not product_name:
@@ -296,9 +298,16 @@ class ReportsDialog(QDialog):
                     total_quantity += int(quantity) if quantity else 0
                     total_ht += float(subtotal) if subtotal else 0
                     
+                    designation_html = html.escape(str(product_name))
+                    if item_information:
+                        designation_html += (
+                            f" <span style=\"font-size: 10px; color: #333;\">"
+                            f"{html.escape(str(item_information))}</span>"
+                        )
+
                     row_html = (
                         f"<tr>"
-                        f"<td style=\"text-align: left\">{product_name}</td>"
+                        f"<td style=\"text-align: left\">{designation_html}</td>"
                         f"<td>{quantity}</td>"
                         f"<td>{_fmt_fr(unit_price)}</td>"
                         f"<td>{_fmt_fr(subtotal)}</td>"

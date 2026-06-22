@@ -140,7 +140,9 @@ class TableRowFactory:
         elif param_key == 'product_preview':
             self._create_preview_cell(table, row, col, item)
         elif param_key == 'product_name':
-            self._create_autocomplete_cell(table, row, col, item)
+            self._create_autocomplete_cell(table, row, col, param_key, item)
+        elif self.data_manager.parameter_definitions.get(param_key, {}).get('autocomplete'):
+            self._create_autocomplete_cell(table, row, col, param_key, item)
         else:
             self._create_regular_cell(table, row, col, param_key, item)
     
@@ -180,22 +182,27 @@ class TableRowFactory:
         
         table.setCellWidget(row, col, container)
     
-    def _create_autocomplete_cell(self, table, row, col, item):
-        """Create autocomplete cell for product names"""
+    def _create_autocomplete_cell(self, table, row, col, param_key, item):
+        """Create autocomplete cell for configured string parameters."""
         from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
         
-        # Get product options
+        param_info = self.data_manager.parameter_definitions.get(param_key, {})
         temp_item = self.data_manager.item_class(0, self.data_manager.database)
-        product_options_method = temp_item.parameters.get('product_name', {}).get('options')
+        options = param_info.get('options', [])
+        if hasattr(temp_item, 'get_parameter_options'):
+            options = lambda key=param_key: temp_item.get_parameter_options(key)
         
-        autocomplete = AutoCompleteLineEdit(options=product_options_method)
-        autocomplete.setPlaceholderText("Product name")
+        autocomplete = AutoCompleteLineEdit(options=options)
+        autocomplete.setPlaceholderText(param_info.get('display_name', {}).get('en', param_key.replace('_', ' ')))
         autocomplete.setProperty('row', row)  # Store row for callbacks
         
         # Set current value if item provided
         if item:
-            current_name = item.get_product_name() if hasattr(item, 'get_product_name') else ""
-            autocomplete.setText(current_name)
+            if param_key == 'product_name' and hasattr(item, 'get_product_name'):
+                value = item.get_product_name()
+            else:
+                value = item.get_value(param_key) if hasattr(item, 'get_value') else ""
+            autocomplete.setText(str(value or ""))
         
         table.setCellWidget(row, col, autocomplete)
     

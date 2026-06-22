@@ -132,6 +132,14 @@ class ServiceClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "keywords": {
+                "value": "",
+                "display_name": {"en": "Keywords", "fr": "Mots clés", "es": "Palabras clave"},
+                "required": False,
+                "default": "",
+                "options": [],
+                "type": "string"
+            },
             "information": {
                 "value": "",
                 "display_name": {"en": "Information", "fr": "Informations", "es": "Información"},
@@ -145,48 +153,25 @@ class ServiceClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "service_code": "r",
                 "name": "r",
-                "information": "r",
                 "description": "r"
             },
             "dialog": {
-                "service_code": "rw",
-                "service_type": "rw",
                 "name": "rw",
-                "door_type_id": "rw",
-                "door_type_name": "rw",
-                "door_type_serial": "r",
-                "door_type_image_path": "r",
-                "wood_type": "rw",
-                "length": "rw",
-                "width": "rw",
-                "thickness": "rw",
-                "unit": "rw",
-                "color": "rw",
-                "description": "rw"
+                "description": "rw",
+                "keywords": "rw"
             },
             "database": {
-                "service_code": "rw",
                 "service_type": "rw",
                 "name": "rw",
-                "door_type_id": "rw",
-                "door_type_name": "rw",
-                "door_type_serial": "rw",
-                "door_type_image_path": "rw",
-                "wood_type": "rw",
-                "length": "rw",
-                "width": "rw",
-                "thickness": "rw",
-                "unit": "rw",
-                "color": "rw",
-                "description": "rw"
+                "description": "rw",
+                "keywords": "rw"
             },
             "report": {
-                "service_code": "r",
                 "service_type": "r",
                 "name": "r",
-                "description": "r"
+                "description": "r",
+                "keywords": "r"
             }
         }
 

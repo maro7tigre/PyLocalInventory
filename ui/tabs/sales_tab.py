@@ -3,8 +3,10 @@ Sales tab - Updated to use unified BaseTab approach
 Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
-from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox, QLineEdit, QWidget, QProgressBar, QSizePolicy, QFrame
+from PySide6.QtCore import Qt, QPoint, QDate
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
+    QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox, QLineEdit, QDateEdit,
+    QWidget, QProgressBar, QSizePolicy, QFrame, QTextBrowser, QPushButton)
 from PySide6.QtGui import QPixmap, QColor
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
@@ -12,6 +14,286 @@ from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
 from datetime import datetime
 import os
 import re
+
+
+def _ensure_payments_table(database):
+    try:
+        if database and database.cursor:
+            database.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Payments (
+                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sale_id INTEGER,
+                    amount REAL,
+                    date TEXT,
+                    FOREIGN KEY (sale_id) REFERENCES Sales(ID) ON DELETE CASCADE
+                )
+            """)
+            database.conn.commit()
+    except Exception as e:
+        print(f"Error creating Payments table: {e}")
+
+
+def _query_total_paid(database, sale_id):
+    try:
+        if database and database.cursor:
+            database.cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE sale_id = ?",
+                (sale_id,)
+            )
+            result = database.cursor.fetchone()
+            return float(result[0]) if result else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+class ReceiptDialog(QDialog):
+    """Printable payment receipt."""
+
+    def __init__(self, sale_id, client, order_date, payment_date,
+                 total, amount_this, total_paid, remaining, parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("Payment Receipt")
+        self.setMinimumWidth(500)
+        self.setMinimumHeight(480)
+        self._html = self._build_html(
+            sale_id, client, order_date, payment_date,
+            total, amount_this, total_paid, remaining
+        )
+        self._setup_ui()
+
+    def _build_html(self, sale_id, client, order_date, payment_date,
+                    total, amount_this, total_paid, remaining):
+        rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
+        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} DA REMAINING'
+        return f"""
+<html><body style="font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;">
+<div style="border:2px solid #222;padding:28px 32px;max-width:440px;margin:20px auto;">
+  <h2 style="text-align:center;color:#1a1a1a;margin:0 0 4px 0;letter-spacing:2px;">PAYMENT RECEIPT</h2>
+  <p style="text-align:center;color:#888;font-size:12px;margin:0 0 16px 0;">Thank you for your payment</p>
+  <hr style="border:none;border-top:1px solid #ccc;margin:0 0 14px 0;"/>
+  <table width="100%" cellspacing="0" cellpadding="4">
+    <tr><td style="color:#555;font-size:13px;">Sale #:</td><td align="right"><b style="font-size:13px;">{sale_id}</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Client:</td><td align="right"><b style="font-size:13px;">{client}</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Order Date:</td><td align="right" style="font-size:13px;">{order_date}</td></tr>
+    <tr><td style="color:#555;font-size:13px;">Payment Date:</td><td align="right" style="font-size:13px;">{payment_date}</td></tr>
+  </table>
+  <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
+  <table width="100%" cellspacing="0" cellpadding="5">
+    <tr><td style="color:#555;font-size:13px;">Total Order:</td><td align="right"><b style="font-size:13px;">{total:.2f} DA</b></td></tr>
+    <tr><td style="color:#1565C0;font-size:14px;font-weight:bold;">Amount Paid (this):</td><td align="right"><b style="color:#1565C0;font-size:14px;">{amount_this:.2f} DA</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Total Paid:</td><td align="right"><b style="color:#27ae60;font-size:13px;">{total_paid:.2f} DA</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Remaining:</td><td align="right"><b style="color:{rem_color};font-size:13px;">{remaining:.2f} DA</b></td></tr>
+  </table>
+  <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
+  <p style="text-align:center;color:{rem_color};font-size:15px;font-weight:bold;margin:0;">{status_text}</p>
+</div>
+</body></html>"""
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(12, 12, 12, 12)
+        layout.setSpacing(10)
+
+        self._browser = QTextBrowser()
+        self._browser.setHtml(self._html)
+        layout.addWidget(self._browser)
+
+        btn_lay = QHBoxLayout()
+        close_btn = QPushButton("Close")
+        close_btn.setStyleSheet(
+            "QPushButton { background:#555; color:#fff; border:none; border-radius:6px; padding:8px 16px; }"
+            "QPushButton:hover { background:#666; }"
+        )
+        close_btn.clicked.connect(self.accept)
+
+        print_btn = QPushButton("🖨️  Print")
+        print_btn.setStyleSheet(
+            "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:6px; padding:8px 16px; font-weight:bold; }"
+            "QPushButton:hover { background:#1976D2; }"
+        )
+        print_btn.clicked.connect(self._print_receipt)
+
+        btn_lay.addWidget(close_btn)
+        btn_lay.addWidget(print_btn)
+        layout.addLayout(btn_lay)
+
+    def _print_receipt(self):
+        try:
+            from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+            from PySide6.QtGui import QTextDocument
+            printer = QPrinter(QPrinter.HighResolution)
+            dlg = QPrintDialog(printer, self)
+            if dlg.exec() == QPrintDialog.Accepted:
+                doc = QTextDocument()
+                doc.setHtml(self._html)
+                doc.print_(printer)
+        except Exception as e:
+            print(f"Print error: {e}")
+
+
+class PaymentDialog(QDialog):
+    """Record a payment installment for a sale and show a printable receipt."""
+
+    def __init__(self, sale_obj, database, parent=None):
+        super().__init__(parent)
+        self.sale_obj = sale_obj
+        self.database = database
+        self.setWindowTitle(f"Payment — Sale #{sale_obj.id}")
+        self.setMinimumWidth(440)
+        self.setFixedWidth(440)
+        self.setStyleSheet("background:#2a2a2a; color:#eee;")
+        _ensure_payments_table(database)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        layout = QVBoxLayout(self)
+        layout.setContentsMargins(20, 20, 20, 20)
+        layout.setSpacing(12)
+
+        client = (self.sale_obj.get_value('client_name') or
+                  self.sale_obj.get_value('client_username') or 'Unknown')
+        order_date = self.sale_obj.get_value('date') or ''
+        header = QLabel(f"Sale #{self.sale_obj.id}  |  Client: {client}  |  Date: {order_date}")
+        header.setStyleSheet("font-size:13px; font-weight:bold; color:#ddd;")
+        layout.addWidget(header)
+
+        self._total = self.sale_obj.calculate_total_price()
+        self._total_paid_before = _query_total_paid(self.database, self.sale_obj.id)
+        self._remaining_before = self._total - self._total_paid_before
+
+        # Summary frame
+        summary = QFrame()
+        summary.setStyleSheet("QFrame { background:#252525; border:1px solid #444; border-radius:6px; }")
+        s_lay = QVBoxLayout(summary)
+        s_lay.setContentsMargins(14, 10, 14, 10)
+        s_lay.setSpacing(6)
+
+        def _row(lbl_text, val_text, color='#eee'):
+            h = QHBoxLayout()
+            l = QLabel(lbl_text)
+            l.setStyleSheet("color:#aaa; font-size:13px;")
+            v = QLabel(val_text)
+            v.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold;")
+            v.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
+            h.addWidget(l)
+            h.addStretch()
+            h.addWidget(v)
+            return h
+
+        s_lay.addLayout(_row("Total Order:", f"{self._total:.2f} DA"))
+        paid_color = '#4CAF50' if self._total_paid_before > 0 else '#888'
+        s_lay.addLayout(_row("Already Paid:", f"{self._total_paid_before:.2f} DA", paid_color))
+        rem_color = '#FF9800' if self._remaining_before > 0 else '#4CAF50'
+        s_lay.addLayout(_row("Remaining:", f"{self._remaining_before:.2f} DA", rem_color))
+        layout.addWidget(summary)
+
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#444;")
+        layout.addWidget(sep)
+
+        # Amount input
+        amount_lbl = QLabel("Amount Paying Now:")
+        amount_lbl.setStyleSheet("color:#ccc; font-size:13px;")
+        layout.addWidget(amount_lbl)
+
+        self._amount_spin = QDoubleSpinBox()
+        self._amount_spin.setRange(0.01, 9_999_999.99)
+        self._amount_spin.setDecimals(2)
+        self._amount_spin.setValue(max(self._remaining_before, 0.0))
+        self._amount_spin.setSuffix(" DA")
+        self._amount_spin.setMinimumHeight(36)
+        self._amount_spin.setStyleSheet(
+            "QDoubleSpinBox { background:#333; color:#eee; border:1px solid #555; padding:4px; font-size:14px; }"
+            "QDoubleSpinBox::up-button, QDoubleSpinBox::down-button { background:#444; }"
+        )
+        self._amount_spin.valueChanged.connect(self._on_amount_changed)
+        layout.addWidget(self._amount_spin)
+
+        # Date input
+        date_lbl = QLabel("Payment Date:")
+        date_lbl.setStyleSheet("color:#ccc; font-size:13px;")
+        layout.addWidget(date_lbl)
+
+        self._date_edit = QDateEdit()
+        self._date_edit.setDate(QDate.currentDate())
+        self._date_edit.setCalendarPopup(True)
+        self._date_edit.setDisplayFormat("dd-MM-yyyy")
+        self._date_edit.setMinimumHeight(36)
+        self._date_edit.setStyleSheet(
+            "QDateEdit { background:#333; color:#eee; border:1px solid #555; padding:4px; font-size:14px; }"
+            "QDateEdit::drop-down { background:#444; }"
+        )
+        layout.addWidget(self._date_edit)
+
+        # Live remaining preview
+        init_remaining_after = self._remaining_before - self._amount_spin.value()
+        after_color = '#4CAF50' if init_remaining_after <= 0 else '#FF9800'
+        self._after_lbl = QLabel(f"Remaining after this payment:  {init_remaining_after:.2f} DA")
+        self._after_lbl.setStyleSheet(f"color:{after_color}; font-size:13px; font-weight:bold; padding-top:4px;")
+        layout.addWidget(self._after_lbl)
+
+        # Buttons
+        btn_lay = QHBoxLayout()
+        cancel_btn = QPushButton("Cancel")
+        cancel_btn.setStyleSheet(
+            "QPushButton { background:#555; color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:13px; }"
+            "QPushButton:hover { background:#666; }"
+        )
+        cancel_btn.clicked.connect(self.reject)
+
+        save_btn = QPushButton("💾  Save & Print Receipt")
+        save_btn.setStyleSheet(
+            "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:6px; padding:8px 16px; font-size:13px; font-weight:bold; }"
+            "QPushButton:hover { background:#1976D2; }"
+        )
+        save_btn.clicked.connect(self._save_payment)
+
+        btn_lay.addWidget(cancel_btn)
+        btn_lay.addWidget(save_btn)
+        layout.addLayout(btn_lay)
+
+    def _on_amount_changed(self, value):
+        remaining_after = self._remaining_before - value
+        color = '#4CAF50' if remaining_after <= 0 else '#FF9800'
+        self._after_lbl.setText(f"Remaining after this payment:  {remaining_after:.2f} DA")
+        self._after_lbl.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold; padding-top:4px;")
+
+    def _save_payment(self):
+        from PySide6.QtWidgets import QMessageBox
+        amount = self._amount_spin.value()
+        if amount <= 0:
+            QMessageBox.warning(self, "Invalid Amount", "Please enter an amount greater than 0.")
+            return
+
+        date_str = self._date_edit.date().toString("dd-MM-yyyy")
+        try:
+            self.database.cursor.execute(
+                "INSERT INTO Payments (sale_id, amount, date) VALUES (?, ?, ?)",
+                (self.sale_obj.id, amount, date_str)
+            )
+            self.database.conn.commit()
+        except Exception as e:
+            QMessageBox.critical(self, "Error", f"Failed to save payment:\n{e}")
+            return
+
+        client = (self.sale_obj.get_value('client_name') or
+                  self.sale_obj.get_value('client_username') or 'Unknown')
+        remaining_after = self._remaining_before - amount
+
+        ReceiptDialog(
+            sale_id=self.sale_obj.id,
+            client=client,
+            order_date=self.sale_obj.get_value('date') or '',
+            payment_date=date_str,
+            total=self._total,
+            amount_this=amount,
+            total_paid=self._total_paid_before + amount,
+            remaining=remaining_after,
+            parent=self
+        ).exec()
+        self.accept()
 
 
 class OrderProgressDialog(QDialog):
@@ -24,6 +306,7 @@ class OrderProgressDialog(QDialog):
         self.setWindowTitle(f"Order Progress — Sale #{sale_obj.id}")
         self.setMinimumWidth(700)
         self.setMinimumHeight(520)
+        _ensure_payments_table(database)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -107,7 +390,7 @@ class OrderProgressDialog(QDialog):
         layout.addWidget(lbl)
 
         self._pay_table = QTableWidget(1, 4)
-        self._pay_table.setHorizontalHeaderLabels(["Total Price", "Amount Paid", "Remaining", "Note"])
+        self._pay_table.setHorizontalHeaderLabels(["Total Price", "Total Paid", "Remaining", "Note"])
         self._pay_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self._pay_table.verticalHeader().hide()
         self._pay_table.setRowHeight(0, 42)
@@ -121,8 +404,8 @@ class OrderProgressDialog(QDialog):
         )
 
         total = self.sale_obj.calculate_total_price()
-        amount_paid = float(self.sale_obj.get_value('amount_paid') or 0.0)
-        remaining = total - amount_paid
+        total_paid = _query_total_paid(self.database, self.sale_obj.id)
+        remaining = total - total_paid
 
         # Col 0 — total price (read-only)
         total_item = QTableWidgetItem(f"{total:.2f}")
@@ -130,17 +413,12 @@ class OrderProgressDialog(QDialog):
         total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
         self._pay_table.setItem(0, 0, total_item)
 
-        # Col 1 — amount paid (editable spinbox)
-        paid_spin = QDoubleSpinBox()
-        paid_spin.setRange(0, 9999999.99)
-        paid_spin.setDecimals(2)
-        paid_spin.setValue(amount_paid)
-        paid_spin.setSuffix(" DA")
-        paid_spin.setStyleSheet(
-            "QDoubleSpinBox { background:#333; color:#eee; border:1px solid #555; padding:2px; }"
-        )
-        paid_spin.valueChanged.connect(self._on_paid_changed)
-        self._pay_table.setCellWidget(0, 1, paid_spin)
+        # Col 1 — total paid so far (read-only, sum from Payments table)
+        paid_item = QTableWidgetItem(f"{total_paid:.2f}")
+        paid_item.setTextAlignment(Qt.AlignCenter)
+        paid_item.setFlags(paid_item.flags() & ~Qt.ItemIsEditable)
+        paid_item.setForeground(QColor('#4CAF50') if total_paid > 0 else QColor('#888'))
+        self._pay_table.setItem(0, 1, paid_item)
 
         # Col 2 — remaining (read-only, colour-coded)
         self._remaining_item = QTableWidgetItem(f"{remaining:.2f}")
@@ -149,7 +427,7 @@ class OrderProgressDialog(QDialog):
         self._refresh_remaining_color(remaining)
         self._pay_table.setItem(0, 2, self._remaining_item)
 
-        # Col 3 — note (editable line edit)
+        # Col 3 — note (editable line edit, saves to Sales.notes)
         note_edit = QLineEdit()
         note_edit.setPlaceholderText("Add a note…")
         note_edit.setText(self.sale_obj.get_value('notes') or '')
@@ -159,20 +437,7 @@ class OrderProgressDialog(QDialog):
         note_edit.editingFinished.connect(lambda: self._on_note_changed(note_edit.text()))
         self._pay_table.setCellWidget(0, 3, note_edit)
 
-        self._total_price = total
         layout.addWidget(self._pay_table)
-
-    def _on_paid_changed(self, value):
-        remaining = self._total_price - value
-        self._remaining_item.setText(f"{remaining:.2f}")
-        self._refresh_remaining_color(remaining)
-        try:
-            if self.database and self.sale_obj.id:
-                self.database.update_item(self.sale_obj.id, {'amount_paid': value}, 'Sales')
-                if 'amount_paid' in self.sale_obj.parameters:
-                    self.sale_obj.parameters['amount_paid']['value'] = value
-        except Exception as e:
-            print(f"Error saving amount_paid: {e}")
 
     def _on_note_changed(self, text):
         try:
@@ -302,6 +567,15 @@ class SalesTab(BaseTab):
             self.reports_btn.setStyleSheet(self.reports_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
             self.reports_btn.setMinimumHeight(20)
             controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)
+
+            self.payment_btn = OrangeButton("💳 Payment")
+            self.payment_btn.clicked.connect(self.show_payment_dialog)
+            self.payment_btn.setStyleSheet(
+                "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:6px; font-size:14px; padding:5px 10px; }"
+                "QPushButton:hover { background:#1976D2; }"
+            )
+            self.payment_btn.setMinimumHeight(20)
+            controls_layout.insertWidget(controls_layout.count() - 1, self.payment_btn)
 
     def setup_table(self):
         """Setup the sales table and give information more room."""
@@ -730,3 +1004,17 @@ class SalesTab(BaseTab):
             print(f"Error in show_reports: {e}")
             import traceback
             traceback.print_exc()
+
+    def show_payment_dialog(self):
+        """Open the payment dialog for the selected sale."""
+        from PySide6.QtWidgets import QMessageBox
+        current_row = self.table.currentRow()
+        if current_row < 0:
+            QMessageBox.information(self, "No Selection", "Please select a sale to record a payment.")
+            return
+        if current_row >= len(self.filtered_items):
+            return
+        selected_sale = self.filtered_items[current_row]
+        dialog = PaymentDialog(selected_sale, self.database, self)
+        if dialog.exec():
+            self.refresh_table()

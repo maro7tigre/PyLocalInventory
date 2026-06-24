@@ -80,13 +80,6 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
-            "amount_paid": {
-                "value": 0.0,
-                "display_name": {"en": "Amount Paid", "fr": "Montant Payé", "es": "Monto Pagado"},
-                "required": False,
-                "default": 0.0,
-                "type": "float"
-            },
             "items": {
                 "display_name": {"en": "Items", "fr": "Articles", "es": "Artículos"},
                 "required": False,
@@ -145,8 +138,7 @@ class SalesClass(BaseClass):
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",
-                "notes": "rw",
-                "amount_paid": "rw"
+                "notes": "rw"
                 # Note: items are stored separately in Sales_Items table
             },
             "report": {

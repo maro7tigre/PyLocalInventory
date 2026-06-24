@@ -19,6 +19,7 @@ from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
 from ui.tabs.imports_tab import ImportsTab
+from ui.tabs.reports_tab import ReportsTab
 # from ui.tabs.log_tab import LogTab  # Hidden per request
 
 from classes.product_class import ProductClass
@@ -31,6 +32,7 @@ from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
+from classes.reports_class import ReportsClass
 
 from core.profiles import ProfileManager
 from core.password import PasswordManager
@@ -82,7 +84,8 @@ class MainWindow(ThemedMainWindow):
         self.database.register_class(SalesItemClass)
         self.database.register_class(ImportClass)
         self.database.register_class(ImportItemClass)
-        
+        self.database.register_class(ReportsClass)
+
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
     def load_app_config(self):
@@ -121,6 +124,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': _bool(self.settings.value("tab_visible/suppliers")),
             'sales':     _bool(self.settings.value("tab_visible/sales")),
             'imports':   _bool(self.settings.value("tab_visible/imports")),
+            'reports':   _bool(self.settings.value("tab_visible/reports")),
         }
     
     def load_saved_profile(self):
@@ -226,6 +230,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales':     "💰 Sales",
             'imports':   "📥 Imports",
+            'reports':   "📝 Reports",
         }
         self._tab_visibility_actions = {}
         for key, label in tab_labels_en.items():
@@ -417,7 +422,15 @@ class MainWindow(ThemedMainWindow):
         except Exception as e:
             print(f"✗ Error adding Imports tab: {e}")
             self.add_error_tab(tab_widget, "Imports", e)
-        
+
+        try:
+            reports_tab = ReportsTab(self.database, self)
+            tab_widget.addTab(reports_tab, labels['reports'])
+            print("✓ Added Reports tab")
+        except Exception as e:
+            print(f"✗ Error adding Reports tab: {e}")
+            self.add_error_tab(tab_widget, "Reports", e)
+
     # Hidden per request: Log tab
     # tab_widget.addTab(LogTab(self.database), labels['log'])
 
@@ -427,7 +440,7 @@ class MainWindow(ThemedMainWindow):
         # Fixed key→index mapping (matches insertion order above)
         self._tab_key_to_index = {
             'home': 0, 'products': 1, 'services': 2, 'clients': 3,
-            'suppliers': 4, 'sales': 5, 'imports': 6,
+            'suppliers': 4, 'sales': 5, 'imports': 6, 'reports': 7,
         }
 
         # Apply stored tab visibility
@@ -506,6 +519,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Fournisseurs",
                 'sales': "💰 Ventes",
                 'imports': "📥 Importations",
+                'reports': "📝 Rapports",
                 'log': "📋 Journal",
             }
         if l == 'es':
@@ -517,6 +531,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Proveedores",
                 'sales': "💰 Ventas",
                 'imports': "📥 Importaciones",
+                'reports': "📝 Informes",
                 'log': "📋 Registro",
             }
         # default English
@@ -528,6 +543,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales': "💰 Sales",
             'imports': "📥 Imports",
+            'reports': "📝 Reports",
             'log': "📋 Log",
         }
     

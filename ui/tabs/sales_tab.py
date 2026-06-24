@@ -4,12 +4,135 @@ Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import QHeaderView
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QWidget, QProgressBar, QSizePolicy
+from PySide6.QtGui import QPixmap, QColor
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
 from datetime import datetime
+import os
 import re
+
+
+class OrderProgressDialog(QDialog):
+    """Popup showing per-product production progress for a sale."""
+
+    def __init__(self, sale_obj, database, parent=None):
+        super().__init__(parent)
+        self.sale_obj = sale_obj
+        self.database = database
+        self.setWindowTitle(f"Order Progress — Sale #{sale_obj.id}")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(380)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self._root_layout = QVBoxLayout(self)
+        self._root_layout.setContentsMargins(16, 16, 16, 16)
+        self._root_layout.setSpacing(10)
+        try:
+            self._build_ui(self._root_layout)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            err = QLabel(f"Error loading progress dialog:\n{e}")
+            err.setStyleSheet("color:#ff6b6b; font-size:13px; padding:8px;")
+            self._root_layout.addWidget(err)
+
+    def _build_ui(self, layout):
+        client = (self.sale_obj.get_value('client_name') or
+                  self.sale_obj.get_value('client_username') or 'Unknown')
+        date = self.sale_obj.get_value('date') or ''
+        header_lbl = QLabel(f"Sale #{self.sale_obj.id}   |   Client: {client}   |   Date: {date}")
+        header_lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#ddd; padding-bottom:4px;")
+        layout.addWidget(header_lbl)
+
+        self.items = self.sale_obj.get_sales_items()
+
+        self.table = QTableWidget(len(self.items), 5)
+        self.table.setHorizontalHeaderLabels(["Preview", "Product", "Target", "Production", "Status"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 68)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(68)
+        self.table.verticalHeader().hide()
+        self.table.setStyleSheet(
+            "QTableWidget { background:#2a2a2a; color:#eee; gridline-color:#444; border:1px solid #555; }"
+            "QHeaderView::section { background:#333; color:#fff; border:1px solid #555; padding:4px; font-weight:bold; }"
+            "QTableWidget::item:alternate { background:#252525; }"
+        )
+
+        for row, item in enumerate(self.items):
+            self._set_preview_cell(row, item.get_product_preview())
+
+            name_cell = QTableWidgetItem(str(item.get_value('product_name') or ''))
+            name_cell.setFlags(name_cell.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, name_cell)
+
+            qty = int(item.get_value('quantity') or 0)
+            qty_cell = QTableWidgetItem(str(qty))
+            qty_cell.setFlags(qty_cell.flags() & ~Qt.ItemIsEditable)
+            qty_cell.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 2, qty_cell)
+
+            prod = int(item.get_value('production') or 0)
+            spinbox = QSpinBox()
+            spinbox.setRange(0, 999999)
+            spinbox.setValue(prod)
+            spinbox.setStyleSheet(
+                "QSpinBox { background:#333; color:#eee; border:1px solid #555; padding:2px; }"
+            )
+            spinbox.valueChanged.connect(
+                lambda val, i=item, r=row, t=qty: self._on_production_changed(val, i, r, t)
+            )
+            self.table.setCellWidget(row, 3, spinbox)
+
+            self._refresh_status_cell(row, qty, prod)
+
+        layout.addWidget(self.table)
+
+    def _set_preview_cell(self, row, image_path):
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setFixedSize(58, 58)
+        if image_path and os.path.exists(image_path):
+            pix = QPixmap(image_path).scaled(58, 58, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            lbl.setPixmap(pix)
+        else:
+            lbl.setText("📦")
+            lbl.setStyleSheet("font-size:22px; background:#333; border-radius:4px;")
+        lay.addWidget(lbl)
+        self.table.setCellWidget(row, 0, container)
+
+    def _on_production_changed(self, value, item, row, target):
+        try:
+            if self.database and item.id:
+                self.database.update_item(item.id, {'production': value}, 'Sales_Items')
+                if 'production' in item.parameters:
+                    item.parameters['production']['value'] = value
+        except Exception as e:
+            print(f"Error saving production value: {e}")
+        self._refresh_status_cell(row, target, value)
+
+    def _refresh_status_cell(self, row, target, production):
+        if target > 0 and production >= target:
+            text, color = "Complete", QColor('#4CAF50')
+        elif production > 0:
+            text, color = "In Progress", QColor('#FF9800')
+        else:
+            text, color = "Pending", QColor('#757575')
+
+        cell = QTableWidgetItem(text)
+        cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+        cell.setForeground(color)
+        cell.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(row, 4, cell)
 
 
 class SalesEditDialog(BaseOperationDialog):
@@ -75,12 +198,11 @@ class SalesTab(BaseTab):
         
         if controls_layout:
             from ui.widgets.themed_widgets import OrangeButton
+
             self.reports_btn = OrangeButton("📊 Reports")
             self.reports_btn.clicked.connect(self.show_reports)
             self.reports_btn.setStyleSheet(self.reports_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
             self.reports_btn.setMinimumHeight(20)
-            
-            # Insert before the last item (which should be the refresh button)
             controls_layout.insertWidget(controls_layout.count() - 1, self.reports_btn)
 
     def setup_table(self):
@@ -249,39 +371,83 @@ class SalesTab(BaseTab):
         return items
 
     # ------------- New columns injection and custom cell rendering -------------
+    _VIRTUAL_COLUMN_HEADERS = {'check_progress': '', 'progress': 'Progress'}
+
     def _ensure_new_columns_order(self):
-        """Ensure state appears after ID for existing DBs."""
+        """Ensure state appears after ID, check_progress button is second, and progress column exists."""
         try:
-            needed = []
-            if 'id' in self.table_columns:
-                needed.append('id')
-            if 'state' in self.object_class(0, self.database).parameters:
-                if 'state' not in self.table_columns:
-                    self.table_columns.insert(1, 'state')
-                needed.append('state')
-            # Rebuild headers if order changed
+            if 'state' not in self.table_columns:
+                self.table_columns.insert(1, 'state')
+            if 'check_progress' not in self.table_columns:
+                # Insert right after id (index 0), before state
+                self.table_columns.insert(1, 'check_progress')
+            if 'progress' not in self.table_columns:
+                self.table_columns.append('progress')
+
             temp_obj = self.object_class(0, self.database)
             headers = []
             for key in self.table_columns:
-                headers.append(temp_obj.get_display_name(key) if key in temp_obj.parameters else key)
+                if key in self._VIRTUAL_COLUMN_HEADERS:
+                    headers.append(self._VIRTUAL_COLUMN_HEADERS[key])
+                elif key in temp_obj.parameters:
+                    headers.append(temp_obj.get_display_name(key))
+                else:
+                    headers.append(key.capitalize())
             self.table.setColumnCount(len(self.table_columns))
             self.table.setHorizontalHeaderLabels(headers)
+            # Fix the check_progress column to a narrow width
+            if 'check_progress' in self.table_columns:
+                cp_col = self.table_columns.index('check_progress')
+                self.table.setColumnWidth(cp_col, 50)
+                self.table.horizontalHeader().setSectionResizeMode(cp_col, QHeaderView.Fixed)
         except Exception as e:
             print(f"Error ensuring sales columns order: {e}")
 
     def populate_table_with_items(self, items):
-        """Populate table with custom state button rendering."""
+        """Populate table with custom state/progress rendering."""
         self.table.setRowCount(len(items))
         for row, obj in enumerate(items):
             try:
                 for col, column_key in enumerate(self.table_columns):
-                    if column_key == 'state':
+                    if column_key == 'check_progress':
+                        self._set_check_progress_cell(row, col, obj)
+                    elif column_key == 'state':
                         self._set_state_cell(row, col, obj)
+                    elif column_key == 'progress':
+                        self._set_progress_cell(row, col, obj)
                     else:
                         self.set_table_cell(row, col, column_key, obj)
             except Exception as e:
                 print(f"Error processing Sales row {row}: {e}")
         self.table.resizeRowsToContents()
+
+    def _set_check_progress_cell(self, row, col, obj):
+        from PySide6.QtWidgets import QPushButton
+        btn = QPushButton("📦")
+        btn.setToolTip("Check Progress")
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.setStyleSheet(
+            "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:4px; padding:3px 8px; font-size:15px; }"
+            "QPushButton:hover { background:#1976D2; }"
+        )
+        btn.clicked.connect(lambda _=None, o=obj, r=row, c=col: (self.table.setCurrentCell(r, c), self._open_progress_for_sale(o)))
+
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(4, 2, 4, 2)
+        lay.addWidget(btn)
+        self.table.setCellWidget(row, col, container)
+
+    def _open_progress_for_sale(self, obj):
+        try:
+            dialog = OrderProgressDialog(obj, self.database, self)
+            dialog.exec()
+            self.refresh_table()
+        except Exception as e:
+            from PySide6.QtWidgets import QMessageBox
+            QMessageBox.critical(self, "Error", f"Failed to open progress dialog:\n{e}")
+            import traceback
+            traceback.print_exc()
 
     def _set_state_cell(self, row, col, obj):
         from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
@@ -295,12 +461,44 @@ class SalesTab(BaseTab):
         btn = QPushButton(label)
         btn.setStyleSheet(f"QPushButton {{ background:{color}; color:#fff; border:none; border-radius:6px; padding:4px 10px; }}")
         btn.setCursor(Qt.PointingHandCursor)
-        btn.clicked.connect(lambda _=None, o=obj, b=btn: self._open_state_popup(o, b))
+        btn.clicked.connect(lambda _=None, o=obj, b=btn, r=row, c=col: (self.table.setCurrentCell(r, c), self._open_state_popup(o, b)))
 
         container = QWidget()
         lay = QHBoxLayout(container)
         lay.setContentsMargins(0,0,0,0)
         lay.addWidget(btn)
+        self.table.setCellWidget(row, col, container)
+
+    def _set_progress_cell(self, row, col, obj):
+        items = obj.get_sales_items()
+        total_target = sum(int(item.get_value('quantity') or 0) for item in items)
+        total_prod = sum(int(item.get_value('production') or 0) for item in items)
+        pct = min(int(total_prod / total_target * 100), 100) if total_target > 0 else 0
+
+        if pct >= 100:
+            chunk_color = '#4CAF50'
+        elif pct > 0:
+            chunk_color = '#FF9800'
+        else:
+            chunk_color = '#555'
+
+        bar = QProgressBar()
+        bar.setRange(0, 100)
+        bar.setValue(pct)
+        bar.setFormat(f"{pct}%")
+        bar.setTextVisible(True)
+        bar.setStyleSheet(
+            f"QProgressBar {{ border:1px solid #444; border-radius:4px; background:#2a2a2a; text-align:center; color:#fff; }}"
+            f"QProgressBar::chunk {{ background:{chunk_color}; border-radius:3px; }}"
+        )
+
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(6, 3, 6, 3)
+        lay.addWidget(bar)
+        # Pass mouse events through so clicking the bar selects the table row
+        bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
+        container.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.table.setCellWidget(row, col, container)
 
     def _open_state_popup(self, obj, anchor):
@@ -379,6 +577,19 @@ class SalesTab(BaseTab):
         except Exception as e:
             print(f"Error updating sale state: {e}")
     
+    def show_order_progress(self):
+        """Show order production progress dialog for the selected sale."""
+        from PySide6.QtWidgets import QMessageBox
+        obj_id = self.get_selected_id()
+        if obj_id is None:
+            QMessageBox.warning(self, "No Selection", "Please select a sale to check progress.")
+            return
+        obj = next((s for s in self.filtered_items if s.id == obj_id), None)
+        if obj is None:
+            obj = next((s for s in self.all_items if s.id == obj_id), None)
+        if obj:
+            self._open_progress_for_sale(obj)
+
     def show_reports(self):
         """Show reports dialog for selected sales record"""
         try:

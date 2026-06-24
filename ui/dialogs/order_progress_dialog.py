@@ -1,0 +1,241 @@
+"""
+Order progress dialog - shows per-product production progress for a sale.
+"""
+from PySide6.QtCore import Qt
+from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, 
+                               QTableWidgetItem, QHeaderView, QSpinBox, QWidget, QLineEdit, QFrame)
+from PySide6.QtGui import QPixmap, QColor
+import os
+
+
+def _ensure_payments_table(database):
+    try:
+        if database and database.cursor:
+            database.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Payments (
+                    ID INTEGER PRIMARY KEY AUTOINCREMENT,
+                    sale_id INTEGER,
+                    amount REAL,
+                    date TEXT,
+                    FOREIGN KEY (sale_id) REFERENCES Sales(ID) ON DELETE CASCADE
+                )
+            """)
+            database.conn.commit()
+    except Exception as e:
+        print(f"Error creating Payments table: {e}")
+
+
+def _query_total_paid(database, sale_id):
+    try:
+        if database and database.cursor:
+            database.cursor.execute(
+                "SELECT COALESCE(SUM(amount), 0) FROM Payments WHERE sale_id = ?",
+                (sale_id,)
+            )
+            result = database.cursor.fetchone()
+            return float(result[0]) if result else 0.0
+    except Exception:
+        pass
+    return 0.0
+
+
+class OrderProgressDialog(QDialog):
+    """Popup showing per-product production progress for a sale."""
+
+    def __init__(self, sale_obj, database, parent=None):
+        super().__init__(parent)
+        self.sale_obj = sale_obj
+        self.database = database
+        self.setWindowTitle(f"Order Progress — Sale #{sale_obj.id}")
+        self.setMinimumWidth(700)
+        self.setMinimumHeight(520)
+        _ensure_payments_table(database)
+        self._setup_ui()
+
+    def _setup_ui(self):
+        self._root_layout = QVBoxLayout(self)
+        self._root_layout.setContentsMargins(16, 16, 16, 16)
+        self._root_layout.setSpacing(10)
+        try:
+            self._build_ui(self._root_layout)
+        except Exception as e:
+            import traceback
+            traceback.print_exc()
+            err = QLabel(f"Error loading progress dialog:\n{e}")
+            err.setStyleSheet("color:#ff6b6b; font-size:13px; padding:8px;")
+            self._root_layout.addWidget(err)
+
+    def _build_ui(self, layout):
+        client = (self.sale_obj.get_value('client_name') or
+                  self.sale_obj.get_value('client_username') or 'Unknown')
+        date = self.sale_obj.get_value('date') or ''
+        header_lbl = QLabel(f"Sale #{self.sale_obj.id}   |   Client: {client}   |   Date: {date}")
+        header_lbl.setStyleSheet("font-size:14px; font-weight:bold; color:#ddd; padding-bottom:4px;")
+        layout.addWidget(header_lbl)
+
+        self.items = self.sale_obj.get_sales_items()
+
+        self.table = QTableWidget(len(self.items), 5)
+        self.table.setHorizontalHeaderLabels(["Preview", "Product", "Target", "Production", "Status"])
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self.table.horizontalHeader().setSectionResizeMode(0, QHeaderView.Fixed)
+        self.table.setColumnWidth(0, 68)
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setSelectionBehavior(QTableWidget.SelectRows)
+        self.table.setAlternatingRowColors(True)
+        self.table.verticalHeader().setDefaultSectionSize(68)
+        self.table.verticalHeader().hide()
+        self.table.setStyleSheet(
+            "QTableWidget { background:#2a2a2a; color:#eee; gridline-color:#444; border:1px solid #555; }"
+            "QHeaderView::section { background:#333; color:#fff; border:1px solid #555; padding:4px; font-weight:bold; }"
+            "QTableWidget::item:alternate { background:#252525; }"
+        )
+
+        for row, item in enumerate(self.items):
+            self._set_preview_cell(row, item.get_product_preview())
+
+            name_cell = QTableWidgetItem(str(item.get_value('product_name') or ''))
+            name_cell.setFlags(name_cell.flags() & ~Qt.ItemIsEditable)
+            self.table.setItem(row, 1, name_cell)
+
+            qty = int(item.get_value('quantity') or 0)
+            qty_cell = QTableWidgetItem(str(qty))
+            qty_cell.setFlags(qty_cell.flags() & ~Qt.ItemIsEditable)
+            qty_cell.setTextAlignment(Qt.AlignCenter)
+            self.table.setItem(row, 2, qty_cell)
+
+            prod = int(item.get_value('production') or 0)
+            spinbox = QSpinBox()
+            spinbox.setRange(0, 999999)
+            spinbox.setValue(prod)
+            spinbox.setStyleSheet(
+                "QSpinBox { background:#333; color:#eee; border:1px solid #555; padding:2px; }"
+            )
+            spinbox.valueChanged.connect(
+                lambda val, i=item, r=row, t=qty: self._on_production_changed(val, i, r, t)
+            )
+            self.table.setCellWidget(row, 3, spinbox)
+
+            self._refresh_status_cell(row, qty, prod)
+
+        self.table.setMaximumHeight(300)
+        layout.addWidget(self.table)
+        self._build_payment_section(layout)
+
+    def _build_payment_section(self, layout):
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#444;")
+        layout.addWidget(sep)
+
+        lbl = QLabel("Payment & Notes")
+        lbl.setStyleSheet("font-size:13px; font-weight:bold; color:#aaa; padding-top:2px;")
+        layout.addWidget(lbl)
+
+        self._pay_table = QTableWidget(1, 4)
+        self._pay_table.setHorizontalHeaderLabels(["Total Price", "Total Paid", "Remaining", "Note"])
+        self._pay_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._pay_table.verticalHeader().hide()
+        self._pay_table.setRowHeight(0, 42)
+        self._pay_table.setFixedHeight(74)
+        self._pay_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pay_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pay_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._pay_table.setStyleSheet(
+            "QTableWidget { background:#2a2a2a; color:#eee; gridline-color:#444; border:1px solid #555; }"
+            "QHeaderView::section { background:#333; color:#fff; border:1px solid #555; padding:4px; font-weight:bold; }"
+        )
+
+        total = self.sale_obj.calculate_total_price()
+        total_paid = _query_total_paid(self.database, self.sale_obj.id)
+        remaining = total - total_paid
+
+        # Col 0 — total price (read-only)
+        total_item = QTableWidgetItem(f"{total:.2f}")
+        total_item.setTextAlignment(Qt.AlignCenter)
+        total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+        self._pay_table.setItem(0, 0, total_item)
+
+        # Col 1 — total paid so far (read-only, sum from Payments table)
+        paid_item = QTableWidgetItem(f"{total_paid:.2f}")
+        paid_item.setTextAlignment(Qt.AlignCenter)
+        paid_item.setFlags(paid_item.flags() & ~Qt.ItemIsEditable)
+        paid_item.setForeground(QColor('#4CAF50') if total_paid > 0 else QColor('#888'))
+        self._pay_table.setItem(0, 1, paid_item)
+
+        # Col 2 — remaining (read-only, colour-coded)
+        self._remaining_item = QTableWidgetItem(f"{remaining:.2f}")
+        self._remaining_item.setTextAlignment(Qt.AlignCenter)
+        self._remaining_item.setFlags(self._remaining_item.flags() & ~Qt.ItemIsEditable)
+        self._refresh_remaining_color(remaining)
+        self._pay_table.setItem(0, 2, self._remaining_item)
+
+        # Col 3 — note (editable line edit, saves to Sales.notes)
+        note_edit = QLineEdit()
+        note_edit.setPlaceholderText("Add a note…")
+        note_edit.setText(self.sale_obj.get_value('notes') or '')
+        note_edit.setStyleSheet(
+            "QLineEdit { background:#333; color:#eee; border:1px solid #555; padding:2px 4px; }"
+        )
+        note_edit.editingFinished.connect(lambda: self._on_note_changed(note_edit.text()))
+        self._pay_table.setCellWidget(0, 3, note_edit)
+
+        layout.addWidget(self._pay_table)
+
+    def _on_note_changed(self, text):
+        try:
+            if self.database and self.sale_obj.id:
+                self.database.update_item(self.sale_obj.id, {'notes': text}, 'Sales')
+                if 'notes' in self.sale_obj.parameters:
+                    self.sale_obj.parameters['notes']['value'] = text
+        except Exception as e:
+            print(f"Error saving notes: {e}")
+
+    def _refresh_remaining_color(self, remaining):
+        if remaining <= 0:
+            color = QColor('#4CAF50')
+        elif remaining > 0:
+            color = QColor('#FF9800')
+        else:
+            color = QColor('#eee')
+        self._remaining_item.setForeground(color)
+
+    def _set_preview_cell(self, row, image_path):
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(4, 4, 4, 4)
+        lbl = QLabel()
+        lbl.setAlignment(Qt.AlignCenter)
+        lbl.setFixedSize(58, 58)
+        if image_path and os.path.exists(image_path):
+            pix = QPixmap(image_path).scaled(58, 58, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            lbl.setPixmap(pix)
+        else:
+            lbl.setText("📦")
+            lbl.setStyleSheet("font-size:22px; background:#333; border-radius:4px;")
+        lay.addWidget(lbl)
+        self.table.setCellWidget(row, 0, container)
+
+    def _on_production_changed(self, value, item, row, target):
+        try:
+            if self.database and item.id:
+                self.database.update_item(item.id, {'production': value}, 'Sales_Items')
+                if 'production' in item.parameters:
+                    item.parameters['production']['value'] = value
+        except Exception as e:
+            print(f"Error saving production value: {e}")
+        self._refresh_status_cell(row, target, value)
+
+    def _refresh_status_cell(self, row, target, production):
+        if target > 0 and production >= target:
+            text, color = "Complete", QColor('#4CAF50')
+        elif production > 0:
+            text, color = "In Progress", QColor('#FF9800')
+        else:
+            text, color = "Pending", QColor('#757575')
+
+        cell = QTableWidgetItem(text)
+        cell.setFlags(cell.flags() & ~Qt.ItemIsEditable)
+        cell.setForeground(color)
+        cell.setTextAlignment(Qt.AlignCenter)
+        self.table.setItem(row, 4, cell)

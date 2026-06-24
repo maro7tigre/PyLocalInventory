@@ -140,6 +140,14 @@ class ImportEditDialog(QDialog):
             params_layout.addRow(QLabel(display_name + ":"), widget)
         
         layout.addWidget(params_widget)
+
+        self.tva_warning_label = QLabel(
+            "Note: Imported product prices already include VAT. "
+            "The TVA checkbox is informational and does not add tax on top of item prices."
+        )
+        self.tva_warning_label.setWordWrap(True)
+        self.tva_warning_label.setStyleSheet("color: #ffcc00; font-size: 13px; margin: 4px 0;")
+        layout.addWidget(self.tva_warning_label)
         
         # Import Items label
         items_label = QLabel("Import Items")
@@ -194,6 +202,7 @@ class ImportEditDialog(QDialog):
         
         # Apply dark theme
         self.apply_theme()
+        
     
     def minimumSizeHint(self):
         """Calculate minimum size to prevent component overlay"""

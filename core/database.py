@@ -196,7 +196,7 @@ class Database:
     def _ensure_additional_columns(self):
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
-            'Sales': {'client_name': 'TEXT', 'state': 'TEXT'},
+            'Sales': {'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT'},
             'Imports': {'supplier_name': 'TEXT'},
             'Sales_Items': {'product_name': 'TEXT'},
             'Import_Items': {'product_name': 'TEXT'}
@@ -633,6 +633,22 @@ class Database:
         except Exception as e:
             print(f"Error getting items from {section}: {e}")
             return []
+
+    def get_client_by_id(self, client_id):
+        """Get a single client by its ID."""
+        if not self.cursor:
+            return None
+
+        try:
+            self.cursor.execute("SELECT * FROM Clients WHERE ID = ? LIMIT 1", (client_id,))
+            row = self.cursor.fetchone()
+            if not row:
+                return None
+            columns = [description[0] for description in self.cursor.description]
+            return dict(zip(columns, row))
+        except Exception as e:
+            print(f"Error getting client by ID {client_id}: {e}")
+            return None
     
     def get_items_by_operation_id(self, operation_id, section):
         """Get items for a specific operation (Sales_Items or Import_Items)"""
@@ -661,6 +677,54 @@ class Database:
         except Exception as e:
             print(f"Error getting items from {section} for operation {operation_id}: {e}")
             return []
+        
+    def get_sales_by_client(self, client_id):
+        """Get all sales for a specific client"""
+        if not self.cursor:
+            return []
+        
+        try:
+            # Detect whether the Sales table has a client_id column
+            self.cursor.execute("PRAGMA table_info('Sales')")
+            columns = [row[1] for row in self.cursor.fetchall()]
+            if 'client_id' in columns:
+                self.cursor.execute(
+                    "SELECT * FROM Sales WHERE client_id = ? ORDER BY date DESC, ID DESC",
+                    (client_id,)
+                )
+                rows = self.cursor.fetchall()
+                if rows:
+                    # If sales already have client_id set, return them immediately
+                    columns = [description[0] for description in self.cursor.description]
+                    return [dict(zip(columns, row)) for row in rows]
+                # Otherwise fallback to matching by saved username for older/legacy rows
+                self.cursor.execute("SELECT username FROM Clients WHERE ID = ? LIMIT 1", (client_id,))
+                client_row = self.cursor.fetchone()
+                if not client_row or not client_row[0]:
+                    return []
+                client_username = client_row[0]
+                self.cursor.execute(
+                    "SELECT * FROM Sales WHERE client_username = ? ORDER BY date DESC, ID DESC",
+                    (client_username,)
+                )
+            else:
+                # Fallback for legacy databases without client_id column
+                self.cursor.execute("SELECT username FROM Clients WHERE ID = ? LIMIT 1", (client_id,))
+                client_row = self.cursor.fetchone()
+                if not client_row or not client_row[0]:
+                    return []
+                client_username = client_row[0]
+                self.cursor.execute(
+                    "SELECT * FROM Sales WHERE client_username = ? ORDER BY date DESC, ID DESC",
+                    (client_username,)
+                )
+            rows = self.cursor.fetchall()
+            columns = [description[0] for description in self.cursor.description]
+            return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            print(f"Error getting sales for client {client_id}: {e}")
+            return []
+   
     
     def delete_item(self, item_id, section):
         """Delete item from section"""
@@ -681,6 +745,7 @@ class Database:
         except Exception as e:
             print(f"Error deleting item from {section}: {e}")
             return False
+    
     
     def close(self):
         """Close database connection"""

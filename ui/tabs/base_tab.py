@@ -127,7 +127,13 @@ class BaseTab(QWidget):
         
         # Action buttons
         entity_name = self.section[:-1] if self.section.endswith('s') else self.section
-        
+         # --- VIEW BUTTON ADDED HERE ---
+        self.view_btn = BlueButton(f"View {entity_name}")
+        self.view_btn.setStyleSheet(self.view_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
+        self.view_btn.setMinimumHeight(20)
+        self.view_btn.clicked.connect(self.view_item)
+        controls_layout.addWidget(self.view_btn)
+
         self.add_btn = BlueButton(f"Add {entity_name}")
         # Increase size only for toolbar buttons next to search bar
         self.add_btn.setStyleSheet(self.add_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
@@ -152,6 +158,8 @@ class BaseTab(QWidget):
         self.refresh_btn.setMinimumHeight(20)
         self.refresh_btn.clicked.connect(self.refresh_table)
         controls_layout.addWidget(self.refresh_btn)
+
+       
         
         layout.addLayout(controls_layout)
         
@@ -163,6 +171,8 @@ class BaseTab(QWidget):
         # Apply theme
         self.apply_theme()
     
+    
+
     def setup_table(self):
         """Setup table columns and properties"""
         # Set column count and headers
@@ -712,7 +722,41 @@ class BaseTab(QWidget):
             except Exception as e:
                 print(f"Error deleting {self.section[:-1].lower()}: {e}")
                 QMessageBox.critical(self, "Error", f"Error deleting {self.section[:-1].lower()}: {e}")
-    
+                
+    def view_item(self):
+        """Open a read-only viewer for the selected item."""
+        obj_id = self.get_selected_id()
+        if obj_id is None:
+            QMessageBox.warning(self, "Selection Required", f"Please select a {self.section[:-1] if self.section.endswith('s') else self.section} to view.")
+            return
+
+        try:
+            # Jbed l-object d l-item huwa l-ol (khāṣ b ga3 l-anwa3)
+            selected_obj = next((item for item in self.all_items if item.id == obj_id), None)
+            if not selected_obj:
+                QMessageBox.critical(self, "Error", "Selected item details could not be found.")
+                return
+
+            # --- ILA KAN CLIENTS ---
+            if self.section == "Clients":
+                from ui.dialogs.client_view_dialog import ClientViewDialog
+                dialog = ClientViewDialog(obj_id, self.database, self.parent_widget)
+                dialog.exec()
+                return
+
+            # --- L-OKHRIN (Products, Suppliers...) ---
+            dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
+            if hasattr(dialog, 'save_btn'):
+                dialog.save_btn.hide()
+            if hasattr(dialog, 'cancel_btn'):
+                dialog.cancel_btn.setText("Close")
+            dialog.exec()
+
+        except Exception as e:
+            print(f"Error opening view dialog: {e}")
+            QMessageBox.critical(self, "View Failure", f"Unable to open view dialog: {e}")
+
+
     def apply_theme(self):
         """Apply dark theme styling with blue selection border"""
         self.setStyleSheet("""
@@ -782,3 +826,4 @@ class BaseTab(QWidget):
                 font-size: 16px; /* larger header font */
             }
         """)
+

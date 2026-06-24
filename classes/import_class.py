@@ -53,7 +53,7 @@ class ImportClass(BaseClass):
             # TVA now a checkbox: unchecked=0%, checked=20%
             "tva": {
                 "value": 20.0,
-                "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
+                "display_name": {"en": "20% VAT (included)", "fr": "TVA 20% (incluse)", "es": "IVA 20% (incluido)"},
                 "required": False,
                 "default": 20.0,
                 "type": "bool",

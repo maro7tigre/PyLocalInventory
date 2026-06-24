@@ -42,9 +42,11 @@ class SalesClass(BaseClass):
             },
             # Stored snapshot values (no longer calculated) so operations keep historical names
             "client_id": {
+                "value": None,
                 "display_name": {"en": "Client ID", "fr": "ID Client", "es": "ID Cliente"},
                 "required": False,
-                "type": "int"  # not stored currently but may be populated dynamically
+                "default": None,
+                "type": "int"
             },
             "client_name": {
                 "value": "",
@@ -129,10 +131,12 @@ class SalesClass(BaseClass):
             "database": {
                 "state": "rw",
                 "client_username": "rw",
+                "client_id": "r",
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",
-                "notes": "rw"
+                "notes": "rw",
+                "total_price": "r"
                 # Note: items are stored separately in Sales_Items table
             },
             "report": {

@@ -92,7 +92,7 @@ class ClientClass(BaseClass):
             "table": {
                 "id": "r",
                 "preview_image": "r",
-                "username": "r",
+                "username": "rw",
                 "name": "r",
                 "client_type": "r"
             },

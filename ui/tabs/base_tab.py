@@ -335,7 +335,8 @@ class BaseTab(QWidget):
                 # Format float values with unit if available
                 unit = param_info.get('unit', '')
                 if value is not None:
-                    formatted_value = f"{float(value):.2f} {unit}".strip()
+                    number = f"{float(value):,.2f}".replace(",", " ")
+                    formatted_value = f"{number} {unit}".strip()
                 else:
                     formatted_value = f"0.00 {unit}".strip()
                 

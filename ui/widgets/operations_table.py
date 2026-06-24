@@ -210,7 +210,11 @@ class TableRowFactory:
         """Create regular text cell"""
         value = ""
         if item and hasattr(item, 'get_value'):
-            value = str(item.get_value(param_key) or "")
+            raw_value = item.get_value(param_key)
+            if param_key == 'subtotal':
+                value = f"{float(raw_value or 0):,.2f}".replace(",", " ")
+            else:
+                value = str(raw_value or "")
         elif param_key == 'quantity':
             # Set default quantity for empty rows
             temp_item = self.data_manager.item_class(0, self.data_manager.database)
@@ -463,7 +467,7 @@ class TableEventHandler:
                 self.table.setItem(row, subtotal_col, subtotal_item)
                 subtotal_item.setFlags(subtotal_item.flags() & ~Qt.ItemIsEditable)
             
-            subtotal_item.setText(f"{subtotal:.2f}")
+            subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
 
             # After updating subtotal, validate stock and style quantity cell if exceeded
             self._validate_stock(row)

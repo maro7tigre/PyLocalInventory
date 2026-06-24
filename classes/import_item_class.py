@@ -313,9 +313,42 @@ class ImportItemClass(BaseClass):
                     success = True
                 else:
                     success = False
-                
+
+            if success:
+                self._update_product_purchase_price()
+
             return success
             
         except Exception as e:
             print(f"Error saving import item: {e}")
             return False
+
+    def _update_product_purchase_price(self):
+        """Use the latest supplier purchase price as the product unit price."""
+        try:
+            unit_price = float(self.get_value('unit_price') or 0)
+            product_id = self.get_value('product_id')
+            product_name = (self.get_value('product_name') or '').strip()
+
+            if product_id:
+                self.database.update_item(
+                    product_id,
+                    {'unit_price': unit_price},
+                    'Products'
+                )
+                return
+
+            if product_name and getattr(self.database, 'cursor', None):
+                self.database.cursor.execute(
+                    "SELECT ID FROM Products WHERE name = ? LIMIT 1",
+                    (product_name,)
+                )
+                row = self.database.cursor.fetchone()
+                if row:
+                    self.database.update_item(
+                        row[0],
+                        {'unit_price': unit_price},
+                        'Products'
+                    )
+        except Exception as e:
+            print(f"Warning: could not update product purchase price: {e}")

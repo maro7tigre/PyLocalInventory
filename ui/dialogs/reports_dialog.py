@@ -195,8 +195,8 @@ class ReportsDialog(QDialog):
             def _fmt_fr(value: float) -> str:
                 try:
                     s = f"{float(value):,.2f}"
-                    # Convert 1,234.56 -> 1.234,56
-                    return s.replace(',', 'X').replace('.', ',').replace('X', '.')
+                    # Convert 1,234.56 -> 1 234,56
+                    return s.replace(',', ' ').replace('.', ',')
                 except Exception:
                     return str(value)
 

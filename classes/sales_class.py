@@ -29,7 +29,7 @@ class SalesClass(BaseClass):
                 "required": False,
                 "default": "pending",
                 "type": "string",
-                "options": ["on_hold", "pending", "confirmed"]  # internal values
+                "options": ["on_hold", "pending", "confirmed", "finished"]  # internal values
             },
             "client_username": {
                 "value": "",
@@ -121,7 +121,6 @@ class SalesClass(BaseClass):
                 "state": "r",
                 "client_name": "r",
                 "date": "r",
-                "information": "r",
                 "subtotal": "r",
                 "total_price": "r"
             },

@@ -577,17 +577,6 @@ class SalesTab(BaseTab):
             self.payment_btn.setMinimumHeight(20)
             controls_layout.insertWidget(controls_layout.count() - 1, self.payment_btn)
 
-    def setup_table(self):
-        """Setup the sales table and give information more room."""
-        super().setup_table()
-        try:
-            info_index = self.table_columns.index('information')
-            header = self.table.horizontalHeader()
-            header.setSectionResizeMode(info_index, QHeaderView.Interactive)
-            self.table.setColumnWidth(info_index, 260)
-        except ValueError:
-            pass
-    
     def get_preview_category(self):
         """Override to specify preview category for sales operations"""
         return "individual"  # Since sales are typically associated with clients
@@ -827,7 +816,8 @@ class SalesTab(BaseTab):
         colors = {
             'on_hold': ('On Hold', '#757575'),
             'pending': ('Pending', '#FF9800'),
-            'confirmed': ('Confirmed', '#4CAF50')
+            'confirmed': ('Confirmed', '#4CAF50'),
+            'finished': ('Finished', '#1976D2')
         }
         label, color = colors.get(state, ('Pending', '#FF9800'))
         btn = QPushButton(label)
@@ -895,7 +885,8 @@ class SalesTab(BaseTab):
         styles = {
             'on_hold': ('On Hold', '#757575'),
             'pending': ('Pending', '#FF9800'),
-            'confirmed': ('Confirmed', '#4CAF50')
+            'confirmed': ('Confirmed', '#4CAF50'),
+            'finished': ('Finished', '#1976D2')
         }
         current = obj.get_value('state') or 'pending'
         for key, (text, color) in styles.items():

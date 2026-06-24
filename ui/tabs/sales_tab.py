@@ -4,7 +4,7 @@ Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
 from PySide6.QtCore import Qt, QPoint
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QWidget, QProgressBar, QSizePolicy
+from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget, QTableWidgetItem, QHeaderView, QSpinBox, QDoubleSpinBox, QLineEdit, QWidget, QProgressBar, QSizePolicy, QFrame
 from PySide6.QtGui import QPixmap, QColor
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
@@ -23,7 +23,7 @@ class OrderProgressDialog(QDialog):
         self.database = database
         self.setWindowTitle(f"Order Progress — Sale #{sale_obj.id}")
         self.setMinimumWidth(700)
-        self.setMinimumHeight(380)
+        self.setMinimumHeight(520)
         self._setup_ui()
 
     def _setup_ui(self):
@@ -92,7 +92,105 @@ class OrderProgressDialog(QDialog):
 
             self._refresh_status_cell(row, qty, prod)
 
+        self.table.setMaximumHeight(300)
         layout.addWidget(self.table)
+        self._build_payment_section(layout)
+
+    def _build_payment_section(self, layout):
+        sep = QFrame()
+        sep.setFrameShape(QFrame.HLine)
+        sep.setStyleSheet("color:#444;")
+        layout.addWidget(sep)
+
+        lbl = QLabel("Payment & Notes")
+        lbl.setStyleSheet("font-size:13px; font-weight:bold; color:#aaa; padding-top:2px;")
+        layout.addWidget(lbl)
+
+        self._pay_table = QTableWidget(1, 4)
+        self._pay_table.setHorizontalHeaderLabels(["Total Price", "Amount Paid", "Remaining", "Note"])
+        self._pay_table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
+        self._pay_table.verticalHeader().hide()
+        self._pay_table.setRowHeight(0, 42)
+        self._pay_table.setFixedHeight(74)
+        self._pay_table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pay_table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        self._pay_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self._pay_table.setStyleSheet(
+            "QTableWidget { background:#2a2a2a; color:#eee; gridline-color:#444; border:1px solid #555; }"
+            "QHeaderView::section { background:#333; color:#fff; border:1px solid #555; padding:4px; font-weight:bold; }"
+        )
+
+        total = self.sale_obj.calculate_total_price()
+        amount_paid = float(self.sale_obj.get_value('amount_paid') or 0.0)
+        remaining = total - amount_paid
+
+        # Col 0 — total price (read-only)
+        total_item = QTableWidgetItem(f"{total:.2f}")
+        total_item.setTextAlignment(Qt.AlignCenter)
+        total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
+        self._pay_table.setItem(0, 0, total_item)
+
+        # Col 1 — amount paid (editable spinbox)
+        paid_spin = QDoubleSpinBox()
+        paid_spin.setRange(0, 9999999.99)
+        paid_spin.setDecimals(2)
+        paid_spin.setValue(amount_paid)
+        paid_spin.setSuffix(" DA")
+        paid_spin.setStyleSheet(
+            "QDoubleSpinBox { background:#333; color:#eee; border:1px solid #555; padding:2px; }"
+        )
+        paid_spin.valueChanged.connect(self._on_paid_changed)
+        self._pay_table.setCellWidget(0, 1, paid_spin)
+
+        # Col 2 — remaining (read-only, colour-coded)
+        self._remaining_item = QTableWidgetItem(f"{remaining:.2f}")
+        self._remaining_item.setTextAlignment(Qt.AlignCenter)
+        self._remaining_item.setFlags(self._remaining_item.flags() & ~Qt.ItemIsEditable)
+        self._refresh_remaining_color(remaining)
+        self._pay_table.setItem(0, 2, self._remaining_item)
+
+        # Col 3 — note (editable line edit)
+        note_edit = QLineEdit()
+        note_edit.setPlaceholderText("Add a note…")
+        note_edit.setText(self.sale_obj.get_value('notes') or '')
+        note_edit.setStyleSheet(
+            "QLineEdit { background:#333; color:#eee; border:1px solid #555; padding:2px 4px; }"
+        )
+        note_edit.editingFinished.connect(lambda: self._on_note_changed(note_edit.text()))
+        self._pay_table.setCellWidget(0, 3, note_edit)
+
+        self._total_price = total
+        layout.addWidget(self._pay_table)
+
+    def _on_paid_changed(self, value):
+        remaining = self._total_price - value
+        self._remaining_item.setText(f"{remaining:.2f}")
+        self._refresh_remaining_color(remaining)
+        try:
+            if self.database and self.sale_obj.id:
+                self.database.update_item(self.sale_obj.id, {'amount_paid': value}, 'Sales')
+                if 'amount_paid' in self.sale_obj.parameters:
+                    self.sale_obj.parameters['amount_paid']['value'] = value
+        except Exception as e:
+            print(f"Error saving amount_paid: {e}")
+
+    def _on_note_changed(self, text):
+        try:
+            if self.database and self.sale_obj.id:
+                self.database.update_item(self.sale_obj.id, {'notes': text}, 'Sales')
+                if 'notes' in self.sale_obj.parameters:
+                    self.sale_obj.parameters['notes']['value'] = text
+        except Exception as e:
+            print(f"Error saving notes: {e}")
+
+    def _refresh_remaining_color(self, remaining):
+        if remaining <= 0:
+            color = QColor('#4CAF50')
+        elif remaining > 0:
+            color = QColor('#FF9800')
+        else:
+            color = QColor('#eee')
+        self._remaining_item.setForeground(color)
 
     def _set_preview_cell(self, row, image_path):
         container = QWidget()

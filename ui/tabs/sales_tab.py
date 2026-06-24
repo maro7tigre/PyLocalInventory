@@ -23,11 +23,19 @@ def _ensure_payments_table(database):
                 CREATE TABLE IF NOT EXISTS Payments (
                     ID INTEGER PRIMARY KEY AUTOINCREMENT,
                     sale_id INTEGER,
+                    sales_item_id INTEGER,
                     amount REAL,
                     date TEXT,
-                    FOREIGN KEY (sale_id) REFERENCES Sales(ID) ON DELETE CASCADE
+                    FOREIGN KEY (sale_id) REFERENCES Sales(ID) ON DELETE CASCADE,
+                    FOREIGN KEY (sales_item_id) REFERENCES Sales_Items(ID) ON DELETE CASCADE
                 )
             """)
+            database.cursor.execute("PRAGMA table_info('Payments')")
+            columns = {row[1] for row in database.cursor.fetchall()}
+            if "sales_item_id" not in columns:
+                database.cursor.execute(
+                    "ALTER TABLE Payments ADD COLUMN sales_item_id INTEGER"
+                )
             database.conn.commit()
     except Exception as e:
         print(f"Error creating Payments table: {e}")
@@ -65,7 +73,7 @@ class ReceiptDialog(QDialog):
     def _build_html(self, sale_id, client, order_date, payment_date,
                     total, amount_this, total_paid, remaining):
         rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
-        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} DA REMAINING'
+        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} MAD REMAINING'
         return f"""
 <html><body style="font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;">
 <div style="border:2px solid #222;padding:28px 32px;max-width:440px;margin:20px auto;">
@@ -80,10 +88,10 @@ class ReceiptDialog(QDialog):
   </table>
   <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
   <table width="100%" cellspacing="0" cellpadding="5">
-    <tr><td style="color:#555;font-size:13px;">Total Order:</td><td align="right"><b style="font-size:13px;">{total:.2f} DA</b></td></tr>
-    <tr><td style="color:#1565C0;font-size:14px;font-weight:bold;">Amount Paid (this):</td><td align="right"><b style="color:#1565C0;font-size:14px;">{amount_this:.2f} DA</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Total Paid:</td><td align="right"><b style="color:#27ae60;font-size:13px;">{total_paid:.2f} DA</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Remaining:</td><td align="right"><b style="color:{rem_color};font-size:13px;">{remaining:.2f} DA</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Total Order:</td><td align="right"><b style="font-size:13px;">{total:.2f} MAD</b></td></tr>
+    <tr><td style="color:#1565C0;font-size:14px;font-weight:bold;">Amount Paid (this):</td><td align="right"><b style="color:#1565C0;font-size:14px;">{amount_this:.2f} MAD</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Total Paid:</td><td align="right"><b style="color:#27ae60;font-size:13px;">{total_paid:.2f} MAD</b></td></tr>
+    <tr><td style="color:#555;font-size:13px;">Remaining:</td><td align="right"><b style="color:{rem_color};font-size:13px;">{remaining:.2f} MAD</b></td></tr>
   </table>
   <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
   <p style="text-align:center;color:{rem_color};font-size:15px;font-weight:bold;margin:0;">{status_text}</p>
@@ -181,11 +189,11 @@ class PaymentDialog(QDialog):
             h.addWidget(v)
             return h
 
-        s_lay.addLayout(_row("Total Order:", f"{self._total:.2f} DA"))
+        s_lay.addLayout(_row("Total Order:", f"{self._total:.2f} MAD"))
         paid_color = '#4CAF50' if self._total_paid_before > 0 else '#888'
-        s_lay.addLayout(_row("Already Paid:", f"{self._total_paid_before:.2f} DA", paid_color))
+        s_lay.addLayout(_row("Already Paid:", f"{self._total_paid_before:.2f} MAD", paid_color))
         rem_color = '#FF9800' if self._remaining_before > 0 else '#4CAF50'
-        s_lay.addLayout(_row("Remaining:", f"{self._remaining_before:.2f} DA", rem_color))
+        s_lay.addLayout(_row("Remaining:", f"{self._remaining_before:.2f} MAD", rem_color))
         layout.addWidget(summary)
 
         sep = QFrame()
@@ -202,7 +210,7 @@ class PaymentDialog(QDialog):
         self._amount_spin.setRange(0.01, 9_999_999.99)
         self._amount_spin.setDecimals(2)
         self._amount_spin.setValue(max(self._remaining_before, 0.0))
-        self._amount_spin.setSuffix(" DA")
+        self._amount_spin.setSuffix(" MAD")
         self._amount_spin.setMinimumHeight(36)
         self._amount_spin.setStyleSheet(
             "QDoubleSpinBox { background:#333; color:#eee; border:1px solid #555; padding:4px; font-size:14px; }"
@@ -230,7 +238,7 @@ class PaymentDialog(QDialog):
         # Live remaining preview
         init_remaining_after = self._remaining_before - self._amount_spin.value()
         after_color = '#4CAF50' if init_remaining_after <= 0 else '#FF9800'
-        self._after_lbl = QLabel(f"Remaining after this payment:  {init_remaining_after:.2f} DA")
+        self._after_lbl = QLabel(f"Remaining after this payment:  {init_remaining_after:.2f} MAD")
         self._after_lbl.setStyleSheet(f"color:{after_color}; font-size:13px; font-weight:bold; padding-top:4px;")
         layout.addWidget(self._after_lbl)
 
@@ -257,7 +265,7 @@ class PaymentDialog(QDialog):
     def _on_amount_changed(self, value):
         remaining_after = self._remaining_before - value
         color = '#4CAF50' if remaining_after <= 0 else '#FF9800'
-        self._after_lbl.setText(f"Remaining after this payment:  {remaining_after:.2f} DA")
+        self._after_lbl.setText(f"Remaining after this payment:  {remaining_after:.2f} MAD")
         self._after_lbl.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold; padding-top:4px;")
 
     def _save_payment(self):

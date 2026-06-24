@@ -4,6 +4,9 @@ Clients Tab - Updated to use BaseTab
 from ui.tabs.base_tab import BaseTab
 from classes.client_class import ClientClass
 from ui.dialogs.edit_dialogs.client_dialog import ClientEditDialog
+from ui.dialogs.client_details_dialog import ClientDetailsDialog
+from ui.widgets.themed_widgets import BlueButton
+from PySide6.QtWidgets import QMessageBox
 
 
 class ClientsTab(BaseTab):
@@ -11,6 +14,44 @@ class ClientsTab(BaseTab):
     
     def __init__(self, database=None, parent=None):
         super().__init__(ClientClass, ClientEditDialog, database, parent)
+
+    def add_additional_toolbar_buttons(self, layout):
+        """Add the client account view command."""
+        self.view_client_btn = BlueButton("View Client")
+        self.view_client_btn.setToolTip("View purchases, payments, and remaining balance")
+        self.view_client_btn.setMinimumHeight(20)
+        self.view_client_btn.setStyleSheet(
+            self.view_client_btn.styleSheet()
+            + "\nQPushButton { font-size: 14px; padding: 5px 10px; }"
+        )
+        self.view_client_btn.clicked.connect(self.view_client)
+        layout.insertWidget(layout.count() - 1, self.view_client_btn)
+
+    def view_client(self):
+        """Open the account view for the selected client."""
+        client_id = self.get_selected_id()
+        if client_id is None:
+            QMessageBox.information(self, "No Selection", "Please select a client first.")
+            return
+
+        client = next((item for item in self.all_items if item.id == client_id), None)
+        if client is None:
+            client = ClientClass(client_id, self.database)
+            if not client.load_database_data():
+                QMessageBox.warning(self, "Client Error", "Could not load the selected client.")
+                return
+
+        dialog = ClientDetailsDialog(client, self.database, self)
+        dialog.showMaximized()
+        dialog.exec()
+
+    def details_callback(self, obj_id):
+        """Open client details from any future details cell."""
+        client = next((item for item in self.all_items if item.id == obj_id), None)
+        if client:
+            dialog = ClientDetailsDialog(client, self.database, self)
+            dialog.showMaximized()
+            dialog.exec()
     
     def get_preview_category(self):
         """Override to specify preview category for clients"""

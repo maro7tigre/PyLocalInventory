@@ -66,29 +66,26 @@ class ReceiptDialog(QDialog):
                     total, amount_this, total_paid, remaining):
         rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
         status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} DA REMAINING'
-        return f"""
-<html><body style="font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;">
-<div style="border:2px solid #222;padding:28px 32px;max-width:440px;margin:20px auto;">
-  <h2 style="text-align:center;color:#1a1a1a;margin:0 0 4px 0;letter-spacing:2px;">PAYMENT RECEIPT</h2>
-  <p style="text-align:center;color:#888;font-size:12px;margin:0 0 16px 0;">Thank you for your payment</p>
-  <hr style="border:none;border-top:1px solid #ccc;margin:0 0 14px 0;"/>
-  <table width="100%" cellspacing="0" cellpadding="4">
-    <tr><td style="color:#555;font-size:13px;">Sale #:</td><td align="right"><b style="font-size:13px;">{sale_id}</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Client:</td><td align="right"><b style="font-size:13px;">{client}</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Order Date:</td><td align="right" style="font-size:13px;">{order_date}</td></tr>
-    <tr><td style="color:#555;font-size:13px;">Payment Date:</td><td align="right" style="font-size:13px;">{payment_date}</td></tr>
-  </table>
-  <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
-  <table width="100%" cellspacing="0" cellpadding="5">
-    <tr><td style="color:#555;font-size:13px;">Total Order:</td><td align="right"><b style="font-size:13px;">{total:.2f} DA</b></td></tr>
-    <tr><td style="color:#1565C0;font-size:14px;font-weight:bold;">Amount Paid (this):</td><td align="right"><b style="color:#1565C0;font-size:14px;">{amount_this:.2f} DA</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Total Paid:</td><td align="right"><b style="color:#27ae60;font-size:13px;">{total_paid:.2f} DA</b></td></tr>
-    <tr><td style="color:#555;font-size:13px;">Remaining:</td><td align="right"><b style="color:{rem_color};font-size:13px;">{remaining:.2f} DA</b></td></tr>
-  </table>
-  <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
-  <p style="text-align:center;color:{rem_color};font-size:15px;font-weight:bold;margin:0;">{status_text}</p>
-</div>
-</body></html>"""
+
+        template_path = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'Receipt_templat.html'
+        ))
+        try:
+            with open(template_path, 'r', encoding='utf-8') as f:
+                template = f.read()
+            html = template.format(
+                sale_id=sale_id, client=client,
+                order_date=order_date, payment_date=payment_date,
+                total=f"{total:.2f}", amount_this=f"{amount_this:.2f}",
+                total_paid=f"{total_paid:.2f}", remaining=f"{remaining:.2f}",
+                status_text=status_text,
+            )
+            return html.replace('REM_COLOR', rem_color)
+        except Exception as e:
+            print(f"Error loading receipt template: {e}")
+            return (f"<html><body><p>Receipt for Sale #{sale_id} — "
+                    f"{amount_this:.2f} DA paid by {client}. "
+                    f"Remaining: {remaining:.2f} DA</p></body></html>")
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)

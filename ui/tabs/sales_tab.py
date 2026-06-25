@@ -873,7 +873,16 @@ class SalesTab(BaseTab):
 
     def _open_state_popup(self, obj, anchor):
         """Open a small popup dialog with state choices."""
-        from PySide6.QtWidgets import QDialog, QVBoxLayout, QPushButton, QSizePolicy, QLabel, QFrame
+        from PySide6.QtWidgets import (
+            QApplication,
+            QDialog,
+            QFrame,
+            QPushButton,
+            QScrollArea,
+            QSizePolicy,
+            QVBoxLayout,
+            QWidget,
+        )
         # Close previous
         if hasattr(self, '_state_popup') and self._state_popup:
             try:
@@ -887,8 +896,18 @@ class SalesTab(BaseTab):
         popup.setObjectName('statePopup')
 
         layout = QVBoxLayout(popup)
-        layout.setContentsMargins(12,12,12,12)
-        layout.setSpacing(8)
+        layout.setContentsMargins(6, 6, 6, 6)
+
+        scroll_area = QScrollArea()
+        scroll_area.setWidgetResizable(True)
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        scroll_area.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+
+        options_widget = QWidget()
+        options_layout = QVBoxLayout(options_widget)
+        options_layout.setContentsMargins(6, 6, 6, 6)
+        options_layout.setSpacing(8)
 
         styles = {
             'on_hold': ('On Hold', '#757575'),
@@ -906,13 +925,13 @@ class SalesTab(BaseTab):
             )
             btn.setCursor(Qt.PointingHandCursor)
             btn.clicked.connect(lambda _=None, k=key: self._select_state_from_popup(popup, obj, k))
-            layout.addWidget(btn)
+            options_layout.addWidget(btn)
 
         # Separator
         line = QFrame()
         line.setFrameShape(QFrame.HLine)
         line.setStyleSheet('color:#555;')
-        layout.addWidget(line)
+        options_layout.addWidget(line)
 
         cancel_btn = QPushButton('Cancel')
         cancel_btn.setStyleSheet("QPushButton { background:#E53935; color:#fff; border:none; border-radius:6px; padding:8px 12px; }"
@@ -920,13 +939,28 @@ class SalesTab(BaseTab):
         cancel_btn.setCursor(Qt.PointingHandCursor)
         cancel_btn.clicked.connect(popup.close)
         cancel_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
-        layout.addWidget(cancel_btn)
+        options_layout.addWidget(cancel_btn)
+
+        scroll_area.setWidget(options_widget)
+        layout.addWidget(scroll_area)
 
         popup.setStyleSheet("#statePopup { background:#2f2f2f; border:2px solid #444; border-radius:10px; }")
+        popup.setMinimumWidth(max(anchor.width(), 250))
+        popup.setMaximumHeight(320)
         self._state_popup = popup
-        # Position near anchor
-        global_pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        popup.move(global_pos + QPoint(0, 6))
+
+        popup.adjustSize()
+        screen = QApplication.screenAt(anchor.mapToGlobal(anchor.rect().center()))
+        available = screen.availableGeometry() if screen else QApplication.primaryScreen().availableGeometry()
+        below = anchor.mapToGlobal(anchor.rect().bottomLeft()) + QPoint(0, 6)
+        above_y = anchor.mapToGlobal(anchor.rect().topLeft()).y() - popup.height() - 6
+
+        x = min(max(below.x(), available.left()), available.right() - popup.width() + 1)
+        if below.y() + popup.height() <= available.bottom() + 1:
+            y = below.y()
+        else:
+            y = max(available.top(), above_y)
+        popup.move(x, y)
         popup.show()
 
     def _select_state_from_popup(self, popup, obj, new_state):

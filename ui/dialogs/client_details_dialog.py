@@ -1,18 +1,15 @@
 """Client account view with purchases, payments, and balance tracking."""
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
-    QDateEdit,
     QDialog,
     QFormLayout,
     QFrame,
     QHeaderView,
     QHBoxLayout,
     QLabel,
-    QLineEdit,
-    QMessageBox,
     QPushButton,
     QScrollArea,
     QTableWidget,
@@ -28,7 +25,7 @@ def _format_money(value):
 
 
 class ClientDetailsDialog(QDialog):
-    """Show a client's account and record payments against unpaid sales."""
+    """Show a client's purchases, payment history, and account balance."""
 
     def __init__(self, client_obj, database, parent=None):
         super().__init__(parent)
@@ -38,7 +35,7 @@ class ClientDetailsDialog(QDialog):
         self.setWindowTitle(
             f"Client Account - {client_obj.get_value('name') or client_obj.get_value('username')}"
         )
-        self.setMinimumSize(1050, 720)
+        self.setMinimumSize(1250, 800)
         self._ensure_payments_table()
         self._setup_ui()
         self.refresh_data()
@@ -76,7 +73,7 @@ class ClientDetailsDialog(QDialog):
         scroll_area.setFrameShape(QFrame.NoFrame)
 
         content = QWidget()
-        content.setMinimumWidth(980)
+        content.setMinimumWidth(1180)
         root = QVBoxLayout(content)
         root.setContentsMargins(18, 18, 18, 18)
         root.setSpacing(12)
@@ -127,18 +124,6 @@ class ClientDetailsDialog(QDialog):
         purchases_title.setStyleSheet("font-size:16px; font-weight:bold;")
         root.addWidget(purchases_title)
 
-        purchase_help = QLabel(
-            "1. Select one product or service below.  "
-            "2. Enter the amount paid manually.  "
-            "3. Choose the payment date and click Add Payment."
-        )
-        purchase_help.setWordWrap(True)
-        purchase_help.setStyleSheet(
-            "background:#19344d; color:#d9efff; border:1px solid #2878b5; "
-            "border-radius:5px; padding:8px; font-weight:bold;"
-        )
-        root.addWidget(purchase_help)
-
         self.purchases_table = self._create_table(
             [
                 "Sale",
@@ -148,13 +133,10 @@ class ClientDetailsDialog(QDialog):
                 "Unit Price",
                 "State",
                 "Total",
-                "Paid",
-                "Remaining",
             ]
         )
-        self.purchases_table.currentCellChanged.connect(self._purchase_selected)
-        self.purchases_table.setMinimumHeight(220)
-        self.purchases_table.verticalHeader().setDefaultSectionSize(38)
+        self.purchases_table.setMinimumHeight(320)
+        self.purchases_table.verticalHeader().setDefaultSectionSize(44)
         root.addWidget(self.purchases_table, 3)
 
         payments_title = QLabel("Payment History")
@@ -162,54 +144,19 @@ class ClientDetailsDialog(QDialog):
         root.addWidget(payments_title)
 
         self.payments_table = self._create_table(
-            ["Payment", "Sale", "Date", "Amount", "Purchase"]
+            ["Payment", "Sale", "Date", "Amount"]
         )
+        self.payments_table.setMinimumHeight(260)
+        self.payments_table.verticalHeader().setDefaultSectionSize(44)
         root.addWidget(self.payments_table, 2)
-
-        payment_form = QWidget()
-        form_layout = QVBoxLayout(payment_form)
-        form_layout.setContentsMargins(0, 4, 0, 0)
-        form_layout.setSpacing(8)
-
-        self.selected_purchase_label = QLabel("No product or service selected")
-        self.selected_purchase_label.setStyleSheet(
-            "background:#3a2f1d; color:#FFD180; border:1px solid #8a6828; "
-            "border-radius:5px; padding:8px; font-weight:bold;"
-        )
-
-        amount_label = QLabel("Amount Paid:")
-        self.amount_input = QLineEdit()
-        self.amount_input.setPlaceholderText("Type amount manually, for example 1 500.00")
-        self.amount_input.setMinimumWidth(260)
-        self.amount_input.setEnabled(False)
-
-        date_label = QLabel("Operation Date:")
-        self.date_input = QDateEdit(QDate.currentDate())
-        self.date_input.setCalendarPopup(True)
-        self.date_input.setDisplayFormat("dd-MM-yyyy")
-        self.date_input.setMinimumWidth(150)
-
-        self.add_payment_button = QPushButton("Add Payment")
-        self.add_payment_button.setToolTip(
-            "Record this payment for the selected product or service"
-        )
-        self.add_payment_button.clicked.connect(self.add_payment)
 
         close_button = QPushButton("Close")
         close_button.clicked.connect(self.accept)
 
         controls = QHBoxLayout()
-        controls.addWidget(amount_label)
-        controls.addWidget(self.amount_input)
-        controls.addWidget(date_label)
-        controls.addWidget(self.date_input)
-        controls.addWidget(self.add_payment_button)
         controls.addStretch()
         controls.addWidget(close_button)
-
-        form_layout.addWidget(self.selected_purchase_label)
-        form_layout.addLayout(controls)
-        root.addWidget(payment_form)
+        root.addLayout(controls)
 
         scroll_area.setWidget(content)
         window_layout.addWidget(scroll_area)
@@ -261,6 +208,9 @@ class ClientDetailsDialog(QDialog):
         table.setSelectionBehavior(QAbstractItemView.SelectRows)
         table.setAlternatingRowColors(True)
         table.verticalHeader().hide()
+        table.setHorizontalScrollMode(QAbstractItemView.ScrollPerPixel)
+        table.horizontalHeader().setMinimumSectionSize(110)
+        table.horizontalHeader().setDefaultSectionSize(150)
         table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
         if len(headers) > 2:
             table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
@@ -364,10 +314,6 @@ class ClientDetailsDialog(QDialog):
         color = "#4CAF50" if remaining <= 0 else "#FF9800"
         self.remaining_label.setStyleSheet(f"font-size:18px; font-weight:bold; color:{color};")
 
-        self.amount_input.clear()
-        self.amount_input.setEnabled(False)
-        self.add_payment_button.setEnabled(False)
-
     def _populate_purchases(self):
         self.purchases_table.setRowCount(len(self.purchases))
         for row, purchase in enumerate(self.purchases):
@@ -379,8 +325,6 @@ class ClientDetailsDialog(QDialog):
                 _format_money(purchase["unit_price"]),
                 str(purchase["state"]).replace("_", " ").title(),
                 _format_money(purchase["total"]),
-                _format_money(purchase["paid"]),
-                _format_money(purchase["remaining"]),
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -388,12 +332,6 @@ class ClientDetailsDialog(QDialog):
                 item.setData(Qt.UserRole + 1, purchase["sale_id"])
                 if col >= 4 and col != 5:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
-                if col == 7:
-                    item.setForeground(QColor("#4CAF50"))
-                elif col == 8:
-                    item.setForeground(
-                        QColor("#4CAF50" if purchase["remaining"] <= 0 else "#FF9800")
-                    )
                 self.purchases_table.setItem(row, col, item)
 
     def _populate_payments(self):
@@ -405,16 +343,8 @@ class ClientDetailsDialog(QDialog):
         placeholders = ",".join("?" for _ in sale_ids)
         self.database.cursor.execute(
             f"""
-            SELECT p.ID, p.sale_id, p.date, p.amount,
-                   COALESCE(
-                       si.product_name,
-                       (SELECT GROUP_CONCAT(all_items.product_name, ', ')
-                        FROM Sales_Items all_items
-                        WHERE all_items.sales_id = p.sale_id),
-                       'Sale payment'
-                   )
+            SELECT p.ID, p.sale_id, p.date, p.amount
             FROM Payments p
-            LEFT JOIN Sales_Items si ON si.ID = p.sales_item_id
             WHERE p.sale_id IN ({placeholders})
             ORDER BY p.ID DESC
             """,
@@ -422,100 +352,11 @@ class ClientDetailsDialog(QDialog):
         )
         rows = self.database.cursor.fetchall()
         self.payments_table.setRowCount(len(rows))
-        for row_index, (payment_id, sale_id, date, amount, products) in enumerate(rows):
-            values = [f"#{payment_id}", f"#{sale_id}", date, _format_money(amount), products or "-"]
+        for row_index, (payment_id, sale_id, date, amount) in enumerate(rows):
+            values = [f"#{payment_id}", f"#{sale_id}", date, _format_money(amount)]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 if col == 3:
                     item.setTextAlignment(Qt.AlignRight | Qt.AlignVCenter)
                     item.setForeground(QColor("#4CAF50"))
                 self.payments_table.setItem(row_index, col, item)
-
-    def _purchase_selected(self, current_row, _current_col, _previous_row, _previous_col):
-        if current_row < 0 or current_row >= len(self.purchases):
-            self.selected_purchase_label.setText("No product or service selected")
-            self.amount_input.clear()
-            self.amount_input.setEnabled(False)
-            self.add_payment_button.setEnabled(False)
-            return
-
-        purchase = self.purchases[current_row]
-        remaining = purchase["remaining"]
-        self.selected_purchase_label.setText(
-            f"Selected: {purchase['product'] or 'Purchase'}  |  "
-            f"Sale #{purchase['sale_id']}  |  "
-            f"Remaining: {_format_money(remaining)} MAD"
-        )
-        if remaining <= 0:
-            self.amount_input.clear()
-            self.amount_input.setPlaceholderText("This item is fully paid")
-            self.amount_input.setEnabled(False)
-            self.add_payment_button.setEnabled(False)
-            return
-
-        self.amount_input.setEnabled(True)
-        self.amount_input.clear()
-        self.amount_input.setPlaceholderText(
-            f"Enter up to {_format_money(remaining)} MAD"
-        )
-        self.amount_input.setFocus()
-        self.add_payment_button.setEnabled(True)
-
-    def add_payment(self):
-        selected_row = self.purchases_table.currentRow()
-        if selected_row < 0 or selected_row >= len(self.purchases):
-            QMessageBox.information(
-                self,
-                "Select Purchase",
-                "Select the product or service that this payment is for.",
-            )
-            return
-
-        purchase = self.purchases[selected_row]
-        amount_text = self.amount_input.text().strip().replace(" ", "").replace(",", ".")
-        try:
-            amount = float(amount_text)
-        except ValueError:
-            QMessageBox.warning(
-                self,
-                "Invalid Amount",
-                "Enter the amount manually using numbers, for example 1500 or 1500.50.",
-            )
-            self.amount_input.setFocus()
-            return
-        outstanding = purchase["remaining"]
-        if outstanding <= 0:
-            QMessageBox.information(
-                self, "Purchase Paid", "This product or service is already fully paid."
-            )
-            return
-        if amount <= 0 or amount > outstanding + 0.001:
-            QMessageBox.warning(
-                self,
-                "Invalid Amount",
-                f"Enter an amount between 0.01 and {_format_money(outstanding)} MAD.",
-            )
-            return
-
-        date = self.date_input.date().toString("dd-MM-yyyy")
-        try:
-            self.database.cursor.execute(
-                """
-                INSERT INTO Payments (sale_id, sales_item_id, amount, date)
-                VALUES (?, ?, ?, ?)
-                """,
-                (purchase["sale_id"], purchase["item_id"], amount, date),
-            )
-            self.database.conn.commit()
-        except Exception as error:
-            self.database.conn.rollback()
-            QMessageBox.critical(self, "Payment Error", f"Could not save payment:\n{error}")
-            return
-
-        QMessageBox.information(
-            self,
-            "Payment Saved",
-            f"Payment of {_format_money(amount)} MAD was recorded for "
-            f"{purchase['product'] or 'the selected purchase'}.",
-        )
-        self.refresh_data()

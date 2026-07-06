@@ -73,6 +73,7 @@ class Database:
 
             # Ensure meta/migrations and run one-time tasks
             self._ensure_meta_table()
+            self._ensure_user_tables()
             self._run_one_time_migrations()
             
             print(f"✓ Connected to database: {db_path}")
@@ -273,6 +274,46 @@ class Database:
         except Exception as e_rebuild:
             self.conn.rollback()
             print(f"✗ Failed rebuilding {table_name} to relax product_id FK: {e_rebuild}")
+
+    def _ensure_user_tables(self):
+        """Create the Users/Roles/RolePermissions tables used for LAN network access.
+
+        Kept separate from the registered-class table system since accounts/roles
+        aren't a display-parameter class - they're used by core.user_manager and
+        core.network.server, not by any UI tab.
+        """
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Roles (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE NOT NULL
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS RolePermissions (
+                    role_id INTEGER NOT NULL,
+                    section TEXT NOT NULL,
+                    can_read INTEGER NOT NULL DEFAULT 0,
+                    can_write INTEGER NOT NULL DEFAULT 0,
+                    can_delete INTEGER NOT NULL DEFAULT 0,
+                    UNIQUE(role_id, section),
+                    FOREIGN KEY (role_id) REFERENCES Roles(id) ON DELETE CASCADE
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS Users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE NOT NULL,
+                    password_hash TEXT NOT NULL,
+                    salt TEXT NOT NULL,
+                    role_id INTEGER,
+                    is_superadmin INTEGER NOT NULL DEFAULT 0,
+                    FOREIGN KEY (role_id) REFERENCES Roles(id) ON DELETE SET NULL
+                )
+            """)
+            self.conn.commit()
+        except Exception as e:
+            print(f"Warning: could not create user/role tables: {e}")
 
     # ---------------- Migration & Meta Helpers -----------------
     def _ensure_meta_table(self):

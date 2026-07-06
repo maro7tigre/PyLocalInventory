@@ -10,8 +10,10 @@ from PySide6.QtGui import QAction, QActionGroup
 from ui.widgets.themed_widgets import ThemedMainWindow
 from ui.widgets.welcome_widget import WelcomeWidget
 from ui.widgets.password_widget import PasswordWidget
+from ui.widgets.login_widget import LoginWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
+from ui.dialogs.network_dialog import NetworkDialog
 from ui.tabs.home_tab import HomeTab
 from ui.tabs.products_tab import ProductsTab
 from ui.tabs.services_tab import ServicesTab
@@ -37,6 +39,8 @@ from classes.reports_class import ReportsClass
 from core.profiles import ProfileManager
 from core.password import PasswordManager
 from core.database import Database
+from core.network.client import RemoteDatabase
+from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
 
 
 class MainWindow(ThemedMainWindow):
@@ -52,10 +56,19 @@ class MainWindow(ThemedMainWindow):
         # Core managers
         self.profile_manager = ProfileManager()
         self.password_manager = PasswordManager(self.profile_manager)
-        
+
+        # Network state: 'standalone' (default, unaffected) or 'client' (connected
+        # to a remote host instead of a local profile database). network_server is
+        # only set when this instance is also hosting (super-admin toggled it on).
+        self.connection_mode = 'standalone'
+        self._client_connected = False
+        self.network_server = None
+        self.network_port = DEFAULT_PORT
+        self.last_network_host = ''
+
         # Load saved profile if it exists
         self.load_saved_profile()
-        
+
         # Initialize database system
         self.database = Database(self.profile_manager)
         # Propagate current language to database for display name resolution
@@ -171,6 +184,8 @@ class MainWindow(ThemedMainWindow):
     def closeEvent(self, event):
         """Handle application close event"""
         self.save_app_config()
+        if self.network_server and self.network_server.is_running:
+            self.network_server.stop()
         if self.database:
             self.database.close()
         event.accept()
@@ -188,6 +203,11 @@ class MainWindow(ThemedMainWindow):
         backups_action = QAction("Backups", self)
         backups_action.triggered.connect(self.open_backups_dialog)
         menubar.addAction(backups_action)
+
+        # Network menu action (host on LAN / manage users & roles)
+        network_action = QAction("Network", self)
+        network_action.triggered.connect(self.open_network_dialog)
+        menubar.addAction(network_action)
 
         # Language selector menu (between Backups and Log Out)
         lang_menu = QMenu("Language", self)
@@ -313,14 +333,21 @@ class MainWindow(ThemedMainWindow):
         self.setCentralWidget(self.main_widget)
         self.main_layout = QVBoxLayout(self.main_widget)
     
-    def refresh_app(self): 
+    def refresh_app(self):
         """Reset and rebuild main widget based on current state"""
         # Clear existing layout properly
         self.clear_layout(self.main_layout)
-        
+
+        if self.connection_mode == 'client':
+            if not self._client_connected:
+                self.setup_login_entry()
+            else:
+                self.setup_main_tabs()
+            return
+
         # Set profiles path in profile manager
         self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
-        
+
         if not self.profile_manager.validate():
             self.setup_profile_selection()
         elif not self.password_manager.validate():
@@ -342,21 +369,83 @@ class MainWindow(ThemedMainWindow):
         """Show welcome widget with profile selection"""
         welcome_widget = WelcomeWidget()
         welcome_widget.profile_requested.connect(self.open_profiles_dialog)
+        welcome_widget.network_login_requested.connect(self.start_network_login)
         self.main_layout.addWidget(welcome_widget)
-    
+
     def setup_password_entry(self):
         """Show password entry widget"""
         password_widget = PasswordWidget(self.profile_manager.selected_profile)
         password_widget.password_submitted.connect(self.validate_password)
         password_widget.profile_change_requested.connect(self.open_profiles_dialog)
         self.main_layout.addWidget(password_widget)
+
+    def setup_login_entry(self):
+        """Show the network login widget (client mode)"""
+        login_widget = LoginWidget(
+            default_host=self.last_network_host,
+            default_port=str(self.network_port) if self.network_port else ''
+        )
+        login_widget.login_submitted.connect(self.attempt_network_login)
+        login_widget.back_requested.connect(self.cancel_network_login)
+        self.main_layout.addWidget(login_widget)
+
+    def start_network_login(self):
+        """Switch from local-profile flow to connecting to a network host"""
+        self.connection_mode = 'client'
+        self._client_connected = False
+        self.refresh_app()
+
+    def cancel_network_login(self):
+        """Switch back from the network login screen to local profiles"""
+        self.connection_mode = 'standalone'
+        self._client_connected = False
+        self.refresh_app()
+
+    def attempt_network_login(self, host, port, username, password):
+        """Try to log into a remote host; on success swap self.database for a
+        RemoteDatabase and proceed exactly like a normal profile unlock."""
+        try:
+            port_num = int(port) if port else DEFAULT_PORT
+        except ValueError:
+            self._show_login_error("Port must be a number.")
+            return
+
+        remote_db = RemoteDatabase(self.profile_manager, host, port_num, username, password)
+        try:
+            remote_db.connect()
+        except (AuthError, ConnectionFailedError, RemoteError) as e:
+            self._show_login_error(str(e))
+            return
+
+        self.database = remote_db
+        self.database.language = getattr(self, 'language', 'en')
+        self.register_parameter_classes()
+
+        self.last_network_host = host
+        self.network_port = port_num
+        self._client_connected = True
+        self.refresh_app()
+
+    def _show_login_error(self, message):
+        for i in range(self.main_layout.count()):
+            widget = self.main_layout.itemAt(i).widget()
+            if hasattr(widget, 'set_error'):
+                widget.set_error(message)
+                break
     
     def setup_main_tabs(self):
         """Show main application tabs - all using unified BaseTab approach"""
-        # Connect to database with current profile
-        if not self.database.connect():
-            self.show_database_error()
-            return
+        # Connect to database with current profile (already connected if we just
+        # logged into a network host - skip re-doing the handshake here)
+        if not self._client_connected:
+            try:
+                connected = self.database.connect()
+            except (AuthError, ConnectionFailedError, RemoteError) as e:
+                self.show_database_error(str(e))
+                return
+            if not connected:
+                self.show_database_error()
+                return
         
         tab_widget = QTabWidget()
         
@@ -556,11 +645,13 @@ class MainWindow(ThemedMainWindow):
         error_layout.addWidget(error_label)
         tab_widget.addTab(error_widget, f"{tab_name} (Error)")
     
-    def show_database_error(self):
+    def show_database_error(self, message=None):
         """Show database connection error"""
         error_widget = QWidget()
         error_layout = QVBoxLayout(error_widget)
-        error_label = QLabel("Database connection failed. Please check your profile configuration.")
+        text = message or "Database connection failed. Please check your profile configuration."
+        error_label = QLabel(text)
+        error_label.setWordWrap(True)
         error_label.setStyleSheet("color: red; font-size: 16px; text-align: center; padding: 50px;")
         error_layout.addWidget(error_label, Qt.AlignCenter)
         self.main_layout.addWidget(error_widget)
@@ -602,14 +693,40 @@ class MainWindow(ThemedMainWindow):
             
         dialog = BackupsDialog(self)
         dialog.exec()
-    
+
+    def open_network_dialog(self):
+        """Open the network hosting / users & roles management dialog"""
+        if self.connection_mode == 'client':
+            QMessageBox.information(
+                self, "Not Available",
+                "Network hosting isn't available while connected as a network client."
+            )
+            return
+        if not self.profile_manager or not self.profile_manager.selected_profile or not self.database.conn:
+            QMessageBox.warning(self, "No Profile Unlocked",
+                              "Unlock a profile before managing network access.")
+            return
+
+        dialog = NetworkDialog(self)
+        dialog.exec()
+
     def logout(self):
         """Log out current user"""
-        self.password_manager.logout()
-        self.profile_manager.logout()
         self.database.close()
-        # Clear saved profile
-        self.settings.setValue("selected_profile", "")
+
+        if self.connection_mode == 'client':
+            # Drop the RemoteDatabase and go back to local-profile mode
+            self.connection_mode = 'standalone'
+            self._client_connected = False
+            self.database = Database(self.profile_manager)
+            self.database.language = getattr(self, 'language', 'en')
+            self.register_parameter_classes()
+        else:
+            self.password_manager.logout()
+            self.profile_manager.logout()
+            # Clear saved profile
+            self.settings.setValue("selected_profile", "")
+
         self.refresh_app()
         
     def refresh_all_tabs(self):

@@ -11,6 +11,7 @@ class WelcomeWidget(QWidget):
     """Welcome screen widget with professional styling and responsive design"""
     
     profile_requested = Signal()  # Emitted when user wants to open profile manager
+    network_login_requested = Signal()  # Emitted when user wants to connect to a network host
     
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -105,7 +106,14 @@ class WelcomeWidget(QWidget):
         self.open_profile_btn.setMinimumHeight(50)  # Make button taller
         self.open_profile_btn.clicked.connect(self.profile_requested.emit)
         button_layout.addWidget(self.open_profile_btn)
-        
+
+        # Connect to a network host instead of a local profile
+        self.network_login_btn = QPushButton("Connect to a Network Host")
+        self.network_login_btn.setObjectName("network_login_btn")
+        self.network_login_btn.setMinimumHeight(40)
+        self.network_login_btn.clicked.connect(self.network_login_requested.emit)
+        button_layout.addWidget(self.network_login_btn)
+
         button_wrapper.addWidget(button_container)
         button_wrapper.addStretch()
         container_layout.addLayout(button_wrapper)
@@ -176,6 +184,22 @@ class WelcomeWidget(QWidget):
             
             QPushButton#open_profile_btn:pressed {
                 background: #45a049;
+            }
+
+            QPushButton#network_login_btn {
+                background-color: transparent;
+                color: #2196F3;
+                border: 2px solid #2196F3;
+                padding: 10px;
+                font-size: 14px;
+                font-weight: 500;
+                border-radius: 8px;
+                margin-top: 10px;
+            }
+
+            QPushButton#network_login_btn:hover {
+                background-color: #2196F3;
+                color: white;
             }
         """)
     

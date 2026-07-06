@@ -78,10 +78,10 @@ class ReportsEditDialog(QDialog):
             items = self.database.get_items("Reports")
             for item in items:
                 if item.get('ID') == self.report_id:
-                    dept = item.get('Department', '')
+                    dept = item.get('department', '')
                     if dept in DEPARTMENTS:
                         self.dept_combo.setCurrentText(dept)
-                    date_str = item.get('Date', '')
+                    date_str = item.get('date', '')
                     if date_str:
                         for fmt in ['%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y']:
                             try:
@@ -90,7 +90,7 @@ class ReportsEditDialog(QDialog):
                                 break
                             except ValueError:
                                 pass
-                    self.report_text.setPlainText(item.get('Report', ''))
+                    self.report_text.setPlainText(item.get('report', ''))
                     break
         except Exception as e:
             print(f"Error loading report data: {e}")
@@ -108,9 +108,9 @@ class ReportsEditDialog(QDialog):
             return
 
         data = {
-            'Department': dept,
-            'Date': date_val,
-            'Report': report_body
+            'department': dept,
+            'date': date_val,
+            'report': report_body
         }
 
         try:

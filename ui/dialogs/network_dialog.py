@@ -13,6 +13,7 @@ from PySide6.QtCore import Qt
 from core.network.server import DatabaseServer
 from core.network.protocol import DEFAULT_PORT
 from core.user_manager import UserManager, MATRIX_SECTIONS
+from core import pg_config
 
 
 class NetworkDialog(QDialog):
@@ -29,6 +30,7 @@ class NetworkDialog(QDialog):
 
         layout = QVBoxLayout(self)
         tabs = QTabWidget()
+        tabs.addTab(self._build_db_server_tab(), "Database Server")
         tabs.addTab(self._build_hosting_tab(), "Hosting")
         tabs.addTab(self._build_users_tab(), "Users")
         tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
@@ -38,9 +40,105 @@ class NetworkDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
+        self._refresh_db_server_fields()
         self._refresh_hosting_status()
         self._refresh_users_table()
         self._refresh_roles_combo()
+
+    # ---------------- Database Server tab ----------------
+
+    def _build_db_server_tab(self):
+        widget = QWidget()
+        form = QVBoxLayout(widget)
+
+        note = QLabel(
+            "Connection settings for the central PostgreSQL server that stores every "
+            "profile's data. These are shared across all profiles on this machine."
+        )
+        note.setWordWrap(True)
+        form.addWidget(note)
+
+        host_row = QHBoxLayout()
+        host_row.addWidget(QLabel("Host:"))
+        self.db_host_input = QLineEdit()
+        host_row.addWidget(self.db_host_input)
+        form.addLayout(host_row)
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("Port:"))
+        self.db_port_input = QLineEdit()
+        port_row.addWidget(self.db_port_input)
+        form.addLayout(port_row)
+
+        dbname_row = QHBoxLayout()
+        dbname_row.addWidget(QLabel("Database:"))
+        self.db_name_input = QLineEdit()
+        dbname_row.addWidget(self.db_name_input)
+        form.addLayout(dbname_row)
+
+        user_row = QHBoxLayout()
+        user_row.addWidget(QLabel("User:"))
+        self.db_user_input = QLineEdit()
+        user_row.addWidget(self.db_user_input)
+        form.addLayout(user_row)
+
+        password_row = QHBoxLayout()
+        password_row.addWidget(QLabel("Password:"))
+        self.db_password_input = QLineEdit()
+        self.db_password_input.setEchoMode(QLineEdit.Password)
+        password_row.addWidget(self.db_password_input)
+        form.addLayout(password_row)
+
+        self.db_status_label = QLabel()
+        form.addWidget(self.db_status_label)
+
+        btn_row = QHBoxLayout()
+        test_btn = QPushButton("Test Connection")
+        test_btn.clicked.connect(self._test_db_server_connection)
+        btn_row.addWidget(test_btn)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._save_db_server_config)
+        btn_row.addWidget(save_btn)
+        form.addLayout(btn_row)
+
+        form.addStretch()
+        return widget
+
+    def _refresh_db_server_fields(self):
+        config = pg_config.load_server_config()
+        self.db_host_input.setText(str(config.get("host", "")))
+        self.db_port_input.setText(str(config.get("port", "")))
+        self.db_name_input.setText(str(config.get("database", "")))
+        self.db_user_input.setText(str(config.get("user", "")))
+        self.db_password_input.setText(str(config.get("password", "")))
+
+    def _collect_db_server_config(self):
+        try:
+            port = int(self.db_port_input.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
+            return None
+        return {
+            "host": self.db_host_input.text().strip(),
+            "port": port,
+            "database": self.db_name_input.text().strip(),
+            "user": self.db_user_input.text().strip(),
+            "password": self.db_password_input.text(),
+        }
+
+    def _test_db_server_connection(self):
+        config = self._collect_db_server_config()
+        if config is None:
+            return
+        ok, message = pg_config.test_connection(config)
+        self.db_status_label.setText(f"{'✓' if ok else '✗'} {message}")
+
+    def _save_db_server_config(self):
+        config = self._collect_db_server_config()
+        if config is None:
+            return
+        pg_config.save_server_config(config)
+        QMessageBox.information(self, "Saved", "Database server settings saved.")
 
     # ---------------- Hosting tab ----------------
 

@@ -372,7 +372,7 @@ class BaseOperationDialog(QDialog):
                             # Try resolve again from DB (in case created just now)
                             if self.database and hasattr(self.database, 'cursor') and self.database.cursor:
                                 try:
-                                    self.database.cursor.execute("SELECT ID FROM Products WHERE name = ?", (pname,))
+                                    self.database.cursor.execute("SELECT ID FROM Products WHERE name = %s", (pname,))
                                     res = self.database.cursor.fetchone()
                                     if res and res[0]:
                                         itm.set_value('product_id', res[0])
@@ -573,7 +573,7 @@ class BaseOperationDialog(QDialog):
                     continue
 
                 cursor.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = ?",
+                    "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = %s",
                     (product_id,)
                 )
                 total_imports = cursor.fetchone()[0] or 0
@@ -583,9 +583,9 @@ class BaseOperationDialog(QDialog):
                     SELECT COALESCE(SUM(si.quantity), 0)
                     FROM Sales_Items si
                     JOIN Sales s ON si.sales_id = s.ID
-                    WHERE si.product_id = ?
+                    WHERE si.product_id = %s
                       AND (s.state IS NULL OR s.state != 'on_hold')
-                      AND si.sales_id != ?
+                      AND si.sales_id != %s
                 """, (product_id, current_sale_id))
                 sold_elsewhere = cursor.fetchone()[0] or 0
 
@@ -607,7 +607,7 @@ class BaseOperationDialog(QDialog):
 
     def _entity_exists(self, table, username):
         try:
-            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE username = ?", (username,))
+            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE username = %s", (username,))
             res = self.database.cursor.fetchone()
             return res and res[0] > 0
         except Exception as e:
@@ -616,7 +616,7 @@ class BaseOperationDialog(QDialog):
 
     def _product_exists(self, name):
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = ?", (name,))
+            self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = %s", (name,))
             res = self.database.cursor.fetchone()
             if res and res[0] > 0:
                 return True

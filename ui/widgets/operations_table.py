@@ -523,7 +523,7 @@ class TableEventHandler:
         # Product ID lookup
         product_id = None
         try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
+            db.cursor.execute("SELECT ID FROM Products WHERE name = %s LIMIT 1", (product_name,))
             res = db.cursor.fetchone()
             if res and res[0]:
                 product_id = res[0]
@@ -543,7 +543,7 @@ class TableEventHandler:
         # Product ID
         product_id = None
         try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
+            db.cursor.execute("SELECT ID FROM Products WHERE name = %s LIMIT 1", (product_name,))
             res = db.cursor.fetchone()
             if res and res[0]:
                 product_id = res[0]
@@ -841,7 +841,7 @@ class OperationsTableWidget(QWidget):
                 try:
                     if self.data_manager.database and hasattr(self.data_manager.database, 'cursor'):
                         self.data_manager.database.cursor.execute(
-                            "SELECT ID FROM Products WHERE name = ?", (item.get_value('product_name'),))
+                            "SELECT ID FROM Products WHERE name = %s", (item.get_value('product_name'),))
                         res = self.data_manager.database.cursor.fetchone()
                         if res and res[0]:
                             item.set_value('product_id', res[0])

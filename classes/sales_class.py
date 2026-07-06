@@ -163,7 +163,7 @@ class SalesClass(BaseClass):
         
         try:
             # Get all sales items for this sales operation
-            self.database.cursor.execute("SELECT ID FROM Sales_Items WHERE sales_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT ID FROM Sales_Items WHERE sales_id = %s", (self.id,))
             item_ids = self.database.cursor.fetchall()
             
             items = []
@@ -269,7 +269,7 @@ class SalesClass(BaseClass):
                 super().set_value('client_id', None)
                 super().set_value('client_name', '')
                 return
-            self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = ?", (username,))
+            self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = %s", (username,))
             res = self.database.cursor.fetchone()
             if res:
                 cid, cname = res

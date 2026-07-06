@@ -60,7 +60,7 @@ class DoorTypeClass(BaseClass):
 
         try:
             self.database.cursor.execute(
-                "SELECT COUNT(*) FROM Door_Types WHERE serial = ? AND ID != ?",
+                "SELECT COUNT(*) FROM Door_Types WHERE serial = %s AND ID != %s",
                 (serial, self.id or 0)
             )
             result = self.database.cursor.fetchone()
@@ -75,7 +75,7 @@ class DoorTypeClass(BaseClass):
 
         try:
             self.database.cursor.execute(
-                "SELECT COUNT(*) FROM Door_Types WHERE name = ? AND ID != ?",
+                "SELECT COUNT(*) FROM Door_Types WHERE name = %s AND ID != %s",
                 (name, self.id or 0)
             )
             result = self.database.cursor.fetchone()

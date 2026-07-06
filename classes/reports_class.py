@@ -21,7 +21,7 @@ class ReportsClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
-            "Department": {
+            "department": {
                 "value": "",
                 "display_name": {"en": "Department", "fr": "Département", "es": "Departamento"},
                 "required": True,
@@ -29,7 +29,7 @@ class ReportsClass(BaseClass):
                 "options": ["sohaib cuisine", "monime porte", "omarchapa", "abd-aziiz vernise", "zohir"],
                 "type": "string"
             },
-            "Date": {
+            "date": {
                 "value": today,
                 "display_name": {"en": "Date", "fr": "Date", "es": "Fecha"},
                 "required": True,
@@ -37,7 +37,7 @@ class ReportsClass(BaseClass):
                 "options": [],
                 "type": "date"
             },
-            "Report": {
+            "report": {
                 "value": "",
                 "display_name": {"en": "Report", "fr": "Rapport", "es": "Informe"},
                 "required": True,
@@ -61,18 +61,18 @@ class ReportsClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "Department": "r",
-                "Date": "r",
+                "department": "r",
+                "date": "r",
                 "view_details": "r"
             },
             "dialog": {
-                "Department": "rw",
-                "Date": "rw",
-                "Report": "rw"
+                "department": "rw",
+                "date": "rw",
+                "report": "rw"
             },
             "database": {
-                "Department": "rw",
-                "Date": "rw",
-                "Report": "rw"
+                "department": "rw",
+                "date": "rw",
+                "report": "rw"
             }
         }

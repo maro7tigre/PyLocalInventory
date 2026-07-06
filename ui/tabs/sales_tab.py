@@ -46,7 +46,7 @@ class SalesEditDialog(BaseOperationDialog):
             return False
         
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = ?", (username,))
+            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = %s", (username,))
             result = self.database.cursor.fetchone()
             return result[0] > 0 if result else False
         except Exception as e:

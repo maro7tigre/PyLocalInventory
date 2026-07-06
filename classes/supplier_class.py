@@ -141,7 +141,7 @@ class SupplierClass(BaseClass):
         
         try:
             # Get all imports from this supplier
-            self.database.cursor.execute("SELECT * FROM Imports WHERE supplier_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT * FROM Imports WHERE supplier_id = %s", (self.id,))
             return self.database.cursor.fetchall()
         except Exception as e:
             print(f"Error getting transactions for supplier {self.id}: {e}")
@@ -154,7 +154,7 @@ class SupplierClass(BaseClass):
         
         try:
             # Get total from imports
-            self.database.cursor.execute("SELECT SUM(total_price) FROM Imports WHERE supplier_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT SUM(total_price) FROM Imports WHERE supplier_id = %s", (self.id,))
             result = self.database.cursor.fetchone()
             return float(result[0]) if result and result[0] else 0.0
         except Exception as e:
@@ -168,7 +168,7 @@ class SupplierClass(BaseClass):
         
         try:
             # Get most recent import date
-            self.database.cursor.execute("SELECT date FROM Imports WHERE supplier_id = ? ORDER BY date DESC LIMIT 1", (self.id,))
+            self.database.cursor.execute("SELECT date FROM Imports WHERE supplier_id = %s ORDER BY date DESC LIMIT 1", (self.id,))
             result = self.database.cursor.fetchone()
             return result[0] if result else None
         except Exception as e:
@@ -186,7 +186,7 @@ class SupplierClass(BaseClass):
                 SELECT DISTINCT p.name, p.ID 
                 FROM Products p 
                 JOIN Imports i ON p.ID = i.product_id 
-                WHERE i.supplier_id = ?
+                WHERE i.supplier_id = %s
             """, (self.id,))
             return self.database.cursor.fetchall()
         except Exception as e:
@@ -233,12 +233,12 @@ class SupplierClass(BaseClass):
             # Check if username exists in other suppliers (excluding current one)
             if self.id and self.id > 0:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Suppliers WHERE username = ? AND ID != ?", 
+                    "SELECT COUNT(*) FROM Suppliers WHERE username = %s AND ID != %s",
                     (username, self.id)
                 )
             else:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Suppliers WHERE username = ?", 
+                    "SELECT COUNT(*) FROM Suppliers WHERE username = %s",
                     (username,)
                 )
             

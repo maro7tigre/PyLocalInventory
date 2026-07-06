@@ -128,7 +128,7 @@ class ImportItemClass(BaseClass):
             return None
         
         try:
-            self.database.cursor.execute("SELECT ID, unit_price, preview_image FROM Products WHERE name = ?", (product_name,))
+            self.database.cursor.execute("SELECT ID, unit_price, preview_image FROM Products WHERE name = %s", (product_name,))
             result = self.database.cursor.fetchone()
             if result:
                 return {
@@ -188,7 +188,7 @@ class ImportItemClass(BaseClass):
         if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
             return snapshot or f"Product {product_id}"
         try:
-            self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT name FROM Products WHERE ID = %s", (product_id,))
             row = self.database.cursor.fetchone()
             if row and row[0]:
                 if row[0] != snapshot:
@@ -209,7 +209,7 @@ class ImportItemClass(BaseClass):
         
         try:
             product_id = self.get_value('product_id')
-            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = %s", (product_id,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
@@ -228,7 +228,7 @@ class ImportItemClass(BaseClass):
             return None
         
         try:
-            self.database.cursor.execute("SELECT ID, name, unit_price FROM Products WHERE name = ?", (product_name,))
+            self.database.cursor.execute("SELECT ID, name, unit_price FROM Products WHERE name = %s", (product_name,))
             result = self.database.cursor.fetchone()
             if result:
                 return {
@@ -340,7 +340,7 @@ class ImportItemClass(BaseClass):
 
             if product_name and getattr(self.database, 'cursor', None):
                 self.database.cursor.execute(
-                    "SELECT ID FROM Products WHERE name = ? LIMIT 1",
+                    "SELECT ID FROM Products WHERE name = %s LIMIT 1",
                     (product_name,)
                 )
                 row = self.database.cursor.fetchone()

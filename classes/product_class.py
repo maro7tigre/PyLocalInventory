@@ -153,7 +153,7 @@ class ProductClass(BaseClass):
         
         try:
             # Get total imports for this product
-            self.database.cursor.execute("SELECT SUM(quantity) FROM Import_Items WHERE product_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT SUM(quantity) FROM Import_Items WHERE product_id = %s", (self.id,))
             imports_result = self.database.cursor.fetchone()
             total_imports = imports_result[0] if imports_result and imports_result[0] else 0
             
@@ -162,7 +162,7 @@ class ProductClass(BaseClass):
                 SELECT SUM(si.quantity)
                 FROM Sales_Items si
                 JOIN Sales s ON si.sales_id = s.ID
-                WHERE si.product_id = ? AND (s.state IS NULL OR s.state != 'on_hold')
+                WHERE si.product_id = %s AND (s.state IS NULL OR s.state != 'on_hold')
             """, (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0
@@ -269,12 +269,12 @@ class ProductClass(BaseClass):
             # Check if username exists in other products (excluding current one)
             if self.id and self.id > 0:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Products WHERE username = ? AND ID != ?", 
+                    "SELECT COUNT(*) FROM Products WHERE username = %s AND ID != %s",
                     (username, self.id)
                 )
             else:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Products WHERE username = ?", 
+                    "SELECT COUNT(*) FROM Products WHERE username = %s",
                     (username,)
                 )
             

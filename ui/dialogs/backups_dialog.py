@@ -11,6 +11,7 @@ from datetime import datetime
 
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
+from core import pg_backup
 
 class BackupsDialog(QDialog):
     def __init__(self, parent=None):
@@ -140,38 +141,27 @@ class BackupsDialog(QDialog):
             
             # Create backup directory
             os.makedirs(backup_path)
-            
-            # Copy profile contents except backups directory
+
+            # Copy profile contents except backups directory (config.json, preview.png, images/)
             for item in os.listdir(self.profile_dir):
                 if item == "backups":
                     continue
-                    
+
                 source_path = os.path.join(self.profile_dir, item)
                 dest_path = os.path.join(backup_path, item)
-                
+
                 try:
                     if os.path.isfile(source_path):
-                        # For database files, use a retry mechanism
-                        if source_path.endswith('.db'):
-                            max_retries = 3
-                            for attempt in range(max_retries):
-                                try:
-                                    shutil.copy2(source_path, dest_path)
-                                    break
-                                except OSError as e:
-                                    if attempt < max_retries - 1:
-                                        time.sleep(0.1)  # Wait before retry
-                                        continue
-                                    else:
-                                        raise e
-                        else:
-                            shutil.copy2(source_path, dest_path)
+                        shutil.copy2(source_path, dest_path)
                     elif os.path.isdir(source_path):
                         shutil.copytree(source_path, dest_path)
                 except OSError as e:
                     print(f"Warning: Could not backup {source_path}: {e}")
                     # Continue with other files - partial backup is better than no backup
-            
+
+            # Dump the profile's actual data out of Postgres into the backup folder
+            pg_backup.backup_schema(self.current_profile.schema_name, backup_path)
+
             return True
             
         except Exception as e:
@@ -227,11 +217,16 @@ class BackupsDialog(QDialog):
                     print(f"Warning: Could not remove {item_path}: {e}")
                     # Continue with other files
             
-            # Copy backup contents back to profile
+            # Copy backup contents back to profile (config.json, preview.png, images/) -
+            # skip the pg-backup files themselves (manifest.json/*.csv/schema.dump),
+            # those get replayed into Postgres separately below.
+            skip_names = {"manifest.json", "schema.dump"}
             for item in os.listdir(backup_path):
+                if item in skip_names or item.endswith(".csv"):
+                    continue
                 source_path = os.path.join(backup_path, item)
                 dest_path = os.path.join(self.profile_dir, item)
-                
+
                 try:
                     if os.path.isfile(source_path):
                         shutil.copy2(source_path, dest_path)
@@ -240,12 +235,15 @@ class BackupsDialog(QDialog):
                 except OSError as e:
                     print(f"Warning: Could not copy {source_path}: {e}")
                     # Continue with other files
-            
-            # Reconnect database with restored files
+
+            # Replay the profile's data back into its Postgres schema
+            pg_backup.restore_schema(self.current_profile.schema_name, backup_path)
+
+            # Reconnect database with restored data
             if hasattr(self.parent(), 'database') and self.parent().database:
                 print("Reconnecting database after backup restore...")
                 self.parent().database.connect()
-                
+
                 # Refresh all tabs if they exist
                 if hasattr(self.parent(), 'refresh_all_tabs'):
                     self.parent().refresh_all_tabs()

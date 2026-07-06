@@ -281,9 +281,10 @@ class ReportsDialog(QDialog):
                         if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
                             try:
                                 # Get product name from Products table
-                                product_data = self.sales_obj.database.cursor.execute(
-                                    "SELECT name FROM Products WHERE ID = ?", (product_id,)
-                                ).fetchone()
+                                self.sales_obj.database.cursor.execute(
+                                    "SELECT name FROM Products WHERE ID = %s", (product_id,)
+                                )
+                                product_data = self.sales_obj.database.cursor.fetchone()
                                 if product_data:
                                     product_name = product_data[0]
                             except Exception as e:

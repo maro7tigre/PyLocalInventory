@@ -9,7 +9,6 @@ from PySide6.QtCore import Qt, QTimer, Signal
 from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor, QLinearGradient
 from PySide6.QtCharts import QChart, QChartView, QPieSeries, QBarSeries, QBarSet, QLineSeries, QValueAxis, QBarCategoryAxis
 from datetime import datetime, timedelta
-import sqlite3
 
 from ui.widgets.themed_widgets import GreenButton, BlueButton, OrangeButton, RedButton
 
@@ -828,7 +827,7 @@ class HomeTab(QWidget):
                     SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
                     FROM Sales s
                     JOIN Sales_Items si ON s.ID = si.sales_id
-                    WHERE s.state != 'on_hold' AND strftime('%Y', s.date) = ? AND strftime('%m', s.date) = ?
+                    WHERE s.state != 'on_hold' AND LEFT(s.date, 4) = %s AND SUBSTRING(s.date, 6, 2) = %s
                 """
             elif table_name == 'Imports':
                 # Calculate total from Import_Items for imports in this month
@@ -836,7 +835,7 @@ class HomeTab(QWidget):
                     SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
                     FROM Imports i
                     JOIN Import_Items ii ON i.ID = ii.import_id
-                    WHERE strftime('%Y', i.date) = ? AND strftime('%m', i.date) = ?
+                    WHERE LEFT(i.date, 4) = %s AND SUBSTRING(i.date, 6, 2) = %s
                 """
             else:
                 return 0.0
@@ -934,10 +933,13 @@ class HomeTab(QWidget):
     def _ensure_stock_alert_column(self):
         """Ensure Products table has stock_alert column (runtime safety if app updated while DB open)."""
         try:
-            self.database.cursor.execute("PRAGMA table_info('Products')")
-            cols = {r[1] for r in self.database.cursor.fetchall()}
+            self.database.cursor.execute(
+                "SELECT column_name FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'products'"
+            )
+            cols = {r[0] for r in self.database.cursor.fetchall()}
             if 'stock_alert' not in cols:
-                self.database.cursor.execute("ALTER TABLE 'Products' ADD COLUMN 'stock_alert' INTEGER")
+                self.database.cursor.execute("ALTER TABLE Products ADD COLUMN stock_alert INTEGER")
                 self.database.conn.commit()
         except Exception:
             pass

@@ -152,7 +152,7 @@ class ImportClass(BaseClass):
         
         try:
             # Get all import items for this import operation
-            self.database.cursor.execute("SELECT ID FROM Import_Items WHERE import_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT ID FROM Import_Items WHERE import_id = %s", (self.id,))
             item_ids = self.database.cursor.fetchall()
             
             items = []
@@ -237,7 +237,7 @@ class ImportClass(BaseClass):
                 super().set_value('supplier_id', None)
                 super().set_value('supplier_name', '')
                 return
-            self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = ?", (uname,))
+            self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = %s", (uname,))
             res = self.database.cursor.fetchone()
             if res:
                 sid, sname = res
@@ -262,7 +262,7 @@ class ImportClass(BaseClass):
             supplier_username = self.get_value('supplier_username')
             if not supplier_username:
                 return None
-            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE username = ?", (supplier_username,))
+            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE username = %s", (supplier_username,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:

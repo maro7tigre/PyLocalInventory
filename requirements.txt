@@ -1,6 +1,7 @@
 # Core
 PySide6
 cryptography
+psycopg2-binary
 
 # PDF generation (fallback chain — venonly one is required)
 # See README or notes below for extra setup steps per library

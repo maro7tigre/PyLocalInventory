@@ -42,7 +42,7 @@ def hash_password(password, salt=None):
 
 
 class UserManager:
-    """Manages Users/Roles/RolePermissions rows in the profile's SQLite database."""
+    """Manages Users/Roles/RolePermissions rows in the profile's Postgres schema."""
 
     def __init__(self, database):
         self.database = database
@@ -51,22 +51,22 @@ class UserManager:
 
     def create_role(self, name):
         cur = self.database.cursor
-        cur.execute("INSERT INTO Roles (name) VALUES (?)", (name,))
+        cur.execute("INSERT INTO Roles (name) VALUES (%s) RETURNING id", (name,))
         self.database.conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()[0]
 
     def rename_role(self, role_id, new_name):
         cur = self.database.cursor
-        cur.execute("UPDATE Roles SET name = ? WHERE id = ?", (new_name, role_id))
+        cur.execute("UPDATE Roles SET name = %s WHERE id = %s", (new_name, role_id))
         self.database.conn.commit()
 
     def delete_role(self, role_id):
         cur = self.database.cursor
-        cur.execute("SELECT COUNT(*) FROM Users WHERE role_id = ?", (role_id,))
+        cur.execute("SELECT COUNT(*) FROM Users WHERE role_id = %s", (role_id,))
         if cur.fetchone()[0] > 0:
             raise ValueError("Cannot delete a role that is still assigned to users")
-        cur.execute("DELETE FROM RolePermissions WHERE role_id = ?", (role_id,))
-        cur.execute("DELETE FROM Roles WHERE id = ?", (role_id,))
+        cur.execute("DELETE FROM RolePermissions WHERE role_id = %s", (role_id,))
+        cur.execute("DELETE FROM Roles WHERE id = %s", (role_id,))
         self.database.conn.commit()
 
     def list_roles(self):
@@ -80,7 +80,7 @@ class UserManager:
         cur = self.database.cursor
         cur.execute(
             "INSERT INTO RolePermissions (role_id, section, can_read, can_write, can_delete) "
-            "VALUES (?, ?, ?, ?, ?) "
+            "VALUES (%s, %s, %s, %s, %s) "
             "ON CONFLICT(role_id, section) DO UPDATE SET "
             "can_read=excluded.can_read, can_write=excluded.can_write, can_delete=excluded.can_delete",
             (role_id, section, int(can_read), int(can_write), int(can_delete))
@@ -91,7 +91,7 @@ class UserManager:
         """Returns {section: {'read':bool,'write':bool,'delete':bool}} for every matrix section."""
         cur = self.database.cursor
         cur.execute(
-            "SELECT section, can_read, can_write, can_delete FROM RolePermissions WHERE role_id = ?",
+            "SELECT section, can_read, can_write, can_delete FROM RolePermissions WHERE role_id = %s",
             (role_id,)
         )
         perms = {row[0]: {'read': bool(row[1]), 'write': bool(row[2]), 'delete': bool(row[3])}
@@ -104,20 +104,21 @@ class UserManager:
 
     def create_user(self, username, password, role_id=None, is_superadmin=False):
         cur = self.database.cursor
-        cur.execute("SELECT COUNT(*) FROM Users WHERE username = ?", (username,))
+        cur.execute("SELECT COUNT(*) FROM Users WHERE username = %s", (username,))
         if cur.fetchone()[0] > 0:
             raise ValueError(f"Username '{username}' already exists")
         password_hash, salt = hash_password(password)
         cur.execute(
-            "INSERT INTO Users (username, password_hash, salt, role_id, is_superadmin) VALUES (?, ?, ?, ?, ?)",
+            "INSERT INTO Users (username, password_hash, salt, role_id, is_superadmin) "
+            "VALUES (%s, %s, %s, %s, %s) RETURNING id",
             (username, password_hash, salt, role_id, int(is_superadmin))
         )
         self.database.conn.commit()
-        return cur.lastrowid
+        return cur.fetchone()[0]
 
     def delete_user(self, user_id):
         cur = self.database.cursor
-        cur.execute("DELETE FROM Users WHERE id = ?", (user_id,))
+        cur.execute("DELETE FROM Users WHERE id = %s", (user_id,))
         self.database.conn.commit()
 
     def list_users(self):
@@ -139,12 +140,12 @@ class UserManager:
     def change_password(self, user_id, new_password):
         password_hash, salt = hash_password(new_password)
         cur = self.database.cursor
-        cur.execute("UPDATE Users SET password_hash = ?, salt = ? WHERE id = ?", (password_hash, salt, user_id))
+        cur.execute("UPDATE Users SET password_hash = %s, salt = %s WHERE id = %s", (password_hash, salt, user_id))
         self.database.conn.commit()
 
     def set_user_role(self, user_id, role_id):
         cur = self.database.cursor
-        cur.execute("UPDATE Users SET role_id = ? WHERE id = ?", (role_id, user_id))
+        cur.execute("UPDATE Users SET role_id = %s WHERE id = %s", (role_id, user_id))
         self.database.conn.commit()
 
     def verify_login(self, username, password):
@@ -152,7 +153,7 @@ class UserManager:
         permissions), or None if the credentials are wrong."""
         cur = self.database.cursor
         cur.execute(
-            "SELECT id, password_hash, salt, role_id, is_superadmin FROM Users WHERE username = ?",
+            "SELECT id, password_hash, salt, role_id, is_superadmin FROM Users WHERE username = %s",
             (username,)
         )
         row = cur.fetchone()

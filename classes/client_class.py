@@ -154,7 +154,7 @@ class ClientClass(BaseClass):
         
         try:
             # Get all sales for this client
-            self.database.cursor.execute("SELECT * FROM Sales WHERE client_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT * FROM Sales WHERE client_id = %s", (self.id,))
             return self.database.cursor.fetchall()
         except Exception as e:
             print(f"Error getting transactions for client {self.id}: {e}")
@@ -167,7 +167,7 @@ class ClientClass(BaseClass):
         
         try:
             # Get total from sales
-            self.database.cursor.execute("SELECT SUM(total_price) FROM Sales WHERE client_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT SUM(total_price) FROM Sales WHERE client_id = %s", (self.id,))
             result = self.database.cursor.fetchone()
             return float(result[0]) if result and result[0] else 0.0
         except Exception as e:
@@ -181,7 +181,7 @@ class ClientClass(BaseClass):
         
         try:
             # Get most recent sale date
-            self.database.cursor.execute("SELECT date FROM Sales WHERE client_id = ? ORDER BY date DESC LIMIT 1", (self.id,))
+            self.database.cursor.execute("SELECT date FROM Sales WHERE client_id = %s ORDER BY date DESC LIMIT 1", (self.id,))
             result = self.database.cursor.fetchone()
             return result[0] if result else None
         except Exception as e:
@@ -228,12 +228,12 @@ class ClientClass(BaseClass):
             # Check if username exists in other clients (excluding current one)
             if self.id and self.id > 0:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Clients WHERE username = ? AND ID != ?", 
+                    "SELECT COUNT(*) FROM Clients WHERE username = %s AND ID != %s",
                     (username, self.id)
                 )
             else:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Clients WHERE username = ?", 
+                    "SELECT COUNT(*) FROM Clients WHERE username = %s",
                     (username,)
                 )
             

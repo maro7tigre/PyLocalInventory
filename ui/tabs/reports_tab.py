@@ -21,9 +21,9 @@ class ReportsTab(BaseTab):
             if not report_obj:
                 return
 
-            department = report_obj.get_value('Department') or ''
-            date_val = report_obj.get_value('Date') or ''
-            report_text = report_obj.get_value('Report') or ''
+            department = report_obj.get_value('department') or ''
+            date_val = report_obj.get_value('date') or ''
+            report_text = report_obj.get_value('report') or ''
 
             from ui.widgets.themed_widgets import RedButton
 
@@ -78,7 +78,7 @@ class ReportsTab(BaseTab):
         options = set()
         for obj in self.all_items:
             try:
-                dept = obj.get_value('Department')
+                dept = obj.get_value('department')
                 if dept:
                     options.add(str(dept))
             except Exception:
@@ -96,15 +96,15 @@ class ReportsTab(BaseTab):
         ])
 
     def get_searchable_fields(self):
-        return ['Department', 'Date']
+        return ['department', 'date']
 
     def matches_search(self, obj, search_text):
         if not search_text:
             return True
         search_lower = search_text.lower()
         try:
-            dept = obj.get_value('Department') or ""
-            date_val = obj.get_value('Date') or ""
+            dept = obj.get_value('department') or ""
+            date_val = obj.get_value('date') or ""
             if search_lower in dept.lower() or search_lower in date_val.lower():
                 return True
         except Exception:
@@ -116,13 +116,13 @@ class ReportsTab(BaseTab):
             return items
         try:
             if order_option == "Department ↑":
-                items.sort(key=lambda x: str(x.get_value('Department') or "").lower())
+                items.sort(key=lambda x: str(x.get_value('department') or "").lower())
             elif order_option == "Department ↓":
-                items.sort(key=lambda x: str(x.get_value('Department') or "").lower(), reverse=True)
+                items.sort(key=lambda x: str(x.get_value('department') or "").lower(), reverse=True)
             elif order_option == "Date ↑":
-                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('Date')))
+                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('date')))
             elif order_option == "Date ↓":
-                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('Date')), reverse=True)
+                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('date')), reverse=True)
         except Exception as e:
             print(f"Error sorting reports: {e}")
         return items

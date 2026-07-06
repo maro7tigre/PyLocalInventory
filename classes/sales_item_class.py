@@ -218,7 +218,7 @@ class SalesItemClass(BaseClass):
         if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
             return snapshot or f"Product {product_id}"
         try:
-            self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT name FROM Products WHERE ID = %s", (product_id,))
             row = self.database.cursor.fetchone()
             if row and row[0]:
                 # If DB name differs from snapshot (product renamed), update snapshot silently
@@ -242,7 +242,7 @@ class SalesItemClass(BaseClass):
             product_id = self.get_value('product_id')
             if not product_id:
                 return None
-            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = %s", (product_id,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
@@ -344,7 +344,7 @@ class SalesItemClass(BaseClass):
         
         try:
             self.database.cursor.execute(
-                "SELECT ID, sale_price, preview_image FROM Products WHERE name = ? LIMIT 1", 
+                "SELECT ID, sale_price, preview_image FROM Products WHERE name = %s LIMIT 1",
                 (product_name,)
             )
             result = self.database.cursor.fetchone()

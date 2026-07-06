@@ -66,6 +66,11 @@ class MainWindow(ThemedMainWindow):
         self.network_port = DEFAULT_PORT
         self.last_network_host = ''
 
+        # Always show the welcome/entry screen on launch, even if a profile was
+        # remembered from last time - only auto-skip to it on later refreshes
+        # (e.g. after picking a profile, changing language, logging out).
+        self._initial_screen_shown = False
+
         # Load saved profile if it exists
         self.load_saved_profile()
 
@@ -348,7 +353,13 @@ class MainWindow(ThemedMainWindow):
         # Set profiles path in profile manager
         self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
 
-        if not self.profile_manager.validate():
+        # First screen of a fresh launch is always the welcome/entry screen,
+        # regardless of a remembered profile - the user picks a profile or a
+        # network host explicitly every time the app starts.
+        if not self._initial_screen_shown:
+            self._initial_screen_shown = True
+            self.setup_profile_selection()
+        elif not self.profile_manager.validate():
             self.setup_profile_selection()
         elif not self.password_manager.validate():
             self.setup_password_entry()

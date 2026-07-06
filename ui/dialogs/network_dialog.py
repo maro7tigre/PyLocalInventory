@@ -136,11 +136,16 @@ class NetworkDialog(QDialog):
         btn_row = QHBoxLayout()
         add_btn = QPushButton("Add User")
         add_btn.clicked.connect(self._add_user)
+        change_role_btn = QPushButton("Change Role")
+        change_role_btn.clicked.connect(self._change_user_role)
         remove_btn = QPushButton("Remove Selected")
         remove_btn.clicked.connect(self._remove_user)
         btn_row.addWidget(add_btn)
+        btn_row.addWidget(change_role_btn)
         btn_row.addWidget(remove_btn)
         layout.addLayout(btn_row)
+
+        self.users_table.doubleClicked.connect(lambda *_: self._change_user_role())
         return widget
 
     def _refresh_users_table(self):
@@ -181,6 +186,33 @@ class NetworkDialog(QDialog):
         except ValueError as e:
             QMessageBox.warning(self, "Could not add user", str(e))
             return
+        self._refresh_users_table()
+
+    def _change_user_role(self):
+        row = self.users_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No Selection", "Select a user first.")
+            return
+        user = self._users_cache[row]
+        if user['is_superadmin']:
+            QMessageBox.warning(self, "Not allowed",
+                              "Super-admin accounts always have full access and don't use roles.")
+            return
+
+        roles = self.user_manager.list_roles()
+        if not roles:
+            QMessageBox.information(self, "No Roles Yet", "Create a role in the Roles tab first.")
+            return
+
+        role_names = [r['name'] for r in roles]
+        current_index = role_names.index(user['role_name']) if user['role_name'] in role_names else 0
+        role_name, ok = QInputDialog.getItem(
+            self, "Change Role", f"Role for '{user['username']}':", role_names, current_index, editable=False
+        )
+        if not ok:
+            return
+        role_id = next(r['id'] for r in roles if r['name'] == role_name)
+        self.user_manager.set_user_role(user['id'], role_id)
         self._refresh_users_table()
 
     def _remove_user(self):

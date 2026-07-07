@@ -15,6 +15,7 @@ import urllib.request
 from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
 )
+from core.user_manager import SECTION_GROUP
 
 
 class RemoteCursor:
@@ -85,6 +86,15 @@ class RemoteDatabase:
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
+
+    def has_permission(self, section, action='read'):
+        """Check the logged-in user's role permissions for a section (or a
+        child table that rolls up into one, e.g. 'Sales_Items' -> 'Sales'),
+        without making a network round-trip."""
+        if self.is_superadmin:
+            return True
+        mapped = SECTION_GROUP.get(section, section)
+        return bool(self.permissions.get(mapped, {}).get(action, False))
 
     def register_class(self, cls):
         """Mirrors Database.register_class - only needs the section name

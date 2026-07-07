@@ -12,6 +12,7 @@ from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
 from ui.widgets.parameters_widgets import ButtonWidget
+from core.network.protocol import PermissionDeniedError
 from datetime import datetime
 import re
 
@@ -91,7 +92,14 @@ class BaseTab(QWidget):
         self.table_permissions = temp_object.available_parameters["table"]
         self.parameter_definitions = temp_object.parameters
         self.section = temp_object.section
-        
+
+        # Role-based write/delete access (local host database is always fully
+        # permitted; a network client is gated by its logged-in user's role).
+        # Read access is handled one level up - MainWindow never builds this
+        # tab at all when the user lacks read permission for the section.
+        self.can_write = self.database.has_permission(self.section, 'write') if self.database else True
+        self.can_delete = self.database.has_permission(self.section, 'delete') if self.database else True
+
         # Store all items for filtering
         self.all_items = []
         self.filtered_items = []
@@ -135,18 +143,30 @@ class BaseTab(QWidget):
         self.add_btn.setMinimumHeight(20)
         self.add_btn.clicked.connect(self.add_item)
         controls_layout.addWidget(self.add_btn)
-        
+
         self.edit_btn = BlueButton(f"Edit {entity_name}")
         self.edit_btn.setStyleSheet(self.edit_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
         self.edit_btn.setMinimumHeight(20)
         self.edit_btn.clicked.connect(self.edit_item)
         controls_layout.addWidget(self.edit_btn)
-        
+
         self.delete_btn = RedButton(f"Delete {entity_name}")
         self.delete_btn.setStyleSheet(self.delete_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
         self.delete_btn.setMinimumHeight(20)
         self.delete_btn.clicked.connect(self.delete_item)
         controls_layout.addWidget(self.delete_btn)
+
+        # Grey out actions the user's role isn't allowed to perform, so they
+        # find out before investing time in a form rather than after trying
+        # to save it.
+        if not self.can_write:
+            self.add_btn.setEnabled(False)
+            self.add_btn.setToolTip(f"You don't have permission to add {entity_name.lower()}")
+            self.edit_btn.setEnabled(False)
+            self.edit_btn.setToolTip(f"You don't have permission to edit {entity_name.lower()}")
+        if not self.can_delete:
+            self.delete_btn.setEnabled(False)
+            self.delete_btn.setToolTip(f"You don't have permission to delete {entity_name.lower()}")
         
         self.refresh_btn = GreenButton("Refresh")
         self.refresh_btn.setStyleSheet(self.refresh_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
@@ -209,7 +229,11 @@ class BaseTab(QWidget):
                 header.setSectionResizeMode(i, QHeaderView.Stretch)
     
     def is_column_editable(self, column_key):
-        """Check if column is editable (has 'w' permission)"""
+        """Check if column is editable: the column itself must allow writes
+        ('w' permission) and the logged-in user's role must have write access
+        to this section at all."""
+        if not self.can_write:
+            return False
         permission = self.table_permissions.get(column_key, '')
         return 'w' in permission.lower()
     
@@ -278,6 +302,12 @@ class BaseTab(QWidget):
             
             print(f"✓ {self.section} table refresh complete")
 
+        except PermissionDeniedError as e:
+            # MainWindow already hides this tab when the user has no read
+            # permission, so this only fires if access was revoked mid-session
+            # - fail quietly with an empty table rather than an alarming dialog.
+            print(f"No read permission for {self.section}, leaving table empty: {e}")
+            self.table.setRowCount(0)
         except Exception as e:
             print(f"Error refreshing {self.section} table: {e}")
             QMessageBox.critical(self, "Error", f"Failed to refresh {self.section}: {e}")
@@ -645,6 +675,12 @@ class BaseTab(QWidget):
                 # Revert the change
                 self.refresh_table()
         
+        except PermissionDeniedError:
+            QMessageBox.information(
+                self, "Read-Only Access",
+                f"You don't have permission to edit {self.section.lower()}."
+            )
+            self.refresh_table()
         except Exception as e:
             print(f"Error updating cell in database: {e}")
             QMessageBox.critical(self, "Error", f"Database update failed: {e}")
@@ -687,6 +723,13 @@ class BaseTab(QWidget):
     
     def add_item(self):
         """Add new item"""
+        if not self.can_write:
+            QMessageBox.information(
+                self, "Read-Only Access",
+                f"You don't have permission to add {self.section.lower()}."
+            )
+            return
+
         try:
             dialog = self.dialog_class(None, self.database, self.parent_widget)
             if dialog.exec():
@@ -699,6 +742,13 @@ class BaseTab(QWidget):
     
     def edit_item(self):
         """Edit selected item"""
+        if not self.can_write:
+            QMessageBox.information(
+                self, "Read-Only Access",
+                f"You don't have permission to edit {self.section.lower()}."
+            )
+            return
+
         obj_id = self.get_selected_id()
         if obj_id is None:
             QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to edit")
@@ -716,6 +766,13 @@ class BaseTab(QWidget):
     
     def delete_item(self):
         """Delete selected item"""
+        if not self.can_delete:
+            QMessageBox.information(
+                self, "Read-Only Access",
+                f"You don't have permission to delete {self.section.lower()}."
+            )
+            return
+
         obj_id = self.get_selected_id()
         if obj_id is None:
             QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to delete")

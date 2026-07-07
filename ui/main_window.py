@@ -480,65 +480,38 @@ class MainWindow(ThemedMainWindow):
 
         # Add Home tab
         tab_widget.addTab(HomeTab(self.database, language=getattr(self, 'language', 'en')), labels['home'])
-        
-        # Add all entity tabs - now all using BaseTab for consistency
-        try:
-            products_tab = ProductsTab(self.database, self)
-            tab_widget.addTab(products_tab, labels['products'])
-            print("✓ Added Products tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Products tab: {e}")
-            self.add_error_tab(tab_widget, "Products", e)
-        
-        try:
-            services_tab = ServicesTab(self.database, self)
-            tab_widget.addTab(services_tab, labels['services'])
-            print("✓ Added Services tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Services tab: {e}")
-            self.add_error_tab(tab_widget, "Services", e)
-        
-        try:
-            clients_tab = ClientsTab(self.database, self)
-            tab_widget.addTab(clients_tab, labels['clients'])
-            print("✓ Added Clients tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Clients tab: {e}")
-            self.add_error_tab(tab_widget, "Clients", e)
-        
-        try:
-            suppliers_tab = SuppliersTab(self.database, self)
-            tab_widget.addTab(suppliers_tab, labels['suppliers'])
-            print("✓ Added Suppliers tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Suppliers tab: {e}")
-            self.add_error_tab(tab_widget, "Suppliers", e)
-        
-        try:
-            # Sales tab now uses BaseTab with BaseOperationDialog - unified experience!
-            sales_tab = SalesTab(self.database, self)
-            tab_widget.addTab(sales_tab, labels['sales'])
-            print("✓ Added Sales tab (BaseTab + BaseOperationDialog)")
-        except Exception as e:
-            print(f"✗ Error adding Sales tab: {e}")
-            self.add_error_tab(tab_widget, "Sales", e)
-        
-        try:
-            # Imports tab now uses BaseTab with BaseOperationDialog - unified experience!
-            imports_tab = ImportsTab(self.database, self)
-            tab_widget.addTab(imports_tab, labels['imports'])
-            print("✓ Added Imports tab (BaseTab + BaseOperationDialog)")
-        except Exception as e:
-            print(f"✗ Error adding Imports tab: {e}")
-            self.add_error_tab(tab_widget, "Imports", e)
 
-        try:
-            reports_tab = ReportsTab(self.database, self)
-            tab_widget.addTab(reports_tab, labels['reports'])
-            print("✓ Added Reports tab")
-        except Exception as e:
-            print(f"✗ Error adding Reports tab: {e}")
-            self.add_error_tab(tab_widget, "Reports", e)
+        # Add all entity tabs - now all using BaseTab for consistency. A tab is
+        # only added at all if the logged-in user (or the local host, which is
+        # always fully permitted) has read access to its section - a user with
+        # no read permission never sees the tab exist, rather than seeing it
+        # and hitting a permission-denied error when it tries to load.
+        entity_tabs = [
+            ('products',  'Products',  lambda: ProductsTab(self.database, self)),
+            ('services',  'Services',  lambda: ServicesTab(self.database, self)),
+            ('clients',   'Clients',   lambda: ClientsTab(self.database, self)),
+            ('suppliers', 'Suppliers', lambda: SuppliersTab(self.database, self)),
+            ('sales',     'Sales',     lambda: SalesTab(self.database, self)),
+            ('imports',   'Imports',   lambda: ImportsTab(self.database, self)),
+            ('reports',   'Reports',   lambda: ReportsTab(self.database, self)),
+        ]
+
+        self._tab_key_to_index = {'home': 0}
+        readable_keys = {'home'}
+
+        for key, section, factory in entity_tabs:
+            if not self.database.has_permission(section, 'read'):
+                print(f"– Skipped {section} tab: no read permission")
+                continue
+            try:
+                tab = factory()
+                self._tab_key_to_index[key] = tab_widget.addTab(tab, labels[key])
+                readable_keys.add(key)
+                print(f"✓ Added {section} tab (BaseTab)")
+            except Exception as e:
+                print(f"✗ Error adding {section} tab: {e}")
+                self._tab_key_to_index[key] = self.add_error_tab(tab_widget, section, e)
+                readable_keys.add(key)
 
     # Hidden per request: Log tab
     # tab_widget.addTab(LogTab(self.database), labels['log'])
@@ -546,14 +519,14 @@ class MainWindow(ThemedMainWindow):
         # Style change: increase tab title font size (fixed)
         tab_widget.setStyleSheet("QTabBar::tab { font-size: 18px; }")
 
-        # Fixed key→index mapping (matches insertion order above)
-        self._tab_key_to_index = {
-            'home': 0, 'products': 1, 'services': 2, 'clients': 3,
-            'suppliers': 4, 'sales': 5, 'imports': 6, 'reports': 7,
-        }
-
         # Apply stored tab visibility
         self._apply_tab_visibility()
+
+        # Sections the user has no read permission for never got a tab/index at
+        # all, so the "Tabs" view-menu toggle for them is meaningless - hide it
+        # rather than let it look like a working option.
+        for key, action in getattr(self, '_tab_visibility_actions', {}).items():
+            action.setVisible(key in readable_keys)
 
         # Sync home tab quick-action cards with current tab visibility
         home_tab = tab_widget.widget(0)
@@ -657,13 +630,13 @@ class MainWindow(ThemedMainWindow):
         }
     
     def add_error_tab(self, tab_widget, tab_name, error):
-        """Add error placeholder tab"""
+        """Add error placeholder tab. Returns the new tab's index."""
         error_widget = QWidget()
         error_layout = QVBoxLayout(error_widget)
         error_label = QLabel(f"{tab_name} tab error: {str(error)}")
         error_label.setStyleSheet("color: red; padding: 20px;")
         error_layout.addWidget(error_label)
-        tab_widget.addTab(error_widget, f"{tab_name} (Error)")
+        return tab_widget.addTab(error_widget, f"{tab_name} (Error)")
     
     def show_database_error(self, message=None):
         """Show database connection error"""

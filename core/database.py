@@ -29,6 +29,11 @@ class Database:
         # Current UI language; allows parameter classes to localize display names
         self.language = 'en'
 
+    def has_permission(self, section, action='read'):
+        """Local database - this is the host's own data, always fully accessible.
+        Only RemoteDatabase (network clients) is actually gated by role permissions."""
+        return True
+
     def register_class(self, cls):
         """Register a parameter class with the database"""
         try:

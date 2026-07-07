@@ -10,6 +10,7 @@ unquoted, so they keep working unchanged against the folded lowercase names.
 import re
 
 import psycopg2
+from psycopg2 import OperationalError
 
 from core.pg_config import load_server_config
 
@@ -22,7 +23,9 @@ class Database:
         self.registered_classes = {}  # section_name -> class
         self.conn = None
         self.cursor = None
+        self.database_name = None
         self.schema_name = None
+        self.last_error = None
         # Current UI language; allows parameter classes to localize display names
         self.language = 'en'
 
@@ -54,11 +57,47 @@ class Database:
             sanitized = f"p_{sanitized}"
         return sanitized
 
+    @staticmethod
+    def _profile_schema_name(company_name):
+        """Build the per-profile schema name from the company name."""
+        return Database._sanitize_schema_name(f"DB_{company_name or ''}")
+
+    @staticmethod
+    def _profile_database_name(company_name):
+        """Build the per-profile database name from the company name."""
+        return Database._sanitize_schema_name(f"DB_{company_name or ''}")
+
+    @staticmethod
+    def _maintenance_database_name(pg_config):
+        return pg_config.get('maintenance_database') or pg_config.get('database') or 'postgres'
+
+    def _connect_admin(self, pg_config):
+        return psycopg2.connect(
+            host=pg_config.get('host'),
+            port=pg_config.get('port'),
+            dbname=self._maintenance_database_name(pg_config),
+            user=pg_config.get('user'),
+            password=pg_config.get('password'),
+        )
+
+    def _ensure_profile_database(self, pg_config, database_name):
+        """Create the profile database if it does not already exist."""
+        admin_conn = self._connect_admin(pg_config)
+        admin_conn.autocommit = True
+        try:
+            admin_cur = admin_conn.cursor()
+            admin_cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
+            if not admin_cur.fetchone():
+                admin_cur.execute(f"CREATE DATABASE {database_name}")
+        finally:
+            admin_conn.close()
+
     def connect(self):
-        """Establish database connection to the central Postgres server, using
-        one schema per profile."""
+        """Establish database connection for the selected profile."""
+        self.last_error = None
         if not self.profile_manager or not self.profile_manager.selected_profile:
-            print("No profile selected, cannot connect to database")
+            self.last_error = "No profile selected, cannot connect to database"
+            print(self.last_error)
             return False
 
         # Close existing connection
@@ -70,7 +109,38 @@ class Database:
         try:
             pg_config = load_server_config()
             profile = self.profile_manager.selected_profile
-            schema_name = self._sanitize_schema_name(profile.name)
+            database_name = profile.database_name or self._profile_database_name(
+                profile.get_value('company name') or profile.name
+            )
+
+            if profile.database_name or not profile.schema_name:
+                profile.database_name = database_name
+                self._ensure_profile_database(pg_config, database_name)
+                self.conn = psycopg2.connect(
+                    host=pg_config.get('host'),
+                    port=pg_config.get('port'),
+                    dbname=database_name,
+                    user=pg_config.get('user'),
+                    password=pg_config.get('password'),
+                )
+                self.cursor = self.conn.cursor()
+                self.database_name = database_name
+                self.schema_name = None
+
+                # Create tables for all registered classes
+                self._create_all_tables()
+
+                # Ensure meta/migrations and run one-time tasks
+                self._ensure_meta_table()
+                self._ensure_user_tables()
+                self._run_one_time_migrations()
+
+                print(f"✓ Connected to database: {database_name}")
+                return True
+
+            schema_name = profile.schema_name or self._profile_schema_name(
+                profile.get_value('company name') or profile.name
+            )
             profile.schema_name = schema_name
 
             self.conn = psycopg2.connect(
@@ -85,6 +155,7 @@ class Database:
             self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
             self.conn.commit()
             self.cursor.execute(f"SET search_path TO {schema_name}")
+            self.database_name = None
             self.schema_name = schema_name
 
             # Create tables for all registered classes
@@ -98,7 +169,12 @@ class Database:
             print(f"✓ Connected to database schema: {schema_name}")
             return True
 
+        except OperationalError as e:
+            self.last_error = str(e)
+            print(f"✗ Failed to connect to database: {e}")
+            return False
         except Exception as e:
+            self.last_error = str(e)
             print(f"✗ Failed to connect to database: {e}")
             return False
 
@@ -337,7 +413,8 @@ class Database:
                 self._get_meta('backfill_product_name_done', '0') == '1'):
             return
 
-        lock_key = f"lamidap_migrate_{self.schema_name}"
+        lock_target = self.database_name or self.schema_name
+        lock_key = f"lamidap_migrate_{lock_target}"
         try:
             self.cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_key,))
         except Exception as e:

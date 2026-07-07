@@ -160,7 +160,10 @@ class BackupsDialog(QDialog):
                     # Continue with other files - partial backup is better than no backup
 
             # Dump the profile's actual data out of Postgres into the backup folder
-            pg_backup.backup_schema(self.current_profile.schema_name, backup_path)
+            if getattr(self.current_profile, 'database_name', None):
+                pg_backup.backup_database(self.current_profile.database_name, backup_path)
+            else:
+                pg_backup.backup_schema(self.current_profile.schema_name, backup_path)
 
             return True
             
@@ -218,9 +221,9 @@ class BackupsDialog(QDialog):
                     # Continue with other files
             
             # Copy backup contents back to profile (config.json, preview.png, images/) -
-            # skip the pg-backup files themselves (manifest.json/*.csv/schema.dump),
+            # skip the pg-backup files themselves (manifest.json/*.csv/schema.dump/database.dump),
             # those get replayed into Postgres separately below.
-            skip_names = {"manifest.json", "schema.dump"}
+            skip_names = {"manifest.json", "schema.dump", "database.dump"}
             for item in os.listdir(backup_path):
                 if item in skip_names or item.endswith(".csv"):
                     continue
@@ -236,8 +239,11 @@ class BackupsDialog(QDialog):
                     print(f"Warning: Could not copy {source_path}: {e}")
                     # Continue with other files
 
-            # Replay the profile's data back into its Postgres schema
-            pg_backup.restore_schema(self.current_profile.schema_name, backup_path)
+            # Replay the profile's data back into its Postgres storage
+            if getattr(self.current_profile, 'database_name', None):
+                pg_backup.restore_database(self.current_profile.database_name, backup_path)
+            else:
+                pg_backup.restore_schema(self.current_profile.schema_name, backup_path)
 
             # Reconnect database with restored data
             if hasattr(self.parent(), 'database') and self.parent().database:

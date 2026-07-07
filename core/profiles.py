@@ -46,11 +46,12 @@ class ProfileManager:
                 try:
                     profile = ProfileClass(item)
                     profile.config_path = config_path
-                    profile.schema_name = Database._sanitize_schema_name(item)
                     profile.preview_path = os.path.join(profile_dir, "preview.png")  # Check for preview image
                     
                     # Load profile data from config
                     profile.load_config_data()
+                    if not profile.database_name and not profile.schema_name:
+                        profile.schema_name = Database._sanitize_schema_name(item)
                     
                     self.available_profiles[item] = profile
                 except Exception as e:
@@ -92,7 +93,7 @@ class ProfileManager:
             # Create profile instance
             profile = ProfileClass(profile_name)
             profile.config_path = os.path.join(profile_dir, "config.json")
-            profile.schema_name = Database._sanitize_schema_name(profile_name)
+            profile.database_name = Database._profile_database_name(profile_data.get('company name') or profile_name)
             
             # Set profile data
             for key, value in profile_data.items():
@@ -209,7 +210,7 @@ class ProfileManager:
         """Get list of available profiles"""
         return list(self.available_profiles.keys())
     
-    def duplicate_profile(self, source_name, new_name):
+    def duplicate_profile(self, source_name, new_name, database_name=None):
         """Duplicate an existing profile with a new name"""
         if source_name not in self.available_profiles:
             raise ValueError(f"Source profile '{source_name}' not found")
@@ -243,14 +244,21 @@ class ProfileManager:
         # Create new profile instance
         new_profile = ProfileClass(new_name)
         new_profile.config_path = os.path.join(new_dir, "config.json")
-        new_profile.schema_name = Database._sanitize_schema_name(new_name)
         new_profile.preview_path = os.path.join(new_dir, "preview.png")
 
         # Load and update the config
         new_profile.load_config_data()
+        new_profile.database_name = database_name or Database._profile_database_name(
+            new_profile.get_value('company name') or new_name
+        )
 
-        # Copy and modify database (only specific tables)
-        self._copy_database_tables(source_profile.schema_name, new_profile.schema_name)
+        # Copy the source storage model into the new profile.
+        if getattr(source_profile, 'database_name', None):
+            from core import pg_backup
+            pg_backup.clone_database(source_profile.database_name, new_profile.database_name)
+        else:
+            # Legacy fallback for older schema-based profiles.
+            self._copy_database_tables(source_profile.schema_name, new_profile.schema_name)
         
         # Save updated config
         new_profile.save_to_config()
@@ -326,6 +334,7 @@ class ProfileClass:
         self.preview_path = None
         self.encrypted_phrase = None  # Placeholder for encrypted validation phrase
         self.config_path = "./config.json"
+        self.database_name = None
         self.schema_name = None
         self.parameters = {
             "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
@@ -394,6 +403,12 @@ class ProfileClass:
                 # Load encrypted phrase if exists
                 if "encrypted_phrase" in data:
                     self.encrypted_phrase = bytes.fromhex(data["encrypted_phrase"])
+
+                if "database_name" in data:
+                    self.database_name = data["database_name"]
+
+                if "schema_name" in data:
+                    self.schema_name = data["schema_name"]
                 
                 return  # Success, exit retry loop
                 
@@ -424,6 +439,12 @@ class ProfileClass:
                 # Save encrypted phrase if exists
                 if self.encrypted_phrase:
                     data["encrypted_phrase"] = self.encrypted_phrase.hex()
+
+                if self.database_name:
+                    data["database_name"] = self.database_name
+
+                if self.schema_name:
+                    data["schema_name"] = self.schema_name
                 
                 # Ensure directory exists
                 os.makedirs(os.path.dirname(self.config_path), exist_ok=True)

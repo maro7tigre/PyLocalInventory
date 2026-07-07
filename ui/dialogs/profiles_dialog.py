@@ -12,6 +12,7 @@ import shutil
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton, PasswordInputWidget
 from ui.widgets.cards_list import GridCardsList
 from core.profiles import ProfileClass, ProfileManager
+from core.database import Database
 
 class ProfilesDialog(QDialog):
     def __init__(self, parent=None):
@@ -561,7 +562,14 @@ class ProfilesDialog(QDialog):
             elif self.edit_mode == 'duplicate':
                 # Use proper duplication method that copies database tables
                 if self.source_profile_name:
-                    profile = self.profile_manager.duplicate_profile(self.source_profile_name, profile_data['name'])
+                    target_database_name = Database._profile_database_name(
+                        profile_data.get('company name') or profile_data['name']
+                    )
+                    profile = self.profile_manager.duplicate_profile(
+                        self.source_profile_name,
+                        profile_data['name'],
+                        database_name=target_database_name,
+                    )
                     
                     # Update any modified parameter values from the UI
                     for key, value in profile_data.items():

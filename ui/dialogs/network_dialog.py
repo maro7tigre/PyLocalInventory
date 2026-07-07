@@ -17,33 +17,62 @@ from core import pg_config
 
 
 class NetworkDialog(QDialog):
-    """Only meaningful once a profile is unlocked - main_window.database is a
-    real, connected Database (not a RemoteDatabase) at this point."""
+    """Database settings are always editable; hosting, users and roles are only
+    available after a profile has been unlocked and the local database is
+    connected."""
 
-    def __init__(self, main_window):
+    def __init__(self, main_window, focus_tab=0):
         super().__init__(main_window)
         self.main_window = main_window
         self.database = main_window.database
-        self.user_manager = UserManager(self.database)
+        self.can_manage_network = bool(
+            getattr(main_window.profile_manager, 'selected_profile', None)
+            and getattr(self.database, 'conn', None)
+        )
+        self.user_manager = UserManager(self.database) if self.can_manage_network else None
         self.setWindowTitle("Network & Users")
         self.setMinimumSize(640, 520)
 
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        tabs.addTab(self._build_db_server_tab(), "Database Server")
-        tabs.addTab(self._build_hosting_tab(), "Hosting")
-        tabs.addTab(self._build_users_tab(), "Users")
-        tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
-        layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        self.tabs.addTab(self._build_db_server_tab(), "Database Server")
+        self.tabs.addTab(self._build_hosting_tab(), "Hosting")
+        self.tabs.addTab(self._build_users_tab(), "Users")
+        self.tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
+        layout.addWidget(self.tabs)
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
         self._refresh_db_server_fields()
-        self._refresh_hosting_status()
-        self._refresh_users_table()
-        self._refresh_roles_combo()
+        self._apply_access_state()
+
+        if self.can_manage_network:
+            self._refresh_hosting_status()
+            self._refresh_users_table()
+            self._refresh_roles_combo()
+
+        self.tabs.setCurrentIndex(min(focus_tab, self.tabs.count() - 1))
+
+    def _apply_access_state(self):
+        """Disable the management tabs until a profile has been unlocked."""
+        for index in range(1, self.tabs.count()):
+            self.tabs.setTabEnabled(index, self.can_manage_network)
+
+        if not self.can_manage_network:
+            self.tabs.setTabToolTip(
+                1,
+                "Unlock a profile before starting or stopping hosting."
+            )
+            self.tabs.setTabToolTip(
+                2,
+                "Unlock a profile before managing users."
+            )
+            self.tabs.setTabToolTip(
+                3,
+                "Unlock a profile before editing roles and permissions."
+            )
 
     # ---------------- Database Server tab ----------------
 
@@ -71,7 +100,7 @@ class NetworkDialog(QDialog):
         form.addLayout(port_row)
 
         dbname_row = QHBoxLayout()
-        dbname_row.addWidget(QLabel("Database:"))
+        dbname_row.addWidget(QLabel("Maintenance Database:"))
         self.db_name_input = QLineEdit()
         dbname_row.addWidget(self.db_name_input)
         form.addLayout(dbname_row)
@@ -108,7 +137,7 @@ class NetworkDialog(QDialog):
         config = pg_config.load_server_config()
         self.db_host_input.setText(str(config.get("host", "")))
         self.db_port_input.setText(str(config.get("port", "")))
-        self.db_name_input.setText(str(config.get("database", "")))
+        self.db_name_input.setText(str(config.get("maintenance_database", config.get("database", "postgres"))))
         self.db_user_input.setText(str(config.get("user", "")))
         self.db_password_input.setText(str(config.get("password", "")))
 
@@ -121,7 +150,7 @@ class NetworkDialog(QDialog):
         return {
             "host": self.db_host_input.text().strip(),
             "port": port,
-            "database": self.db_name_input.text().strip(),
+            "maintenance_database": self.db_name_input.text().strip(),
             "user": self.db_user_input.text().strip(),
             "password": self.db_password_input.text(),
         }
@@ -137,7 +166,9 @@ class NetworkDialog(QDialog):
         config = self._collect_db_server_config()
         if config is None:
             return
-        pg_config.save_server_config(config)
+        current = pg_config.load_server_config()
+        current.update(config)
+        pg_config.save_server_config(current)
         QMessageBox.information(self, "Saved", "Database server settings saved.")
 
     # ---------------- Hosting tab ----------------
@@ -145,6 +176,15 @@ class NetworkDialog(QDialog):
     def _build_hosting_tab(self):
         widget = QWidget()
         form = QVBoxLayout(widget)
+
+        if not self.can_manage_network:
+            note = QLabel(
+                "Unlock a profile first to start hosting this database on the LAN."
+            )
+            note.setWordWrap(True)
+            form.addWidget(note)
+            form.addStretch()
+            return widget
 
         self.status_label = QLabel()
         form.addWidget(self.status_label)
@@ -224,6 +264,15 @@ class NetworkDialog(QDialog):
     def _build_users_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        if not self.can_manage_network:
+            note = QLabel(
+                "Users can only be created after a profile is unlocked and the local database is connected."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch()
+            return widget
 
         self.users_table = QTableWidget(0, 3)
         self.users_table.setHorizontalHeaderLabels(["Username", "Role", "Super Admin"])
@@ -330,6 +379,15 @@ class NetworkDialog(QDialog):
     def _build_roles_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        if not self.can_manage_network:
+            note = QLabel(
+                "Roles and permissions can only be edited after a profile is unlocked and the local database is connected."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch()
+            return widget
 
         role_row = QHBoxLayout()
         role_row.addWidget(QLabel("Role:"))

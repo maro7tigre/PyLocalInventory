@@ -11,6 +11,7 @@ import json
 import os
 import shutil
 import subprocess
+import tempfile
 
 import psycopg2
 
@@ -28,11 +29,95 @@ def _connection_and_env():
     return config, env
 
 
+def _maintenance_database_name(config):
+    return config.get('maintenance_database') or config.get('database') or 'postgres'
+
+
 def _connect(config):
     return psycopg2.connect(
         host=config.get('host'), port=config.get('port'), dbname=config.get('database'),
         user=config.get('user'), password=config.get('password'),
     )
+
+
+def _connect_admin(config):
+    return psycopg2.connect(
+        host=config.get('host'),
+        port=config.get('port'),
+        dbname=_maintenance_database_name(config),
+        user=config.get('user'),
+        password=config.get('password'),
+    )
+
+
+def _ensure_database_exists(database_name):
+    config, _ = _connection_and_env()
+    conn = _connect_admin(config)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
+        if not cur.fetchone():
+            cur.execute(f"CREATE DATABASE {database_name}")
+    finally:
+        conn.close()
+
+
+def _drop_database(database_name):
+    config, _ = _connection_and_env()
+    conn = _connect_admin(config)
+    conn.autocommit = True
+    try:
+        cur = conn.cursor()
+        cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
+        cur.execute(f"DROP DATABASE IF EXISTS {database_name}")
+    finally:
+        conn.close()
+
+
+def backup_database(database_name, dest_dir):
+    """Write a full database backup into `dest_dir`."""
+    os.makedirs(dest_dir, exist_ok=True)
+    config, env = _connection_and_env()
+    if shutil.which('pg_dump') is None or shutil.which('pg_restore') is None:
+        raise RuntimeError("pg_dump/pg_restore are required for real database backups")
+
+    dump_file = os.path.join(dest_dir, "database.dump")
+    cmd = [
+        'pg_dump', '-h', str(config.get('host')), '-p', str(config.get('port')),
+        '-U', str(config.get('user')), '-d', database_name, '-Fc', '-f', dump_file,
+    ]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"pg_dump failed: {result.stderr}")
+
+
+def restore_database(database_name, source_dir):
+    """Restore a full database backup previously written by backup_database()."""
+    dump_file = os.path.join(source_dir, "database.dump")
+    if not os.path.exists(dump_file):
+        raise RuntimeError("No database dump found (database.dump missing)")
+    if shutil.which('pg_dump') is None or shutil.which('pg_restore') is None:
+        raise RuntimeError("pg_dump/pg_restore are required for real database restores")
+
+    config, env = _connection_and_env()
+    _drop_database(database_name)
+    _ensure_database_exists(database_name)
+
+    cmd = [
+        'pg_restore', '-h', str(config.get('host')), '-p', str(config.get('port')),
+        '-U', str(config.get('user')), '-d', database_name, '--no-owner', dump_file,
+    ]
+    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
+    if result.returncode != 0:
+        raise RuntimeError(f"pg_restore failed: {result.stderr}")
+
+
+def clone_database(source_database, dest_database):
+    """Clone one profile database into another."""
+    with tempfile.TemporaryDirectory() as temp_dir:
+        backup_database(source_database, temp_dir)
+        restore_database(dest_database, temp_dir)
 
 
 def backup_schema(schema_name, dest_dir):

@@ -14,6 +14,7 @@ CONFIG_PATH = os.path.join("profiles", "_server_config.json")
 DEFAULT_CONFIG = {
     "host": "localhost",
     "port": 5432,
+    "maintenance_database": "postgres",
     "database": "lamidap",
     "user": "",
     "password": "",
@@ -50,7 +51,7 @@ def test_connection(config):
         conn = psycopg2.connect(
             host=config.get("host"),
             port=config.get("port"),
-            dbname=config.get("database"),
+            dbname=config.get("maintenance_database") or config.get("database"),
             user=config.get("user"),
             password=config.get("password"),
             connect_timeout=5,

@@ -110,6 +110,7 @@ class DatabaseServer:
         self.database = database
         self.port = port
         self.sessions = _SessionStore()
+        self.database_name = None
         self.schema_name = None
         self._pool = None
         self._httpd = None
@@ -124,20 +125,35 @@ class DatabaseServer:
             return
 
         pg_config = load_server_config()
-        schema_name = Database._sanitize_schema_name(
-            self.database.profile_manager.selected_profile.name
-        )
-        self.schema_name = schema_name
+        selected_profile = self.database.profile_manager.selected_profile
+        if getattr(selected_profile, 'database_name', None):
+            database_name = selected_profile.database_name
+            self.database_name = database_name
+            self.schema_name = None
+            self._pool = ThreadedConnectionPool(
+                2, 10,
+                host=pg_config.get('host'),
+                port=pg_config.get('port'),
+                dbname=database_name,
+                user=pg_config.get('user'),
+                password=pg_config.get('password'),
+            )
+        else:
+            schema_name = selected_profile.schema_name or Database._profile_schema_name(
+                selected_profile.get_value('company name') or selected_profile.name
+            )
+            self.database_name = None
+            self.schema_name = schema_name
 
-        self._pool = ThreadedConnectionPool(
-            2, 10,
-            host=pg_config.get('host'),
-            port=pg_config.get('port'),
-            dbname=pg_config.get('database'),
-            user=pg_config.get('user'),
-            password=pg_config.get('password'),
-            options=f'-c search_path={schema_name}',
-        )
+            self._pool = ThreadedConnectionPool(
+                2, 10,
+                host=pg_config.get('host'),
+                port=pg_config.get('port'),
+                dbname=pg_config.get('database'),
+                user=pg_config.get('user'),
+                password=pg_config.get('password'),
+                options=f'-c search_path={schema_name}',
+            )
 
         self._httpd = ThreadingHTTPServer(('0.0.0.0', self.port), self._make_handler())
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
@@ -176,6 +192,7 @@ class DatabaseServer:
         conn = self._pool.getconn()
         request_db = Database(profile_manager=None)
         request_db.registered_classes = self.database.registered_classes
+        request_db.database_name = self.database_name
         request_db.schema_name = self.schema_name
         request_db.conn = conn
         request_db.cursor = conn.cursor()

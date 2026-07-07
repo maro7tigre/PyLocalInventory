@@ -209,10 +209,19 @@ class MainWindow(ThemedMainWindow):
         backups_action.triggered.connect(self.open_backups_dialog)
         menubar.addAction(backups_action)
 
-        # Network menu action (host on LAN / manage users & roles)
-        network_action = QAction("Network", self)
-        network_action.triggered.connect(self.open_network_dialog)
-        menubar.addAction(network_action)
+        # Network dropdown: database settings are always reachable, while the
+        # hosting / users / roles tools stay gated by an unlocked profile.
+        network_menu = QMenu("Network", self)
+
+        database_config_action = QAction("Database Config", self)
+        database_config_action.triggered.connect(self.open_database_config)
+        network_menu.addAction(database_config_action)
+
+        network_config_action = QAction("Network Config", self)
+        network_config_action.triggered.connect(self.open_network_dialog)
+        network_menu.addAction(network_config_action)
+
+        menubar.addMenu(network_menu)
 
         # Language selector menu (between Backups and Log Out)
         lang_menu = QMenu("Language", self)
@@ -455,7 +464,7 @@ class MainWindow(ThemedMainWindow):
                 self.show_database_error(str(e))
                 return
             if not connected:
-                self.show_database_error()
+                self.show_database_error(getattr(self.database, 'last_error', None))
                 return
         
         tab_widget = QTabWidget()
@@ -705,20 +714,28 @@ class MainWindow(ThemedMainWindow):
         dialog = BackupsDialog(self)
         dialog.exec()
 
+    def open_database_config(self):
+        """Open the shared PostgreSQL connection settings dialog."""
+        if self.connection_mode == 'client':
+            QMessageBox.information(
+                self, "Not Available",
+                "Database configuration isn't available while connected as a network client."
+            )
+            return
+
+        dialog = NetworkDialog(self, focus_tab=0)
+        dialog.exec()
+
     def open_network_dialog(self):
-        """Open the network hosting / users & roles management dialog"""
+        """Open the network hosting / users & roles management dialog."""
         if self.connection_mode == 'client':
             QMessageBox.information(
                 self, "Not Available",
                 "Network hosting isn't available while connected as a network client."
             )
             return
-        if not self.profile_manager or not self.profile_manager.selected_profile or not self.database.conn:
-            QMessageBox.warning(self, "No Profile Unlocked",
-                              "Unlock a profile before managing network access.")
-            return
 
-        dialog = NetworkDialog(self)
+        dialog = NetworkDialog(self, focus_tab=1)
         dialog.exec()
 
     def logout(self):

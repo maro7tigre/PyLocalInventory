@@ -8,6 +8,8 @@ from PySide6.QtGui import QGuiApplication, QIcon
 from ui.main_window import MainWindow
 
 
+
+
 def main():
     """Application entry point"""
     app = QApplication(sys.argv)

@@ -112,8 +112,23 @@ class TableDataManager:
                 return float(value) if value else 0.0
             except ValueError:
                 return 0.0
+
+        if param_key == 'information':
+            return self._normalize_keyword_text(value)
         
         return value
+
+    @staticmethod
+    def _normalize_keyword_text(value):
+        keywords = []
+        seen = set()
+        for part in str(value).replace("\n", ",").replace(";", ",").split(","):
+            keyword = part.strip()
+            key = keyword.lower()
+            if keyword and key not in seen:
+                seen.add(key)
+                keywords.append(keyword)
+        return ", ".join(keywords)
 
 
 class TableRowFactory:
@@ -192,7 +207,7 @@ class TableRowFactory:
         if hasattr(temp_item, 'get_parameter_options'):
             options = lambda key=param_key: temp_item.get_parameter_options(key)
         
-        autocomplete = AutoCompleteLineEdit(options=options)
+        autocomplete = AutoCompleteLineEdit(options=options, complete_multiple=(param_key == 'information'))
         autocomplete.setPlaceholderText(param_info.get('display_name', {}).get('en', param_key.replace('_', ' ')))
         autocomplete.setProperty('row', row)  # Store row for callbacks
         

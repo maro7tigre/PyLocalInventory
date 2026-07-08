@@ -184,11 +184,14 @@ class SalesItemClass(BaseClass):
     def get_service_keyword_options(self):
         """Return service keywords for the line-item information autocomplete."""
         if not (self.database and getattr(self.database, 'cursor', None)):
-            return []
+            return ["dimension", "color", "wood", "height", "width", "thickness"]
 
         try:
-            options = []
+            options = ["dimension", "color", "wood", "height", "width", "thickness"]
             seen = set()
+            for option in options:
+                seen.add(option.lower())
+
             self.database.cursor.execute(
                 "SELECT keywords FROM Services WHERE keywords IS NOT NULL AND keywords != ''"
             )
@@ -198,6 +201,20 @@ class SalesItemClass(BaseClass):
                     if key not in seen:
                         seen.add(key)
                         options.append(keyword)
+
+            try:
+                self.database.cursor.execute(
+                    "SELECT information FROM Sales_Items WHERE information IS NOT NULL AND information != ''"
+                )
+                for (information,) in self.database.cursor.fetchall():
+                    for keyword in self._split_keywords(information or ""):
+                        key = keyword.lower()
+                        if key not in seen:
+                            seen.add(key)
+                            options.append(keyword)
+            except Exception:
+                pass
+
             return options
         except Exception as e:
             print(f"Error getting service keyword options: {e}")
@@ -385,7 +402,7 @@ class SalesItemClass(BaseClass):
     def _split_keywords(value):
         return [
             part.strip()
-            for part in str(value).replace("\n", ",").split(",")
+            for part in str(value).replace("\n", ",").replace(";", ",").split(",")
             if part.strip()
         ]
     

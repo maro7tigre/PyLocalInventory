@@ -90,11 +90,11 @@ class PaymentDialog(QDialog):
             h.addWidget(v)
             return h
 
-        s_lay.addLayout(_row("Total Order:", f"{self._total:.2f} {self.currency}"))
+        s_lay.addLayout(_row("Total Order:", f"{self._total:.2f} MAD"))
         paid_color = '#4CAF50' if self._total_paid_before > 0 else '#888'
-        s_lay.addLayout(_row("Already Paid:", f"{self._total_paid_before:.2f} {self.currency}", paid_color))
+        s_lay.addLayout(_row("Already Paid:", f"{self._total_paid_before:.2f} DA", paid_color))
         rem_color = '#FF9800' if self._remaining_before > 0 else '#4CAF50'
-        s_lay.addLayout(_row("Remaining:", f"{self._remaining_before:.2f} {self.currency}", rem_color))
+        s_lay.addLayout(_row("Remaining:", f"{self._remaining_before:.2f} DA", rem_color))
         layout.addWidget(summary)
 
         sep = QFrame()
@@ -111,7 +111,7 @@ class PaymentDialog(QDialog):
         self._amount_spin.setRange(0.01, 9_999_999.99)
         self._amount_spin.setDecimals(2)
         self._amount_spin.setValue(max(self._remaining_before, 0.0))
-        self._amount_spin.setSuffix(f" {self.currency}")
+        self._amount_spin.setSuffix(" DA")
         self._amount_spin.setMinimumHeight(36)
         self._amount_spin.setStyleSheet(
             "QDoubleSpinBox { background:#333; color:#eee; border:1px solid #555; padding:4px; font-size:14px; }"
@@ -139,7 +139,7 @@ class PaymentDialog(QDialog):
         # Live remaining preview
         init_remaining_after = self._remaining_before - self._amount_spin.value()
         after_color = '#4CAF50' if init_remaining_after <= 0 else '#FF9800'
-        self._after_lbl = QLabel(f"Remaining after this payment:  {init_remaining_after:.2f} {self.currency}")
+        self._after_lbl = QLabel(f"Remaining after this payment:  {init_remaining_after:.2f} DA")
         self._after_lbl.setStyleSheet(f"color:{after_color}; font-size:13px; font-weight:bold; padding-top:4px;")
         layout.addWidget(self._after_lbl)
 
@@ -166,7 +166,7 @@ class PaymentDialog(QDialog):
     def _on_amount_changed(self, value):
         remaining_after = self._remaining_before - value
         color = '#4CAF50' if remaining_after <= 0 else '#FF9800'
-        self._after_lbl.setText(f"Remaining after this payment:  {remaining_after:.2f} {self.currency}")
+        self._after_lbl.setText(f"Remaining after this payment:  {remaining_after:.2f} DA")
         self._after_lbl.setStyleSheet(f"color:{color}; font-size:13px; font-weight:bold; padding-top:4px;")
 
     def _save_payment(self):

@@ -285,10 +285,13 @@ class NetworkDialog(QDialog):
         add_btn.clicked.connect(self._add_user)
         change_role_btn = QPushButton("Change Role")
         change_role_btn.clicked.connect(self._change_user_role)
+        change_password_btn = QPushButton("Change Password")
+        change_password_btn.clicked.connect(self._change_user_password)
         remove_btn = QPushButton("Remove Selected")
         remove_btn.clicked.connect(self._remove_user)
         btn_row.addWidget(add_btn)
         btn_row.addWidget(change_role_btn)
+        btn_row.addWidget(change_password_btn)
         btn_row.addWidget(remove_btn)
         layout.addLayout(btn_row)
 
@@ -361,6 +364,20 @@ class NetworkDialog(QDialog):
         role_id = next(r['id'] for r in roles if r['name'] == role_name)
         self.user_manager.set_user_role(user['id'], role_id)
         self._refresh_users_table()
+
+    def _change_user_password(self):
+        row = self.users_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No Selection", "Select a user first.")
+            return
+        user = self._users_cache[row]
+        password, ok = QInputDialog.getText(
+            self, "Change Password", f"New password for '{user['username']}':", QLineEdit.Password
+        )
+        if not ok or not password:
+            return
+        self.user_manager.change_password(user['id'], password)
+        QMessageBox.information(self, "Password Changed", f"Password updated for '{user['username']}'.")
 
     def _remove_user(self):
         row = self.users_table.currentRow()

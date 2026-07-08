@@ -189,6 +189,21 @@ class ReportsDialog(QDialog):
         
         return html_content
     
+    def _get_lamidap_logo_block(self):
+        """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
+        logo_path = os.path.normpath(os.path.join(
+            os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'lamidap_logo.png'
+        ))
+        try:
+            with open(logo_path, 'rb') as img_f:
+                b64 = base64.b64encode(img_f.read()).decode('ascii')
+            return (
+                f'<img src="data:image/png;base64,{b64}" '
+                f'style="max-width: 150px; max-height: 90px; object-fit: contain; display: block; margin-bottom: 6px;" />'
+            )
+        except Exception:
+            return '<div class="logo-placeholder">LOGO</div>'
+
     def _extract_sales_data(self, report_type: str):
         """Extract data from sales object"""
         try:
@@ -208,24 +223,7 @@ class ReportsDialog(QDialog):
             company_email = profile.get_value("email") or ""
             report_footer = profile.get_value("report footer") or ""
 
-            # Build logo block from profile preview if available
-            logo_block = '<div class="logo-placeholder">LOGO</div>'
-            try:
-                preview_path = getattr(profile, 'preview_path', None)
-                if preview_path and os.path.exists(preview_path):
-                    # Read and encode image as base64 data URI (supports png/jpg)
-                    ext = os.path.splitext(preview_path)[1].lower()
-                    mime = 'image/png' if ext in ['.png'] else ('image/jpeg' if ext in ['.jpg', '.jpeg'] else 'image/png')
-                    with open(preview_path, 'rb') as img_f:
-                        b64 = base64.b64encode(img_f.read()).decode('ascii')
-                    # Constrain displayed logo size via inline style to fit header nicely
-                    logo_block = (
-                        f'<img src="data:{mime};base64,{b64}" '
-                        f'style="max-width: 200px; max-height: 80px; object-fit: contain; display: block; margin-bottom: 4px;" />'
-                    )
-            except Exception as _e:
-                # Fallback to placeholder on any issue
-                logo_block = '<div class="logo-placeholder">LOGO</div>'
+            logo_block = self._get_lamidap_logo_block()
 
             # Extract sales data
             client_username = self.sales_obj.get_value('client_username') or ""
@@ -468,7 +466,7 @@ class ReportsDialog(QDialog):
                 # BDL specific pricing fields
                 'tva': '0,00',
                 'total_ttc': '0,00',
-                'logo_block': '<div class="logo-placeholder">LOGO</div>'
+                'logo_block': self._get_lamidap_logo_block()
             }
     
     def _replace_placeholders(self, template_content, data):

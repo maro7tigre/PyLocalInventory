@@ -342,7 +342,8 @@ class ProfileClass:
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
             "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"},
             # Multiline footer text that will appear centered at the bottom of the last report page
-            "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"}
+            "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"},
+            "currency": {"value": None, "display name": {"en" : "currency","fr": "devise", "es": "moneda"}, "required": False, "default": "DA", "options": [], "type": "string"}
         }
         self.available_parameters = {
             # Order determines display order in dialog

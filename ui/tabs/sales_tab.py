@@ -527,6 +527,13 @@ class SalesTab(BaseTab):
         if current_row >= len(self.filtered_items):
             return
         selected_sale = self.filtered_items[current_row]
-        dialog = PaymentDialog(selected_sale, self.database, self)
+        
+        # Get config from parent's profile manager
+        config = {}
+        if hasattr(self.parent(), 'profile_manager') and self.parent().profile_manager.selected_profile:
+            profile = self.parent().profile_manager.selected_profile
+            config = profile.get_value()  # Get all values as dict
+        
+        dialog = PaymentDialog(selected_sale, self.database, self, config=config)
         if dialog.exec():
             self.refresh_table()

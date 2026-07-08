@@ -24,7 +24,7 @@ class ReceiptDialog(QDialog):
     def _build_html(self, sale_id, client, order_date, payment_date,
                     total, amount_this, total_paid, remaining):
         rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
-        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} DA REMAINING'
+        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} MAD REMAINING'
 
         template_path = os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'Receipt_templat.html'
@@ -43,8 +43,8 @@ class ReceiptDialog(QDialog):
         except Exception as e:
             print(f"Error loading receipt template: {e}")
             return (f"<html><body><p>Receipt for Sale #{sale_id} — "
-                    f"{amount_this:.2f} DA paid by {client}. "
-                    f"Remaining: {remaining:.2f} DA</p></body></html>")
+                    f"{amount_this:.2f} MAD paid by {client}. "
+                    f"Remaining: {remaining:.2f} MAD</p></body></html>")
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)

@@ -230,7 +230,23 @@ class ReportsDialog(QDialog):
             client_name = self.sales_obj.get_value('client_name') or ""
             date = self.sales_obj.get_value('date') or datetime.now().strftime("%d-%m-%Y")
             total_price = self.sales_obj.get_value('total_price') or 0
-            
+
+            # Look up the client's own address/phone for the delivery note client block
+            client_address = ""
+            client_phone = ""
+            client_id = self.sales_obj.get_value('client_id')
+            if client_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                try:
+                    self.sales_obj.database.cursor.execute(
+                        "SELECT address, phone FROM Clients WHERE ID = %s", (client_id,)
+                    )
+                    client_row = self.sales_obj.database.cursor.fetchone()
+                    if client_row:
+                        client_address = client_row[0] or ""
+                        client_phone = client_row[1] or ""
+                except Exception as e:
+                    print(f"DEBUG: Error getting client address/phone: {e}")
+
             # Generate document reference
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
             doc_ref = f"DOC-{sales_id:06d}"
@@ -297,45 +313,61 @@ class ReportsDialog(QDialog):
                     total_quantity += int(quantity) if quantity else 0
                     total_ht += float(subtotal) if subtotal else 0
                     
-                    designation_html = html.escape(str(product_name))
-                    if item_information:
-                        designation_html += (
-                            f" <span style=\"font-size: 10px; color: #333;\">"
-                            f"{html.escape(str(item_information))}</span>"
+                    if report_type == 'bdl':
+                        # Bon de livraison: Qté, Désignation, Dimension, P.U, Total
+                        dimension_html = html.escape(str(item_information)) if item_information else "&nbsp;"
+                        row_html = (
+                            f"<tr>"
+                            f"<td>{quantity}</td>"
+                            f"<td style=\"text-align: left\">{html.escape(str(product_name))}</td>"
+                            f"<td>{dimension_html}</td>"
+                            f"<td>{_fmt_fr(unit_price)}</td>"
+                            f"<td>{_fmt_fr(subtotal)}</td>"
+                            f"</tr>"
                         )
+                        items_html += row_html + "\n"
+                    else:
+                        designation_html = html.escape(str(product_name))
+                        if item_information:
+                            designation_html += (
+                                f" <span style=\"font-size: 10px; color: #333;\">"
+                                f"{html.escape(str(item_information))}</span>"
+                            )
 
-                    row_html = (
-                        f"<tr>"
-                        f"<td style=\"text-align: left\">{designation_html}</td>"
-                        f"<td>{quantity}</td>"
-                        f"<td>{_fmt_fr(unit_price)}</td>"
-                        f"<td>{_fmt_fr(subtotal)}</td>"
-                        f"</tr>"
-                    )
-                    # For BDL or legacy simple replacement
-                    items_html += row_html + "\n"
-                    # For Devis paginated tables
-                    devis_rows.append(row_html)
+                        row_html = (
+                            f"<tr>"
+                            f"<td style=\"text-align: left\">{designation_html}</td>"
+                            f"<td>{quantity}</td>"
+                            f"<td>{_fmt_fr(unit_price)}</td>"
+                            f"<td>{_fmt_fr(subtotal)}</td>"
+                            f"</tr>"
+                        )
+                        items_html += row_html + "\n"
+                        # For Devis paginated tables
+                        devis_rows.append(row_html)
                 # Add filler rows to visually fill the table area to the footer
                 try:
                     current_rows = len(self.sales_obj.items)
-                    # Target rows per page tuned for current CSS; adjust if needed
-                    target_rows = 22
+                    # Target rows per page tuned for current CSS; adjust if needed.
+                    # BDL's taller letterhead/title/client-info block leaves less
+                    # room than the other templates, so it needs fewer filler rows
+                    # to keep the totals/signature on the same page.
+                    target_rows = 18 if report_type == 'bdl' else 22
                     filler_needed = max(0, target_rows - current_rows)
-                    for _ in range(filler_needed):
-                        items_html += """
-                        <tr class=\"filler\">
-                            <td style=\"text-align: left\">&nbsp;</td>
-                            <td>&nbsp;</td>
-                            <td>&nbsp;</td>
-                            <td>&nbsp;</td>
-                        </tr>
-                        """
+                    filler_cols = 5 if report_type == 'bdl' else 4
+                    filler_row = (
+                        '<tr class="filler">'
+                        + '<td style="text-align: left">&nbsp;</td>'
+                        + '<td>&nbsp;</td>' * (filler_cols - 1)
+                        + '</tr>\n'
+                    )
+                    items_html += filler_row * filler_needed
                 except Exception:
                     pass
             else:
                 print("DEBUG: No sales items found")
-                items_html = '<tr><td colspan="4">No items found for this sale</td></tr>'
+                filler_cols = 5 if report_type == 'bdl' else 4
+                items_html = f'<tr><td colspan="{filler_cols}">No items found for this sale</td></tr>'
                 devis_rows = []
                 total_ht = 0
             
@@ -429,7 +461,8 @@ class ReportsDialog(QDialog):
                 'date': date,
                 'document_ref': doc_ref,
                 'client_name': client_name,
-                'client_address': company_address,  # Use company address as fallback
+                'client_address': client_address,
+                'client_phone': client_phone,
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
                 # New financial fields for devis
@@ -456,6 +489,7 @@ class ReportsDialog(QDialog):
                 'document_ref': 'DOC-000001',
                 'client_name': 'Client Name',
                 'client_address': '',
+                'client_phone': '',
                 'commercial': 'Sales Team',
                 'items': '<tr><td colspan="4">No items found</td></tr>',
                 # Financial fields for devis

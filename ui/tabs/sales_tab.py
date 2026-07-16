@@ -6,7 +6,7 @@ from ui.tabs.base_tab import BaseTab
 from PySide6.QtCore import Qt, QPoint, QDate
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QSpinBox, QLineEdit,
-    QWidget, QProgressBar, QSizePolicy, QFrame, QPushButton)
+    QWidget, QProgressBar, QSizePolicy, QFrame, QPushButton, QMessageBox)
 from PySide6.QtGui import QPixmap, QColor
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
@@ -431,7 +431,9 @@ class SalesTab(BaseTab):
         cancel_btn.setStyleSheet("QPushButton { background:#E53935; color:#fff; border:none; border-radius:6px; padding:8px 12px; }"
                                 "QPushButton:hover { background:#EF5350; }")
         cancel_btn.setCursor(Qt.PointingHandCursor)
-        cancel_btn.clicked.connect(popup.close)
+        cancel_btn.clicked.connect(
+            lambda _=None: self._cancel_sale_from_popup(popup, obj)
+        )
         cancel_btn.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         layout.addWidget(cancel_btn)
 
@@ -441,6 +443,26 @@ class SalesTab(BaseTab):
         global_pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
         popup.move(global_pos + QPoint(0, 6))
         popup.show()
+
+    def _cancel_sale_from_popup(self, popup, obj):
+        """Permanently remove a sale after explicit confirmation."""
+        popup.close()
+        reply = QMessageBox.question(
+            self,
+            "Cancel Sale",
+            "Cancel this sale and remove it permanently?",
+            QMessageBox.Yes | QMessageBox.No,
+            QMessageBox.No,
+        )
+        if reply != QMessageBox.Yes:
+            return
+        try:
+            if not self.database.delete_item(obj.id, 'Sales'):
+                QMessageBox.critical(self, "Error", "The sale could not be cancelled.")
+                return
+            self.refresh_table()
+        except Exception as exc:
+            QMessageBox.critical(self, "Error", f"The sale could not be cancelled:\n{exc}")
 
     def _select_state_from_popup(self, popup, obj, new_state):
         try:

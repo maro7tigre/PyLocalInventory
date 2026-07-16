@@ -14,6 +14,27 @@ from core.network.server import DatabaseServer
 from core.network.protocol import DEFAULT_PORT
 from core.user_manager import UserManager, MATRIX_SECTIONS
 from core import pg_config
+from ui.widgets.password_widget import CircularCheckBox
+
+
+class PermissionCheckBox(CircularCheckBox):
+    """Permission toggle that responds immediately inside a table cell."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.setChecked(not self.isChecked())
+            self.pressed.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.released.emit()
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
 
 
 class NetworkDialog(QDialog):
@@ -459,7 +480,7 @@ class NetworkDialog(QDialog):
         for row, section in enumerate(MATRIX_SECTIONS):
             perm = perms[section]
             for col, key in enumerate(('read', 'write', 'delete')):
-                checkbox = QCheckBox()
+                checkbox = PermissionCheckBox()
                 checkbox.setChecked(perm[key])
                 cell = QWidget()
                 cell_layout = QHBoxLayout(cell)

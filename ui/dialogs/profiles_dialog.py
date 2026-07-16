@@ -2,7 +2,7 @@
 Profile management dialog - create, delete, and switch between user profiles
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QFileDialog, QScrollArea,
-                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton, QMessageBox, QTextEdit)
+                               QSplitter, QWidget, QHBoxLayout, QLineEdit, QPushButton, QMessageBox, QTextEdit, QFrame)
 from PySide6.QtCore import Qt
 from PySide6.QtGui import QPixmap
 import os
@@ -12,7 +12,9 @@ import shutil
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton, PasswordInputWidget
 from ui.widgets.cards_list import GridCardsList
 from core.profiles import ProfileClass, ProfileManager
+from core.runtime_paths import portable_dir
 from core.database import Database
+from ui.theme import WINDOW, TEXT
 
 class ProfilesDialog(QDialog):
     def __init__(self, parent=None):
@@ -105,7 +107,17 @@ class ProfilesDialog(QDialog):
 
         # Create left and right widgets and set their layouts
         self.left_widget = QWidget()
+        self.left_widget.setObjectName("profiles_left_panel")
+        self.left_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self.left_widget.setAutoFillBackground(True)
+        self.left_widget.setStyleSheet(f"background-color: {WINDOW}; color: {TEXT};")
+
         self.right_widget = QWidget()
+        self.right_widget.setObjectName("right_panel")
+        self.right_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self.right_widget.setAutoFillBackground(True)
+        self.right_widget.setStyleSheet(f"background-color: {WINDOW}; color: {TEXT};")
+
         self.left_widget.setLayout(self.create_left_layout())
         self.right_widget.setLayout(self.create_right_layout())
 
@@ -223,7 +235,24 @@ class ProfilesDialog(QDialog):
         
         # Scrollable area
         scroll_area = QScrollArea()
+        scroll_area.setFrameShape(QFrame.NoFrame)
+        scroll_area.setAttribute(Qt.WA_StyledBackground, True)
+        scroll_area.setStyleSheet(f"""
+            QScrollArea {{
+                background-color: {WINDOW};
+                border: none;
+            }}
+            QScrollArea::viewport {{
+                background-color: {WINDOW};
+            }}
+            QScrollArea QWidget {{
+                background-color: {WINDOW};
+            }}
+        """)
         self.scroll_widget = QWidget()
+        self.scroll_widget.setAttribute(Qt.WA_StyledBackground, True)
+        self.scroll_widget.setAutoFillBackground(True)
+        self.scroll_widget.setStyleSheet(f"background-color: {WINDOW}; color: {TEXT};")
         self.scroll_layout = QVBoxLayout()
         
         # Image preview
@@ -273,6 +302,9 @@ class ProfilesDialog(QDialog):
         self.scroll_widget.setLayout(self.scroll_layout)
         scroll_area.setWidget(self.scroll_widget)
         scroll_area.setWidgetResizable(True)
+        scroll_area.viewport().setAttribute(Qt.WA_StyledBackground, True)
+        scroll_area.viewport().setAutoFillBackground(True)
+        scroll_area.viewport().setStyleSheet(f"background-color: {WINDOW};")
         
         self.right_layout.addWidget(scroll_area)
         
@@ -292,22 +324,26 @@ class ProfilesDialog(QDialog):
         """Set border color based on edit mode"""
         if edit_mode:
             # Blue border for edit mode - apply only to the right widget itself, not children
-            self.right_widget.setStyleSheet("""
-                QWidget#right_panel {
+            self.right_widget.setObjectName("right_panel")
+            self.right_widget.setStyleSheet(f"""
+                QWidget#right_panel {{
                     border: 2px solid #2196F3;
                     border-radius: 4px;
-                }
+                    background-color: {WINDOW};
+                    color: {TEXT};
+                }}
             """)
-            self.right_widget.setObjectName("right_panel")
         else:
             # Grey border for normal mode
-            self.right_widget.setStyleSheet("""
-                QWidget#right_panel {
+            self.right_widget.setObjectName("right_panel")
+            self.right_widget.setStyleSheet(f"""
+                QWidget#right_panel {{
                     border: 2px solid #555555;
                     border-radius: 4px;
-                }
+                    background-color: {WINDOW};
+                    color: {TEXT};
+                }}
             """)
-            self.right_widget.setObjectName("right_panel")
     
     def release_image_resources(self):
         """Release any resources held by the image label to prevent file locking"""
@@ -758,7 +794,7 @@ class ProfilesDialog(QDialog):
         if hasattr(parent, 'profiles_path'):
             self.profiles_path = parent.profiles_path
         else:
-            self.profiles_path = "./profiles"
+            self.profiles_path = portable_dir("profiles")
         # Use parent's language if available
         if hasattr(parent, 'language') and parent.language:
             self.language = parent.language

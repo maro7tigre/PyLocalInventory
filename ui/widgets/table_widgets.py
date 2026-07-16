@@ -99,6 +99,7 @@ class ParameterTableWidget(QWidget):
         # Table properties
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
 
@@ -128,6 +129,7 @@ class ParameterTableWidget(QWidget):
                 
                 for col, param_key in enumerate(self.table_columns):
                     self.set_table_cell(row, col, param_key, obj)
+            self.table.resizeRowsToContents()
         
         except Exception as e:
             print(f"Error refreshing table: {e}")

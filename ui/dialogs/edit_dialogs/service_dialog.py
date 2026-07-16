@@ -86,20 +86,34 @@ class ServiceEditDialog(QDialog):
             self.keywords_list.addItem(keyword)
 
     def add_keyword(self):
-        keyword, ok = QInputDialog.getText(self, "Add Keyword", "Keyword:")
+        text, ok = QInputDialog.getMultiLineText(
+            self,
+            "Add Keywords",
+            "Enter one keyword per line, or separate keywords with commas:",
+        )
         if not ok:
             return
 
-        keyword = keyword.strip()
-        if not keyword:
+        keywords = self._parse_keywords(text)
+        if not keywords:
             return
 
-        existing = {self.keywords_list.item(i).text().lower() for i in range(self.keywords_list.count())}
-        if keyword.lower() in existing:
-            QMessageBox.information(self, "Keyword Exists", "This keyword is already in the list.")
-            return
+        existing = {self.keywords_list.item(i).text().casefold() for i in range(self.keywords_list.count())}
+        added = 0
+        for keyword in keywords:
+            normalized = keyword.casefold()
+            if normalized in existing:
+                continue
+            self.keywords_list.addItem(keyword)
+            existing.add(normalized)
+            added += 1
 
-        self.keywords_list.addItem(keyword)
+        if added == 0:
+            QMessageBox.information(
+                self,
+                "Keywords Exist",
+                "All entered keywords are already in the list.",
+            )
 
     def remove_selected_keyword(self):
         row = self.keywords_list.currentRow()
@@ -143,7 +157,7 @@ class ServiceEditDialog(QDialog):
     def _parse_keywords(value):
         return [
             part.strip()
-            for part in str(value).replace("\n", ",").split(",")
+            for part in str(value).replace("\r", "\n").replace("\n", ",").replace(";", ",").split(",")
             if part.strip()
         ]
 

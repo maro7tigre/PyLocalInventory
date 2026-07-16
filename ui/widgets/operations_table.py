@@ -151,7 +151,9 @@ class TableRowFactory:
         button_param = {'text': '🗑️', 'color': 'red', 'size': 30}
         delete_btn = ButtonWidget(button_param)
         delete_btn.setProperty('row', row)  # Store row for callback
-        delete_btn.clicked.connect(lambda: self.delete_callback(row))
+        delete_btn.clicked.connect(
+            lambda _checked=False, btn=delete_btn: self.delete_callback(btn.property('row'))
+        )
         
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -184,7 +186,7 @@ class TableRowFactory:
     
     def _create_autocomplete_cell(self, table, row, col, param_key, item):
         """Create autocomplete cell for configured string parameters."""
-        from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+        from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingTextEdit
         
         param_info = self.data_manager.parameter_definitions.get(param_key, {})
         temp_item = self.data_manager.item_class(0, self.data_manager.database)
@@ -192,9 +194,22 @@ class TableRowFactory:
         if hasattr(temp_item, 'get_parameter_options'):
             options = lambda key=param_key: temp_item.get_parameter_options(key)
         
-        autocomplete = AutoCompleteLineEdit(options=options)
+        if param_info.get('auto_expand', param_info.get('type') == 'string'):
+            autocomplete = AutoExpandingTextEdit(
+                options=options,
+                multi_value=param_info.get('multi_value', False),
+                allow_free_text=param_info.get('allow_free_text', True),
+            )
+        else:
+            autocomplete = AutoCompleteLineEdit(
+                options=options,
+                allow_free_text=param_info.get('allow_free_text', False),
+                multi_value=param_info.get('multi_value', False),
+            )
         autocomplete.setPlaceholderText(param_info.get('display_name', {}).get('en', param_key.replace('_', ' ')))
         autocomplete.setProperty('row', row)  # Store row for callbacks
+        if hasattr(autocomplete, '_adjust_height'):
+            autocomplete._adjust_height()
         
         # Set current value if item provided
         if item:
@@ -223,10 +238,6 @@ class TableRowFactory:
         
         cell_item = QTableWidgetItem(value)
         
-        # Make subtotal read-only
-        if param_key == 'subtotal':
-            cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
-        
         table.setItem(row, col, cell_item)
 
 
@@ -239,11 +250,24 @@ class EmptyRowManager:
     
     def ensure_single_empty_row(self):
         """Ensure exactly one empty row exists at the bottom"""
-        # Remove all empty rows
-        self._remove_all_empty_rows()
-        
-        # Add one empty row at the end
-        self._add_empty_row()
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            self._remove_all_empty_rows()
+            self._add_empty_row()
+            self.reindex_row_widgets()
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+
+    def reindex_row_widgets(self):
+        """Keep widget callbacks aligned after table rows move or are deleted."""
+        for row in range(self.table.rowCount()):
+            for col in range(self.table.columnCount()):
+                widget = self.table.cellWidget(row, col)
+                if widget is None:
+                    continue
+                widget.setProperty('row', row)
+                for child in widget.findChildren(QWidget):
+                    child.setProperty('row', row)
     
     def _remove_all_empty_rows(self):
         """Remove all empty rows from table"""
@@ -279,6 +303,9 @@ class EmptyRowManager:
             if param_key in ['delete_action', 'product_preview', 'subtotal', 'quantity']:
                 continue
             
+            widget = self.table.cellWidget(row, col)
+            if widget and hasattr(widget, 'text') and widget.text().strip():
+                return False
             cell_item = self.table.item(row, col)
             if cell_item and cell_item.text().strip():
                 return False
@@ -321,9 +348,29 @@ class TableEventHandler:
             col = self.data_manager.table_columns.index('product_name')
             widget = self.table.cellWidget(row, col)
             if widget and hasattr(widget, 'textChanged'):
-                widget.textChanged.connect(lambda text, r=row: self._on_product_name_changed(r, text))
+                widget.setProperty('row', row)
+                if widget.property('operation_events_connected'):
+                    return
+                if hasattr(widget, 'toPlainText'):
+                    widget.textChanged.connect(
+                        lambda w=widget: self._on_product_name_changed(
+                            int(w.property('row')), w.text()
+                        )
+                    )
+                else:
+                    widget.textChanged.connect(
+                        lambda text, w=widget: self._on_product_name_changed(
+                            int(w.property('row')), text
+                        )
+                    )
             if widget and hasattr(widget, 'editingFinished'):
-                widget.editingFinished.connect(lambda r=row: self._on_product_selection_finished(r))
+                widget.editingFinished.connect(
+                    lambda w=widget: self._on_product_selection_finished(
+                        int(w.property('row'))
+                    )
+                )
+            if widget:
+                widget.setProperty('operation_events_connected', True)
         except (ValueError, AttributeError):
             pass
     
@@ -339,17 +386,70 @@ class TableEventHandler:
             param_key = self.data_manager.table_columns[col]
             
             if param_key in ['quantity', 'unit_price']:
-                self._update_row_subtotal(row)
+                self._updating = True
+                try:
+                    self._update_row_subtotal(row)
+                finally:
+                    self._updating = False
                 # Trigger immediate validation for quantity changes
                 if param_key == 'quantity':
                     self._validate_stock(row)
+            elif param_key == 'subtotal':
+                self._apply_subtotal_override(row)
         
         # Ensure empty row management
         if not self.empty_row_manager._is_row_empty(row):
-            self.empty_row_manager.ensure_single_empty_row()
-            self._reconnect_all_widgets()
+            self._updating = True
+            try:
+                self.empty_row_manager.ensure_single_empty_row()
+                self._reconnect_all_widgets()
+            finally:
+                self._updating = False
         
         self.items_changed_callback()
+
+    @staticmethod
+    def _parse_number(value):
+        try:
+            return float(str(value or "0").replace(" ", "").replace(",", "."))
+        except ValueError:
+            return 0.0
+
+    def _apply_subtotal_override(self, row):
+        """Derive unit price when a user enters the line subtotal directly."""
+        try:
+            qty_col = self.data_manager.table_columns.index('quantity')
+            price_col = self.data_manager.table_columns.index('unit_price')
+            subtotal_col = self.data_manager.table_columns.index('subtotal')
+            qty_item = self.table.item(row, qty_col)
+            price_item = self.table.item(row, price_col)
+            subtotal_item = self.table.item(row, subtotal_col)
+            if subtotal_item is None:
+                return
+
+            quantity = self._parse_number(qty_item.text() if qty_item else "")
+            self._updating = True
+            if quantity <= 0:
+                quantity = 1.0
+                if qty_item is None:
+                    qty_item = QTableWidgetItem()
+                    self.table.setItem(row, qty_col, qty_item)
+                qty_item.setText("1")
+
+            subtotal = self._parse_number(subtotal_item.text())
+            unit_price = subtotal / quantity
+            if price_item is None:
+                price_item = QTableWidgetItem()
+                self.table.setItem(row, price_col, price_item)
+
+            price_item.setText(f"{unit_price:.6f}".rstrip('0').rstrip('.'))
+            was_updating = self._updating
+            self._updating = True
+            subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
+            self._updating = was_updating
+            self._updating = False
+        except (ValueError, AttributeError, IndexError):
+            self._updating = False
     
     def _on_product_name_changed(self, row, text):
         """Handle product name text changes"""
@@ -465,7 +565,6 @@ class TableEventHandler:
             if not subtotal_item:
                 subtotal_item = QTableWidgetItem()
                 self.table.setItem(row, subtotal_col, subtotal_item)
-                subtotal_item.setFlags(subtotal_item.flags() & ~Qt.ItemIsEditable)
             
             subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
 
@@ -730,6 +829,7 @@ class OperationsTableWidget(QWidget):
         # Table properties
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.table.verticalHeader().setDefaultSectionSize(45)
@@ -853,8 +953,16 @@ class OperationsTableWidget(QWidget):
     
     def _delete_row(self, row):
         """Delete a specific row"""
-        if row < self.table.rowCount():
-            self.table.removeRow(row)
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            return
+        if 0 <= row < self.table.rowCount():
+            signals_were_blocked = self.table.blockSignals(True)
+            try:
+                self.table.removeRow(row)
+            finally:
+                self.table.blockSignals(signals_were_blocked)
             self.empty_row_manager.ensure_single_empty_row()
             self.event_handler._reconnect_all_widgets()
             self._on_items_changed()

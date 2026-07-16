@@ -1,0 +1,8 @@
+{
+  "host": "192.168.0.133",
+  "port": 5432,
+  "maintenance_database": "postgres",
+  "database": "lamidap",
+  "user": "postgres",
+  "password": "haitam1212"
+}

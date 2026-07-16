@@ -1,16 +1,19 @@
 import sys
 from PySide6.QtWidgets import (QApplication, QLineEdit, QCompleter, QVBoxLayout, 
                                QWidget, QLabel, QTableWidget, QStyledItemDelegate, 
-                               QTableWidgetItem, QHBoxLayout)
-from PySide6.QtCore import Qt, QStringListModel, QTimer
+                               QTableWidgetItem, QHBoxLayout, QTextEdit)
+from PySide6.QtCore import Qt, QStringListModel, QTimer, Signal
+from PySide6.QtGui import QTextCursor
 
 
 class AutoCompleteLineEdit(QLineEdit):
     """Custom QLineEdit with smart autocomplete functionality"""
     
-    def __init__(self, parent=None, options=None):
+    def __init__(self, parent=None, options=None, allow_free_text=False, multi_value=False):
         super().__init__(parent)
         self.options = options or []
+        self.allow_free_text = allow_free_text
+        self.multi_value = multi_value
         self.completer = None
         self.suggestions_frozen = False
         
@@ -63,7 +66,27 @@ class AutoCompleteLineEdit(QLineEdit):
     
     def _on_completion_selected(self, text):
         """Handle when user selects from completion dropdown"""
-        self.setText(text)
+        if self.multi_value:
+            current = self.text()
+            cursor = self.cursorPosition()
+            prefix = current[:cursor]
+            suffix = current[cursor:]
+
+            # Replace only the word currently being typed. Everything else
+            # (dimensions, notes, numbers, and earlier keywords) is preserved.
+            token_start = cursor
+            while token_start > 0 and prefix[token_start - 1] not in " ,;\n\t":
+                token_start -= 1
+            before = current[:token_start]
+            separator = "" if not before or before[-1].isspace() else " "
+            completed = f"{before}{separator}{text}"
+            if not suffix.lstrip().startswith((",", ";")):
+                completed += ", "
+            completed += suffix.lstrip()
+            self.setText(completed)
+            self.setCursorPosition(len(completed) - len(suffix.lstrip()))
+        else:
+            self.setText(text)
         # Hide the completer popup first
         if self.completer:
             self.completer.popup().hide()
@@ -78,10 +101,19 @@ class AutoCompleteLineEdit(QLineEdit):
     def _calculate_suggestions(self, text):
         """Calculate suggestions with scoring system"""
         options_list = self._get_options_list()
-        if not text.strip():
+        search_text = text
+        if self.multi_value:
+            cursor = self.cursorPosition()
+            prefix = text[:cursor]
+            token_start = len(prefix)
+            while token_start > 0 and prefix[token_start - 1] not in " ,;\n\t":
+                token_start -= 1
+            search_text = prefix[token_start:]
+
+        if not search_text.strip():
             return {option: 1 for option in options_list}
         
-        input_words = text.lower().split()
+        input_words = search_text.lower().split()
         suggestions = {}
         
         for option in options_list:
@@ -89,7 +121,7 @@ class AutoCompleteLineEdit(QLineEdit):
             score = 0
             
             # Check if option starts with full input string
-            if option.lower().startswith(text.lower()):
+            if option.lower().startswith(search_text.lower()):
                 score += 3
             
             # Check each input word against option words
@@ -147,7 +179,7 @@ class AutoCompleteLineEdit(QLineEdit):
             self.completer.setCompletionPrefix("")
         
         # Apply orange border if no matches found for non-empty input, preserve background
-        if text.strip() and not suggestions:
+        if text.strip() and not suggestions and not self.allow_free_text:
             self.setStyleSheet("QLineEdit { background-color: #2D2D2D; color: white; border: 2px solid orange; }")
         else:
             self.setStyleSheet("QLineEdit { background-color: #2D2D2D; color: white; }")
@@ -156,7 +188,7 @@ class AutoCompleteLineEdit(QLineEdit):
         """Handle completion of text editing"""
         self.suggestions_frozen = False
         text = self.text().strip()
-        if text and self.options:
+        if text and self.options and not self.allow_free_text:
             suggestions = self._calculate_suggestions(text)
             if not suggestions:
                 self.on_invalid_input(text)
@@ -164,6 +196,135 @@ class AutoCompleteLineEdit(QLineEdit):
     def on_invalid_input(self, text):
         """Override this method to handle invalid input cases"""
         pass
+
+
+class AutoExpandingTextEdit(QTextEdit):
+    """Wrapping free-text editor that grows its containing table row."""
+
+    editingFinished = Signal()
+
+    def __init__(self, parent=None, options=None, minimum_height=56, maximum_height=160,
+                 multi_value=False, allow_free_text=True):
+        super().__init__(parent)
+        self.options = options or []
+        self.multi_value = multi_value
+        self.allow_free_text = allow_free_text
+        self.minimum_editor_height = minimum_height
+        self.maximum_editor_height = maximum_height
+        self.setAcceptRichText(False)
+        self.setPlaceholderText("Information")
+        self.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.setStyleSheet("QTextEdit { background-color: #2D2D2D; color: white; padding: 5px; }")
+
+        self.completer = QCompleter(self)
+        self.completer.setCaseSensitivity(Qt.CaseInsensitive)
+        self.completer.setCompletionMode(QCompleter.PopupCompletion)
+        self.completer.setMaxVisibleItems(5)
+        self.completer.activated.connect(self._insert_completion)
+
+        self.textChanged.connect(self._on_text_changed)
+        self._refresh_completions()
+        self._adjust_height()
+
+    def text(self):
+        """Provide the QLineEdit-compatible API used by operation tables."""
+        return self.toPlainText()
+
+    def setText(self, text):
+        self.setPlainText(str(text or ""))
+
+    def _get_options_list(self):
+        if callable(self.options):
+            try:
+                return self.options() or []
+            except Exception as exc:
+                print(f"Error calling options method: {exc}")
+                return []
+        return self.options or []
+
+    def _current_fragment(self):
+        cursor = self.textCursor()
+        text = self.toPlainText()
+        position = cursor.position()
+        start = position
+        while start > 0 and text[start - 1] not in " ,;\n\t":
+            start -= 1
+        return text[start:position], start, position
+
+    def _refresh_completions(self):
+        fragment, _, _ = self._current_fragment()
+        options = self._get_options_list()
+        if not fragment.strip():
+            matches = []
+        else:
+            needle = fragment.casefold()
+            matches = [option for option in options if needle in str(option).casefold()]
+        self.completer.setModel(QStringListModel(matches, self.completer))
+        self.completer.setWidget(self)
+        return matches
+
+    def _on_text_changed(self):
+        matches = self._refresh_completions()
+        self._adjust_height()
+        if matches and self.hasFocus():
+            popup_rect = self.cursorRect()
+            popup_rect.setWidth(max(220, self.completer.popup().sizeHintForColumn(0) + 24))
+            self.completer.complete(popup_rect)
+        else:
+            self.completer.popup().hide()
+
+    def _insert_completion(self, completion):
+        if not self.multi_value:
+            self.setPlainText(str(completion))
+            cursor = self.textCursor()
+            cursor.movePosition(QTextCursor.End)
+            self.setTextCursor(cursor)
+            self.completer.popup().hide()
+            return
+
+        _, start, end = self._current_fragment()
+        cursor = self.textCursor()
+        cursor.setPosition(start)
+        cursor.setPosition(end, QTextCursor.KeepAnchor)
+        cursor.insertText(f"{completion}, ")
+        self.setTextCursor(cursor)
+        self.completer.popup().hide()
+
+    def keyPressEvent(self, event):
+        if self.completer.popup().isVisible() and event.key() in (
+            Qt.Key_Enter, Qt.Key_Return, Qt.Key_Tab, Qt.Key_Backtab,
+        ):
+            event.ignore()
+            return
+        super().keyPressEvent(event)
+
+    def resizeEvent(self, event):
+        super().resizeEvent(event)
+        self._adjust_height()
+
+    def focusOutEvent(self, event):
+        super().focusOutEvent(event)
+        self.editingFinished.emit()
+
+    def _adjust_height(self):
+        document_height = int(self.document().documentLayout().documentSize().height()) + 12
+        desired = max(self.minimum_editor_height, min(self.maximum_editor_height, document_height))
+        if self.minimumHeight() != desired or self.maximumHeight() != desired:
+            self.setFixedHeight(desired)
+
+        row = self.property('row')
+        parent = self.parentWidget()
+        while parent is not None and not isinstance(parent, QTableWidget):
+            parent = parent.parentWidget()
+        if parent is not None and row is not None:
+            row = int(row)
+            editor_heights = [
+                parent.cellWidget(row, column).height() + 2
+                for column in range(parent.columnCount())
+                if parent.cellWidget(row, column) is not None
+                and isinstance(parent.cellWidget(row, column), AutoExpandingTextEdit)
+            ]
+            parent.setRowHeight(row, max([58, *editor_heights]))
 
 
 class AutoCompleteDelegate(QStyledItemDelegate):

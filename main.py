@@ -3,18 +3,18 @@ Application entry point - initializes and starts the PySide6 application
 """
 import sys
 from PySide6.QtWidgets import QApplication
-from PySide6.QtCore import Qt
-from PySide6.QtGui import QGuiApplication, QIcon
+from PySide6.QtGui import QIcon
+from core.runtime_paths import resource_path
 from ui.main_window import MainWindow
- 
-
+from ui.theme import apply_dark_theme
 
 
 def main():
     """Application entry point"""
     app = QApplication(sys.argv)
-    app.setWindowIcon(QIcon("logo.png"))
-    QGuiApplication.styleHints().setColorScheme(Qt.ColorScheme.Dark)
+    app.setApplicationName("PyLocalInventory")
+    app.setWindowIcon(QIcon(resource_path("logo.png")))
+    apply_dark_theme(app)
 
     # Create and show main window
     window = MainWindow()

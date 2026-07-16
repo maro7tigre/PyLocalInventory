@@ -5,12 +5,13 @@ Unified table experience for all entities (Products, Clients, Suppliers, Sales, 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
                                QMessageBox, QPushButton, QAbstractItemView,
-                               QStyledItemDelegate, QLineEdit, QComboBox)
+                               QStyledItemDelegate, QLineEdit, QComboBox, QStyle,
+                               QApplication, QStyleOptionViewItem)
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QSize, QTimer
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
-from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingTextEdit
 from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
 from datetime import datetime
@@ -47,24 +48,73 @@ class BaseTableDelegate(QStyledItemDelegate):
         param_info = self.base_tab.get_column_param_info(column_key)
         options = param_info.get('options', [])
         
-        if options:
-            # Use autocomplete for columns with options
+        if param_info.get('type', 'string') == 'string':
+            editor = AutoExpandingTextEdit(
+                parent,
+                options=options,
+                multi_value=param_info.get('multi_value', False),
+                allow_free_text=param_info.get('allow_free_text', True),
+            )
+        elif options:
             editor = AutoCompleteLineEdit(parent, options)
         else:
-            # Regular line edit for other editable columns
             editor = QLineEdit(parent)
         
         return editor
+
+    def sizeHint(self, option, index):
+        """Grow rows for wrapped text, including long strings without spaces."""
+        text = str(index.data(Qt.DisplayRole) or "")
+        if not text:
+            return super().sizeHint(option, index)
+
+        column_width = self.base_tab.table.columnWidth(index.column())
+        available_width = max(40, column_width - 16)
+        bounds = option.fontMetrics.boundingRect(
+            0,
+            0,
+            available_width,
+            10000,
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap | Qt.TextWrapAnywhere,
+            text,
+        )
+        return QSize(column_width, max(70, bounds.height() + 16))
+
+    def paint(self, painter, option, index):
+        """Paint overflowing cell text with wrapping instead of ellipsis."""
+        text = str(index.data(Qt.DisplayRole) or "")
+        available_width = max(40, option.rect.width() - 16)
+        needs_wrap = "\n" in text or option.fontMetrics.horizontalAdvance(text) > available_width
+        if not needs_wrap:
+            super().paint(painter, option, index)
+            return
+
+        styled_option = QStyleOptionViewItem(option)
+        self.initStyleOption(styled_option, index)
+        painter.save()
+        style = styled_option.widget.style() if styled_option.widget else QApplication.style()
+        style.drawPrimitive(QStyle.PE_PanelItemViewItem, styled_option, painter, styled_option.widget)
+        selected = bool(styled_option.state & QStyle.State_Selected)
+        painter.setPen(
+            styled_option.palette.highlightedText().color()
+            if selected else styled_option.palette.text().color()
+        )
+        painter.drawText(
+            styled_option.rect.adjusted(8, 5, -8, -5),
+            Qt.AlignLeft | Qt.AlignVCenter | Qt.TextWordWrap | Qt.TextWrapAnywhere,
+            text,
+        )
+        painter.restore()
     
     def setEditorData(self, editor, index):
         """Set current cell value in editor"""
         value = index.model().data(index, Qt.EditRole)
-        if isinstance(editor, (QLineEdit, AutoCompleteLineEdit)):
+        if isinstance(editor, (QLineEdit, AutoCompleteLineEdit, AutoExpandingTextEdit)):
             editor.setText(str(value) if value else "")
     
     def setModelData(self, editor, model, index):
         """Set editor value back to model and update database"""
-        if isinstance(editor, (QLineEdit, AutoCompleteLineEdit)):
+        if isinstance(editor, (QLineEdit, AutoCompleteLineEdit, AutoExpandingTextEdit)):
             new_value = editor.text()
             old_value = model.data(index, Qt.EditRole)
             
@@ -205,8 +255,12 @@ class BaseTab(QWidget):
 
         # Table properties
         header = self.table.horizontalHeader()
+        header.sectionResized.connect(
+            lambda *_: QTimer.singleShot(0, self.table.resizeRowsToContents)
+        )
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
         self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.table.setSelectionMode(QAbstractItemView.SingleSelection)
 
@@ -649,6 +703,7 @@ class BaseTab(QWidget):
                     except:
                         item = QTableWidgetItem("Error")
                         self.table.setItem(row, col, item)
+        self.table.resizeRowsToContents()
     
     def get_preview_category(self):
         """Override in subclasses to specify preview category"""

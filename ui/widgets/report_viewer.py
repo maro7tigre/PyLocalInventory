@@ -63,6 +63,7 @@ class ReportViewerWidget(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
         layout.addWidget(self.table)
     
     def set_report_data(self, headers, data, summary=None):
@@ -80,6 +81,7 @@ class ReportViewerWidget(QWidget):
         for row, item in enumerate(data):
             for col, value in enumerate(item):
                 self.table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.table.resizeRowsToContents()
         
         # Update summary if provided
         if summary:

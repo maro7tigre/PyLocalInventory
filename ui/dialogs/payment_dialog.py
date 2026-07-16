@@ -47,7 +47,7 @@ class PaymentDialog(QDialog):
         self.sale_obj = sale_obj
         self.database = database
         self.config = config or {}
-        self.currency = self.config.get('currency', 'DA')
+        self.currency = self.config.get('currency', 'MAD')
         self.setWindowTitle(f"Payment — Sale #{sale_obj.id}")
         self.setMinimumWidth(440)
         self.setFixedWidth(440)

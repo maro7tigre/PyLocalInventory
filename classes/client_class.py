@@ -52,6 +52,15 @@ class ClientClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "ice": {
+                "value": "",
+                "display_name": {"en": "ICE", "fr": "ICE", "es": "ICE"},
+                "required": False,
+                "default": "",
+                "options": [],
+                # Keep this as text so leading zeroes are never lost.
+                "type": "string"
+            },
             "email": {
                 "value": "",
                 "display_name": {"en": "Email", "fr": "Email", "es": "Correo Electrónico"},
@@ -101,6 +110,7 @@ class ClientClass(BaseClass):
                 "name": "rw",
                 "client_type": "rw",
                 "address": "rw",
+                "ice": "rw",
                 "email": "rw",
                 "phone": "rw",
                 "notes": "rw",
@@ -111,6 +121,7 @@ class ClientClass(BaseClass):
                 "name": "rw",
                 "client_type": "rw",
                 "address": "rw",
+                "ice": "rw",
                 "email": "rw",
                 "phone": "rw",
                 "notes": "rw",
@@ -123,6 +134,7 @@ class ClientClass(BaseClass):
                 "display_name": "r",
                 "client_type": "r",
                 "address": "r",
+                "ice": "r",
                 "email": "r",
                 "phone": "r"
             }

@@ -6,10 +6,11 @@ not tied to any one of them.
 """
 import json
 import os
+from core.runtime_paths import portable_dir
 
 import psycopg2
 
-CONFIG_PATH = os.path.join("profiles", "_server_config.json")
+CONFIG_PATH = os.path.join(portable_dir("profiles"), "_server_config.json")
 
 DEFAULT_CONFIG = {
     "host": "localhost",

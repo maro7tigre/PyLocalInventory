@@ -10,7 +10,7 @@ class ReceiptDialog(QDialog):
     """Printable payment receipt."""
 
     def __init__(self, sale_id, client, order_date, payment_date,
-                 total, amount_this, total_paid, remaining, parent=None, currency='DA'):
+                 total, amount_this, total_paid, remaining, parent=None, currency='MAD'):
         super().__init__(parent)
         self.setWindowTitle("Payment Receipt")
         self.setMinimumWidth(500)

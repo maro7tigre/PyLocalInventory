@@ -7,12 +7,15 @@ import shutil
 import time
 
 from core.database import Database
+from core.runtime_paths import portable_dir
 
 class ProfileManager:
     def __init__(self):
         self.selected_profile : ProfileClass = None
         self.available_profiles = {}
-        self.profiles_path = "./profiles"
+        # Never depend on the process working directory. Windows Startup often
+        # launches applications from a protected system directory.
+        self.profiles_path = portable_dir("profiles")
 
         self.empty_profile = ProfileClass("")
         empty_values = {

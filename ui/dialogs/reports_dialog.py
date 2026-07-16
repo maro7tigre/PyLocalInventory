@@ -9,11 +9,15 @@ import subprocess
 import tempfile
 import shutil
 import html
+from pathlib import Path
 from datetime import datetime, timedelta
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QMarginsF, QUrl
+from PySide6.QtGui import QTextDocument, QPageLayout, QPageSize, QColor
+from PySide6.QtPrintSupport import QPrinter
 from ui.widgets.themed_widgets import BlueButton, RedButton
+from core.runtime_paths import resource_path
 import base64
 
 
@@ -172,7 +176,7 @@ class ReportsDialog(QDialog):
     def _generate_html_content(self, report_type):
         """Generate HTML content based on report type"""
         # Get template path - all templates have _templet suffix
-        template_path = os.path.join("report", f"{report_type}_templet.html")
+        template_path = resource_path("report", f"{report_type}_templet.html")
         
         if not os.path.exists(template_path):
             raise Exception(f"Template file not found: {template_path}")
@@ -191,15 +195,14 @@ class ReportsDialog(QDialog):
     
     def _get_lamidap_logo_block(self):
         """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
-        logo_path = os.path.normpath(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'lamidap_logo.png'
-        ))
+        logo_path = resource_path('report', 'lamidap_logo.png')
         try:
             with open(logo_path, 'rb') as img_f:
                 b64 = base64.b64encode(img_f.read()).decode('ascii')
             return (
                 f'<img src="data:image/png;base64,{b64}" '
-                f'style="max-width: 150px; max-height: 90px; object-fit: contain; display: block; margin-bottom: 6px;" />'
+                f'class="report-logo" width="120" '
+                f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
             )
         except Exception:
             return '<div class="logo-placeholder">LOGO</div>'
@@ -231,21 +234,32 @@ class ReportsDialog(QDialog):
             date = self.sales_obj.get_value('date') or datetime.now().strftime("%d-%m-%Y")
             total_price = self.sales_obj.get_value('total_price') or 0
 
-            # Look up the client's own address/phone for the delivery note client block
+            # Look up the client's contact details for the report customer block.
             client_address = ""
             client_phone = ""
+            client_email = ""
+            client_ice = ""
             client_id = self.sales_obj.get_value('client_id')
-            if client_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+            if hasattr(self.sales_obj, 'database') and self.sales_obj.database:
                 try:
-                    self.sales_obj.database.cursor.execute(
-                        "SELECT address, phone FROM Clients WHERE ID = %s", (client_id,)
-                    )
+                    if client_id:
+                        self.sales_obj.database.cursor.execute(
+                            "SELECT address, phone, email, ice FROM Clients WHERE ID = %s", (client_id,)
+                        )
+                    else:
+                        self.sales_obj.database.cursor.execute(
+                            "SELECT address, phone, email, ice FROM Clients WHERE username = %s", (client_username,)
+                        )
                     client_row = self.sales_obj.database.cursor.fetchone()
                     if client_row:
                         client_address = client_row[0] or ""
                         client_phone = client_row[1] or ""
+                        client_email = client_row[2] or ""
+                        client_ice = client_row[3] or ""
                 except Exception as e:
-                    print(f"DEBUG: Error getting client address/phone: {e}")
+                    print(f"DEBUG: Error getting client contact details: {e}")
+
+            sale_notes = self.sales_obj.get_value('notes') or ""
 
             # Generate document reference
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
@@ -254,6 +268,30 @@ class ReportsDialog(QDialog):
             # Get sales items - ensure they are loaded from database
             items_html = ""
             total_quantity = 0
+
+            # BDL uses the service catalog to exclude product-only rows.
+            report_services = []
+            if report_type == 'bdl' and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                try:
+                    self.sales_obj.database.cursor.execute(
+                        "SELECT id, name, description, keywords FROM Services "
+                        "WHERE name IS NOT NULL AND name != '' ORDER BY id"
+                    )
+                    for service_id, service_name, description, keywords in self.sales_obj.database.cursor.fetchall():
+                        aliases = [service_name]
+                        aliases.extend(
+                            part.strip()
+                            for part in str(keywords or '').replace('\n', ',').replace(';', ',').split(',')
+                            if part.strip()
+                        )
+                        report_services.append({
+                            'id': service_id,
+                            'name': service_name,
+                            'description': description or '',
+                            'aliases': {str(alias).strip().casefold() for alias in aliases if alias},
+                        })
+                except Exception as e:
+                    print(f"DEBUG: Error loading report services: {e}")
             
             # Load sales items if not already loaded
             if not hasattr(self.sales_obj, 'items') or not self.sales_obj.items:
@@ -281,17 +319,16 @@ class ReportsDialog(QDialog):
                     except Exception as e:
                         print(f"DEBUG: Error loading sales items: {e}")
             
-            devis_rows = []  # rows for devis/facture full-table rendering
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
                 total_ht = 0
                 for item in self.sales_obj.items:
                     product_name = item.get_value('product_name') or ""
                     item_information = item.get_value('information') or ""
+                    product_id = item.get_value('product_id') or ""
                     
                     # If product_name is empty, try to get it from product_id
                     if not product_name:
-                        product_id = item.get_value('product_id')
                         if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
                             try:
                                 # Get product name from Products table
@@ -307,6 +344,7 @@ class ReportsDialog(QDialog):
                     quantity = item.get_value('quantity') or 0
                     unit_price = item.get_value('unit_price') or 0
                     subtotal = item.get_value('subtotal') or (quantity * unit_price)
+                    product_token = str(product_name or '').strip().casefold()
                     
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
@@ -314,47 +352,67 @@ class ReportsDialog(QDialog):
                     total_ht += float(subtotal) if subtotal else 0
                     
                     if report_type == 'bdl':
-                        # Bon de livraison: Qté, Désignation, Dimension, P.U, Total
-                        dimension_html = html.escape(str(item_information)) if item_information else "&nbsp;"
-                        row_html = (
-                            f"<tr>"
-                            f"<td>{quantity}</td>"
-                            f"<td style=\"text-align: left\">{html.escape(str(product_name))}</td>"
-                            f"<td>{dimension_html}</td>"
-                            f"<td>{_fmt_fr(unit_price)}</td>"
-                            f"<td>{_fmt_fr(subtotal)}</td>"
-                            f"</tr>"
+                        info_tokens = {
+                            part.strip().casefold()
+                            for part in str(item_information or '').replace('\n', ',').replace(';', ',').split(',')
+                            if part.strip()
+                        }
+                        matched_services = [
+                            service for service in report_services
+                            if product_token in service['aliases']
+                            or bool(info_tokens.intersection(service['aliases']))
+                        ]
+
+                        # A delivery note contains services only. Product-only
+                        # sale rows stay stored and remain visible in Devis.
+                        if not matched_services:
+                            continue
+
+                        service_codes = " / ".join(html.escape(str(service['id'])) for service in matched_services)
+                        designation_html = "<br>".join(
+                            html.escape(str(service['name'])) for service in matched_services
                         )
-                        items_html += row_html + "\n"
+                        row_html = (
+                            f"<tr><td>{service_codes}</td>"
+                            f"<td>{designation_html}</td>"
+                            f"<td>{quantity}</td></tr>"
+                        )
+                    elif report_type == 'devis':
+                        product_code = html.escape(str(product_id)) if product_id else "-"
+                        designation_html = html.escape(str(product_name))
+                        if item_information:
+                            designation_html += (
+                                f'<span class="item-detail">{html.escape(str(item_information))}</span>'
+                            )
+                        row_html = (
+                            f"<tr><td>{product_code}</td>"
+                            f"<td>{designation_html}</td>"
+                            f"<td>{quantity}</td>"
+                            f"<td>{_fmt_fr(unit_price)}</td>"
+                            f"<td>{_fmt_fr(subtotal)}</td></tr>"
+                        )
                     else:
                         designation_html = html.escape(str(product_name))
                         if item_information:
                             designation_html += (
-                                f" <span style=\"font-size: 10px; color: #333;\">"
-                                f"{html.escape(str(item_information))}</span>"
+                                f'<span class="item-detail">{html.escape(str(item_information))}</span>'
                             )
-
+                        # Preserve the existing four-column facture presentation.
                         row_html = (
-                            f"<tr>"
-                            f"<td style=\"text-align: left\">{designation_html}</td>"
+                            f"<tr><td>{designation_html}</td>"
                             f"<td>{quantity}</td>"
                             f"<td>{_fmt_fr(unit_price)}</td>"
-                            f"<td>{_fmt_fr(subtotal)}</td>"
-                            f"</tr>"
+                            f"<td>{_fmt_fr(subtotal)}</td></tr>"
                         )
-                        items_html += row_html + "\n"
-                        # For Devis paginated tables
-                        devis_rows.append(row_html)
-                # Add filler rows to visually fill the table area to the footer
+
+                    items_html += row_html + "\n"
+                if report_type == 'bdl' and not items_html.strip():
+                    items_html = '<tr class="empty-row"><td colspan="3">Aucun service</td></tr>'
+                # Do not add visual filler rows; they stretch the printable report table.
                 try:
                     current_rows = len(self.sales_obj.items)
-                    # Target rows per page tuned for current CSS; adjust if needed.
-                    # BDL's taller letterhead/title/client-info block leaves less
-                    # room than the other templates, so it needs fewer filler rows
-                    # to keep the totals/signature on the same page.
-                    target_rows = 18 if report_type == 'bdl' else 22
-                    filler_needed = max(0, target_rows - current_rows)
-                    filler_cols = 5 if report_type == 'bdl' else 4
+                    filler_needed = 0
+                    filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
                     filler_row = (
                         '<tr class="filler">'
                         + '<td style="text-align: left">&nbsp;</td>'
@@ -366,9 +424,9 @@ class ReportsDialog(QDialog):
                     pass
             else:
                 print("DEBUG: No sales items found")
-                filler_cols = 5 if report_type == 'bdl' else 4
-                items_html = f'<tr><td colspan="{filler_cols}">No items found for this sale</td></tr>'
-                devis_rows = []
+                filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
+                empty_label = 'Aucun service' if report_type == 'bdl' else 'Aucun article'
+                items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
                 total_ht = 0
             
             # Calculate financial totals for devis
@@ -383,67 +441,9 @@ class ReportsDialog(QDialog):
             tva_amount = total_ht * tva_rate
             total_ttc = total_ht + tva_amount
             
-            # Build items HTML based on report type
-            if report_type == 'devis':
-                # For devis, use the paginated logic
-                devis_items_html = ""
-                # Row capacities (calibrated):
-                # - single page (header+table+totals) => base-2
-                # - first of multi (header+table)     => base+1
-                # - middle pages (table only)         => base+10
-                # - last page (table+totals)          => base-4
-                BASE = 18
-                rows_one_page = 21                # single page needs more rows
-                rows_first_multi = 25             # first page of multi needs more rows
-                rows_middle = 29                  # middle pages a bit more
-                rows_last = 29                    # last page a lot more rows before totals
-
-                total_rows = len(devis_rows)
-                if total_rows == 0:
-                    # Render a single empty table with one filler row so borders appear
-                    pages = [(0, rows_one_page)]
-                elif total_rows <= rows_one_page:
-                    pages = [(total_rows, rows_one_page)]
-                else:
-                    remaining = total_rows
-                    pages = []
-                    # First page (no bottom yet)
-                    take = min(remaining, rows_first_multi)
-                    pages.append((take, rows_first_multi))
-                    remaining -= take
-                    # Middle pages
-                    while remaining > rows_last:
-                        take = min(remaining, rows_middle)
-                        pages.append((take, rows_middle))
-                        remaining -= take
-                    # Last page
-                    pages.append((remaining, rows_last))
-
-                # Build HTML tables with page breaks
-                cursor = 0
-                for idx, (take, capacity) in enumerate(pages):
-                    page_rows = devis_rows[cursor:cursor + take]
-                    cursor += take
-                    fillers = max(0, capacity - len(page_rows))
-                    block_class = "items-block page-break" if idx < len(pages) - 1 else "items-block"
-                    table_html = [f'<div class="{block_class}">']
-                    table_html.append('<table>')
-                    table_html.append('<thead><tr>'
-                                      '<th>Désignation</th>'
-                                      '<th>Qté</th>'
-                                      '<th>P.U HT</th>'
-                                      '<th>Total HT</th>'
-                                      '</tr></thead>')
-                    table_html.append('<tbody>')
-                    table_html.extend(page_rows)
-                    for _ in range(fillers):
-                        table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
-                    table_html.append('</tbody></table></div>')
-                    devis_items_html += "".join(table_html)
-                items_final = devis_items_html
-            else:
-                # For BDL, use simple table format (items_html already includes proper table structure)
-                items_final = items_html
+            # The templates own the table structure so print engines can repeat
+            # its header and paginate rows naturally.
+            items_final = items_html
 
             # No separate BDL logic anymore
             total_qte_commandee = 0
@@ -463,6 +463,10 @@ class ReportsDialog(QDialog):
                 'client_name': client_name,
                 'client_address': client_address,
                 'client_phone': client_phone,
+                'client_email': client_email,
+                'client_ice': html.escape(str(client_ice)),
+                'sale_notes': html.escape(str(sale_notes)).replace('\n', '<br>'),
+                'payment_terms': '',
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
                 # New financial fields for devis
@@ -490,8 +494,12 @@ class ReportsDialog(QDialog):
                 'client_name': 'Client Name',
                 'client_address': '',
                 'client_phone': '',
+                'client_email': '',
+                'client_ice': '',
+                'sale_notes': '',
+                'payment_terms': '',
                 'commercial': 'Sales Team',
-                'items': '<tr><td colspan="4">No items found</td></tr>',
+                'items': f'<tr><td colspan="{5 if report_type == "devis" else (3 if report_type == "bdl" else 4)}">No items found</td></tr>',
                 # Financial fields for devis
                 'total_remise': '0,00',
                 'total_ht': '0,00',
@@ -514,35 +522,47 @@ class ReportsDialog(QDialog):
     def _html_to_pdf(self, html_content, output_path):
         """Convert HTML to PDF with full CSS support"""
         try:
+            errors = []
+            def _safe_error(error):
+                return str(error).encode('ascii', 'backslashreplace').decode('ascii')
+
+            base_url = os.path.abspath(resource_path("report"))
+            os.makedirs(base_url, exist_ok=True)
             # Create a temporary HTML file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8', dir=base_url) as temp_html:
                 temp_html.write(html_content)
                 temp_html_path = temp_html.name
-            
+
             # Try playwright first (best CSS support)
             try:
                 from playwright.sync_api import sync_playwright
                 print("DEBUG: Using Playwright for PDF generation")
                 
                 with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
+                    try:
+                        browser = p.chromium.launch(headless=True)
+                    except Exception:
+                        executable = self._find_installed_chromium()
+                        if not executable:
+                            raise
+                        print(f"DEBUG: Using installed Chromium executable: {executable}")
+                        browser = p.chromium.launch(headless=True, executable_path=executable)
                     page = browser.new_page()
-                    page.set_content(html_content, wait_until='networkidle')
+                    page.emulate_media(media="print")
+                    page.goto(Path(temp_html_path).as_uri(), wait_until='networkidle')
                     
                     # Configure PDF options for A4 size with proper margins and page breaks
                     pdf_options = {
                         'path': output_path,
                         'format': 'A4',
-                        'margin': {
-                            'top': '0.5in',
-                            'bottom': '0.5in', 
-                            'left': '0.5in',
-                            'right': '0.5in'
-                        },
                         'print_background': True,
-                        'prefer_css_page_size': False,
-                        'width': '8.27in',  # A4 width
-                        'height': '11.69in'  # A4 height
+                        'prefer_css_page_size': True,
+                        'margin': {
+                            'top': '0',
+                            'bottom': '0',
+                            'left': '0',
+                            'right': '0'
+                        }
                     }
                     
                     page.pdf(**pdf_options)
@@ -552,11 +572,32 @@ class ReportsDialog(QDialog):
                 print(f"DEBUG: Successfully generated PDF with Playwright: {output_path}")
                 return output_path
             except ImportError:
+                errors.append("Playwright not available")
                 print("DEBUG: Playwright not available")
                 pass
             except Exception as e:
-                print(f"DEBUG: Playwright failed: {e}")
+                message = _safe_error(e)
+                errors.append(f"Playwright failed: {message}")
+                print(f"DEBUG: Playwright failed: {message}")
             
+            # Try WeasyPrint next (good print CSS support)
+            try:
+                import weasyprint
+                print("DEBUG: Using WeasyPrint for PDF generation")
+                html = weasyprint.HTML(string=html_content, base_url=base_url)
+                html.write_pdf(output_path)
+                os.unlink(temp_html_path)
+                print(f"DEBUG: Successfully generated PDF with WeasyPrint: {output_path}")
+                return output_path
+            except ImportError:
+                errors.append("WeasyPrint not available")
+                print("DEBUG: WeasyPrint not available")
+                pass
+            except Exception as e:
+                message = _safe_error(e)
+                errors.append(f"WeasyPrint failed: {message}")
+                print(f"DEBUG: WeasyPrint failed: {message}")
+
             # Try xhtml2pdf as fallback (limited CSS support)
             try:
                 from xhtml2pdf import pisa
@@ -564,35 +605,29 @@ class ReportsDialog(QDialog):
                 
                 with open(output_path, "wb") as result_file:
                     # Convert HTML to PDF
-                    pisa_status = pisa.CreatePDF(html_content, dest=result_file)
+                    pisa_status = pisa.CreatePDF(
+                        html_content,
+                        dest=result_file,
+                        path=temp_html_path,
+                        encoding='utf-8'
+                    )
                     
                     if not pisa_status.err:
                         os.unlink(temp_html_path)
                         print(f"DEBUG: Successfully generated PDF with xhtml2pdf: {output_path}")
                         return output_path
                     else:
+                        errors.append(f"xhtml2pdf reported errors: {pisa_status.err}")
                         print(f"DEBUG: xhtml2pdf reported errors: {pisa_status.err}")
                         
             except ImportError:
+                errors.append("xhtml2pdf not available")
                 print("DEBUG: xhtml2pdf not available")
                 pass
             except Exception as e:
-                print(f"DEBUG: xhtml2pdf failed: {e}")
-            
-            # Try weasyprint third
-            try:
-                import weasyprint
-                print("DEBUG: Using WeasyPrint for PDF generation")
-                html = weasyprint.HTML(string=html_content)
-                html.write_pdf(output_path)
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with WeasyPrint: {output_path}")
-                return output_path
-            except ImportError:
-                print("DEBUG: WeasyPrint not available")
-                pass
-            except Exception as e:
-                print(f"DEBUG: WeasyPrint failed: {e}")
+                message = _safe_error(e)
+                errors.append(f"xhtml2pdf failed: {message}")
+                print(f"DEBUG: xhtml2pdf failed: {message}")
             
             # Try pdfkit as last resort
             try:
@@ -608,44 +643,59 @@ class ReportsDialog(QDialog):
                     'encoding': "UTF-8",
                     'no-outline': None
                 }
-                pdfkit.from_string(html_content, output_path, options=options)
+                pdfkit.from_file(temp_html_path, output_path, options=options)
                 os.unlink(temp_html_path)
                 print(f"DEBUG: Successfully generated PDF with PDFKit: {output_path}")
                 return output_path
             except ImportError:
+                errors.append("PDFKit not available")
                 print("DEBUG: PDFKit not available")
                 pass
             except Exception as e:
-                print(f"DEBUG: PDFKit failed: {e}")
+                message = _safe_error(e)
+                errors.append(f"PDFKit failed: {message}")
+                print(f"DEBUG: PDFKit failed: {message}")
+
+            # Last-resort built-in backend. Normal reports use Playwright above,
+            # preserving the existing HTML/CSS template design.
+            try:
+                printer = QPrinter(QPrinter.HighResolution)
+                printer.setOutputFormat(QPrinter.PdfFormat)
+                printer.setOutputFileName(output_path)
+                printer.setPageSize(QPageSize(QPageSize.A4))
+                printer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter)
+                document = QTextDocument()
+                document.setBaseUrl(QUrl.fromLocalFile(base_url + os.sep))
+                document.setHtml(html_content)
+                root_format = document.rootFrame().frameFormat()
+                root_format.setBackground(QColor("#ffffff"))
+                document.rootFrame().setFrameFormat(root_format)
+                document.setPageSize(printer.pageRect(QPrinter.Point).size())
+                document.print_(printer)
+                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
+                    os.unlink(temp_html_path)
+                    print(f"DEBUG: Successfully generated fallback PDF with Qt: {output_path}")
+                    return output_path
+                errors.append("Qt PDF backend produced no output")
+            except Exception as e:
+                message = _safe_error(e)
+                errors.append(f"Qt PDF backend failed: {message}")
+                print(f"DEBUG: Qt PDF backend failed: {message}")
             
             # If PDF generation fails, save as HTML with proper extension
             print("DEBUG: Falling back to HTML generation")
             html_output_path = output_path.replace('.pdf', '.html')
             with open(html_output_path, 'w', encoding='utf-8') as f:
-                f.write(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Sales Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: white; color: black; }}
-        .notice {{ background: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; margin: 10px 0; border-radius: 4px; }}
-    </style>
-</head>
-<body>
-    <div class="notice">
-        <strong>Note:</strong> PDF generation failed. This is an HTML version of your report. 
-        For proper PDF generation, ensure weasyprint is properly installed.
-    </div>
-    {html_content}
-</body>
-</html>
-                """)
+                f.write(html_content)
             
             # Clean up temporary file
             os.unlink(temp_html_path)
             print(f"DEBUG: Generated HTML fallback: {html_output_path}")
-            return html_output_path
+            raise Exception(
+                "PDF generation failed. HTML fallback was saved to:\n"
+                f"{html_output_path}\n\n"
+                "PDF backend errors:\n- " + "\n- ".join(errors)
+            )
             
         except Exception as e:
             # Clean up temporary file if it exists
@@ -657,6 +707,26 @@ class ReportsDialog(QDialog):
             print(f"DEBUG: HTML to PDF conversion failed: {e}")
             print(f"DEBUG: Output path: {output_path}")
             raise Exception(f"Failed to convert HTML to PDF: {str(e)}")
+
+    @staticmethod
+    def _find_installed_chromium():
+        """Find a usable Playwright/Chrome executable when revisions differ."""
+        local_appdata = os.getenv('LOCALAPPDATA') or ''
+        program_files = os.getenv('PROGRAMFILES') or ''
+        candidates = []
+        candidates.extend(glob.glob(os.path.join(
+            local_appdata, 'ms-playwright', 'chromium_headless_shell-*',
+            'chrome-headless-shell-win64', 'chrome-headless-shell.exe'
+        )))
+        candidates.extend(glob.glob(os.path.join(
+            local_appdata, 'ms-playwright', 'chromium-*', 'chrome-win64', 'chrome.exe'
+        )))
+        candidates.extend([
+            os.path.join(local_appdata, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            os.path.join(program_files, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ])
+        existing = [path for path in candidates if path and os.path.isfile(path)]
+        return max(existing, key=os.path.getmtime) if existing else None
     
 
     

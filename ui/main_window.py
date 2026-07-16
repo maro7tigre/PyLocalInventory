@@ -2,6 +2,8 @@
 Main window - Updated with unified tabs approach
 All tabs now use consistent BaseTab experience
 """
+import os
+
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QSettings
@@ -37,10 +39,19 @@ from classes.import_item_class import ImportItemClass
 from classes.reports_class import ReportsClass
 
 from core.profiles import ProfileManager
+from core.runtime_paths import portable_dir
 from core.password import PasswordManager
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
+from core.user_settings import (
+    load_settings,
+    remember_profile_enabled,
+    get_remembered_profile_id,
+    set_remembered_profile,
+    clear_remembered_profile,
+    set_startup_enabled,
+)
 
 
 class MainWindow(ThemedMainWindow):
@@ -52,6 +63,8 @@ class MainWindow(ThemedMainWindow):
         # Load application settings
         self.settings = QSettings("PyLocalInventory", "MainApp")
         self.load_app_config()
+        self.user_settings = load_settings()
+        self.ensure_startup_registration()
         
         # Core managers
         self.profile_manager = ProfileManager()
@@ -113,8 +126,12 @@ class MainWindow(ThemedMainWindow):
         if geometry:
             self.restoreGeometry(geometry)
         
-        # Load profiles path (default to ./profiles)
-        profiles_path = self.settings.value("profiles_path", "./profiles")
+        # Use an absolute default because Startup shortcuts have an unrelated
+        # working directory (commonly C:\\Windows\\System32).
+        profiles_path = self.settings.value("profiles_path", portable_dir("profiles"))
+        if not os.path.isabs(profiles_path):
+            # Migrate the legacy "./profiles" preference to per-user storage.
+            profiles_path = portable_dir("profiles")
         self.profiles_path = profiles_path
 
         # Load language (default to 'en')
@@ -145,15 +162,31 @@ class MainWindow(ThemedMainWindow):
             'reports':   _bool(self.settings.value("tab_visible/reports")),
         }
     
+    def ensure_startup_registration(self):
+        """Ensure startup registration state is consistent with saved settings."""
+        if self.user_settings.get("start_with_windows"):
+            try:
+                set_startup_enabled(True)
+            except Exception as exc:
+                print(f"Warning: could not enable startup registration: {exc}")
+
     def load_saved_profile(self):
-        """Load the last selected profile from config"""
+        """Load the last selected profile from config or the remembered profile settings."""
+        self.profile_manager.profiles_path = self.profiles_path
+        self.profile_manager.load_profiles()
+
+        # Prefer the remembered profile stored in per-user settings
+        remembered_profile_name = get_remembered_profile_id(self.user_settings)
+        if remembered_profile_name:
+            if self.profile_manager.load_profile(remembered_profile_name):
+                print(f"✓ Loaded remembered profile: {remembered_profile_name}")
+                return
+            print(f"⚠️  Could not load remembered profile: {remembered_profile_name}")
+            clear_remembered_profile(self.user_settings)
+
+        # Fall back to the last selected profile stored in QSettings
         saved_profile_name = self.settings.value("selected_profile")
         if saved_profile_name:
-            # Set profiles path first
-            self.profile_manager.profiles_path = self.profiles_path
-            self.profile_manager.load_profiles()
-            
-            # Try to load the saved profile
             if self.profile_manager.load_profile(saved_profile_name):
                 print(f"✓ Loaded saved profile: {saved_profile_name}")
             else:
@@ -165,7 +198,7 @@ class MainWindow(ThemedMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         
         # Save profiles path
-        self.settings.setValue("profiles_path", getattr(self, 'profiles_path', './profiles'))
+        self.settings.setValue("profiles_path", getattr(self, 'profiles_path', portable_dir("profiles")))
         
         # Save selected profile
         if self.profile_manager.selected_profile:
@@ -360,14 +393,16 @@ class MainWindow(ThemedMainWindow):
             return
 
         # Set profiles path in profile manager
-        self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
+        self.profile_manager.profiles_path = getattr(self, 'profiles_path', portable_dir("profiles"))
 
-        # First screen of a fresh launch is always the welcome/entry screen,
-        # regardless of a remembered profile - the user picks a profile or a
-        # network host explicitly every time the app starts.
+        # Show the remembered profile's password entry directly if the user has
+        # chosen to remember a profile and it is valid.
         if not self._initial_screen_shown:
             self._initial_screen_shown = True
-            self.setup_profile_selection()
+            if remember_profile_enabled(self.user_settings) and self.profile_manager.validate():
+                self.setup_password_entry()
+            else:
+                self.setup_profile_selection()
         elif not self.profile_manager.validate():
             self.setup_profile_selection()
         elif not self.password_manager.validate():
@@ -394,7 +429,14 @@ class MainWindow(ThemedMainWindow):
 
     def setup_password_entry(self):
         """Show password entry widget"""
-        password_widget = PasswordWidget(self.profile_manager.selected_profile)
+        self.user_settings = load_settings()
+        remember_checked = remember_profile_enabled(self.user_settings)
+        startup_checked = bool(self.user_settings.get("start_with_windows"))
+        password_widget = PasswordWidget(
+            self.profile_manager.selected_profile,
+            remember_profile=remember_checked,
+            startup_enabled=startup_checked,
+        )
         password_widget.password_submitted.connect(self.validate_password)
         password_widget.profile_change_requested.connect(self.open_profiles_dialog)
         self.main_layout.addWidget(password_widget)
@@ -649,7 +691,7 @@ class MainWindow(ThemedMainWindow):
         error_layout.addWidget(error_label, Qt.AlignCenter)
         self.main_layout.addWidget(error_widget)
     
-    def validate_password(self, password):
+    def validate_password(self, password, remember_profile=False, startup_enabled=False):
         """Validate entered password"""
         if not self.password_manager.validate(password):
             # Find the password widget and show error
@@ -659,12 +701,27 @@ class MainWindow(ThemedMainWindow):
                     widget.set_password_error()
                     break
             return False
+
+        self.password_manager.set_password(password)
+
+        # Persist profile preferences and Windows startup registration.
+        if remember_profile:
+            self.user_settings = set_remembered_profile(self.user_settings, self.profile_manager.selected_profile.name)
         else:
-            self.password_manager.set_password(password)
-            # Save the successful profile selection
-            self.save_app_config()
-            self.refresh_app()
-            return True
+            self.user_settings = clear_remembered_profile(self.user_settings)
+
+        try:
+            if startup_enabled:
+                set_startup_enabled(True)
+            else:
+                set_startup_enabled(False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Startup Registration", f"Could not update startup registration: {exc}")
+
+        # Save the successful profile selection
+        self.save_app_config()
+        self.refresh_app()
+        return True
     
     def open_profiles_dialog(self):
         """Open profiles management dialog"""
@@ -672,6 +729,11 @@ class MainWindow(ThemedMainWindow):
         if dialog.exec():
             # Profile may have changed, refresh the main window
             self.profiles_path = dialog.profiles_path
+            if self.user_settings.get("remember_profile") and self.profile_manager.selected_profile:
+                self.user_settings = set_remembered_profile(
+                    self.user_settings,
+                    self.profile_manager.selected_profile.name,
+                )
             # Save the new profile selection
             self.save_app_config()
             self.refresh_app()

@@ -70,10 +70,13 @@ class ClientsTab(BaseTab):
                 # Add usernames and client names
                 username = obj.get_value('username')
                 name = obj.get_value('name')
+                ice = obj.get_value('ice')
                 if username:
                     options.add(str(username))
                 if name:
                     options.add(str(name))
+                if ice:
+                    options.add(str(ice))
             except:
                 pass
         
@@ -92,7 +95,7 @@ class ClientsTab(BaseTab):
     
     def get_searchable_fields(self):
         """Get fields that can be searched for clients"""
-        return ['username', 'name']
+        return ['username', 'name', 'ice']
     
     def matches_search(self, obj, search_text):
         """Check if client matches search criteria"""
@@ -105,9 +108,11 @@ class ClientsTab(BaseTab):
         try:
             username = obj.get_value('username') or ""
             name = obj.get_value('name') or ""
+            ice = obj.get_value('ice') or ""
             
             if (search_lower in username.lower() or 
-                search_lower in name.lower()):
+                search_lower in name.lower() or
+                search_lower in ice.lower()):
                 return True
         except:
             pass

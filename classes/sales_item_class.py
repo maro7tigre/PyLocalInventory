@@ -65,6 +65,9 @@ class SalesItemClass(BaseClass):
                 "default": "",
                 "type": "string",
                 "autocomplete": True,
+                "allow_free_text": True,
+                "multi_value": True,
+                "auto_expand": True,
                 "options": self.get_service_keyword_options
             },
             "quantity": {

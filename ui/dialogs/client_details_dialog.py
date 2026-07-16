@@ -108,6 +108,7 @@ class ClientDetailsDialog(QDialog):
             ("Client ID", "id"),
             ("Username", "username"),
             ("Client Type", "client_type"),
+            ("ICE", "ice"),
             ("Phone", "phone"),
             ("Email", "email"),
             ("Address", "address"),

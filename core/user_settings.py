@@ -16,8 +16,13 @@ STARTUP_REG_NAME = "PyLocalInventory"
 DEFAULT_SETTINGS = {
     "remember_profile": False,
     "remembered_profile_id": "",
+    "remember_network_connection": False,
+    "remembered_network": {},
+    "startup_mode": "none",
     "start_with_windows": False,
 }
+
+VALID_STARTUP_MODES = {"none", "local_profile", "network_client"}
 
 
 def settings_dir() -> str:
@@ -48,15 +53,54 @@ def load_settings() -> dict:
                 return dict(DEFAULT_SETTINGS)
             settings = dict(DEFAULT_SETTINGS)
             settings.update(data)
+            if "startup_mode" not in data:
+                settings["startup_mode"] = (
+                    "local_profile"
+                    if data.get("remember_profile") and data.get("remembered_profile_id")
+                    else "none"
+                )
+            _normalize_settings(settings)
             return settings
     except (json.JSONDecodeError, OSError) as exc:
         print(f"Warning: Could not load settings file: {exc}")
         return dict(DEFAULT_SETTINGS)
 
 
+def _normalize_settings(settings: dict) -> dict:
+    """Validate remembered-session state and migrate legacy local settings."""
+    mode = settings.get("startup_mode")
+    if mode not in VALID_STARTUP_MODES:
+        mode = "local_profile" if settings.get("remember_profile") else "none"
+
+    network = settings.get("remembered_network")
+    if not isinstance(network, dict):
+        network = {}
+    try:
+        network_port = int(network.get("port", 0))
+    except (TypeError, ValueError):
+        network_port = 0
+    valid_network = bool(
+        settings.get("remember_network_connection")
+        and str(network.get("host") or "").strip()
+        and str(network.get("username") or "").strip()
+        and 1 <= network_port <= 65535
+    )
+    settings["remembered_network"] = network if valid_network else {}
+    settings["remember_network_connection"] = valid_network
+
+    valid_local = bool(settings.get("remember_profile") and settings.get("remembered_profile_id"))
+    if mode == "network_client" and not valid_network:
+        mode = "local_profile" if valid_local else "none"
+    elif mode == "local_profile" and not valid_local:
+        mode = "network_client" if valid_network else "none"
+    settings["startup_mode"] = mode
+    return settings
+
+
 def save_settings(settings: dict) -> dict:
     """Save settings atomically to the per-user JSON settings file."""
     settings = dict(DEFAULT_SETTINGS, **(settings or {}))
+    _normalize_settings(settings)
     path = settings_path()
     temp_path = f"{path}.tmp"
     try:
@@ -72,21 +116,22 @@ def save_settings(settings: dict) -> dict:
 
 
 def get_remembered_profile_id(settings: dict = None) -> str:
-    settings = settings or load_settings()
-    if not settings.get("remember_profile"):
+    settings = _normalize_settings(dict(settings or load_settings()))
+    if not settings.get("remember_profile") or settings.get("startup_mode") != "local_profile":
         return ""
     return str(settings.get("remembered_profile_id") or "")
 
 
 def remember_profile_enabled(settings: dict = None) -> bool:
-    settings = settings or load_settings()
-    return bool(settings.get("remember_profile"))
+    settings = _normalize_settings(dict(settings or load_settings()))
+    return bool(settings.get("remember_profile") and settings.get("startup_mode") == "local_profile")
 
 
 def set_remembered_profile(settings: dict, profile_id: str) -> dict:
     settings = dict(settings or load_settings())
     settings["remember_profile"] = True
     settings["remembered_profile_id"] = str(profile_id or "")
+    settings["startup_mode"] = "local_profile"
     return save_settings(settings)
 
 
@@ -94,6 +139,37 @@ def clear_remembered_profile(settings: dict) -> dict:
     settings = dict(settings or load_settings())
     settings["remember_profile"] = False
     settings["remembered_profile_id"] = ""
+    if settings.get("startup_mode") == "local_profile":
+        settings["startup_mode"] = "none"
+    return save_settings(settings)
+
+
+def get_remembered_network(settings: dict = None) -> dict:
+    settings = _normalize_settings(dict(settings or load_settings()))
+    if settings.get("startup_mode") != "network_client":
+        return {}
+    return dict(settings.get("remembered_network") or {})
+
+
+def set_remembered_network(settings: dict, host: str, port: int, username: str) -> dict:
+    settings = dict(settings or load_settings())
+    settings["remember_network_connection"] = True
+    settings["remembered_network"] = {
+        "host": str(host).strip(),
+        "port": int(port),
+        "username": str(username).strip(),
+        "connection_type": "network_client",
+    }
+    settings["startup_mode"] = "network_client"
+    return save_settings(settings)
+
+
+def clear_remembered_network(settings: dict) -> dict:
+    settings = dict(settings or load_settings())
+    settings["remember_network_connection"] = False
+    settings["remembered_network"] = {}
+    if settings.get("startup_mode") == "network_client":
+        settings["startup_mode"] = "none"
     return save_settings(settings)
 
 

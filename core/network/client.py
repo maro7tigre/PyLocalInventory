@@ -9,6 +9,7 @@ self.database to either a real Database or a RemoteDatabase and every tab/
 dialog/domain class keeps working unmodified.
 """
 import json
+import socket
 import urllib.error
 import urllib.request
 
@@ -122,10 +123,22 @@ class RemoteDatabase:
             if e.code == 401:
                 raise AuthError("Invalid username or password")
             raise RemoteError(f"Host rejected the connection ({e.code})")
-        except Exception as e:
-            raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
+        except (TimeoutError, socket.timeout):
+            raise ConnectionFailedError("Connection timed out")
+        except urllib.error.URLError as e:
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise ConnectionFailedError("Connection timed out")
+            if isinstance(reason, ConnectionRefusedError):
+                raise ConnectionFailedError("Server unavailable")
+            raise ConnectionFailedError("Unable to reach host")
+        except (json.JSONDecodeError, KeyError):
+            raise RemoteError("Server returned an invalid response")
+        except Exception:
+            raise ConnectionFailedError("Network error")
 
         self._token = data['token']
+        self._password = None
         self.permissions = data.get('permissions', {})
         self.is_superadmin = data.get('is_superadmin', False)
         return True

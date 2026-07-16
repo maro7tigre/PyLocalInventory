@@ -12,7 +12,7 @@ from PySide6.QtGui import QAction, QActionGroup
 from ui.widgets.themed_widgets import ThemedMainWindow
 from ui.widgets.welcome_widget import WelcomeWidget
 from ui.widgets.password_widget import PasswordWidget
-from ui.widgets.login_widget import LoginWidget
+from ui.widgets.login_widget import LoginWidget, NetworkUnlockWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.dialogs.network_dialog import NetworkDialog
@@ -50,6 +50,9 @@ from core.user_settings import (
     get_remembered_profile_id,
     set_remembered_profile,
     clear_remembered_profile,
+    get_remembered_network,
+    set_remembered_network,
+    clear_remembered_network,
     set_startup_enabled,
 )
 
@@ -73,8 +76,10 @@ class MainWindow(ThemedMainWindow):
         # Network state: 'standalone' (default, unaffected) or 'client' (connected
         # to a remote host instead of a local profile database). network_server is
         # only set when this instance is also hosting (super-admin toggled it on).
-        self.connection_mode = 'standalone'
+        self.remembered_network = get_remembered_network(self.user_settings)
+        self.connection_mode = 'client' if self.remembered_network else 'standalone'
         self._client_connected = False
+        self._network_unlock_mode = bool(self.remembered_network)
         self.network_server = None
         self.network_port = DEFAULT_PORT
         self.last_network_host = ''
@@ -387,7 +392,10 @@ class MainWindow(ThemedMainWindow):
 
         if self.connection_mode == 'client':
             if not self._client_connected:
-                self.setup_login_entry()
+                if self._network_unlock_mode and self.remembered_network:
+                    self.setup_network_unlock()
+                else:
+                    self.setup_login_entry()
             else:
                 self.setup_main_tabs()
             return
@@ -443,33 +451,56 @@ class MainWindow(ThemedMainWindow):
 
     def setup_login_entry(self):
         """Show the network login widget (client mode)"""
+        saved = self.remembered_network or {}
         login_widget = LoginWidget(
-            default_host=self.last_network_host,
-            default_port=str(self.network_port) if self.network_port else ''
+            default_host=saved.get("host", self.last_network_host),
+            default_port=str(saved.get("port", self.network_port or '')),
+            default_username=saved.get("username", ""),
+            remember_connection=bool(saved),
+            startup_enabled=bool(self.user_settings.get("start_with_windows")),
         )
         login_widget.login_submitted.connect(self.attempt_network_login)
         login_widget.back_requested.connect(self.cancel_network_login)
         self.main_layout.addWidget(login_widget)
 
+    def setup_network_unlock(self):
+        widget = NetworkUnlockWidget(
+            self.remembered_network,
+            startup_enabled=bool(self.user_settings.get("start_with_windows")),
+        )
+        widget.login_submitted.connect(self.attempt_network_login)
+        widget.change_requested.connect(self.change_network_connection)
+        self.main_layout.addWidget(widget)
+
+    def change_network_connection(self):
+        self._network_unlock_mode = False
+        self.refresh_app()
+
     def start_network_login(self):
         """Switch from local-profile flow to connecting to a network host"""
         self.connection_mode = 'client'
         self._client_connected = False
+        self._network_unlock_mode = False
         self.refresh_app()
 
     def cancel_network_login(self):
         """Switch back from the network login screen to local profiles"""
         self.connection_mode = 'standalone'
         self._client_connected = False
+        self._network_unlock_mode = False
         self.refresh_app()
 
-    def attempt_network_login(self, host, port, username, password):
+    def attempt_network_login(self, host, port, username, password,
+                              remember_connection=False, startup_enabled=False):
         """Try to log into a remote host; on success swap self.database for a
         RemoteDatabase and proceed exactly like a normal profile unlock."""
         try:
             port_num = int(port) if port else DEFAULT_PORT
         except ValueError:
-            self._show_login_error("Port must be a number.")
+            self._show_login_error("Invalid port. Enter a number from 1 to 65535.")
+            return
+        if not 1 <= port_num <= 65535:
+            self._show_login_error("Invalid port. Enter a number from 1 to 65535.")
             return
 
         remote_db = RemoteDatabase(self.profile_manager, host, port_num, username, password)
@@ -478,6 +509,20 @@ class MainWindow(ThemedMainWindow):
         except (AuthError, ConnectionFailedError, RemoteError) as e:
             self._show_login_error(str(e))
             return
+
+        if remember_connection:
+            self.user_settings = set_remembered_network(
+                self.user_settings, host, port_num, username
+            )
+            self.remembered_network = get_remembered_network(self.user_settings)
+        else:
+            self.user_settings = clear_remembered_network(self.user_settings)
+            self.remembered_network = {}
+        try:
+            set_startup_enabled(bool(startup_enabled))
+            self.user_settings = load_settings()
+        except Exception as exc:
+            QMessageBox.warning(self, "Startup Registration", f"Could not update startup registration: {exc}")
 
         self.database = remote_db
         self.database.language = getattr(self, 'language', 'en')
@@ -493,6 +538,8 @@ class MainWindow(ThemedMainWindow):
             widget = self.main_layout.itemAt(i).widget()
             if hasattr(widget, 'set_error'):
                 widget.set_error(message)
+                if hasattr(widget, 'clear_password'):
+                    widget.clear_password()
                 break
     
     def setup_main_tabs(self):

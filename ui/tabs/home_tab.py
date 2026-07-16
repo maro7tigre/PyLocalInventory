@@ -673,17 +673,19 @@ class HomeTab(QWidget):
         
         # Activity container
         activity_frame = QFrame()
+        activity_frame.setObjectName("recentActivityFrame")
         activity_frame.setStyleSheet("""
-            QFrame {
+            QFrame#recentActivityFrame {
                 background-color: #3c3c3c;
                 border: 2px solid #555555;
                 border-radius: 12px;
-                padding: 16px;
             }
         """)
         activity_frame.setFixedHeight(400)
         
         activity_layout = QVBoxLayout(activity_frame)
+        activity_layout.setContentsMargins(24, 24, 24, 24)
+        activity_layout.setSpacing(12)
         self.recent_activity_layout = activity_layout
         self.recent_activity_frame = activity_frame
         
@@ -722,18 +724,20 @@ class HomeTab(QWidget):
     def create_activity_item(self, activity):
         """Create a single activity item widget"""
         item_frame = QFrame()
+        item_frame.setObjectName("recentActivityItem")
+        item_frame.setMinimumHeight(58)
+        item_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         item_frame.setStyleSheet("""
-            QFrame {
+            QFrame#recentActivityItem {
                 background-color: #2b2b2b;
                 border: 1px solid #555555;
                 border-radius: 6px;
-                padding: 8px;
-                margin: 2px;
             }
         """)
         
         item_layout = QHBoxLayout(item_frame)
-        item_layout.setContentsMargins(12, 8, 12, 8)
+        item_layout.setContentsMargins(16, 10, 16, 10)
+        item_layout.setSpacing(14)
         
         # Activity type badge
         _ = self._t()
@@ -749,13 +753,16 @@ class HomeTab(QWidget):
             f"color: {badge_color}; font-size: 11px; font-weight: bold;"
         )
         badge_label.setMinimumWidth(60)
-        badge_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        badge_label.setMinimumHeight(24)
+        badge_label.setAlignment(Qt.AlignCenter)
         item_layout.addWidget(badge_label)
         
         # Description
         desc_label = QLabel(activity['description'])
         desc_label.setStyleSheet("color: #ffffff; font-size: 12px;")
-        item_layout.addWidget(desc_label)
+        desc_label.setMinimumHeight(24)
+        desc_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        item_layout.addWidget(desc_label, 1)
         
         item_layout.addStretch()
         
@@ -763,6 +770,9 @@ class HomeTab(QWidget):
         amount_label = QLabel(f"{activity['amount']:.2f} MAD")
         amount_color = "#4CAF50" if activity['type'] == 'Sales' else "#2196F3"
         amount_label.setStyleSheet(f"color: {amount_color}; font-size: 12px; font-weight: bold;")
+        amount_label.setMinimumHeight(24)
+        amount_label.setMinimumWidth(120)
+        amount_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         item_layout.addWidget(amount_label)
         
         return item_frame

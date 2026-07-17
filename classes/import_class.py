@@ -274,9 +274,8 @@ class ImportClass(BaseClass):
         # Call parent set_value first
         super().set_value(param_key, value)
         
-        # Handle connected parameters for supplier_username
-        if param_key == 'supplier_username':
-            self._refresh_supplier_snapshot()
+        # Snapshot resolution is deferred to save_to_database() to avoid an
+        # HTTP/database round trip for every row loaded on a network client.
     
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for supplier_username"""

@@ -337,7 +337,8 @@ class BaseTab(QWidget):
                     # client/supplier names appear without manual reopen. This will persist
                     # only if name actually changed (handled inside method).
                     try:
-                        if hasattr(obj, 'refresh_external_snapshots'):
+                        if (hasattr(obj, 'refresh_external_snapshots') and
+                                self.database.__class__.__name__ != 'RemoteDatabase'):
                             obj.refresh_external_snapshots()
                     except Exception as snap_e:
                         print(f"Snapshot refresh skipped for {self.section} ID {obj.id}: {snap_e}")

@@ -3,9 +3,11 @@ Sales Item Class - Represents individual items within a sales operation
 Updated example showing button parameter for delete actions
 """
 from classes.base_class import BaseClass
+import time
 
 
 class SalesItemClass(BaseClass):
+    _catalog_cache = {}
     def __init__(self, id, database, sales_id=0, product_id=0):
         super().__init__(id, database)
         self.section = "Sales_Items"
@@ -158,6 +160,10 @@ class SalesItemClass(BaseClass):
         """Return product and service keywords for autocomplete (non-empty)."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
+        cache_key = id(self.database)
+        cached = self._catalog_cache.get(cache_key)
+        if cached and time.monotonic() - cached['loaded_at'] < 60:
+            return list(cached['products'])
         try:
             options = []
             seen = set()
@@ -181,6 +187,19 @@ class SalesItemClass(BaseClass):
             except Exception:
                 pass
 
+            service_keywords = []
+            try:
+                self.database.cursor.execute(
+                    "SELECT keywords FROM Services WHERE keywords IS NOT NULL AND keywords != ''"
+                )
+                for (keywords,) in self.database.cursor.fetchall():
+                    service_keywords.extend(self._split_keywords(keywords or ""))
+            except Exception:
+                pass
+            self._catalog_cache[cache_key] = {
+                'loaded_at': time.monotonic(), 'products': list(options),
+                'service_keywords': list(dict.fromkeys(service_keywords)),
+            }
             return options
         except Exception:
             return []
@@ -190,6 +209,15 @@ class SalesItemClass(BaseClass):
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
 
+        cache_key = id(self.database)
+        cached = self._catalog_cache.get(cache_key)
+        if cached and time.monotonic() - cached['loaded_at'] < 60:
+            return list(cached['service_keywords'])
+        # Populate both lists in one shared catalog load.
+        self.get_product_options()
+        cached = self._catalog_cache.get(cache_key)
+        if cached:
+            return list(cached['service_keywords'])
         try:
             options = []
             seen = set()

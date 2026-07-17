@@ -293,10 +293,8 @@ class SalesClass(BaseClass):
         # Call parent set_value first
         super().set_value(param_key, value)
         
-        # Handle connected parameters for client_username
-        if param_key == 'client_username':
-            # Update snapshot fields
-            self._refresh_client_snapshot()
+        # Snapshot resolution is intentionally deferred to save_to_database().
+        # Running it here creates one remote query per sale while loading tabs.
 
     
     def get_parameter_options(self, param_key):

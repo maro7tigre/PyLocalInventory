@@ -76,7 +76,7 @@
  [],
  False,
  False,
- 1784285785,
+ 1784289813,
  [('runw.exe',
    'C:\\Users\\xvipe\\Documents\\GitHub\\PyLocalInventory\\.venv\\Lib\\site-packages\\PyInstaller\\bootloader\\Windows-64bit-intel\\runw.exe',
    'EXECUTABLE')],

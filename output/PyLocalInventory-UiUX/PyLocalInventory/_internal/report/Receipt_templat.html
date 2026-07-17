@@ -1,0 +1,24 @@
+<html>
+    <body style="font-family:Arial,sans-serif;background:#fff;margin:0;padding:0;">
+        <div style="border:2px solid #222;padding:28px 32px;max-width:440px;margin:20px auto;">
+            <h2 style="text-align:center;color:#1a1a1a;margin:0 0 4px 0;letter-spacing:2px;">PAYMENT RECEIPT</h2>
+            <p style="text-align:center;color:#888;font-size:13px;margin:0 0 16px 0;">Thank you for your payment</p>
+            <hr style="border:none;border-top:1px solid #ccc;margin:0 0 14px 0;"/>
+            <table width="100%" cellspacing="0" cellpadding="4">
+                <tr><td style="color:#000;font-size:13px;">Sale #:</td><td align="right"><b style="color:#000;font-size:13px;">{sale_id}</b></td></tr>
+                <tr><td style="color:#000;font-size:13px;">Client:</td><td align="right"><b style="color:#000;font-size:13px;">{client}</b></td></tr>
+                <tr><td style="color:#000;font-size:13px;">Order Date:</td><td align="right" style="color:#000;font-size:13px;">{order_date}</td></tr>
+                <tr><td style="color:#000;font-size:13px;">Payment Date:</td><td align="right" style="color:#000;font-size:13px;">{payment_date}</td></tr>
+            </table>
+            <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
+            <table width="100%" cellspacing="0" cellpadding="5">
+                <tr><td style="color:#000;font-size:13px;">Total Order:</td><td align="right"><b style="color:#000;font-size:13px;">{total} {currency}</b></td></tr>
+                <tr><td style="color:#1565C0;font-size:14px;font-weight:bold;">Amount Paid (this):</td><td align="right"><b style="color:#1565C0;font-size:14px;">{amount_this} {currency}</b></td></tr>
+                <tr><td style="color:#000;font-size:13px;">Total Paid:</td><td align="right"><b style="color:#27ae60;font-size:13px;">{total_paid} {currency}</b></td></tr>
+                <tr><td style="color:#000;font-size:13px;">Remaining:</td><td align="right"><b style="color:REM_COLOR;font-size:13px;">{remaining} {currency}</b></td></tr>
+            </table>
+            <hr style="border:none;border-top:1px solid #ccc;margin:14px 0;"/>
+            <p style="text-align:center;color:REM_COLOR;font-size:15px;font-weight:bold;margin:0;">{status_text}</p>
+        </div>
+    </body>
+</html>

@@ -9,6 +9,7 @@ from ui.widgets.operations_table import OperationsTableWidget
 from PySide6.QtWidgets import QDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QLabel, QWidget
 from PySide6.QtGui import QFont
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 
 class SaleEditDialog(QDialog):
@@ -318,18 +319,18 @@ class SaleEditDialog(QDialog):
             items = self.sales_items_table.get_items_data()
             
             # Calculate subtotal
-            subtotal = sum(item.get_value('subtotal') or 0 for item in items)
+            subtotal = sum((Decimal(str(item.get_value('subtotal') or 0)) for item in items), Decimal("0"))
             
             # Get VAT percentage from the tva parameter widget
-            vat_percent = 0
+            vat_percent = Decimal("0")
             if 'tva' in self.parameter_widgets:
                 try:
-                    vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
-                except Exception:
-                    vat_percent = 0
+                    vat_percent = Decimal(str(self.get_widget_value(self.parameter_widgets['tva']) or 0))
+                except (InvalidOperation, ValueError, TypeError):
+                    vat_percent = Decimal("0")
             
             # Calculate VAT amount
-            vat_amount = subtotal * (vat_percent / 100)
+            vat_amount = subtotal * (vat_percent / Decimal("100"))
             
             # Calculate total
             total = subtotal + vat_amount

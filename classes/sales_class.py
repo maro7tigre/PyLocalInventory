@@ -200,9 +200,10 @@ class SalesClass(BaseClass):
     
     def calculate_total_tva(self):
         """Calculate total VAT amount"""
+        from decimal import Decimal
         subtotal = self.calculate_subtotal()
         tva_percent = self.get_value('tva') or 0
-        return subtotal * (tva_percent / 100)
+        return Decimal(str(subtotal)) * (Decimal(str(tva_percent)) / Decimal("100"))
     
     def calculate_total_price(self):
         """Calculate total price including VAT"""

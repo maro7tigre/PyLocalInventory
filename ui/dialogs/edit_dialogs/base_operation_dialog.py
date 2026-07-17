@@ -12,6 +12,7 @@ from ui.widgets.themed_widgets import GreenButton, RedButton
 from ui.widgets.operations_table import OperationsTableWidget
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 
 class BaseOperationDialog(QDialog):
@@ -246,20 +247,23 @@ class BaseOperationDialog(QDialog):
             items = self.items_table.get_items_data()
             
             # Calculate subtotal
-            subtotal = sum(item.get_value('subtotal') or 0 for item in items)
+            subtotal = sum(
+                (Decimal(str(item.get_value('subtotal') or 0)) for item in items),
+                Decimal("0")
+            )
             
             # Get VAT percentage
-            vat_percent = 0
+            vat_percent = Decimal("0")
             if 'tva' in self.parameter_widgets:
                 try:
-                    vat_percent = float(
+                    vat_percent = Decimal(str(
                         ParameterWidgetFactory.get_widget_value(self.parameter_widgets['tva']) or 0
-                    )
-                except Exception:
-                    vat_percent = 0
+                    ))
+                except (InvalidOperation, ValueError, TypeError):
+                    vat_percent = Decimal("0")
             
             # Calculate totals
-            vat_amount = subtotal * (vat_percent / 100)
+            vat_amount = subtotal * (vat_percent / Decimal("100"))
             total = subtotal + vat_amount
             
             # Update displays
@@ -488,13 +492,52 @@ class BaseOperationDialog(QDialog):
                     raw_names = self.items_table.get_all_entered_product_names()
                     for product_name in raw_names:
                         if product_name and not self._product_exists(product_name):
-                            if product_name not in missing_products:
+                            if not any(self._normalize_name(product_name) == self._normalize_name(existing)
+                                       for existing in missing_products):
                                 missing_products.append(product_name)
                 except Exception as e:
                     print(f"Error collecting raw product names: {e}")
 
             if not (missing_clients or missing_suppliers or missing_products):
                 return True, True  # Nothing missing
+
+            allow_unresolved = False
+            for item_name in missing_products:
+                box = QMessageBox(self)
+                box.setIcon(QMessageBox.Question)
+                box.setWindowTitle("Unknown Item")
+                box.setText(
+                    f"'{item_name}' does not exist in Products or Services.\n"
+                    "Where would you like to save it?"
+                )
+                product_btn = box.addButton("Save as Product", QMessageBox.AcceptRole)
+                service_btn = box.addButton("Save as Service", QMessageBox.AcceptRole)
+                continue_btn = box.addButton("Continue without saving", QMessageBox.DestructiveRole)
+                cancel_btn = box.addButton(QMessageBox.Cancel)
+                box.exec()
+                clicked = box.clickedButton()
+                if clicked == product_btn:
+                    self._create_product(item_name)
+                elif clicked == service_btn:
+                    self._create_service(item_name)
+                elif clicked == continue_btn:
+                    allow_unresolved = True
+                else:
+                    try:
+                        names = self.items_table.get_all_entered_product_names()
+                        row = next(i for i, value in enumerate(names) if self._normalize_name(value) == self._normalize_name(item_name))
+                        column = self.items_table.data_manager.table_columns.index('product_name')
+                        widget = self.items_table.table.cellWidget(row, column)
+                        if widget:
+                            widget.setFocus()
+                    except Exception:
+                        pass
+                    return False, False
+
+            # Unknown items were handled individually above.
+            missing_products = []
+            if not (missing_clients or missing_suppliers):
+                return True, allow_unresolved
 
             # Build message
             msg_lines = ["Some referenced entries do not exist:"]
@@ -616,24 +659,28 @@ class BaseOperationDialog(QDialog):
 
     def _product_exists(self, name):
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = %s", (name,))
-            res = self.database.cursor.fetchone()
-            if res and res[0] > 0:
+            target = self._normalize_name(name)
+            self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL")
+            if any(self._normalize_name(row[0]) == target for row in self.database.cursor.fetchall()):
                 return True
 
             self.database.cursor.execute(
                 "SELECT name, keywords FROM Services WHERE name IS NOT NULL AND name != ''"
             )
-            name_clean = (name or '').strip().lower()
+            name_clean = target
             for service_name, keywords in self.database.cursor.fetchall():
                 candidates = [service_name, *self._split_keywords(keywords or "")]
-                if any(name_clean == str(candidate).strip().lower() for candidate in candidates if candidate):
+                if any(name_clean == self._normalize_name(candidate) for candidate in candidates if candidate):
                     return True
 
             return False
         except Exception as e:
             print(f"Error checking product existence: {e}")
             return True
+
+    @staticmethod
+    def _normalize_name(value):
+        return " ".join(str(value or "").split()).casefold()
 
     @staticmethod
     def _split_keywords(value):
@@ -673,3 +720,14 @@ class BaseOperationDialog(QDialog):
             product.save_to_database()
         except Exception as e:
             print(f"Error auto-creating product '{name}': {e}")
+
+    def _create_service(self, name):
+        try:
+            from classes.service_class import ServiceClass
+            service = ServiceClass(0, self.database, name=name)
+            code = "SRV-" + "-".join(str(name).upper().split())[:40]
+            service.set_value('service_code', code or 'SRV-NEW')
+            service.set_value('service_type', 'Custom Service')
+            service.save_to_database()
+        except Exception as e:
+            print(f"Error auto-creating service '{name}': {e}")

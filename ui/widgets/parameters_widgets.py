@@ -38,9 +38,9 @@ class NumericWidget(QWidget):
         # Determine if int or float
         param_type = param_info.get('type', 'int')
         
-        if param_type == 'float':
+        if param_type in ('float', 'decimal'):
             self.spinbox = QDoubleSpinBox()
-            self.spinbox.setDecimals(2)
+            self.spinbox.setDecimals(param_info.get('precision', 2))
         else:
             self.spinbox = QSpinBox()
         
@@ -447,7 +447,7 @@ class ParameterWidgetFactory:
         ui_config = ui_config or {}
         param_type = param_info.get('type', 'string')
         
-        if param_type in ['int', 'float']:
+        if param_type in ['int', 'float', 'decimal']:
             return NumericWidget(param_info, editable)
         elif param_type == 'bool':
             # Checkbox that maps to true_value / false_value

@@ -17,8 +17,10 @@ from PySide6.QtCore import Qt, QMarginsF, QUrl
 from PySide6.QtGui import QTextDocument, QPageLayout, QPageSize, QColor
 from PySide6.QtPrintSupport import QPrinter
 from ui.widgets.themed_widgets import BlueButton, RedButton
-from core.runtime_paths import resource_path
+from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 import base64
+from decimal import Decimal, InvalidOperation
+import traceback
 
 
 class ReportsDialog(QDialog):
@@ -121,7 +123,9 @@ class ReportsDialog(QDialog):
             self.devis_btn.setEnabled(True)
             self.bdl_btn.setEnabled(True)
             self.cancel_btn.setEnabled(True)
-            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{str(e)}")
+            details = self._report_context(report_type, getattr(self, '_last_output_path', None), e)
+            self._write_report_log(details)
+            QMessageBox.critical(self, "Report Error", details)
     
     def _generate_report_sync(self, report_type):
         """Synchronously generate report and return PDF path"""
@@ -129,10 +133,10 @@ class ReportsDialog(QDialog):
         if not self.profile_manager.selected_profile:
             raise Exception("No profile selected")
         
-        profile_path = os.path.dirname(self.profile_manager.selected_profile.config_path)
-        # Per-machine subfolder so each user on the LAN has their own reports directory
-        machine_name = socket.gethostname()
-        reports_dir = os.path.join(profile_path, "reports", machine_name)
+        profile = self.profile_manager.selected_profile
+        database = getattr(self.sales_obj, 'database', None)
+        application_username = getattr(database, 'username', None) or 'DefaultUser'
+        reports_dir = local_reports_dir(application_username)
         
         # Create reports directory if it doesn't exist
         os.makedirs(reports_dir, exist_ok=True)
@@ -141,22 +145,59 @@ class ReportsDialog(QDialog):
         self._cleanup_old_reports(reports_dir)
         
         # Generate unique filename
-        date_str = datetime.now().strftime("%d_%m_%Y")
+        report_names = {'devis': 'DEVIS', 'bdl': 'DELIVERY_NOTE', 'facture': 'INVOICE'}
+        report_label = report_names.get(report_type, safe_windows_component(report_type, 'REPORT').upper())
+        sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 0
+        report_id = f"DOC-{int(sales_id):06d}" if report_type == 'devis' else str(sales_id)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         counter = 0
         while True:
-            filename = f"{date_str}_{counter}.pdf"
+            suffix = f"_{counter}" if counter else ""
+            filename = f"{report_label}_{report_id}_{timestamp}{suffix}.pdf"
             filepath = os.path.join(reports_dir, filename)
             if not os.path.exists(filepath):
                 break
             counter += 1
+        self._last_output_path = filepath
         
         # Generate HTML content
         html_content = self._generate_html_content(report_type)
         
         # Convert HTML to PDF (or HTML fallback)
-        actual_output_path = self._html_to_pdf(html_content, filepath)
+        try:
+            actual_output_path = self._html_to_pdf(html_content, filepath)
+        except Exception as exc:
+            raise RuntimeError(self._report_context(report_type, filepath, exc)) from exc
+
+        self._write_report_log(self._report_context(report_type, actual_output_path, None))
         
         return actual_output_path
+
+    def _report_context(self, report_type, path, error):
+        database = getattr(self.sales_obj, 'database', None)
+        mode = 'connected client' if database.__class__.__name__ == 'RemoteDatabase' else 'host/local'
+        status = 'success' if error is None else 'failed'
+        message = [
+            f"Report operation: {status}",
+            f"Report type: {report_type}",
+            f"Application username: {getattr(database, 'username', None) or 'DefaultUser'}",
+            f"Computer mode: {mode}",
+            f"Computer name: {socket.gethostname()}",
+            f"Local path: {path or 'not allocated'}",
+        ]
+        if error is not None:
+            message.extend((f"Exception: {error}", traceback.format_exc()))
+        return "\n".join(message)
+
+    @staticmethod
+    def _write_report_log(message):
+        try:
+            log_path = os.path.join(user_data_root(), 'logs', 'report_operations.log')
+            os.makedirs(os.path.dirname(log_path), exist_ok=True)
+            with open(log_path, 'a', encoding='utf-8') as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}]\n{message}\n\n")
+        except Exception as log_error:
+            print(f"Could not write report diagnostic log: {log_error}")
     
     def _cleanup_old_reports(self, reports_dir):
         """Delete reports older than 48 hours"""
@@ -218,6 +259,16 @@ class ReportsDialog(QDialog):
                 except Exception:
                     return str(value)
 
+            def _decimal(value) -> Decimal:
+                try:
+                    return Decimal(str(value or 0).replace(" ", "").replace(",", "."))
+                except InvalidOperation:
+                    return Decimal("0")
+
+            def _fmt_quantity(value) -> str:
+                number = _decimal(value)
+                return format(number.normalize(), "f") if number != number.to_integral() else str(int(number))
+
             # Get profile data
             profile = self.profile_manager.selected_profile
             company_name = profile.get_value("company name") or "Your Company"
@@ -268,6 +319,7 @@ class ReportsDialog(QDialog):
             # Get sales items - ensure they are loaded from database
             items_html = ""
             total_quantity = 0
+            rendered_rows = 0
 
             # BDL uses the service catalog to exclude product-only rows.
             report_services = []
@@ -341,15 +393,16 @@ class ReportsDialog(QDialog):
                             except Exception as e:
                                 print(f"DEBUG: Error getting product name: {e}")
                     
-                    quantity = item.get_value('quantity') or 0
-                    unit_price = item.get_value('unit_price') or 0
+                    quantity = _decimal(item.get_value('quantity'))
+                    unit_price = _decimal(item.get_value('unit_price'))
                     subtotal = item.get_value('subtotal') or (quantity * unit_price)
                     product_token = str(product_name or '').strip().casefold()
                     
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
-                    total_quantity += int(quantity) if quantity else 0
-                    total_ht += float(subtotal) if subtotal else 0
+                    total_quantity += quantity
+                    total_ht += _decimal(subtotal)
+                    quantity_text = _fmt_quantity(quantity)
                     
                     if report_type == 'bdl':
                         info_tokens = {
@@ -369,43 +422,47 @@ class ReportsDialog(QDialog):
                             continue
 
                         service_codes = " / ".join(html.escape(str(service['id'])) for service in matched_services)
-                        designation_html = "<br>".join(
-                            html.escape(str(service['name'])) for service in matched_services
+                        designation_html = " / ".join(
+                            f'<strong class="item-name">{html.escape(str(service["name"]))}</strong>'
+                            for service in matched_services
                         )
+                        if item_information:
+                            designation_html += f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
                         row_html = (
                             f"<tr><td>{service_codes}</td>"
                             f"<td>{designation_html}</td>"
-                            f"<td>{quantity}</td></tr>"
+                            f"<td>{quantity_text}</td></tr>"
                         )
                     elif report_type == 'devis':
                         product_code = html.escape(str(product_id)) if product_id else "-"
-                        designation_html = html.escape(str(product_name))
+                        designation_html = f'<strong class="item-name">{html.escape(str(product_name))}</strong>'
                         if item_information:
                             designation_html += (
-                                f'<span class="item-detail">{html.escape(str(item_information))}</span>'
+                                f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
                             )
                         row_html = (
                             f"<tr><td>{product_code}</td>"
                             f"<td>{designation_html}</td>"
-                            f"<td>{quantity}</td>"
+                            f"<td>{quantity_text}</td>"
                             f"<td>{_fmt_fr(unit_price)}</td>"
                             f"<td>{_fmt_fr(subtotal)}</td></tr>"
                         )
                     else:
-                        designation_html = html.escape(str(product_name))
+                        designation_html = f'<strong class="item-name">{html.escape(str(product_name))}</strong>'
                         if item_information:
                             designation_html += (
-                                f'<span class="item-detail">{html.escape(str(item_information))}</span>'
+                                f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
                             )
                         # Preserve the existing four-column facture presentation.
                         row_html = (
                             f"<tr><td>{designation_html}</td>"
-                            f"<td>{quantity}</td>"
+                            f"<td>{quantity_text}</td>"
                             f"<td>{_fmt_fr(unit_price)}</td>"
                             f"<td>{_fmt_fr(subtotal)}</td></tr>"
                         )
 
                     items_html += row_html + "\n"
+                    rendered_rows += 1
                 if report_type == 'bdl' and not items_html.strip():
                     items_html = '<tr class="empty-row"><td colspan="3">Aucun service</td></tr>'
                 # Do not add visual filler rows; they stretch the printable report table.
@@ -437,7 +494,7 @@ class ReportsDialog(QDialog):
             # Calculate TVA and Total TTC based on sales record
             # Get the TVA percentage from the sales object (0 or 20)
             tva_percent = self.sales_obj.get_value('tva') or 0
-            tva_rate = tva_percent / 100.0  # Convert percentage to decimal
+            tva_rate = _decimal(tva_percent) / Decimal("100")
             tva_amount = total_ht * tva_rate
             total_ttc = total_ht + tva_amount
             
@@ -469,6 +526,7 @@ class ReportsDialog(QDialog):
                 'payment_terms': '',
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
+                'table_frame_class': 'fill-page' if rendered_rows <= 8 else '',
                 # New financial fields for devis
                 'total_remise': _fmt_fr(total_remise),
                 'total_ht': _fmt_fr(total_ht),
@@ -500,6 +558,7 @@ class ReportsDialog(QDialog):
                 'payment_terms': '',
                 'commercial': 'Sales Team',
                 'items': f'<tr><td colspan="{5 if report_type == "devis" else (3 if report_type == "bdl" else 4)}">No items found</td></tr>',
+                'table_frame_class': 'fill-page',
                 # Financial fields for devis
                 'total_remise': '0,00',
                 'total_ht': '0,00',
@@ -527,9 +586,8 @@ class ReportsDialog(QDialog):
                 return str(error).encode('ascii', 'backslashreplace').decode('ascii')
 
             base_url = os.path.abspath(resource_path("report"))
-            os.makedirs(base_url, exist_ok=True)
             # Create a temporary HTML file
-            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8', dir=base_url) as temp_html:
+            with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
                 temp_html.write(html_content)
                 temp_html_path = temp_html.name
 

@@ -2,7 +2,7 @@ import sys
 from PySide6.QtWidgets import (QApplication, QLineEdit, QCompleter, QVBoxLayout, 
                                QWidget, QLabel, QTableWidget, QStyledItemDelegate, 
                                QTableWidgetItem, QHBoxLayout, QTextEdit)
-from PySide6.QtCore import Qt, QStringListModel, QTimer, Signal
+from PySide6.QtCore import Qt, QStringListModel, QTimer, Signal, QSignalBlocker
 from PySide6.QtGui import QTextCursor
 
 
@@ -16,6 +16,7 @@ class AutoCompleteLineEdit(QLineEdit):
         self.multi_value = multi_value
         self.completer = None
         self.suggestions_frozen = False
+        self._options_cache = None
         
         # Set default background for table editing
         self.setStyleSheet("QLineEdit { background-color: #2D2D2D; color: white; }")
@@ -37,8 +38,11 @@ class AutoCompleteLineEdit(QLineEdit):
     def _get_options_list(self):
         """Get the actual options list, calling method if necessary"""
         if callable(self.options):
+            if self._options_cache is not None:
+                return self._options_cache
             try:
-                return self.options() or []
+                self._options_cache = self.options() or []
+                return self._options_cache
             except Exception as e:
                 print(f"Error calling options method: {e}")
                 return []
@@ -60,12 +64,11 @@ class AutoCompleteLineEdit(QLineEdit):
             self.completer.setCompletionMode(QCompleter.PopupCompletion)
             self.completer.setFilterMode(Qt.MatchContains)
             self.completer.activated.connect(self._on_completion_selected)
-            # Use highlighted signal for mouse clicks (more reliable than activated)
-            self.completer.highlighted.connect(self._on_completion_highlighted)
             self.setCompleter(self.completer)
     
     def _on_completion_selected(self, text):
         """Handle when user selects from completion dropdown"""
+        blocker = QSignalBlocker(self)
         if self.multi_value:
             current = self.text()
             cursor = self.cursorPosition()
@@ -87,16 +90,13 @@ class AutoCompleteLineEdit(QLineEdit):
             self.setCursorPosition(len(completed) - len(suffix.lstrip()))
         else:
             self.setText(text)
+            self.setCursorPosition(len(text))
+        del blocker
         # Hide the completer popup first
         if self.completer:
             self.completer.popup().hide()
         # Then clear focus to commit the edit
         QTimer.singleShot(0, self.clearFocus)
-    
-    def _on_completion_highlighted(self, text):
-        """Handle when user highlights an item in completion dropdown"""
-        # Directly trigger selection when highlighted (this covers mouse clicks)
-        self._on_completion_selected(text)
     
     def _calculate_suggestions(self, text):
         """Calculate suggestions with scoring system"""
@@ -155,11 +155,13 @@ class AutoCompleteLineEdit(QLineEdit):
     def update_options(self, new_options):
         """Update options and refresh completer"""
         self.options = new_options
+        self._options_cache = None
         self._setup_completer()
     
     def refresh_options(self):
         """Refresh options if they are callable (for dynamic database updates)"""
         if callable(self.options):
+            self._options_cache = None
             self._setup_completer()
     
     def _update_autocomplete(self, text):
@@ -209,6 +211,7 @@ class AutoExpandingTextEdit(QTextEdit):
         self.options = options or []
         self.multi_value = multi_value
         self.allow_free_text = allow_free_text
+        self._options_cache = None
         self.minimum_editor_height = minimum_height
         self.maximum_editor_height = maximum_height
         self.setAcceptRichText(False)
@@ -235,8 +238,11 @@ class AutoExpandingTextEdit(QTextEdit):
 
     def _get_options_list(self):
         if callable(self.options):
+            if self._options_cache is not None:
+                return self._options_cache
             try:
-                return self.options() or []
+                self._options_cache = self.options() or []
+                return self._options_cache
             except Exception as exc:
                 print(f"Error calling options method: {exc}")
                 return []
@@ -246,6 +252,8 @@ class AutoExpandingTextEdit(QTextEdit):
         cursor = self.textCursor()
         text = self.toPlainText()
         position = cursor.position()
+        if not self.multi_value:
+            return text, 0, len(text)
         start = position
         while start > 0 and text[start - 1] not in " ,;\n\t":
             start -= 1
@@ -274,12 +282,14 @@ class AutoExpandingTextEdit(QTextEdit):
             self.completer.popup().hide()
 
     def _insert_completion(self, completion):
+        blocker = QSignalBlocker(self)
         if not self.multi_value:
             self.setPlainText(str(completion))
             cursor = self.textCursor()
             cursor.movePosition(QTextCursor.End)
             self.setTextCursor(cursor)
             self.completer.popup().hide()
+            del blocker
             return
 
         _, start, end = self._current_fragment()
@@ -289,11 +299,16 @@ class AutoExpandingTextEdit(QTextEdit):
         cursor.insertText(f"{completion}, ")
         self.setTextCursor(cursor)
         self.completer.popup().hide()
+        del blocker
 
     def keyPressEvent(self, event):
-        if self.completer.popup().isVisible() and event.key() in (
-            Qt.Key_Enter, Qt.Key_Return, Qt.Key_Tab, Qt.Key_Backtab,
-        ):
+        if self.completer.popup().isVisible() and event.key() in (Qt.Key_Enter, Qt.Key_Return):
+            completion = self.completer.currentCompletion()
+            if completion:
+                self._insert_completion(completion)
+                event.accept()
+                return
+        if self.completer.popup().isVisible() and event.key() in (Qt.Key_Tab, Qt.Key_Backtab):
             event.ignore()
             return
         super().keyPressEvent(event)

@@ -12,6 +12,10 @@ import json
 import socket
 import urllib.error
 import urllib.request
+import time
+import os
+from datetime import datetime
+from core.runtime_paths import user_data_root
 
 from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
@@ -154,6 +158,7 @@ class RemoteDatabase:
             headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self._token}'},
             method='POST'
         )
+        started = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
@@ -172,6 +177,18 @@ class RemoteDatabase:
         except Exception as e:
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        if elapsed_ms >= 250:
+            try:
+                log_dir = os.path.join(user_data_root(), 'logs')
+                os.makedirs(log_dir, exist_ok=True)
+                with open(os.path.join(log_dir, 'network_timing.log'), 'a', encoding='utf-8') as stream:
+                    stream.write(
+                        f"{datetime.now().isoformat(timespec='seconds')} method={method} "
+                        f"duration_ms={elapsed_ms:.1f} host={self.host}:{self.port}\n"
+                    )
+            except OSError:
+                pass
         return data.get('result')
 
     def __getattr__(self, name):

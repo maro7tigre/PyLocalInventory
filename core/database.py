@@ -196,6 +196,8 @@ class Database:
         """
         if param_type == 'int':
             return "INTEGER"
+        if param_type == 'decimal':
+            return "NUMERIC(15, 3)"
         if param_type in ('float', 'bool'):
             return "DOUBLE PRECISION"
         return "TEXT"  # string, image, date, text
@@ -335,6 +337,26 @@ class Database:
             except Exception as e_tab:
                 self.conn.rollback()
                 print(f"⚠️ Snapshot column check failed for {table}: {e_tab}")
+
+        # Existing installations created this column as INTEGER. PostgreSQL's
+        # cast keeps all old values intact. Check first to avoid taking an
+        # unnecessary table lock every time another LAN client starts.
+        try:
+            self.cursor.execute(
+                "SELECT data_type, numeric_precision, numeric_scale "
+                "FROM information_schema.columns WHERE table_schema=current_schema() "
+                "AND table_name='sales_items' AND column_name='quantity'"
+            )
+            column = self.cursor.fetchone()
+            if column and column != ('numeric', 15, 3):
+                self.cursor.execute(
+                    "ALTER TABLE sales_items ALTER COLUMN quantity TYPE NUMERIC(15, 3) "
+                    "USING quantity::NUMERIC(15, 3)"
+                )
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not migrate sales_items.quantity to decimal: {exc}")
 
     def _ensure_user_tables(self):
         """Create the Users/Roles/RolePermissions tables used for LAN network access.

@@ -354,7 +354,7 @@ class SalesTab(BaseTab):
 
     def _set_progress_cell(self, row, col, obj):
         items = obj.get_sales_items()
-        total_target = sum(int(item.get_value('quantity') or 0) for item in items)
+        total_target = sum(float(item.get_value('quantity') or 0) for item in items)
         total_prod = sum(int(item.get_value('production') or 0) for item in items)
         pct = min(int(total_prod / total_target * 100), 100) if total_target > 0 else 0
 

@@ -76,8 +76,9 @@ class SalesItemClass(BaseClass):
                 "required": True,
                 "default": 1,
                 "options": [],
-                "type": "int",
-                "min": 1
+                "type": "decimal",
+                "min": 0.001,
+                "precision": 3
             },
             "production": {
                 "value": 0,
@@ -254,8 +255,9 @@ class SalesItemClass(BaseClass):
     
     def calculate_subtotal(self):
         """Calculate subtotal (quantity * unit_price)"""
-        quantity = self.get_value('quantity') or 0
-        unit_price = self.get_value('unit_price') or 0.0
+        from decimal import Decimal
+        quantity = Decimal(str(self.get_value('quantity') or 0))
+        unit_price = Decimal(str(self.get_value('unit_price') or 0))
         return quantity * unit_price
     
     def delete_self(self):

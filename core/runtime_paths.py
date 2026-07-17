@@ -2,6 +2,8 @@
 import os
 import shutil
 import sys
+import re
+from pathlib import Path
 
 
 def is_frozen():
@@ -53,3 +55,34 @@ def portable_dir(name):
         else:
             os.makedirs(target, exist_ok=True)
     return target
+
+
+_WINDOWS_RESERVED = {
+    'CON', 'PRN', 'AUX', 'NUL',
+    *(f'COM{i}' for i in range(1, 10)), *(f'LPT{i}' for i in range(1, 10)),
+}
+
+
+def safe_windows_component(value, fallback="DefaultUser", max_length=80):
+    value = re.sub(r'[<>:"/\\|?*\x00-\x1f]', '_', str(value or '').strip())
+    value = re.sub(r'\s+', ' ', value).rstrip(' .')[:max_length].rstrip(' .')
+    if not value or value.upper() in _WINDOWS_RESERVED:
+        value = fallback
+    return value
+
+
+def local_reports_dir(application_username="DefaultUser"):
+    """Per-application-user reports on the computer running this process."""
+    username = safe_windows_component(application_username)
+    documents = Path.home() / "Documents" / "PyLocalInventory" / "Reports" / username
+    fallback = Path(user_data_root()) / "Reports" / username
+    for target in (documents, fallback):
+        try:
+            target.mkdir(parents=True, exist_ok=True)
+            probe = target / ".write_test"
+            probe.touch(exist_ok=True)
+            probe.unlink()
+            return str(target)
+        except OSError:
+            continue
+    raise OSError(f"No writable local reports directory for {username}")

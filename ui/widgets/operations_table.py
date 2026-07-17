@@ -3,11 +3,12 @@ Operations Table Widget - Clean architecture with proper separation of concerns
 """
 from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit, QStyledItemDelegate)
-from PySide6.QtGui import QColor, QBrush
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
+from PySide6.QtCore import Qt, Signal, QRegularExpression
 from ui.widgets.preview_widget import PreviewWidget
 from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
+from decimal import Decimal, InvalidOperation
 
 
 class TableDataManager:
@@ -107,11 +108,12 @@ class TableDataManager:
                 return int(value) if value else 0
             except ValueError:
                 return 0
-        elif param_type == 'float':
+        elif param_type in ('float', 'decimal'):
             try:
-                return float(value) if value else 0.0
-            except ValueError:
-                return 0.0
+                normalized = str(value).replace(" ", "").replace(",", ".")
+                return Decimal(normalized) if normalized else Decimal("0")
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
         
         return value
 
@@ -557,8 +559,8 @@ class TableEventHandler:
             qty_item = self.table.item(row, qty_col)
             price_item = self.table.item(row, price_col)
             
-            quantity = float(qty_item.text()) if qty_item and qty_item.text().strip() else 0.0
-            unit_price = float(price_item.text()) if price_item and price_item.text().strip() else 0.0
+            quantity = Decimal(str(qty_item.text()).replace(" ", "").replace(",", ".")) if qty_item and qty_item.text().strip() else Decimal("0")
+            unit_price = Decimal(str(price_item.text()).replace(" ", "").replace(",", ".")) if price_item and price_item.text().strip() else Decimal("0")
             subtotal = quantity * unit_price
             
             subtotal_item = self.table.item(row, subtotal_col)
@@ -723,6 +725,9 @@ class QuantityDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
+        editor.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r"^(?:\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
+        ))
         row = index.row()
         self.active_editors[row] = editor  # Store reference
         self._apply_style(editor, row)

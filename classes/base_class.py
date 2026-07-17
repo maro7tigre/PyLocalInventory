@@ -69,11 +69,15 @@ class BaseClass:
             except (ValueError, TypeError):
                 raise ValueError(f"Invalid integer value for '{param_key}': {value}")
         
-        elif param_type == 'float' and value is not None:
+        elif param_type in ('float', 'decimal') and value is not None:
             try:
-                value = float(value)
-            except (ValueError, TypeError):
-                raise ValueError(f"Invalid float value for '{param_key}': {value}")
+                if param_type == 'decimal':
+                    from decimal import Decimal
+                    value = Decimal(str(value).replace(" ", "").replace(",", "."))
+                else:
+                    value = float(value)
+            except (ValueError, TypeError, ArithmeticError):
+                raise ValueError(f"Invalid number value for '{param_key}': {value}")
         
         elif param_type == 'string' and value is not None:
             value = str(value)
@@ -178,7 +182,7 @@ class BaseClass:
         # Check type-specific constraints
         param_type = param_info.get('type', 'string')
         
-        if param_type in ['int', 'float'] and value is not None:
+        if param_type in ['int', 'float', 'decimal'] and value is not None:
             try:
                 num_value = float(value)
                 

@@ -31,6 +31,29 @@ pip install -r requirements.txt  # If provided; else install pyside6 & cryptogra
 python main.py
 ```
 
+### Reproducible Windows EXE build
+
+After cloning the repository, or after pulling changes, build the complete
+PyInstaller **onedir** application from PowerShell:
+
+```powershell
+git pull
+.\build_windows.ps1
+```
+
+Launch it from its generated application folder:
+
+```powershell
+.\dist\PyLocalInventory\PyLocalInventory.exe
+```
+
+`PyLocalInventory.exe` depends on the adjacent `_internal` directory. Never
+move or transfer the EXE by itself. On another Windows computer, either run the
+build script there or transfer the complete `dist\PyLocalInventory` folder.
+Generated `build`/`dist` folders and archives are intentionally excluded from
+Git. Publish compiled distributions through GitHub Releases or an external
+artifact store, not as normal repository files.
+
 If no `requirements.txt` exists, minimal dependencies:
 ```bash
 

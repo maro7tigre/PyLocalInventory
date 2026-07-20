@@ -1,12 +1,5 @@
-# Core
-PySide6
-cryptography
-psycopg2-binary
-psycopg2
-
-# PDF generation (fallback chain — venonly one is required)
-# See README or notes below for extra setup steps per library
-playwright       # Option 1 — best quality (requires: playwright install chromium)
-xhtml2pdf        # Option 2 — pure Python, no extra steps
-weasyprint       # Option 3 — requires GTK+ runtime on Windows
-pdfkit           # Option 4 — requires wkhtmltopdf binary installed on Windows
+# Application runtime dependencies. PyInstaller is installed by build_windows.ps1.
+PySide6>=6.8,<7
+cryptography>=44,<50
+psycopg2-binary>=2.9,<3
+xhtml2pdf>=0.2.17,<0.3

@@ -9,6 +9,7 @@ $VenvPath = Join-Path $ProjectRoot '.venv'
 $PythonPath = Join-Path $VenvPath 'Scripts\python.exe'
 $SpecPath = Join-Path $ProjectRoot 'PyLocalInventory.spec'
 $ExePath = Join-Path $ProjectRoot 'dist\PyLocalInventory\PyLocalInventory.exe'
+$BrowserPath = Join-Path $ProjectRoot '.playwright-browsers'
 
 try {
     Set-Location $ProjectRoot
@@ -25,8 +26,13 @@ try {
     Write-Host 'Installing application and build dependencies...'
     & $PythonPath -m pip install --upgrade pip
     if ($LASTEXITCODE -ne 0) { throw 'pip upgrade failed.' }
-    & $PythonPath -m pip install -r (Join-Path $ProjectRoot 'requirements.txt') 'PyInstaller>=6.14,<7'
+    & $PythonPath -m pip install -r (Join-Path $ProjectRoot 'requirements.txt') 'PyInstaller==6.21.0'
     if ($LASTEXITCODE -ne 0) { throw 'Dependency installation failed.' }
+
+    $env:PLAYWRIGHT_BROWSERS_PATH = $BrowserPath
+    Write-Host 'Installing the pinned Chromium report engine...'
+    & $PythonPath -m playwright install chromium
+    if ($LASTEXITCODE -ne 0) { throw 'Chromium installation failed.' }
 
     foreach ($DirectoryName in @('build', 'dist')) {
         $Target = Join-Path $ProjectRoot $DirectoryName
@@ -46,6 +52,19 @@ try {
     $BaseLibrary = Join-Path $ProjectRoot 'dist\PyLocalInventory\_internal\base_library.zip'
     if (-not (Test-Path -LiteralPath $BaseLibrary -PathType Leaf)) {
         throw "Build is incomplete: $BaseLibrary is missing; Python encodings cannot start without it."
+    }
+    foreach ($Resource in @(
+        'dist\PyLocalInventory\_internal\report\devis_templet.html',
+        'dist\PyLocalInventory\_internal\report\bdl_templet.html',
+        'dist\PyLocalInventory\_internal\report\facture_templet.html',
+        'dist\PyLocalInventory\_internal\report\Receipt_templat.html',
+        'dist\PyLocalInventory\_internal\report\lamidap_logo.png',
+        'dist\PyLocalInventory\_internal\playwright-browsers'
+    )) {
+        $ResolvedResource = Join-Path $ProjectRoot $Resource
+        if (-not (Test-Path -LiteralPath $ResolvedResource)) {
+            throw "Build is incomplete: required resource is missing: $ResolvedResource"
+        }
     }
 
     Write-Host "Build succeeded: $ExePath" -ForegroundColor Green

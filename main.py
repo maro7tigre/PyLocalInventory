@@ -16,6 +16,11 @@ def main():
     app.setWindowIcon(QIcon(resource_path("logo.png")))
     apply_dark_theme(app)
 
+    if '--verify-report' in sys.argv:
+        from core.report_verification import generate_verification_report
+        generate_verification_report()
+        return
+
     # Create and show main window
     window = MainWindow()
     window.show()

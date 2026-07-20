@@ -25,7 +25,8 @@ def bundled_root():
 
 
 def resource_path(*parts):
-    return os.path.join(bundled_root(), *parts)
+    """Return an absolute path to a bundled, read-only application resource."""
+    return os.path.abspath(os.path.join(bundled_root(), *parts))
 
 
 def app_path(*parts):

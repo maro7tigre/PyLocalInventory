@@ -13,9 +13,7 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
-from PySide6.QtCore import Qt, QMarginsF, QUrl
-from PySide6.QtGui import QTextDocument, QPageLayout, QPageSize, QColor
-from PySide6.QtPrintSupport import QPrinter
+from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 import base64
@@ -163,7 +161,7 @@ class ReportsDialog(QDialog):
         # Generate HTML content
         html_content = self._generate_html_content(report_type)
         
-        # Convert HTML to PDF (or HTML fallback)
+        # Convert HTML to PDF with the single supported Chromium renderer.
         try:
             actual_output_path = self._html_to_pdf(html_content, filepath)
         except Exception as exc:
@@ -203,8 +201,7 @@ class ReportsDialog(QDialog):
         """Delete reports older than 48 hours"""
         cutoff_date = datetime.now() - timedelta(hours=48)
         
-        # Clean up both PDF and HTML reports (fallback reports)
-        for pattern in ["*.pdf", "*.html"]:
+        for pattern in ["*.pdf"]:
             for report_file in glob.glob(os.path.join(reports_dir, pattern)):
                 try:
                     file_mtime = datetime.fromtimestamp(os.path.getmtime(report_file))
@@ -218,9 +215,9 @@ class ReportsDialog(QDialog):
         """Generate HTML content based on report type"""
         # Get template path - all templates have _templet suffix
         template_path = resource_path("report", f"{report_type}_templet.html")
-        
-        if not os.path.exists(template_path):
-            raise Exception(f"Template file not found: {template_path}")
+        self._log_report_resources(report_type, template_path)
+        if not os.path.isfile(template_path):
+            raise FileNotFoundError(f"Required report template is missing: {template_path}")
         
         # Read template
         with open(template_path, 'r', encoding='utf-8') as f:
@@ -237,16 +234,15 @@ class ReportsDialog(QDialog):
     def _get_lamidap_logo_block(self):
         """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
         logo_path = resource_path('report', 'lamidap_logo.png')
-        try:
-            with open(logo_path, 'rb') as img_f:
-                b64 = base64.b64encode(img_f.read()).decode('ascii')
-            return (
-                f'<img src="data:image/png;base64,{b64}" '
-                f'class="report-logo" width="120" '
-                f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-            )
-        except Exception:
-            return '<div class="logo-placeholder">LOGO</div>'
+        if not os.path.isfile(logo_path):
+            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
+        with open(logo_path, 'rb') as img_f:
+            b64 = base64.b64encode(img_f.read()).decode('ascii')
+        return (
+            f'<img src="data:image/png;base64,{b64}" '
+            f'class="report-logo" width="120" '
+            f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
+        )
 
     def _extract_sales_data(self, report_type: str):
         """Extract data from sales object"""
@@ -539,36 +535,7 @@ class ReportsDialog(QDialog):
                 'logo_block': logo_block
             }
         except Exception as e:
-            print(f"Error extracting sales data: {e}")
-            # Return default data structure
-            return {
-                'company_name': 'Your Company',
-                'company_phone': '',
-                'report_footer': '',
-                'company_siret': '',
-                'company_tva': '',
-                'date': datetime.now().strftime("%d-%m-%Y"),
-                'document_ref': 'DOC-000001',
-                'client_name': 'Client Name',
-                'client_address': '',
-                'client_phone': '',
-                'client_email': '',
-                'client_ice': '',
-                'sale_notes': '',
-                'payment_terms': '',
-                'commercial': 'Sales Team',
-                'items': f'<tr><td colspan="{5 if report_type == "devis" else (3 if report_type == "bdl" else 4)}">No items found</td></tr>',
-                'table_frame_class': 'fill-page',
-                # Financial fields for devis
-                'total_remise': '0,00',
-                'total_ht': '0,00',
-                'total_regle': '0,00',
-                'net_a_payer': '0,00',
-                # BDL specific pricing fields
-                'tva': '0,00',
-                'total_ttc': '0,00',
-                'logo_block': self._get_lamidap_logo_block()
-            }
+            raise RuntimeError(f"Could not extract report data: {e}") from e
     
     def _replace_placeholders(self, template_content, data):
         """Replace template placeholders with actual data"""
@@ -579,198 +546,88 @@ class ReportsDialog(QDialog):
         return template_content
     
     def _html_to_pdf(self, html_content, output_path):
-        """Convert HTML to PDF with full CSS support"""
+        """Convert HTML to PDF with the bundled Chromium renderer."""
+        temp_html_path = None
         try:
-            errors = []
-            def _safe_error(error):
-                return str(error).encode('ascii', 'backslashreplace').decode('ascii')
-
             base_url = os.path.abspath(resource_path("report"))
-            # Create a temporary HTML file
             with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
                 temp_html.write(html_content)
                 temp_html_path = temp_html.name
-
-            # Try playwright first (best CSS support)
-            try:
-                from playwright.sync_api import sync_playwright
-                print("DEBUG: Using Playwright for PDF generation")
-                
-                with sync_playwright() as p:
-                    try:
-                        browser = p.chromium.launch(headless=True)
-                    except Exception:
-                        executable = self._find_installed_chromium()
-                        if not executable:
-                            raise
-                        print(f"DEBUG: Using installed Chromium executable: {executable}")
-                        browser = p.chromium.launch(headless=True, executable_path=executable)
+            from playwright.sync_api import sync_playwright
+            executable = self._find_installed_chromium()
+            if not executable:
+                raise FileNotFoundError("The bundled Chromium PDF engine is missing.")
+            self._write_report_log(
+                f"PDF engine: Playwright Chromium\nBase path: {base_url}\n"
+                f"Temporary HTML URI: {Path(temp_html_path).as_uri()}\n"
+                f"Chromium: {executable}\nChromium exists: {os.path.isfile(executable)}"
+            )
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, executable_path=executable)
+                try:
                     page = browser.new_page()
                     page.emulate_media(media="print")
                     page.goto(Path(temp_html_path).as_uri(), wait_until='networkidle')
-                    
-                    # Configure PDF options for A4 size with proper margins and page breaks
-                    pdf_options = {
-                        'path': output_path,
-                        'format': 'A4',
-                        'print_background': True,
-                        'prefer_css_page_size': True,
-                        'margin': {
-                            'top': '0',
-                            'bottom': '0',
-                            'left': '0',
-                            'right': '0'
-                        }
-                    }
-                    
-                    page.pdf(**pdf_options)
-                    browser.close()
-                    
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with Playwright: {output_path}")
-                return output_path
-            except ImportError:
-                errors.append("Playwright not available")
-                print("DEBUG: Playwright not available")
-                pass
-            except Exception as e:
-                message = _safe_error(e)
-                errors.append(f"Playwright failed: {message}")
-                print(f"DEBUG: Playwright failed: {message}")
-            
-            # Try WeasyPrint next (good print CSS support)
-            try:
-                import weasyprint
-                print("DEBUG: Using WeasyPrint for PDF generation")
-                html = weasyprint.HTML(string=html_content, base_url=base_url)
-                html.write_pdf(output_path)
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with WeasyPrint: {output_path}")
-                return output_path
-            except ImportError:
-                errors.append("WeasyPrint not available")
-                print("DEBUG: WeasyPrint not available")
-                pass
-            except Exception as e:
-                message = _safe_error(e)
-                errors.append(f"WeasyPrint failed: {message}")
-                print(f"DEBUG: WeasyPrint failed: {message}")
-
-            # Try xhtml2pdf as fallback (limited CSS support)
-            try:
-                from xhtml2pdf import pisa
-                print("DEBUG: Using xhtml2pdf for PDF generation")
-                
-                with open(output_path, "wb") as result_file:
-                    # Convert HTML to PDF
-                    pisa_status = pisa.CreatePDF(
-                        html_content,
-                        dest=result_file,
-                        path=temp_html_path,
-                        encoding='utf-8'
+                    page.pdf(
+                        path=output_path, format='A4', print_background=True,
+                        prefer_css_page_size=True,
+                        margin={'top': '0', 'bottom': '0', 'left': '0', 'right': '0'},
                     )
-                    
-                    if not pisa_status.err:
-                        os.unlink(temp_html_path)
-                        print(f"DEBUG: Successfully generated PDF with xhtml2pdf: {output_path}")
-                        return output_path
-                    else:
-                        errors.append(f"xhtml2pdf reported errors: {pisa_status.err}")
-                        print(f"DEBUG: xhtml2pdf reported errors: {pisa_status.err}")
-                        
-            except ImportError:
-                errors.append("xhtml2pdf not available")
-                print("DEBUG: xhtml2pdf not available")
-                pass
-            except Exception as e:
-                message = _safe_error(e)
-                errors.append(f"xhtml2pdf failed: {message}")
-                print(f"DEBUG: xhtml2pdf failed: {message}")
-            
-            # Try pdfkit as last resort
-            try:
-                import pdfkit
-                print("DEBUG: Using PDFKit for PDF generation")
-                # Configure pdfkit options for better compatibility
-                options = {
-                    'page-size': 'A4',
-                    'margin-top': '0.75in',
-                    'margin-right': '0.75in',
-                    'margin-bottom': '0.75in',
-                    'margin-left': '0.75in',
-                    'encoding': "UTF-8",
-                    'no-outline': None
-                }
-                pdfkit.from_file(temp_html_path, output_path, options=options)
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with PDFKit: {output_path}")
-                return output_path
-            except ImportError:
-                errors.append("PDFKit not available")
-                print("DEBUG: PDFKit not available")
-                pass
-            except Exception as e:
-                message = _safe_error(e)
-                errors.append(f"PDFKit failed: {message}")
-                print(f"DEBUG: PDFKit failed: {message}")
-
-            # Last-resort built-in backend. Normal reports use Playwright above,
-            # preserving the existing HTML/CSS template design.
-            try:
-                printer = QPrinter(QPrinter.HighResolution)
-                printer.setOutputFormat(QPrinter.PdfFormat)
-                printer.setOutputFileName(output_path)
-                printer.setPageSize(QPageSize(QPageSize.A4))
-                printer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter)
-                document = QTextDocument()
-                document.setBaseUrl(QUrl.fromLocalFile(base_url + os.sep))
-                document.setHtml(html_content)
-                root_format = document.rootFrame().frameFormat()
-                root_format.setBackground(QColor("#ffffff"))
-                document.rootFrame().setFrameFormat(root_format)
-                document.setPageSize(printer.pageRect(QPrinter.Point).size())
-                document.print_(printer)
-                if os.path.exists(output_path) and os.path.getsize(output_path) > 0:
-                    os.unlink(temp_html_path)
-                    print(f"DEBUG: Successfully generated fallback PDF with Qt: {output_path}")
-                    return output_path
-                errors.append("Qt PDF backend produced no output")
-            except Exception as e:
-                message = _safe_error(e)
-                errors.append(f"Qt PDF backend failed: {message}")
-                print(f"DEBUG: Qt PDF backend failed: {message}")
-            
-            # If PDF generation fails, save as HTML with proper extension
-            print("DEBUG: Falling back to HTML generation")
-            html_output_path = output_path.replace('.pdf', '.html')
-            with open(html_output_path, 'w', encoding='utf-8') as f:
-                f.write(html_content)
-            
-            # Clean up temporary file
-            os.unlink(temp_html_path)
-            print(f"DEBUG: Generated HTML fallback: {html_output_path}")
-            raise Exception(
-                "PDF generation failed. HTML fallback was saved to:\n"
-                f"{html_output_path}\n\n"
-                "PDF backend errors:\n- " + "\n- ".join(errors)
-            )
-            
+                finally:
+                    browser.close()
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("Chromium completed without producing a PDF.")
+            return output_path
         except Exception as e:
-            # Clean up temporary file if it exists
-            if 'temp_html_path' in locals() and os.path.exists(temp_html_path):
-                try:
-                    os.unlink(temp_html_path)
-                except:
-                    pass
-            print(f"DEBUG: HTML to PDF conversion failed: {e}")
-            print(f"DEBUG: Output path: {output_path}")
-            raise Exception(f"Failed to convert HTML to PDF: {str(e)}")
+            raise RuntimeError(f"Chromium PDF generation failed: {e}") from e
+        finally:
+            if temp_html_path and os.path.exists(temp_html_path):
+                os.unlink(temp_html_path)
+
+    def _log_report_resources(self, report_type, template_path):
+        report_dir = resource_path('report')
+        logo_path = resource_path('report', 'lamidap_logo.png')
+        browser_path = self._find_installed_chromium()
+        self._write_report_log("\n".join([
+            f"Frozen runtime: {bool(getattr(sys, 'frozen', False))}",
+            f"sys._MEIPASS: {getattr(sys, '_MEIPASS', 'not set')}",
+            f"Report type: {report_type}",
+            f"Report base path: {report_dir}",
+            f"Report base path exists: {os.path.isdir(report_dir)}",
+            f"Template: {template_path}",
+            f"Template exists: {os.path.isfile(template_path)}",
+            "CSS: inline in template",
+            f"CSS source exists: {os.path.isfile(template_path)}",
+            "Fonts: Arial/Helvetica system fonts (no custom font files referenced)",
+            f"Logo: {logo_path}",
+            f"Logo exists: {os.path.isfile(logo_path)}",
+            f"Chromium: {browser_path or 'not found'}",
+            f"Chromium exists: {bool(browser_path and os.path.isfile(browser_path))}",
+        ]))
 
     @staticmethod
     def _find_installed_chromium():
         """Find a usable Playwright/Chrome executable when revisions differ."""
         local_appdata = os.getenv('LOCALAPPDATA') or ''
         program_files = os.getenv('PROGRAMFILES') or ''
+        bundled_candidates = []
+        # The build cache is dot-prefixed in source mode and is copied without
+        # the dot into PyInstaller's read-only resource directory.
+        for bundled_browser_root in (
+            resource_path('playwright-browsers'),
+            resource_path('.playwright-browsers'),
+        ):
+            bundled_candidates.extend(glob.glob(os.path.join(
+                bundled_browser_root, 'chromium_headless_shell-*',
+                'chrome-headless-shell-win64', 'chrome-headless-shell.exe'
+            )))
+            bundled_candidates.extend(glob.glob(os.path.join(
+                bundled_browser_root, 'chromium-*', 'chrome-win64', 'chrome.exe'
+            )))
+        bundled_existing = [path for path in bundled_candidates if os.path.isfile(path)]
+        if bundled_existing:
+            return max(bundled_existing, key=os.path.getmtime)
+
         candidates = []
         candidates.extend(glob.glob(os.path.join(
             local_appdata, 'ms-playwright', 'chromium_headless_shell-*',

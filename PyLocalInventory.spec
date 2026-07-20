@@ -1,22 +1,29 @@
 # -*- mode: python ; coding: utf-8 -*-
+import os
 from pathlib import Path
-from PyInstaller.utils.hooks import collect_submodules
+from PyInstaller.utils.hooks import collect_all
 
 project_root = Path(SPECPATH)
+browser_root = Path(os.environ['PLAYWRIGHT_BROWSERS_PATH'])
+if not browser_root.is_dir():
+    raise SystemExit(f'Playwright browser directory is missing: {browser_root}')
+
+playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
 a = Analysis(
     [str(project_root / 'main.py')],
     pathex=[str(project_root)],
-    binaries=[],
-    datas=[
+    binaries=playwright_binaries,
+    datas=playwright_datas + [
         (str(project_root / 'logo.png'), '.'),
         (str(project_root / 'report'), 'report'),
+        (str(browser_root), 'playwright-browsers'),
     ],
-    hiddenimports=collect_submodules('encodings') + ['xhtml2pdf'],
+    hiddenimports=playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],
-    excludes=['playwright', 'weasyprint', 'pdfkit'],
+    excludes=['weasyprint', 'xhtml2pdf', 'pdfkit'],
     noarchive=False,
     optimize=0,
 )

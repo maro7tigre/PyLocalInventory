@@ -404,43 +404,27 @@ class SaleEditDialog(QDialog):
                 value = self.get_widget_value(widget)
                 self.sale_obj.set_value(param_key, value)
             
-            # Save sale to database first
-            if self.sale_id:
-                # Update existing sale
-                success = self.sale_obj.save_to_database()
-                action = "updated"
-            else:
-                # Add new sale and get the new ID
-                success = self.sale_obj.save_to_database()
-                if success:
-                    self.sale_id = self.sale_obj.id
-                    action = "created"
-            
-            if success:
-                # Simple approach: Clear all existing items and add current ones
-                operation_id = self.sale_obj.id
-                
-                # Delete all existing sales items for this operation
-                if hasattr(self.sale_obj, 'get_sales_items'):
-                    existing_items = self.sale_obj.get_sales_items()
-                    for item in existing_items:
-                        if hasattr(item, 'id') and item.id:
-                            self.database.delete_item(item.id, "Sales_Items")
-                
-                # Add all current table items
-                current_data = self.sales_items_table.get_current_table_data()
-                items_saved = 0
-                
-                for item_data in current_data:
-                    item_data['sales_id'] = operation_id
-                    if self.database.add_item(item_data, "Sales_Items"):
-                        items_saved += 1
-                
-                QMessageBox.information(self, "Success", 
-                    f"Sale {action} successfully!\n{items_saved} items saved.")
-                self.accept()  # Close dialog
-            else:
-                QMessageBox.critical(self, "Error", "Failed to save sale to database")
+            action = "updated" if self.sale_id else "created"
+            current_data = self.sales_items_table.get_current_table_data()
+            header = {
+                key: self.sale_obj.get_value(key)
+                for key in self.sale_obj.get_visible_parameters('database')
+                if not self.sale_obj.is_parameter_calculated(key)
+            }
+            result = self.database.save_sale_with_items(
+                header, current_data, self.sale_id, len(current_data)
+            )
+            if not isinstance(result, dict) or result.get('saved') != len(current_data):
+                raise RuntimeError(
+                    f"Sale was not saved: {len(current_data)} visible items were found, "
+                    f"but the server confirmed {result.get('saved', 0) if isinstance(result, dict) else 0}."
+                )
+            self.sale_id = result['sale_id']
+            self.sale_obj.id = result['sale_id']
+            QMessageBox.information(
+                self, "Success", f"Sale {action} successfully. {result['saved']} items saved."
+            )
+            self.accept()
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save sale: {str(e)}")

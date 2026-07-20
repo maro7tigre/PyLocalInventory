@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 import time
 import os
+from decimal import Decimal
 from datetime import datetime
 from core.runtime_paths import user_data_root
 
@@ -152,7 +153,18 @@ class RemoteDatabase:
             raise AuthError("Not connected")
 
         url = f"http://{self.host}:{self.port}/rpc"
-        payload = json.dumps({'method': method, 'args': args or [], 'kwargs': kwargs or {}}).encode('utf-8')
+        safe_args = self._json_safe(args or [])
+        safe_kwargs = self._json_safe(kwargs or {})
+        payload = json.dumps({'method': method, 'args': safe_args, 'kwargs': safe_kwargs}).encode('utf-8')
+        if method == 'save_sale_with_items':
+            sale_data = safe_args[0] if safe_args else {}
+            items = safe_args[1] if len(safe_args) > 1 else []
+            self._write_network_log(
+                f"request_url={url} method={method} sale_id={safe_args[2] if len(safe_args) > 2 else None} "
+                f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
+                f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
+                f"items_sent={len(items)} items={items}"
+            )
         req = urllib.request.Request(
             url, data=payload,
             headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self._token}'},
@@ -161,12 +173,17 @@ class RemoteDatabase:
         started = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=10) as resp:
+                http_status = resp.status
                 data = json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             try:
                 message = json.loads(e.read().decode('utf-8')).get('error', str(e))
             except Exception:
                 message = str(e)
+            if method == 'save_sale_with_items':
+                self._write_network_log(
+                    f"response_url={url} http_status={e.code} validation=failed error={message}"
+                )
             if e.code == 401:
                 raise AuthError(message)
             if e.code == 403:
@@ -175,6 +192,10 @@ class RemoteDatabase:
         except (AuthError, PermissionDeniedError, RemoteError):
             raise
         except Exception as e:
+            if method == 'save_sale_with_items':
+                self._write_network_log(
+                    f"response_url={url} http_status=unavailable connection_error={e}"
+                )
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -189,7 +210,35 @@ class RemoteDatabase:
                     )
             except OSError:
                 pass
-        return data.get('result')
+        result = data.get('result')
+        if method == 'save_sale_with_items':
+            self._write_network_log(
+                f"response_url={url} http_status={http_status} validation=ok result={self._json_safe(result)}"
+            )
+        return result
+
+    @classmethod
+    def _json_safe(cls, value):
+        """Convert database/UI values to JSON primitives without losing decimals."""
+        if isinstance(value, Decimal):
+            return format(value, 'f')
+        if isinstance(value, dict):
+            return {str(key): cls._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
+
+    @staticmethod
+    def _write_network_log(message):
+        try:
+            log_dir = os.path.join(user_data_root(), 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] client {message}\n")
+        except OSError:
+            pass
 
     def __getattr__(self, name):
         # Reached only for attributes not set in __init__: add_item, update_item,

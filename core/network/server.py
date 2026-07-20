@@ -23,6 +23,8 @@ import json
 import secrets
 import socket
 import threading
+import os
+from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from psycopg2.pool import ThreadedConnectionPool
@@ -31,6 +33,7 @@ from core.database import Database
 from core.pg_config import load_server_config
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
+from core.runtime_paths import user_data_root
 
 # method name -> (kind, index into `args` holding the section name)
 _SECTION_METHODS = {
@@ -72,6 +75,11 @@ def _check_permission(user, method, args, kwargs):
     if user['is_superadmin']:
         return True, None
     if method in _ALWAYS_ALLOWED or method in ('conn.commit', 'conn.rollback'):
+        return True, None
+
+    if method == 'save_sale_with_items':
+        if not user['permissions'].get('Sales', {}).get('write'):
+            return False, "You don't have write access to Sales"
         return True, None
 
     if method == 'cursor.execute':
@@ -214,7 +222,11 @@ class DatabaseServer:
                 cur = request_db.cursor
                 cur.execute(sql, params)
                 kind, _table = classify_sql(sql)
-                if kind in ('write', 'delete'):
+                # Each RPC borrows a different pooled connection, so leaving
+                # DDL uncommitted and calling conn.commit in a later RPC cannot
+                # commit the original transaction. Commit all mutating SQL in
+                # the request that executed it.
+                if kind in ('schema', 'write', 'delete'):
                     request_db.conn.commit()
                 result = {'rowcount': cur.rowcount}
                 if cur.description:
@@ -229,12 +241,25 @@ class DatabaseServer:
                 request_db.conn.rollback()
                 return None
 
+            if method == 'save_sale_with_items':
+                return request_db.save_sale_with_items(*args, **kwargs)
+
             if method in _SECTION_METHODS or method in _ALWAYS_ALLOWED:
                 return getattr(request_db, method)(*args, **kwargs)
 
             raise ValueError(f"Method not allowed over network: {method}")
         finally:
             self._return_database(request_db)
+
+    @staticmethod
+    def _write_sales_log(message):
+        try:
+            log_dir = os.path.join(user_data_root(), 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] server {message}\n")
+        except OSError:
+            pass
 
     def _make_handler(self):
         server_obj = self
@@ -299,14 +324,33 @@ class DatabaseServer:
                 args = body.get('args', [])
                 kwargs = body.get('kwargs', {})
 
+                if method == 'save_sale_with_items':
+                    sale_data = args[0] if args else {}
+                    items = args[1] if len(args) > 1 else []
+                    server_obj._write_sales_log(
+                        f"received user={user.get('username')} sale_id={args[2] if len(args) > 2 else None} "
+                        f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
+                        f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
+                        f"items_array={isinstance(items, list)} items_received={len(items) if isinstance(items, list) else 'invalid'} "
+                        f"items={items}"
+                    )
+
                 allowed, reason = _check_permission(user, method, args, kwargs)
                 if not allowed:
                     return self._send_json(403, {'error': reason})
 
                 try:
                     result = server_obj._dispatch(method, args, kwargs)
+                except ValueError as e:
+                    if method == 'save_sale_with_items':
+                        server_obj._write_sales_log(f"validation=failed transaction=rollback error={e}")
+                    return self._send_json(400, {'error': str(e)})
                 except Exception as e:
+                    if method == 'save_sale_with_items':
+                        server_obj._write_sales_log(f"validation_or_transaction=rollback error={e}")
                     return self._send_json(500, {'error': str(e)})
+                if method == 'save_sale_with_items':
+                    server_obj._write_sales_log(f"validation=ok transaction=commit result={result}")
                 self._send_json(200, {'result': result})
 
         return Handler

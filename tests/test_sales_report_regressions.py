@@ -14,6 +14,9 @@ from PySide6.QtCore import Qt
 from classes.sales_item_class import SalesItemClass
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
 from ui.dialogs.reports_dialog import ReportsDialog
+from ui.dialogs.payment_dialog import PaymentDialog
+from ui.dialogs.order_progress_dialog import OrderProgressDialog
+from ui.dialogs.client_details_dialog import ClientDetailsDialog
 from ui.tabs.sales_tab import SalesEditDialog
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from ui.widgets.autocomplete_widgets import AutoExpandingTextEdit
@@ -28,6 +31,30 @@ class _Values:
         return self.values.get(key)
 
 
+class _PaymentCursor:
+    def __init__(self):
+        self._row = (Decimal("0"),)
+        self.statements = []
+
+    def execute(self, sql, params=None):
+        self.statements.append(" ".join(sql.split()))
+        return self
+
+    def fetchone(self):
+        return self._row
+
+
+class _PaymentConnection:
+    def commit(self):
+        pass
+
+
+class _PaymentDatabase:
+    def __init__(self):
+        self.cursor = _PaymentCursor()
+        self.conn = _PaymentConnection()
+
+
 class SalesReportRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -39,6 +66,38 @@ class SalesReportRegressionTests(unittest.TestCase):
         item.set_value("unit_price", 10)
         self.assertEqual(item.get_value("quantity"), Decimal("12.52"))
         self.assertEqual(item.get_value("subtotal"), Decimal("125.20"))
+
+    def test_payment_dialog_accepts_decimal_sale_total(self):
+        sale = _Values({
+            "client_name": "Client", "client_username": "client", "date": "2026-07-20"
+        })
+        sale.id = 7
+        sale.calculate_total_price = lambda: Decimal("439.20")
+        dialog = PaymentDialog(sale, _PaymentDatabase(), config={"currency": None})
+        self.assertEqual(dialog._total, 439.20)
+        self.assertEqual(dialog._remaining_before, 439.20)
+        self.assertEqual(dialog.currency, "MAD")
+        dialog.close()
+
+    def test_order_progress_accepts_decimal_sale_total(self):
+        sale = _Values({
+            "client_name": "Client", "client_username": "client",
+            "date": "2026-07-20", "notes": ""
+        })
+        sale.id = 8
+        sale.calculate_total_price = lambda: Decimal("439.20")
+        sale.get_sales_items = lambda: []
+        dialog = OrderProgressDialog(sale, _PaymentDatabase())
+        self.assertEqual(dialog._remaining_item.text(), "439.20")
+        dialog.close()
+
+    def test_client_payment_migration_avoids_blocked_information_schema_query(self):
+        database = _PaymentDatabase()
+        holder = type("ClientDetailsHolder", (), {"database": database})()
+        ClientDetailsDialog._ensure_payments_table(holder)
+        sql = "\n".join(database.cursor.statements).lower()
+        self.assertIn("add column if not exists sales_item_id", sql)
+        self.assertNotIn("information_schema", sql)
 
     def test_highlighting_suggestion_does_not_replace_typed_words(self):
         edit = AutoCompleteLineEdit(options=["Transport Service Tanger"], allow_free_text=True)

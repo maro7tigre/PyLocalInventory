@@ -13,6 +13,8 @@ from ui.widgets.operations_table import OperationsTableWidget
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+import os
+from core.runtime_paths import user_data_root
 
 
 class BaseOperationDialog(QDialog):
@@ -337,6 +339,45 @@ class BaseOperationDialog(QDialog):
                 pass
             
             # Save operation to database first (ensures ID exists)
+            if self.operation_obj.section == 'Sales':
+                items_objects = self.items_table.get_items_data()
+                sale_state = self.operation_obj.get_value('state') or 'pending'
+                if sale_state != 'on_hold':
+                    stock_errors = self._validate_stock(items_objects)
+                    mw = self._get_main_window()
+                    warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                    if stock_errors and warn_stock:
+                        reply = QMessageBox.warning(
+                            self, "Insufficient Stock",
+                            "Not enough stock for:\n\n" +
+                            "\n".join(f"  • {e}" for e in stock_errors) +
+                            "\n\nSave anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.No
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
+                action = "updated" if self.operation_id else "created"
+                result = self._save_sale_atomically()
+                self.operation_id = result['sale_id']
+                self.operation_obj.id = result['sale_id']
+                self.operation_obj.set_value('id', result['sale_id'])
+                expected = result.get('expected', 0)
+                saved = result.get('saved', 0)
+                if saved != expected:
+                    raise RuntimeError(
+                        f"Sale was not saved: {expected} visible items were found, "
+                        f"but the server confirmed {saved} saved items."
+                    )
+                QMessageBox.information(
+                    self, "Success",
+                    f"Operation {action} successfully. {saved} items saved.\n"
+                    f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
+                    f"deleted: {result.get('deleted', 0)}."
+                )
+                self.accept()
+                return
+
             success = self.operation_obj.save_to_database()
             action = "updated" if self.operation_id else "created"
             self.operation_id = self.operation_obj.id
@@ -426,6 +467,57 @@ class BaseOperationDialog(QDialog):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
+
+    def _save_sale_atomically(self):
+        """Send the complete visible sale and line set in one database operation."""
+        raw_items = self.items_table.get_current_table_data()
+        extraction = getattr(self.items_table, 'last_extraction_diagnostics', {})
+        prepared = []
+        for index, raw in enumerate(raw_items, start=1):
+            item = dict(raw)
+            item.pop('row_index', None)
+            product_id = item.get('product_id')
+            service_id = item.get('service_id')
+            item['product_id'] = product_id
+            item['service_id'] = service_id
+            item['item_type'] = 'product' if product_id else ('service' if service_id else 'manual')
+            item['is_new'] = not bool(item.get('id'))
+            prepared.append(item)
+
+        header = {
+            key: self.operation_obj.get_value(key)
+            for key in self.operation_obj.get_visible_parameters('database')
+            if not self.operation_obj.is_parameter_calculated(key)
+        }
+        self._write_sale_save_log(
+            f"mode={self.database.__class__.__name__} host={getattr(self.database, 'host', 'local')} "
+            f"port={getattr(self.database, 'port', 'local')} visible_rows={len(raw_items)} "
+            f"extracted_rows={len(prepared)} extraction={extraction} sale_id={self.operation_id} "
+            f"client_id={header.get('client_id')} client_identifier={header.get('client_username')} date={header.get('date')} vat={header.get('tva')} "
+            f"notes_present={bool(header.get('notes'))} items={prepared}"
+        )
+        result = self.database.save_sale_with_items(
+            header, prepared, self.operation_id, len(raw_items)
+        )
+        if not isinstance(result, dict) or result.get('transaction') != 'committed':
+            raise RuntimeError(f"Host returned an invalid sale-save result: {result!r}")
+        result['expected'] = len(prepared)
+        self._write_sale_save_log(
+            f"server_result validation=ok inserted={result.get('inserted')} "
+            f"updated={result.get('updated')} deleted={result.get('deleted')} "
+            f"saved={result.get('saved')} transaction={result.get('transaction')}"
+        )
+        return result
+
+    @staticmethod
+    def _write_sale_save_log(message):
+        try:
+            log_dir = os.path.join(user_data_root(), 'logs')
+            os.makedirs(log_dir, exist_ok=True)
+            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
+                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] ui {message}\n")
+        except OSError:
+            pass
     
     def apply_theme(self):
         """Apply dark theme"""

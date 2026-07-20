@@ -29,21 +29,24 @@ class ClientsTab(BaseTab):
 
     def view_client(self):
         """Open the account view for the selected client."""
-        client_id = self.get_selected_id()
-        if client_id is None:
-            QMessageBox.information(self, "No Selection", "Please select a client first.")
-            return
-
-        client = next((item for item in self.all_items if item.id == client_id), None)
-        if client is None:
-            client = ClientClass(client_id, self.database)
-            if not client.load_database_data():
-                QMessageBox.warning(self, "Client Error", "Could not load the selected client.")
+        try:
+            client_id = self.get_selected_id()
+            if client_id is None:
+                QMessageBox.information(self, "No Selection", "Please select a client first.")
                 return
 
-        dialog = ClientDetailsDialog(client, self.database, self)
-        dialog.showMaximized()
-        dialog.exec()
+            client = next((item for item in self.all_items if item.id == client_id), None)
+            if client is None:
+                client = ClientClass(client_id, self.database)
+                if not client.load_database_data():
+                    QMessageBox.warning(self, "Client Error", "Could not load the selected client.")
+                    return
+
+            dialog = ClientDetailsDialog(client, self.database, self)
+            dialog.showMaximized()
+            dialog.exec()
+        except Exception as error:
+            QMessageBox.critical(self, "Client Error", f"Could not open the selected client:\n{error}")
 
     def details_callback(self, obj_id):
         """Open client details from any future details cell."""

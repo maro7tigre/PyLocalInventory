@@ -620,6 +620,169 @@ class Database:
         if self.conn:
             self.conn.rollback()
 
+    @staticmethod
+    def _sale_decimal(value, field, minimum=None):
+        from decimal import Decimal, InvalidOperation
+        try:
+            number = Decimal(str(value if value not in (None, '') else 0).replace(' ', '').replace(',', '.'))
+        except (InvalidOperation, ValueError):
+            raise ValueError(f"Invalid numeric value for {field}: {value!r}")
+        if minimum is not None and number < Decimal(str(minimum)):
+            raise ValueError(f"{field} must be at least {minimum}")
+        return number
+
+    def save_sale_with_items(self, sale_data, items, sale_id=None, visible_row_count=None):
+        """Atomically save one sale header and its complete visible line set."""
+        if not isinstance(sale_data, dict):
+            raise ValueError("sale_data must be an object")
+        if not isinstance(items, list):
+            raise ValueError("items must be an array")
+        visible_count = int(visible_row_count if visible_row_count is not None else len(items))
+        if visible_count > 0 and not items:
+            raise ValueError(
+                f"Sale was not saved: {visible_count} visible items were found, but the server received 0 valid items."
+            )
+
+        validated = []
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item {index} must be an object")
+            name = str(raw.get('product_name') or raw.get('designation') or '').strip()
+            if not name:
+                raise ValueError(f"Item {index}: designation is required")
+            quantity = self._sale_decimal(raw.get('quantity'), f"item {index} quantity", '0.001')
+            unit_price = self._sale_decimal(raw.get('unit_price'), f"item {index} unit price", '0')
+            item_id = raw.get('id')
+            product_id = raw.get('product_id')
+            service_id = raw.get('service_id')
+            try:
+                item_id = int(item_id) if item_id not in (None, '', 0, '0') else None
+                product_id = int(product_id) if product_id not in (None, '', 0, '0') else None
+                service_id = int(service_id) if service_id not in (None, '', 0, '0') else None
+            except (TypeError, ValueError):
+                raise ValueError(f"Item {index}: IDs must be integers when present")
+
+            validated.append({
+                'id': item_id,
+                'product_id': product_id,
+                'service_id': service_id,
+                'product_name': name,
+                'information': str(raw.get('information') or '').strip(),
+                'quantity': quantity,
+                'unit_price': unit_price,
+                'production': int(raw.get('production') or 0),
+                'item_type': 'product' if product_id else ('service' if service_id else 'manual'),
+            })
+
+        try:
+            # Resolve product/service names on the host connection that owns the transaction.
+            for item in validated:
+                if item['product_id'] is None:
+                    self.cursor.execute(
+                        "SELECT id FROM products WHERE LOWER(name) = LOWER(%s) LIMIT 1",
+                        (item['product_name'],),
+                    )
+                    row = self.cursor.fetchone()
+                    item['product_id'] = int(row[0]) if row else None
+                if item['product_id'] is None and item['service_id'] is None:
+                    self.cursor.execute(
+                        "SELECT id FROM services WHERE LOWER(name) = LOWER(%s) LIMIT 1",
+                        (item['product_name'],),
+                    )
+                    row = self.cursor.fetchone()
+                    item['service_id'] = int(row[0]) if row else None
+                item['item_type'] = (
+                    'product' if item['product_id'] else
+                    ('service' if item['service_id'] else 'manual')
+                )
+
+            sale_cls = self.registered_classes['Sales']
+            sale_obj = sale_cls(0, None)
+            header = {
+                key: sale_data[key]
+                for key in sale_obj.get_visible_parameters('database')
+                if key in sale_data and not sale_obj.is_parameter_calculated(key)
+            }
+            if not header:
+                raise ValueError("Sale header contains no storable fields")
+
+            if sale_id:
+                sale_id = int(sale_id)
+                assignments = ', '.join(f"{key} = %s" for key in header)
+                self.cursor.execute(
+                    f"UPDATE sales SET {assignments} WHERE id = %s",
+                    [*header.values(), sale_id],
+                )
+                if self.cursor.rowcount != 1:
+                    raise ValueError(f"Sale {sale_id} does not exist")
+            else:
+                columns = ', '.join(header)
+                placeholders = ', '.join('%s' for _ in header)
+                self.cursor.execute(
+                    f"INSERT INTO sales ({columns}) VALUES ({placeholders}) RETURNING id",
+                    list(header.values()),
+                )
+                row = self.cursor.fetchone()
+                if not row:
+                    raise RuntimeError("Host database did not return the new sale ID")
+                sale_id = int(row[0])
+
+            self.cursor.execute("SELECT id FROM sales_items WHERE sales_id = %s", (sale_id,))
+            existing_ids = {int(row[0]) for row in self.cursor.fetchall()}
+            retained_ids = set()
+            inserted = updated = 0
+            for item in validated:
+                values = (
+                    item['product_id'], item['product_name'], item['information'],
+                    item['quantity'], item['unit_price'], item['production'],
+                )
+                if item['id'] is not None:
+                    if item['id'] not in existing_ids:
+                        raise ValueError(f"Item ID {item['id']} does not belong to sale {sale_id}")
+                    self.cursor.execute(
+                        "UPDATE sales_items SET product_id=%s, product_name=%s, information=%s, "
+                        "quantity=%s, unit_price=%s, production=%s WHERE id=%s AND sales_id=%s",
+                        (*values, item['id'], sale_id),
+                    )
+                    retained_ids.add(item['id'])
+                    updated += 1
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO sales_items (sales_id, product_id, product_name, information, quantity, unit_price, production) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (sale_id, *values),
+                    )
+                    row = self.cursor.fetchone()
+                    if not row:
+                        raise RuntimeError(f"Item {item['product_name']!r} was not inserted")
+                    retained_ids.add(int(row[0]))
+                    inserted += 1
+
+            delete_ids = existing_ids - retained_ids
+            if delete_ids:
+                self.cursor.execute(
+                    "DELETE FROM sales_items WHERE sales_id = %s AND id = ANY(%s)",
+                    (sale_id, list(delete_ids)),
+                )
+            deleted = len(delete_ids)
+            self.conn.commit()
+            return {
+                'sale_id': sale_id,
+                'saved': len(validated),
+                'inserted': inserted,
+                'updated': updated,
+                'deleted': deleted,
+                'items': [
+                    {'item_type': item['item_type'], 'product_id': item['product_id'],
+                     'service_id': item['service_id'], 'designation': item['product_name']}
+                    for item in validated
+                ],
+                'transaction': 'committed',
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def query(self, cls, **filters):
         """Query objects with optional filters"""
         if not self.cursor:

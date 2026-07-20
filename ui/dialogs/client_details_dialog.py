@@ -57,15 +57,11 @@ class ClientDetailsDialog(QDialog):
             )
             """
         )
+        # Avoid querying information_schema through the LAN permission layer.
+        # PostgreSQL can perform this migration safely and idempotently itself.
         self.database.cursor.execute(
-            "SELECT column_name FROM information_schema.columns "
-            "WHERE table_schema = current_schema() AND table_name = 'payments'"
+            "ALTER TABLE Payments ADD COLUMN IF NOT EXISTS sales_item_id INTEGER"
         )
-        columns = {row[0] for row in self.database.cursor.fetchall()}
-        if "sales_item_id" not in columns:
-            self.database.cursor.execute(
-                "ALTER TABLE Payments ADD COLUMN sales_item_id INTEGER"
-            )
         self.database.conn.commit()
 
     def _setup_ui(self):

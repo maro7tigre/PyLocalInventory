@@ -70,8 +70,19 @@ class TableDataManager:
             if param_key == 'product_name' and value and value.lower() == 'product name':
                 continue
                 
-            if value:
+            if value != "":
                 row_data[param_key] = self._convert_value_type(param_key, value)
+
+        try:
+            name_col = self.table_columns.index('product_name')
+            name_widget = table.cellWidget(row, name_col)
+            if name_widget:
+                for key in ('item_id', 'product_id', 'service_id', 'item_type'):
+                    value = name_widget.property(key)
+                    if value not in (None, '', 0, '0'):
+                        row_data['id' if key == 'item_id' else key] = value
+        except (ValueError, AttributeError):
+            pass
 
         # If we have product_name but no quantity yet, set default 1 (so later logic can proceed)
         if 'product_name' in row_data and 'quantity' not in row_data:
@@ -83,6 +94,11 @@ class TableDataManager:
         # If unit_price absent, default to 0.0 (it may be filled later)
         if 'product_name' in row_data and 'unit_price' not in row_data:
             row_data['unit_price'] = 0.0
+        if 'product_name' in row_data:
+            row_data['subtotal'] = (
+                Decimal(str(row_data.get('quantity', 0))) *
+                Decimal(str(row_data.get('unit_price', 0)))
+            )
         
         return row_data
     
@@ -220,6 +236,10 @@ class TableRowFactory:
             else:
                 value = item.get_value(param_key) if hasattr(item, 'get_value') else ""
             autocomplete.setText(str(value or ""))
+            autocomplete.setProperty('item_id', getattr(item, 'id', None) or item.get_value('id'))
+            autocomplete.setProperty('product_id', item.get_value('product_id'))
+            autocomplete.setProperty('service_id', item.get_value('service_id') if 'service_id' in getattr(item, 'parameters', {}) else None)
+            autocomplete.setProperty('item_type', 'product' if item.get_value('product_id') else 'manual')
         
         table.setCellWidget(row, col, autocomplete)
     
@@ -886,13 +906,25 @@ class OperationsTableWidget(QWidget):
     def get_current_table_data(self):
         """Get all non-empty rows as data dictionaries"""
         items_data = []
-        
+        diagnostics = []
         for row in range(self.table.rowCount()):
-            if not self.empty_row_manager._is_row_empty(row):
-                row_data = self.data_manager.extract_row_data(self.table, row)
-                if row_data.get('product_name'):
-                    items_data.append(row_data)
-        
+            if self.empty_row_manager._is_row_empty(row):
+                diagnostics.append({'row': row + 1, 'status': 'skipped', 'reason': 'empty row'})
+                continue
+            row_data = self.data_manager.extract_row_data(self.table, row)
+            row_data['row_index'] = row + 1
+            items_data.append(row_data)
+            diagnostics.append({
+                'row': row + 1,
+                'status': 'extracted',
+                'designation': row_data.get('product_name', ''),
+                'has_id': bool(row_data.get('id')),
+            })
+        self.last_extraction_diagnostics = {
+            'visible_rows': self.table.rowCount(),
+            'extracted_rows': len(items_data),
+            'rows': diagnostics,
+        }
         return items_data
 
     def get_all_entered_product_names(self):

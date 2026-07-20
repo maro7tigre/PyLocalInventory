@@ -542,20 +542,24 @@ class SalesTab(BaseTab):
     def show_payment_dialog(self):
         """Open the payment dialog for the selected sale."""
         from PySide6.QtWidgets import QMessageBox
-        current_row = self.table.currentRow()
-        if current_row < 0:
-            QMessageBox.information(self, "No Selection", "Please select a sale to record a payment.")
-            return
-        if current_row >= len(self.filtered_items):
-            return
-        selected_sale = self.filtered_items[current_row]
-        
-        # Get config from parent's profile manager
-        config = {}
-        if hasattr(self.parent(), 'profile_manager') and self.parent().profile_manager.selected_profile:
-            profile = self.parent().profile_manager.selected_profile
-            config = profile.get_value()  # Get all values as dict
-        
-        dialog = PaymentDialog(selected_sale, self.database, self, config=config)
-        if dialog.exec():
-            self.refresh_table()
+        try:
+            current_row = self.table.currentRow()
+            if current_row < 0:
+                QMessageBox.information(self, "No Selection", "Please select a sale to record a payment.")
+                return
+            if current_row >= len(self.filtered_items):
+                QMessageBox.warning(self, "Payment Error", "The selected sale row is no longer valid. Please refresh and try again.")
+                return
+            selected_sale = self.filtered_items[current_row]
+
+            config = {}
+            owner = self.parent_widget
+            profile_manager = getattr(owner, 'profile_manager', None)
+            if profile_manager and profile_manager.selected_profile:
+                config = profile_manager.selected_profile.get_value() or {}
+
+            dialog = PaymentDialog(selected_sale, self.database, self, config=config)
+            if dialog.exec():
+                self.refresh_table()
+        except Exception as error:
+            QMessageBox.critical(self, "Payment Error", f"Could not open the payment window:\n{error}")

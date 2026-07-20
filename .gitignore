@@ -29,6 +29,7 @@ tmp/
 *.zip
 *.7z
 *.rar
+*.pdf
 *.egg-info/
 
 # Runtime-generated/private application data
@@ -40,6 +41,8 @@ logs/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
+*.db-shm
+*.db-wal
 
 # Editor and OS metadata
 .vscode/

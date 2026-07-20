@@ -41,6 +41,18 @@ git pull
 .\build_windows.ps1
 ```
 
+The script detects `py` or `python`, creates `.venv`, installs all dependencies
+and Pillow for deterministic Windows icon conversion,
+and the Chromium headless PDF engine, removes stale generated browser/build/
+`dist` output, builds from
+`PyLocalInventory.spec`, and verifies the EXE, `_internal` runtime, report
+templates, logo, and browser before reporting success. To launch automatically
+after a successful build:
+
+```powershell
+.\build_windows.ps1 -RunAfterBuild
+```
+
 Launch it from its generated application folder:
 
 ```powershell
@@ -53,11 +65,6 @@ build script there or transfer the complete `dist\PyLocalInventory` folder.
 Generated `build`/`dist` folders and archives are intentionally excluded from
 Git. Publish compiled distributions through GitHub Releases or an external
 artifact store, not as normal repository files.
-
-If no `requirements.txt` exists, minimal dependencies:
-```bash
-
-```
 
 When the app starts you'll see either:
 1. A welcome screen (no profile selected yet), or

@@ -10,15 +10,31 @@ if not browser_root.is_dir():
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
+application_datas = [
+    (str(project_root / 'logo.png'), '.'),
+    (str(project_root / 'report'), 'report'),
+    (str(browser_root), 'playwright-browsers'),
+]
+
+# Automatically include future runtime-only asset directories when present.
+for resource_dir in ('assets', 'static', 'fonts', 'images', 'icons', 'translations', 'config'):
+    source = project_root / resource_dir
+    if source.is_dir():
+        application_datas.append((str(source), resource_dir))
+
+# Include tracked database initialization resources, but never user databases.
+database_dir = project_root / 'database'
+if database_dir.is_dir():
+    for pattern in ('*.sql', '*.json'):
+        for source in database_dir.rglob(pattern):
+            destination = str(Path('database') / source.parent.relative_to(database_dir))
+            application_datas.append((str(source), destination))
+
 a = Analysis(
     [str(project_root / 'main.py')],
     pathex=[str(project_root)],
     binaries=playwright_binaries,
-    datas=playwright_datas + [
-        (str(project_root / 'logo.png'), '.'),
-        (str(project_root / 'report'), 'report'),
-        (str(browser_root), 'playwright-browsers'),
-    ],
+    datas=playwright_datas + application_datas,
     hiddenimports=playwright_hiddenimports,
     hookspath=[],
     hooksconfig={},

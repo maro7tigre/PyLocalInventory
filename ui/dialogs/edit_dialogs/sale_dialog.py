@@ -186,6 +186,10 @@ class SaleEditDialog(QDialog):
         button_layout.addStretch()
         
         from ui.widgets.themed_widgets import GreenButton, RedButton
+        if self.sale_id:
+            self.attachments_btn = QPushButton("Attachments…")
+            self.attachments_btn.clicked.connect(self.show_attachments)
+            button_layout.addWidget(self.attachments_btn)
         self.save_btn = GreenButton("Save")
         self.save_btn.clicked.connect(self.save_changes)
         button_layout.addWidget(self.save_btn)
@@ -198,6 +202,19 @@ class SaleEditDialog(QDialog):
         
         # Apply dark theme
         self.apply_theme()
+
+    def show_attachments(self):
+        """Open the sale-specific attachment section without crowding item editing."""
+        if not self.sale_id:
+            QMessageBox.information(self, "Attachments", "Save the sale first, then reopen it to add attachments.")
+            return
+        from ui.widgets.attachments_widget import AttachmentPanel
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Sale {self.sale_id} Attachments")
+        dialog.resize(900, 600)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(AttachmentPanel(self.database, 'sale', int(self.sale_id), dialog))
+        dialog.exec()
     
     def minimumSizeHint(self):
         """Calculate minimum size to prevent component overlay"""

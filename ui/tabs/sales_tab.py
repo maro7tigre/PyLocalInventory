@@ -98,6 +98,25 @@ class SalesTab(BaseTab):
             self.payment_btn.setMinimumHeight(20)
             controls_layout.insertWidget(controls_layout.count() - 1, self.payment_btn)
 
+            self.attachments_btn = OrangeButton("Attachments")
+            self.attachments_btn.setToolTip("Manage files for the selected sale")
+            self.attachments_btn.clicked.connect(self.show_attachments)
+            self.attachments_btn.setMinimumHeight(20)
+            controls_layout.insertWidget(controls_layout.count() - 1, self.attachments_btn)
+
+    def show_attachments(self):
+        sale_id = self.get_selected_id()
+        if sale_id is None:
+            QMessageBox.information(self, "Attachments", "Select a sale first.")
+            return
+        from ui.widgets.attachments_widget import AttachmentPanel
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Sale Attachments")
+        dialog.resize(950, 620)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(AttachmentPanel(self.database, 'sale', sale_id, dialog))
+        dialog.exec()
+
     def get_preview_category(self):
         """Override to specify preview category for sales operations"""
         return "individual"  # Since sales are typically associated with clients

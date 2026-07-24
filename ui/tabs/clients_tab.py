@@ -6,7 +6,7 @@ from classes.client_class import ClientClass
 from ui.dialogs.edit_dialogs.client_dialog import ClientEditDialog
 from ui.dialogs.client_details_dialog import ClientDetailsDialog
 from ui.widgets.themed_widgets import BlueButton
-from PySide6.QtWidgets import QMessageBox
+from PySide6.QtWidgets import QMessageBox, QDialog, QVBoxLayout
 
 
 class ClientsTab(BaseTab):
@@ -26,6 +26,25 @@ class ClientsTab(BaseTab):
         )
         self.view_client_btn.clicked.connect(self.view_client)
         layout.insertWidget(layout.count() - 1, self.view_client_btn)
+
+        self.attachments_btn = BlueButton("Attachments")
+        self.attachments_btn.setToolTip("Manage permanent files for the selected client")
+        self.attachments_btn.setMinimumHeight(20)
+        self.attachments_btn.clicked.connect(self.show_attachments)
+        layout.insertWidget(layout.count() - 1, self.attachments_btn)
+
+    def show_attachments(self):
+        client_id = self.get_selected_id()
+        if client_id is None:
+            QMessageBox.information(self, "Attachments", "Select a client first.")
+            return
+        from ui.widgets.attachments_widget import AttachmentPanel
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Client Sales")
+        dialog.resize(1100, 820)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(AttachmentPanel(self.database, 'client', client_id, dialog))
+        dialog.exec()
 
     def view_client(self):
         """Open the account view for the selected client."""

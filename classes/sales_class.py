@@ -120,6 +120,7 @@ class SalesClass(BaseClass):
                 "id": "r",
                 "state": "r",
                 "client_name": "r",
+                "notes": "r",
                 "date": "r",
                 "subtotal": "r",
                 "total_price": "r"
@@ -134,6 +135,7 @@ class SalesClass(BaseClass):
             "database": {
                 "state": "rw",
                 "client_username": "rw",
+                "client_id": "rw",
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",

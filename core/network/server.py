@@ -43,6 +43,14 @@ _SECTION_METHODS = {
     'get_items': ('read', 0),                   # get_items(section)
     'get_items_by_operation_id': ('read', 1),   # get_items_by_operation_id(operation_id, section)
 }
+_ATTACHMENT_METHODS = {
+    'list_attachments': ('read', 0),
+    'download_attachment': ('read', None),
+    'get_attachment_thumbnail': ('read', None),
+    'upload_attachment': ('write', 0),
+    'update_attachment': ('write', None),
+    'delete_attachment': ('delete', None),
+}
 _ALWAYS_ALLOWED = {'begin_transaction', 'commit_transaction', 'rollback_transaction'}
 _ACTION_FOR_KIND = {'read': 'read', 'write': 'write', 'delete': 'delete'}
 
@@ -102,6 +110,21 @@ def _check_permission(user, method, args, kwargs):
         needed = _ACTION_FOR_KIND[kind]
         if not user['permissions'].get(mapped, {}).get(needed):
             return False, f"You don't have {needed} access to {mapped}"
+        return True, None
+
+    if method in _ATTACHMENT_METHODS:
+        kind, index = _ATTACHMENT_METHODS[method]
+        # Attachment id alone cannot reveal scope cheaply before dispatch; both
+        # supported scopes are customer business data, so require access to both.
+        if index is None:
+            permitted = all(user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind])
+                            for section in ('Clients', 'Sales'))
+        else:
+            entity = args[index] if len(args) > index else ''
+            section = 'Clients' if entity == 'client' else 'Sales' if entity == 'sale' else None
+            permitted = bool(section and user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind]))
+        if not permitted:
+            return False, "You don't have permission to manage these attachments"
         return True, None
 
     return False, f"Method '{method}' is not permitted over the network"
@@ -244,7 +267,7 @@ class DatabaseServer:
             if method == 'save_sale_with_items':
                 return request_db.save_sale_with_items(*args, **kwargs)
 
-            if method in _SECTION_METHODS or method in _ALWAYS_ALLOWED:
+            if method in _SECTION_METHODS or method in _ATTACHMENT_METHODS or method in _ALWAYS_ALLOWED:
                 return getattr(request_db, method)(*args, **kwargs)
 
             raise ValueError(f"Method not allowed over network: {method}")

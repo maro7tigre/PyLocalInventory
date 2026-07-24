@@ -4,7 +4,7 @@ Client Dialog - Clean version updated to work with new ClientClass
 
 from ui.dialogs.edit_dialogs.base_dialog import BaseEditDialog
 from classes.client_class import ClientClass
-from PySide6.QtWidgets import QDialog, QMessageBox
+from PySide6.QtWidgets import QDialog, QMessageBox, QVBoxLayout
 import re
 
 
@@ -48,6 +48,19 @@ class ClientEditDialog(BaseEditDialog):
         
         # Initialize base dialog
         super().__init__(self.client, ui_config, parent)
+
+        # Attachments are intentionally separate from the client form: they are
+        # permanent client records and require an already persisted client ID.
+        if self.client_id:
+            from ui.widgets.attachments_widget import AttachmentPanel
+            from PySide6.QtWidgets import QGroupBox
+            group = QGroupBox("Attachments")
+            group_layout = QVBoxLayout(group)
+            panel = AttachmentPanel(database, 'client', int(self.client_id), group)
+            panel.setMinimumHeight(220)
+            group_layout.addWidget(panel)
+            self.layout().insertWidget(1, group, 1)
+            self.resize(780, 720)
         
         # Set specific window title
         self.setWindowTitle(window_title)

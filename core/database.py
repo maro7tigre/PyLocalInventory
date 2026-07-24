@@ -138,6 +138,7 @@ class Database:
                 # Ensure meta/migrations and run one-time tasks
                 self._ensure_meta_table()
                 self._ensure_user_tables()
+                self._ensure_attachment_tables()
                 self._run_one_time_migrations()
 
                 print(f"✓ Connected to database: {database_name}")
@@ -169,6 +170,7 @@ class Database:
             # Ensure meta/migrations and run one-time tasks
             self._ensure_meta_table()
             self._ensure_user_tables()
+            self._ensure_attachment_tables()
             self._run_one_time_migrations()
 
             print(f"✓ Connected to database schema: {schema_name}")
@@ -312,7 +314,7 @@ class Database:
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
             'clients': {'ice': 'TEXT'},
-            'sales': {'client_name': 'TEXT', 'state': 'TEXT'},
+            'sales': {'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT'},
             'imports': {'supplier_name': 'TEXT'},
             'sales_items': {'product_name': 'TEXT'},
             'import_items': {'product_name': 'TEXT'}
@@ -330,13 +332,13 @@ class Database:
                         try:
                             self.cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ctype}")
                             self.conn.commit()
-                            print(f"✓ Added missing column '{col}' to {table}")
+                            print(f"Added missing column '{col}' to {table}")
                         except Exception as e_add:
                             self.conn.rollback()
-                            print(f"⚠️ Could not add column {col} to {table}: {e_add}")
+                            print(f"Warning: could not add column {col} to {table}: {e_add}")
             except Exception as e_tab:
                 self.conn.rollback()
-                print(f"⚠️ Snapshot column check failed for {table}: {e_tab}")
+                print(f"Warning: snapshot column check failed for {table}: {e_tab}")
 
         # Existing installations created this column as INTEGER. PostgreSQL's
         # cast keeps all old values intact. Check first to avoid taking an
@@ -357,6 +359,19 @@ class Database:
         except Exception as exc:
             self.conn.rollback()
             print(f"Warning: could not migrate sales_items.quantity to decimal: {exc}")
+
+        # Client IDs were historically only resolved in memory. Backfill the
+        # stable relation from usernames once, then index it for client views.
+        try:
+            self.cursor.execute(
+                "UPDATE sales s SET client_id=c.id FROM clients c "
+                "WHERE s.client_id IS NULL AND s.client_username=c.username"
+            )
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS sales_client_id_idx ON sales(client_id)")
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not backfill sales.client_id: {exc}")
 
     def _ensure_user_tables(self):
         """Create the Users/Roles/RolePermissions tables used for LAN network access.
@@ -398,6 +413,15 @@ class Database:
         except Exception as e:
             self.conn.rollback()
             print(f"Warning: could not create user/role tables: {e}")
+
+    def _ensure_attachment_tables(self):
+        """Create generic attachment metadata; document bytes are disk-backed."""
+        try:
+            from core.attachments import AttachmentService
+            AttachmentService(self).ensure_tables()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create attachment tables: {e}")
 
     # ---------------- Migration & Meta Helpers -----------------
     def _ensure_meta_table(self):
@@ -706,6 +730,19 @@ class Database:
             if not header:
                 raise ValueError("Sale header contains no storable fields")
 
+            # Resolve the relational client ID server-side for every create and
+            # edit. The name remains a historical snapshot, but all client-sale
+            # views filter exclusively on this immutable database ID.
+            username = (header.get('client_username') or '').strip()
+            if username:
+                self.cursor.execute("SELECT id, name FROM clients WHERE username=%s", (username,))
+                client_row = self.cursor.fetchone()
+                header['client_id'] = int(client_row[0]) if client_row else None
+                if client_row:
+                    header['client_name'] = client_row[1] or username
+            else:
+                header['client_id'] = None
+
             if sale_id:
                 sale_id = int(sale_id)
                 assignments = ', '.join(f"{key} = %s" for key in header)
@@ -967,6 +1004,11 @@ class Database:
             return False
 
         try:
+            if section in ('Clients', 'Sales'):
+                from core.attachments import AttachmentService
+                AttachmentService(self).delete_owner(
+                    'client' if section == 'Clients' else 'sale', int(item_id)
+                )
             # Pre-clean references if deleting a product
             if section == 'Products':
                 try:
@@ -982,6 +1024,32 @@ class Database:
             self.conn.rollback()
             print(f"Error deleting item from {section}: {e}")
             return False
+
+    # Attachment operations transfer bytes as base64 over LAN RPC. The host's
+    # data directory is never returned to a workstation.
+    def list_attachments(self, entity_type, entity_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).list(entity_type, int(entity_id))
+
+    def upload_attachment(self, entity_type, entity_id, filename, content_b64, description='', category=''):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).upload(entity_type, int(entity_id), filename, content_b64, description, category)
+
+    def download_attachment(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).download(int(attachment_id))
+
+    def get_attachment_thumbnail(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).thumbnail(int(attachment_id))
+
+    def update_attachment(self, attachment_id, display_name=None, description=None, category=None):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).update(int(attachment_id), display_name, description, category)
+
+    def delete_attachment(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).delete(int(attachment_id))
 
     def close(self):
         """Close database connection"""

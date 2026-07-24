@@ -12,6 +12,7 @@ from datetime import datetime
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
 from core import pg_backup
+from core.attachments import attachment_backup_root
 
 class BackupsDialog(QDialog):
     def __init__(self, parent=None):
@@ -165,6 +166,14 @@ class BackupsDialog(QDialog):
             else:
                 pg_backup.backup_schema(self.current_profile.schema_name, backup_path)
 
+            # Files are centrally stored beside the host application's data,
+            # not in PostgreSQL or a workstation profile directory.
+            db = getattr(self.parent(), 'database', None)
+            if db:
+                source = attachment_backup_root(db)
+                if source.exists():
+                    shutil.copytree(source, os.path.join(backup_path, 'attachments'))
+
             return True
             
         except Exception as e:
@@ -244,6 +253,14 @@ class BackupsDialog(QDialog):
                 pg_backup.restore_database(self.current_profile.database_name, backup_path)
             else:
                 pg_backup.restore_schema(self.current_profile.schema_name, backup_path)
+
+            db = getattr(self.parent(), 'database', None)
+            stored = os.path.join(backup_path, 'attachments')
+            if db and os.path.isdir(stored):
+                target = attachment_backup_root(db)
+                if target.exists():
+                    shutil.rmtree(target)
+                shutil.copytree(stored, target)
 
             # Reconnect database with restored data
             if hasattr(self.parent(), 'database') and self.parent().database:

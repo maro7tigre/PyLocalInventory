@@ -145,18 +145,8 @@ class AttachmentPanel(QWidget):
         self.client_sales_table.setRowCount(0)
         self.client_sales_empty.setVisible(False)
         try:
-            self.database.cursor.execute(
-                "SELECT s.id, s.notes, s.date, s.tva, "
-                "COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
-                "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
-                "WHERE s.client_id=%s "
-                "GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC",
-                (self.entity_id,),
-            )
-            sales = self.database.cursor.fetchall()
+            sales = self.database.get_client_sales(self.entity_id)
         except Exception as exc:
-            try: self.database.conn.rollback()
-            except Exception: pass
             QMessageBox.warning(self, 'Client sales', f'Could not load this client\'s sales: {exc}')
             sales = []
         self.client_sales_empty.setVisible(not sales)

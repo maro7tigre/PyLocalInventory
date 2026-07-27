@@ -54,6 +54,8 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
     def test_client_account_rpc_requires_only_clients_read(self):
         allowed, _ = _check_permission(_user(client_read=True), "get_client_account", [7], {})
         self.assertTrue(allowed)
+        allowed, _ = _check_permission(_user(client_read=True), "get_client_sales", [7], {})
+        self.assertTrue(allowed)
         denied, _ = _check_permission(_user(), "get_client_account", [7], {})
         self.assertFalse(denied)
 

@@ -51,7 +51,9 @@ _ATTACHMENT_METHODS = {
     'update_attachment': ('write', None),
     'delete_attachment': ('delete', None),
 }
-_CLIENT_ACCOUNT_METHODS = {'get_client_account', 'add_client_payment'}
+_CLIENT_ACCOUNT_METHODS = {
+    'get_client_account', 'get_client_sales', 'add_client_payment'
+}
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels'}
 _ALWAYS_ALLOWED = {'begin_transaction', 'commit_transaction', 'rollback_transaction'}

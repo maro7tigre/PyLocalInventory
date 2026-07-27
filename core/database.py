@@ -1823,6 +1823,29 @@ class Database:
             "payments": [list(row) for row in payment_rows],
         }
 
+    def get_client_sales(self, client_id, user=None):
+        """Return aggregate sale rows for a client through an ownership-safe API."""
+        client_id = int(client_id)
+        owner_clause = ""
+        params = [client_id]
+        if user and not user.get("is_superadmin"):
+            owner_clause = " AND s.created_by=%s"
+            params.append(int(user.get("id") or 0))
+        self.cursor.execute(
+            f"""
+            SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''),
+                   COALESCE(s.tva, 0),
+                   COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal
+            FROM sales s
+            LEFT JOIN sales_items si ON si.sales_id=s.id
+            WHERE s.client_id=%s{owner_clause}
+            GROUP BY s.id, s.notes, s.date, s.tva
+            ORDER BY s.date DESC, s.id DESC
+            """,
+            params,
+        )
+        return [list(row) for row in self.cursor.fetchall()]
+
     def add_client_payment(
         self, client_id, sale_id, sales_item_id, amount, date, user=None
     ):

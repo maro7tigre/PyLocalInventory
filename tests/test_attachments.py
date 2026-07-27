@@ -50,17 +50,16 @@ class AttachmentSafetyTests(unittest.TestCase):
         self.assertIn('client_id', SalesClass(0, None).get_visible_parameters('database'))
 
     def test_client_sales_table_filters_by_client_id(self):
-        class Cursor:
-            def __init__(self): self.calls = []
-            def execute(self, sql, params=()): self.calls.append((sql, params))
-            def fetchall(self): return [(17, 'Kitchen order', '2026-07-24', 20, 1000)]
         class Database:
-            def __init__(self): self.cursor = Cursor(); self.conn = SimpleNamespace(rollback=lambda: None)
+            def __init__(self): self.client_sales_calls = []
             def list_attachments(self, *_args): return []
+            def get_client_sales(self, client_id):
+                self.client_sales_calls.append(client_id)
+                return [[17, 'Kitchen order', '2026-07-24', 20, 1000]]
         app = QApplication.instance() or QApplication([])
         database = Database()
         panel = AttachmentPanel(database, 'client', 42)
         self.assertEqual(panel.client_sales_table.rowCount(), 1)
-        self.assertEqual(database.cursor.calls[-1][1], (42,))
+        self.assertEqual(database.client_sales_calls, [42])
         self.assertEqual(panel.client_sales_table.item(0, 0).text(), '17')
         panel.deleteLater()

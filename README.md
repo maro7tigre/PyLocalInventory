@@ -1,209 +1,458 @@
-<div align="center">
-
 # PyLocalInventory
 
-Offline, local-first inventory & sales desktop application with multi-profile support, dark UI, backups, and optional password protection. No server. No cloud. Your data stays on your machine.
+PyLocalInventory is a Windows desktop inventory and business-management
+application for managing products, services, clients, suppliers, sales,
+imports, reports, profiles, permissions, attachments, payments, and database
+backups.
 
-</div>
+The application uses a PySide6 interface and stores business data in
+PostgreSQL. It can be used directly on the computer hosting PostgreSQL, connect
+to a remote PostgreSQL server, or serve authenticated clients on a local
+network.
 
-## 1. Highlights
-- 100% offline (SQLite) – zero setup, zero network
-- Multiple business profiles (each isolated in its own folder & database)
-- Optional password protection (per profile) + encrypted validation phrase (note: only a validation phrase is encrypted; database content is plain SQLite)
-- Products, Clients, Suppliers, Sales and Imports (with line items & snapshots)
-- Automatic name snapshots in operations (keeps history even if base records are edited/deleted)
-- Integrated backup & restore (timestamped folders you can copy anywhere)
-- Multilingual UI: English / Français / Español (switch at runtime)
-- Dark, compact, keyboard-friendly interface
-- Portable: copy the whole `profiles/<YourProfile>` folder to move/share
+## Overview
 
-## 2. Quick Start
-### Prerequisites
-Python 3.10+ (recommended 3.11+). A virtual environment is strongly suggested.
+PyLocalInventory is designed for small businesses that need a desktop
+application for catalog, stock, customer, supplier, purchasing, and sales
+workflows. Business data is separated by profile. New profiles use a dedicated
+PostgreSQL database; legacy schema-based profiles remain supported by the
+application.
 
-### Install & Run
-```bash
-python -m venv .venv
-# Activate on Windows (PowerShell)
+The normal local workflow connects the desktop application directly to
+PostgreSQL. The PostgreSQL server may run on the same computer or on another
+reachable computer. PyLocalInventory can also host its own HTTP/JSON service on
+the LAN so other PyLocalInventory installations can sign in with application
+users and role-based permissions.
+
+## Main Features
+
+- Business profiles with company details, optional profile images, duplication,
+  deletion, and password-based locking.
+- Product catalog, pricing, stock quantities, stock alerts, categories, door
+  types, and wood types.
+- Service, client, and supplier management.
+- Sales and imports with multiple line items and automatically calculated
+  totals.
+- Stock tracking based on imported and sold quantities.
+- Sale payments, progress tracking, and receipt generation.
+- PDF report generation from the included HTML templates using Playwright and
+  Chromium.
+- JPG, PNG, WEBP, and PDF attachments for supported business records.
+- PostgreSQL backup and restore, including profile files and attachments.
+- LAN hosting with authenticated users, roles, and section-level permissions.
+- English, French, and Spanish interface options.
+- Windows packaging through PyInstaller in one-directory mode.
+
+## Technology Stack
+
+| Component | Technology |
+| --- | --- |
+| Application language | Python |
+| Desktop interface | PySide6 `>=6.8,<7` |
+| Database | PostgreSQL |
+| PostgreSQL driver | psycopg2-binary `>=2.9,<3` |
+| Profile password support | cryptography `>=44,<50` |
+| PDF rendering | Playwright `1.60.0` with Chromium |
+| Windows packaging | PyInstaller, configured by `PyLocalInventory.spec` |
+
+PyInstaller and Pillow are installed by `build_windows.ps1`; they are build
+dependencies rather than runtime entries in `requirements.txt`.
+
+## Project Structure
+
+```text
+PyLocalInventory/
+|-- classes/                 # Business entity and operation models
+|-- core/                    # Database, profiles, backups, networking, and security
+|   `-- network/             # LAN client, server, and protocol
+|-- report/                  # HTML report templates and report assets
+|-- scripts/
+|   `-- migrate_sqlite_to_postgres.py
+|-- tests/                   # unittest-based regression tests
+|-- ui/                      # Main window, tabs, dialogs, and widgets
+|-- build_windows.ps1        # Reproducible Windows build script
+|-- LICENSE                  # GNU GPL version 3 license
+|-- logo.png                 # Application icon
+|-- main.py                  # Application entry point
+|-- PyLocalInventory.spec    # PyInstaller build definition
+|-- README.md
+`-- requirements.txt
+```
+
+Generated folders such as `.venv`, `.playwright-browsers`, `build`, `dist`,
+`output`, and `tmp` are intentionally omitted from this tree.
+
+## Requirements
+
+To run the application from source:
+
+- Windows for the documented commands and desktop workflow.
+- Python 3.10 or newer. This minimum is enforced by the Windows build script;
+  use a Python release compatible with the versions in `requirements.txt`.
+- `pip`.
+- PostgreSQL with a reachable server and credentials that can connect to the
+  maintenance database and create or access profile databases.
+- The Python packages in `requirements.txt`.
+- A Playwright Chromium installation for PDF report generation.
+
+A virtual environment is strongly recommended. PostgreSQL's `pg_dump` and
+`pg_restore` command-line tools are additionally required for backup and
+restore.
+
+## Installation
+
+Download or open the project folder, then start PowerShell or Command Prompt in
+the directory that contains `main.py`.
+
+Create a virtual environment:
+
+```powershell
+py -m venv .venv
+```
+
+Activate it in Command Prompt:
+
+```bat
+.venv\Scripts\activate
+```
+
+Or activate it in PowerShell:
+
+```powershell
 .\.venv\Scripts\Activate.ps1
-pip install --upgrade pip
-pip install -r requirements.txt  # If provided; else install pyside6 & cryptography
+```
+
+Install the Python dependencies:
+
+```powershell
+py -m pip install --upgrade pip
+py -m pip install -r requirements.txt
+```
+
+Install Chromium for PDF generation when running from source:
+
+```powershell
+py -m playwright install --only-shell chromium
+```
+
+The Windows build script performs its own dependency and Chromium installation
+inside `.venv`.
+
+## Database Configuration
+
+PyLocalInventory stores its shared PostgreSQL connection settings in:
+
+```text
+%LOCALAPPDATA%\PyLocalInventory\profiles\_server_config.json
+```
+
+Configure these settings through **Network > Database Config**, which opens the
+**Database Server** tab:
+
+| Setting | Purpose |
+| --- | --- |
+| Host | PostgreSQL server hostname or IP address |
+| Port | PostgreSQL server port |
+| Maintenance Database | Existing database used to test the connection and create profile databases |
+| User | PostgreSQL username |
+| Password | PostgreSQL password |
+| PostgreSQL Bin Directory | Optional folder containing `pg_dump.exe` and `pg_restore.exe` |
+
+Use **Test Connection** before saving. New profiles generate and use a dedicated
+PostgreSQL database automatically, so the profile database name is not entered
+in this screen.
+
+Do not commit or share `_server_config.json`: it is a local runtime file and may
+contain a database password. The application does not use a `.env` file for
+these settings.
+
+For a remote PostgreSQL server, its network listening configuration,
+host-based authentication rules, operating-system firewall, and database user
+privileges must allow the connection. Configure those controls according to
+your PostgreSQL installation and network policy.
+
+## Running the Application
+
+Open a terminal in the project root—the directory containing `main.py`—and
+normally activate the virtual environment first.
+
+Primary command:
+
+```powershell
+py main.py
+```
+
+Alternative:
+
+```powershell
 python main.py
 ```
 
-### Reproducible Windows EXE build
-
-After cloning the repository, or after pulling changes, build the complete
-PyInstaller **onedir** application from PowerShell:
+Complete PowerShell example:
 
 ```powershell
-git pull
+cd path\to\PyLocalInventory
+.\.venv\Scripts\Activate.ps1
+py main.py
+```
+
+## Building the Windows Application
+
+The verified build script is `build_windows.ps1`. There is no
+`build_windows.py` in this repository.
+
+Run the build from PowerShell in the project root:
+
+```powershell
+cd path\to\PyLocalInventory
 .\build_windows.ps1
 ```
 
-The script detects `py` or `python`, creates `.venv`, installs all dependencies
-and Pillow for deterministic Windows icon conversion,
-and the Chromium headless PDF engine, removes stale generated browser/build/
-`dist` output, builds from
-`PyLocalInventory.spec`, and verifies the EXE, `_internal` runtime, report
-templates, logo, and browser before reporting success. To launch automatically
-after a successful build:
+The script:
+
+1. Locates `py` or `python` and creates `.venv` when needed.
+2. Installs or updates pip, setuptools, wheel, PyInstaller, Pillow, and the
+   packages in `requirements.txt`.
+3. Installs the Playwright Chromium headless shell into
+   `.playwright-browsers`.
+4. Deletes and recreates the generated `build` and `dist` directories.
+5. Runs PyInstaller with `PyLocalInventory.spec`.
+6. Verifies the executable, `_internal` runtime directory, logo, report assets,
+   and bundled Chromium engine.
+
+The specification bundles `logo.png`, the `report` directory, Playwright,
+Chromium, and any supported optional asset directories that exist at build
+time. It creates a folder-based application, not a single-file executable and
+not an installer.
+
+To launch the application automatically after a successful build:
 
 ```powershell
 .\build_windows.ps1 -RunAfterBuild
 ```
 
-Launch it from its generated application folder:
+## Running the Built Application
+
+The verified output executable is:
+
+```text
+dist\PyLocalInventory\PyLocalInventory.exe
+```
+
+Launch it from PowerShell with:
 
 ```powershell
 .\dist\PyLocalInventory\PyLocalInventory.exe
 ```
 
-`PyLocalInventory.exe` depends on the adjacent `_internal` directory. Never
-move or transfer the EXE by itself. On another Windows computer, either run the
-build script there or transfer the complete `dist\PyLocalInventory` folder.
-Generated `build`/`dist` folders and archives are intentionally excluded from
-Git. Publish compiled distributions through GitHub Releases or an external
-artifact store, not as normal repository files.
+The executable depends on the adjacent `dist\PyLocalInventory\_internal`
+directory. Keep and distribute the complete `dist\PyLocalInventory` folder;
+do not copy `PyLocalInventory.exe` by itself. The build does not create a
+Windows installer.
 
-When the app starts you'll see either:
-1. A welcome screen (no profile selected yet), or
-2. A password screen (if the last used profile has a password), or
-3. The main tabbed interface (if an open, non‑protected profile is active).
+## PostgreSQL Backup Requirements
 
-## 3. Profiles (Your Data Containers)
-Each profile = one business/company context.
+Creating a backup requires `pg_dump`; restoring one requires `pg_restore`.
+Both tools are normally installed with PostgreSQL.
 
-Folder structure example:
+PyLocalInventory searches for these tools in this order:
+
+1. The **PostgreSQL Bin Directory** saved in the Database Server settings.
+2. `POSTGRES_BIN`, `POSTGRESQL_BIN`, or `PG_BIN`.
+3. The `bin` directory below `PGHOME`.
+4. The system `PATH`.
+5. Installed PostgreSQL version folders below the Windows Program Files
+   locations, preferring newer versions.
+
+An example installation folder is:
+
+```text
+C:\Program Files\PostgreSQL\<version>\bin
 ```
-profiles/
-  WoodCraft_Demo/
-    WoodCraft_Demo.db
-    config.json
-    preview.png (optional logo/thumbnail)
-    backups/ (auto-created when you create backups)
-    images/   (your own added images if any)
+
+In Command Prompt, verify tool discovery with:
+
+```bat
+where pg_dump
+where pg_restore
 ```
 
-### Creating a Profile
-Menu > Profiles → Create (fill company name, optional info, pick an image). A database file is created automatically when first opened.
+In PowerShell, use:
 
-### Switching Profiles
-Menu > Profiles → select another profile. The UI reloads accordingly. Your last selection persists across restarts.
+```powershell
+where.exe pg_dump
+where.exe pg_restore
+```
 
-### Duplicating / Deleting
-Provided via the Profiles dialog. Duplication copies base entities (Products, Clients, Suppliers) into a fresh database; operational history (Sales/Imports) is not copied (clean starting point).
+Backups use PostgreSQL's custom dump format and are stored below the selected
+profile's `backups` directory in the per-user application data area. A backup
+also includes the profile configuration and available attachments. Restoring a
+backup replaces the profile's current database content, so create and verify a
+current backup before restoring older data.
 
-## 4. Password Protection
-Profiles start UNLOCKED (no password) unless a password was already set.
+## Usage
 
-To set or change a password:
-1. Open profile (unlocked state)
-2. Use the password/encryption option (if exposed) OR first-time protection flow (if implemented in your build)
-3. A validation phrase is stored encrypted; on login it's decrypted to verify correctness.
+1. Start PyLocalInventory from source or from the built application folder.
+2. Open **Network > Database Config**, enter the PostgreSQL settings, and test
+   the connection.
+3. Create or select a business profile and unlock it if it is protected.
+4. Add products and services.
+5. Add clients and suppliers.
+6. Record imports to capture incoming stock and purchase costs.
+7. Record sales, line items, payments, and attachments.
+8. Generate and review PDF reports.
+9. Use **Backups** to create regular PostgreSQL backups.
 
-Behavior:
-- Wrong password → red border feedback
-- Correct password → main tabs load
-- Logout (Menu > Log Out) returns to password or profile selection
+To share a profile over a LAN, use **Network > Network Config** on the host.
+Start hosting, create the initial Super Admin when prompted, and create
+application users and roles. Client computers sign in with the host address,
+hosting port, username, and password. The default hosting port is `8765`; it
+must be allowed through the host firewall for LAN clients.
 
-Important: Only the validation phrase is encrypted in config; database tables themselves are plain SQLite. For full at-rest encryption use external disk encryption or adapt the data layer.
+## Permissions and User Roles
 
-## 5. Main Interface
-Tabs (localized with emojis):
-- Home: High-level overview / dashboard
-- Products: Create/update product records (name, pricing, quantity, etc.)
-- Clients: Manage customer identities
-- Suppliers: Manage provider identities
-- Sales: Record sales operations with line items (detached snapshots of product names & client name)
-- Imports: Record stock/import operations with item lines & supplier snapshot
+LAN access uses application users and configurable roles stored with the
+selected profile.
 
-Line item tables automatically keep product_name snapshots so even if a product is later renamed or deleted, historic records remain readable.
+- A **Super Admin** has full read, write, and delete access to every permission
+  section and can manage hosting, users, roles, and permissions.
+- A regular user receives permissions from the assigned role.
+- An account without a role has no section permissions.
+- Permissions are configured separately as **Read**, **Write**, and **Delete**
+  for Products, Services, Clients, Suppliers, Sales, Imports, and Reports.
+- Related records inherit their parent permission. For example, sale items and
+  payments follow Sales permissions.
+- Sections without read permission are hidden from a network user's main
+  interface. The server also enforces permissions on requests.
 
-## 6. Working With Data
-### Adding Items
-Use the + / Add button inside each tab (dialog opens). Required fields are validated. 
+Application user passwords are stored as salted PBKDF2-HMAC-SHA256 hashes.
+The LAN transport is plain HTTP/JSON, so use it only on a trusted network or
+behind appropriate network protection.
 
-### Editing
-Select a row → Edit (or double-click depending on UX) → Save.
+## Troubleshooting
 
-### Deleting
-Deletes the entity. For Products, existing historical operation items retain the stored product_name while product_id references are nullified safely.
+### Python command not found
 
-### Searching & Ordering
-Product tab includes search (username/name) and ordering (price, quantity, alphabetical, etc.). Other tabs follow a similar pattern (depending on current build).
+Check whether the Python launcher is available:
 
-## 7. Sales & Imports (Operations)
-1. Create a Sale/Import (parent record)
-2. Add line items (quantities, pricing or cost fields)
-3. Totals aggregate automatically (if implemented in base class)
-4. Deleting a Sale/Import cascades to its line items (ON DELETE CASCADE)
+```powershell
+py --version
+```
 
-Snapshots: client_name / supplier_name and product_name columns are stored so history survives later edits.
+If it is not found, install Python and enable the Windows Python launcher or
+make `python` available in the terminal.
 
-## 8. Backups
-Menu > Backups opens the Backups Manager.
+### Missing Python packages
 
-Features:
-- Create backup (suggested timestamp name)
-- Restore selected backup (replaces current profile files except the backups directory)
-- Rename / Duplicate / Delete backups
+Activate `.venv`, then reinstall the declared dependencies:
 
-Each backup is a folder under: `profiles/<ProfileName>/backups/<BackupTimestamp>/`
+```powershell
+py -m pip install -r requirements.txt
+```
 
-Manual safety copy: You can just copy any backup folder elsewhere (USB, external drive, etc.).
+### PowerShell blocks virtual-environment activation
 
-Restore Warning: Restoring overwrites current profile data. Make a new backup first if unsure.
+Allow local script activation for the current PowerShell session only:
 
-## 9. Language Switching
-Menu > Language → choose English / Français / Español. The interface reloads instantly. Your choice is saved and reused next time.
+```powershell
+Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass
+.\.venv\Scripts\Activate.ps1
+```
 
-## 10. Portability & Migration
-To move a profile to another machine:
-1. Close the application (ensures SQLite file is released)
-2. Copy the whole `profiles/<ProfileName>` folder
-3. Paste it into the `profiles` directory on the target machine
-4. Launch the app → Profile appears automatically
+### Application cannot connect to PostgreSQL
 
-To clone the entire application with data, copy the whole project folder (or just keep code separate and only move the `profiles` directory).
+Verify that:
 
-## 11. Troubleshooting
-| Issue | Possible Cause | Fix |
-|-------|----------------|-----|
-| Profile not appearing | Folder name mismatch or missing `config.json` | Ensure folder contains valid `config.json` |
-| Cannot delete a product | Product referenced in operations (legacy FK) | App now nullifies references; restart & retry |
-| Wrong password always | Typo or config corruption | Recreate profile if password truly lost |
-| DB locked errors (rare) | Open file handle during backup/restore | Wait a moment & retry; ensure only one app instance |
+- PostgreSQL is running.
+- The host and port are correct.
+- The maintenance database exists.
+- The username and password are correct.
+- The user can create or access the selected profile database.
+- The firewall allows PostgreSQL traffic for remote database connections.
+- PostgreSQL accepts connections from the client computer.
 
-Logs / console output (when launched from terminal) will display table creation, migrations, and refresh steps – useful for diagnosing.
+Use **Network > Database Config > Test Connection** to see the connection
+error returned by PostgreSQL.
 
-## 12. Data Safety Notes
-- Back up regularly before large deletes
-- Snapshots keep historic text, but deleting a Product removes its live record
-- No cloud sync; use your own storage strategy (external drive, OS backups)
+### A LAN client cannot connect
 
-## 13. Extending (Optional Note)
-Even though this README focuses on end users, advanced users can inspect the `classes/` folder to see parameter-driven models and extend new entities following the same pattern.
+- Confirm that hosting is running on the host computer.
+- Confirm the host IP address and port; the default port is `8765`.
+- Allow the hosting port through the host firewall.
+- Verify the application username and password.
+- Check that the user's role grants the required section permission.
 
-## 14. License
-This project is licensed under the GNU General Public License v3.0 (GPL-3.0).
+### `pg_dump` or `pg_restore` not found
 
-You are free to run, study, share, and modify the software under the terms of the GPL. Any distributed modified version must also be GPL-licensed. See the `LICENSE` file for the full text.
+Run `where.exe pg_dump` and `where.exe pg_restore` in PowerShell. If a tool is
+not found, install the PostgreSQL command-line tools, add their `bin` directory
+to `PATH`, or select that directory under **Network > Database Config >
+PostgreSQL Bin Directory**.
 
-## 15. Disclaimer (No Warranty)
-PyLocalInventory is provided "AS IS", without any express or implied warranties – including but not limited to merchantability, fitness for a particular purpose, non‑infringement, data accuracy, or uninterrupted operation. You use the application entirely at your own risk.
+### Backup creation reports that a file already exists
 
-By using this software you agree that:
-- You are solely responsible for creating and verifying backups of your data.
-- The authors/contributors are not liable for data loss, corruption, business interruption, or any consequential, incidental, or indirect damages.
-- The built‑in password feature does NOT encrypt the database contents; it only gates access within the UI and stores an encrypted validation phrase. For true at‑rest protection use full-disk / OS-level encryption or adapt the storage layer.
-- This tool is not certified accounting or compliance software. Always verify exported/derived figures before financial or legal use.
+Backup names must be unique within the current profile. Choose a different
+name or rename/delete the existing backup from the Backups Manager.
 
-The full legal disclaimer is already included in the GPL‑3.0 license text (see the "NO WARRANTY" sections). This README section is a plain‑language summary only.
+### PDF reports cannot be generated
 
-## 16. Attribution & Thanks
-Built with Python, PySide6, and SQLite. Thanks to the open-source ecosystem.
-AI Assistance: Portions of ideation, refactoring suggestions, and documentation wording were assisted by large language models (Anthropic Claude Sonnet 4 and OpenAI GPT-5). All architectural and approach choices, code integration, testing, and final verification were performed manually.
+When running from source, install the required Chromium engine:
 
----
-Enjoy using PyLocalInventory. Keep control of your data.
+```powershell
+py -m playwright install --only-shell chromium
+```
+
+For a packaged build, keep the entire application folder together because the
+bundled browser is stored below `_internal`.
+
+### Application does not start
+
+Run it from the project root in a terminal so the complete error is visible:
+
+```powershell
+py main.py
+```
+
+## Development Notes
+
+- Install dependencies from `requirements.txt` and run from source with
+  `py main.py`.
+- Run the unittest suite with:
+
+  ```powershell
+  py -m unittest discover -s tests
+  ```
+
+- Test database, backup, restore, report, and LAN permission changes carefully.
+- Review terminal output and relevant per-user log files when diagnosing an
+  error.
+- `scripts\migrate_sqlite_to_postgres.py` is a migration utility for legacy
+  data; inspect its arguments and back up source data before using it.
+- Do not commit generated builds, virtual environments, local configuration,
+  profiles, logs, reports, or customer data. The repository's `.gitignore`
+  excludes the corresponding common runtime and build paths.
+
+## Security
+
+- Never commit or share database passwords, API keys, private configuration,
+  customer information, attachment data, or production backups.
+- Protect `%LOCALAPPDATA%\PyLocalInventory`, especially
+  `profiles\_server_config.json`, with appropriate Windows account and file
+  permissions.
+- Restrict PostgreSQL accounts to the permissions required by the application.
+- Keep PostgreSQL and Python dependencies updated within the supported version
+  constraints.
+- The built-in LAN service uses plain HTTP rather than TLS. Do not expose its
+  port directly to the public internet.
+- Verify backups and store protected copies outside the application computer.
+
+## License
+
+PyLocalInventory is licensed under the GNU General Public License version 3.
+See [LICENSE](LICENSE) for the full terms, including the warranty disclaimer.
+
+## Author and Maintainers
+
+The repository does not currently provide public maintainer contact
+information. Use the repository's established contribution or issue workflow
+when one is available.

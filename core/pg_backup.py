@@ -1,25 +1,155 @@
 """
-Postgres-schema-level backup/restore for a single profile.
-
-Replaces the old approach of just copying the profile's SQLite .db file, which
-no longer exists now that data lives in one shared Postgres database. Prefers
-the pg_dump/pg_restore CLI tools when available on PATH (full fidelity - data,
-sequences, constraints), and falls back to a pure-psycopg2 per-table COPY dump
-when those client tools aren't installed on this machine.
+PostgreSQL custom-format backup/restore for a single profile.
 """
+from datetime import datetime
 import json
+import logging
 import os
+import re
 import shutil
 import subprocess
 import tempfile
 
 import psycopg2
+from psycopg2 import sql
 
 from core.pg_config import load_server_config
 
+LOGGER = logging.getLogger(__name__)
+_TOOL_ENV_VARS = ("POSTGRES_BIN", "POSTGRESQL_BIN", "PG_BIN")
 
-def _pg_dump_available():
-    return shutil.which('pg_dump') is not None and shutil.which('pg_restore') is not None
+
+def _version_key(path):
+    match = re.search(r"PostgreSQL[\\/](\d+(?:\.\d+)*)[\\/]bin", path, re.IGNORECASE)
+    if not match:
+        return ()
+    return tuple(int(part) for part in match.group(1).split("."))
+
+
+def discover_postgres_tool(tool_name, config=None):
+    """Return ``(executable_path, searched_locations)`` in priority order."""
+    config = config or load_server_config()
+    executable = f"{tool_name}.exe" if os.name == "nt" else tool_name
+    candidates = []
+
+    for key in ("postgres_bin_dir", "pg_bin_dir", "postgresql_bin_dir"):
+        configured = str(config.get(key) or "").strip()
+        if configured:
+            candidates.append(os.path.join(configured, executable))
+
+    for variable in _TOOL_ENV_VARS:
+        directory = os.environ.get(variable, "").strip()
+        if directory:
+            candidates.append(os.path.join(directory, executable))
+    pg_home = os.environ.get("PGHOME", "").strip()
+    if pg_home:
+        candidates.append(os.path.join(pg_home, "bin", executable))
+
+    searched = list(candidates)
+    for candidate in candidates:
+        if os.path.isfile(candidate):
+            resolved = os.path.abspath(candidate)
+            LOGGER.info("PostgreSQL tool %s found: %s", tool_name, resolved)
+            return resolved, searched
+
+    path_match = shutil.which(tool_name)
+    searched.append(f"PATH ({tool_name})")
+    if path_match:
+        LOGGER.info("PostgreSQL tool %s found on PATH: %s", tool_name, path_match)
+        return os.path.abspath(path_match), searched
+
+    if os.name == "nt":
+        roots = []
+        for variable in ("ProgramFiles", "ProgramW6432", "ProgramFiles(x86)"):
+            root = os.environ.get(variable)
+            if root:
+                roots.append(os.path.join(root, "PostgreSQL"))
+        common = []
+        for root in dict.fromkeys(roots):
+            if not os.path.isdir(root):
+                searched.append(os.path.join(root, "<version>", "bin", executable))
+                continue
+            for version in os.listdir(root):
+                common.append(os.path.join(root, version, "bin", executable))
+        common.sort(key=_version_key, reverse=True)
+        candidates = common
+
+    for candidate in candidates:
+        if candidate not in searched:
+            searched.append(candidate)
+        if os.path.isfile(candidate):
+            resolved = os.path.abspath(candidate)
+            LOGGER.info("PostgreSQL tool %s found: %s", tool_name, resolved)
+            return resolved, searched
+
+    LOGGER.warning("PostgreSQL tool %s was not found; searched: %s", tool_name, searched)
+    return None, searched
+
+
+def _require_tool(tool_name, config):
+    path, searched = discover_postgres_tool(tool_name, config)
+    if path:
+        return path
+    configured = str(config.get("postgres_bin_dir") or "").strip() or "(not configured)"
+    locations = "\n".join(f"- {location}" for location in searched)
+    raise RuntimeError(
+        f"{tool_name} was not found.\n"
+        f"Configured PostgreSQL Bin Directory: {configured}\n"
+        f"Searched locations:\n{locations}\n"
+        "Set 'PostgreSQL Bin Directory' in Network & Users > Database Server "
+        "to the folder containing the PostgreSQL command-line tools."
+    )
+
+
+def _run_tool(command, env, config, tool_name):
+    LOGGER.info("Running %s: %s", tool_name, " ".join(command))
+    result = subprocess.run(
+        command,
+        env=env,
+        capture_output=True,
+        text=True,
+        shell=False,
+    )
+    if result.returncode != 0:
+        detail = (result.stderr or result.stdout or "No error output").strip()
+        password = str(config.get("password") or "")
+        if password:
+            detail = detail.replace(password, "[REDACTED]")
+        raise RuntimeError(f"{tool_name} failed (exit code {result.returncode}): {detail}")
+    return result
+
+
+def _safe_name(value):
+    cleaned = re.sub(r"[^A-Za-z0-9._-]+", "_", str(value or "database")).strip("._")
+    return cleaned or "database"
+
+
+def _new_dump_path(dest_dir, database_name):
+    stamp = datetime.now().strftime("%Y%m%d_%H%M%S_%f")
+    return os.path.join(dest_dir, f"{_safe_name(database_name)}_{stamp}.backup")
+
+
+def _find_dump(source_dir, legacy_name):
+    legacy = os.path.join(source_dir, legacy_name)
+    if os.path.isfile(legacy) and os.path.getsize(legacy) > 0:
+        return legacy
+    backups = [
+        os.path.join(source_dir, name)
+        for name in os.listdir(source_dir)
+        if name.lower().endswith(".backup")
+        and os.path.isfile(os.path.join(source_dir, name))
+        and os.path.getsize(os.path.join(source_dir, name)) > 0
+    ]
+    if not backups:
+        raise RuntimeError(f"No valid PostgreSQL custom-format backup found in {source_dir}")
+    return max(backups, key=os.path.getmtime)
+
+
+def _verify_dump(dump_file):
+    if not os.path.isfile(dump_file):
+        raise RuntimeError("PostgreSQL reported success but did not create the backup file")
+    if os.path.getsize(dump_file) <= 0:
+        raise RuntimeError("PostgreSQL created an empty backup file")
 
 
 def _connection_and_env():
@@ -58,7 +188,7 @@ def _ensure_database_exists(database_name):
         cur = conn.cursor()
         cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
         if not cur.fetchone():
-            cur.execute(f"CREATE DATABASE {database_name}")
+            cur.execute(sql.SQL("CREATE DATABASE {}").format(sql.Identifier(database_name)))
     finally:
         conn.close()
 
@@ -70,7 +200,7 @@ def _drop_database(database_name):
     try:
         cur = conn.cursor()
         cur.execute("SELECT pg_terminate_backend(pid) FROM pg_stat_activity WHERE datname = %s AND pid <> pg_backend_pid()", (database_name,))
-        cur.execute(f"DROP DATABASE IF EXISTS {database_name}")
+        cur.execute(sql.SQL("DROP DATABASE IF EXISTS {}").format(sql.Identifier(database_name)))
     finally:
         conn.close()
 
@@ -79,38 +209,41 @@ def backup_database(database_name, dest_dir):
     """Write a full database backup into `dest_dir`."""
     os.makedirs(dest_dir, exist_ok=True)
     config, env = _connection_and_env()
-    if shutil.which('pg_dump') is None or shutil.which('pg_restore') is None:
-        raise RuntimeError("pg_dump/pg_restore are required for real database backups")
+    pg_dump = _require_tool("pg_dump", config)
 
-    dump_file = os.path.join(dest_dir, "database.dump")
+    dump_file = _new_dump_path(dest_dir, database_name)
     cmd = [
-        'pg_dump', '-h', str(config.get('host')), '-p', str(config.get('port')),
-        '-U', str(config.get('user')), '-d', database_name, '-Fc', '-f', dump_file,
+        pg_dump, '--host', str(config.get('host')), '--port', str(config.get('port')),
+        '--username', str(config.get('user')), '--dbname', database_name,
+        '--format=custom', '--file', dump_file,
     ]
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"pg_dump failed: {result.stderr}")
+    try:
+        _run_tool(cmd, env, config, "pg_dump")
+        _verify_dump(dump_file)
+        return dump_file
+    except Exception:
+        if os.path.exists(dump_file):
+            try:
+                os.remove(dump_file)
+            except OSError as cleanup_error:
+                LOGGER.warning("Could not remove failed backup %s: %s", dump_file, cleanup_error)
+        raise
 
 
 def restore_database(database_name, source_dir):
     """Restore a full database backup previously written by backup_database()."""
-    dump_file = os.path.join(source_dir, "database.dump")
-    if not os.path.exists(dump_file):
-        raise RuntimeError("No database dump found (database.dump missing)")
-    if shutil.which('pg_dump') is None or shutil.which('pg_restore') is None:
-        raise RuntimeError("pg_dump/pg_restore are required for real database restores")
-
+    dump_file = _find_dump(source_dir, "database.dump")
     config, env = _connection_and_env()
+    pg_restore = _require_tool("pg_restore", config)
     _drop_database(database_name)
     _ensure_database_exists(database_name)
 
     cmd = [
-        'pg_restore', '-h', str(config.get('host')), '-p', str(config.get('port')),
-        '-U', str(config.get('user')), '-d', database_name, '--no-owner', dump_file,
+        pg_restore, '--host', str(config.get('host')), '--port', str(config.get('port')),
+        '--username', str(config.get('user')), '--dbname', database_name,
+        '--no-owner', dump_file,
     ]
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"pg_restore failed: {result.stderr}")
+    _run_tool(cmd, env, config, "pg_restore")
 
 
 def clone_database(source_database, dest_database):
@@ -123,36 +256,45 @@ def clone_database(source_database, dest_database):
 def backup_schema(schema_name, dest_dir):
     """Write a backup of `schema_name` into `dest_dir` (caller ensures it exists)."""
     os.makedirs(dest_dir, exist_ok=True)
-    if _pg_dump_available():
-        _backup_with_pg_dump(schema_name, dest_dir)
-    else:
-        _backup_with_copy(schema_name, dest_dir)
+    return _backup_with_pg_dump(schema_name, dest_dir)
 
 
 def restore_schema(schema_name, source_dir):
     """Restore `schema_name` from a backup previously written by backup_schema()."""
-    dump_file = os.path.join(source_dir, "schema.dump")
-    if os.path.exists(dump_file) and _pg_dump_available():
-        _restore_with_pg_restore(schema_name, dump_file)
-    else:
+    try:
+        dump_file = _find_dump(source_dir, "schema.dump")
+    except RuntimeError:
+        # Retain restore compatibility for backups made by older releases.
         _restore_with_copy(schema_name, source_dir)
+        return
+    _restore_with_pg_restore(schema_name, dump_file)
 
 
 def _backup_with_pg_dump(schema_name, dest_dir):
     config, env = _connection_and_env()
-    dump_file = os.path.join(dest_dir, "schema.dump")
+    pg_dump = _require_tool("pg_dump", config)
+    dump_file = _new_dump_path(dest_dir, schema_name)
     cmd = [
-        'pg_dump', '-h', str(config.get('host')), '-p', str(config.get('port')),
-        '-U', str(config.get('user')), '-d', str(config.get('database')),
-        '-n', schema_name, '-Fc', '-f', dump_file,
+        pg_dump, '--host', str(config.get('host')), '--port', str(config.get('port')),
+        '--username', str(config.get('user')), '--dbname', str(config.get('database')),
+        '--schema', schema_name, '--format=custom', '--file', dump_file,
     ]
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"pg_dump failed: {result.stderr}")
+    try:
+        _run_tool(cmd, env, config, "pg_dump")
+        _verify_dump(dump_file)
+        return dump_file
+    except Exception:
+        if os.path.exists(dump_file):
+            try:
+                os.remove(dump_file)
+            except OSError as cleanup_error:
+                LOGGER.warning("Could not remove failed backup %s: %s", dump_file, cleanup_error)
+        raise
 
 
 def _restore_with_pg_restore(schema_name, dump_file):
     config, env = _connection_and_env()
+    pg_restore = _require_tool("pg_restore", config)
     # Drop and recreate the schema first so restore starts from a clean slate
     conn = _connect(config)
     conn.autocommit = True
@@ -162,13 +304,11 @@ def _restore_with_pg_restore(schema_name, dump_file):
     conn.close()
 
     cmd = [
-        'pg_restore', '-h', str(config.get('host')), '-p', str(config.get('port')),
-        '-U', str(config.get('user')), '-d', str(config.get('database')),
+        pg_restore, '--host', str(config.get('host')), '--port', str(config.get('port')),
+        '--username', str(config.get('user')), '--dbname', str(config.get('database')),
         '--no-owner', dump_file,
     ]
-    result = subprocess.run(cmd, env=env, capture_output=True, text=True)
-    if result.returncode != 0:
-        raise RuntimeError(f"pg_restore failed: {result.stderr}")
+    _run_tool(cmd, env, config, "pg_restore")
 
 
 def _backup_with_copy(schema_name, dest_dir):

@@ -37,7 +37,10 @@ class ReportsEditDialog(QDialog):
         # Department
         layout.addWidget(self._field_label("Department *"))
         self.dept_combo = QComboBox()
-        self.dept_combo.addItems(DEPARTMENTS)
+        self.dept_combo.addItem(
+            getattr(self.database, "username", None) or "Local Admin"
+        )
+        self.dept_combo.setEnabled(False)
         layout.addWidget(self.dept_combo)
 
         # Date
@@ -47,6 +50,14 @@ class ReportsEditDialog(QDialog):
         self.date_edit.setCalendarPopup(True)
         self.date_edit.setDisplayFormat("dd-MM-yyyy")
         layout.addWidget(self.date_edit)
+
+        layout.addWidget(self._field_label("Report Type"))
+        self.type_combo = QComboBox()
+        self.type_combo.addItems([
+            "General", "Sales", "Products", "Services", "Clients",
+            "Revenue", "Profit", "Activity",
+        ])
+        layout.addWidget(self.type_combo)
 
         # Report text
         layout.addWidget(self._field_label("Report *"))
@@ -75,12 +86,14 @@ class ReportsEditDialog(QDialog):
         if not self.database or not self.report_id:
             return
         try:
-            items = self.database.get_items("Reports")
+            items = self.database.get_reports()
             for item in items:
                 if item.get('ID') == self.report_id:
                     dept = item.get('department', '')
-                    if dept in DEPARTMENTS:
-                        self.dept_combo.setCurrentText(dept)
+                    self.dept_combo.clear()
+                    self.dept_combo.addItem(
+                        item.get("created_by_username") or dept or "Legacy / Unassigned"
+                    )
                     date_str = item.get('date', '')
                     if date_str:
                         for fmt in ['%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y']:
@@ -91,6 +104,9 @@ class ReportsEditDialog(QDialog):
                             except ValueError:
                                 pass
                     self.report_text.setPlainText(item.get('report', ''))
+                    report_type = item.get("report_type") or "General"
+                    type_index = self.type_combo.findText(report_type)
+                    self.type_combo.setCurrentIndex(type_index if type_index >= 0 else 0)
                     break
         except Exception as e:
             print(f"Error loading report data: {e}")
@@ -110,16 +126,16 @@ class ReportsEditDialog(QDialog):
         data = {
             'department': dept,
             'date': date_val,
+            'report_type': self.type_combo.currentText(),
             'report': report_body
         }
 
         try:
-            if self.report_id:
-                self.database.update_item(self.report_id, data, "Reports")
-            else:
-                self.database.add_item(data, "Reports")
+            self.save_btn.setEnabled(False)
+            self.database.save_report(self.report_id, data)
             self.accept()
         except Exception as e:
+            self.save_btn.setEnabled(True)
             QMessageBox.critical(self, "Error", f"Failed to save report:\n{e}")
 
     def apply_theme(self):

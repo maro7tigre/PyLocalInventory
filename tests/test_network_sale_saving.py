@@ -37,10 +37,16 @@ class _Cursor:
         self.fetchone_value = None
         self.fetchall_value = []
         self.rowcount = 1
-        if normalized.startswith('select id from products'):
-            self.fetchone_value = (11,) if params[0].lower() == 'known product' else None
-        elif normalized.startswith('select id from services'):
-            self.fetchone_value = (22,) if params[0].lower() == 'known service' else None
+        if normalized.startswith('select id, name from products'):
+            self.fetchone_value = (11, 'Known Product') if str(params[0]).lower() == 'known product' else None
+        elif normalized.startswith('select id, name from services'):
+            self.fetchone_value = (22, 'Known Service') if str(params[0]).lower() == 'known service' else None
+        elif normalized.startswith('select id, name, username from clients'):
+            self.fetchone_value = (33, 'Client', 'client')
+        elif normalized.startswith('select coalesce(sum(quantity), 0) from import_items'):
+            self.fetchone_value = (100,)
+        elif normalized.startswith('select coalesce(sum(si.quantity), 0)'):
+            self.fetchone_value = (0,)
         elif normalized.startswith('insert into sales '):
             self.fetchone_value = (self.next_sale_id,)
         elif normalized.startswith('select id from sales_items'):
@@ -140,20 +146,19 @@ class NetworkSaleSavingTests(unittest.TestCase):
         self.assertEqual(captured['args'][1][0]['unit_price'], '0')
         self.assertEqual(result['saved'], 1)
 
-    def test_create_saves_product_service_and_manual_lines_atomically(self):
+    def test_create_saves_product_and_service_lines_atomically(self):
         database = _database()
         result = database.save_sale_with_items(
             {'client_username': 'client', 'date': '2026-07-20', 'tva': 20, 'state': 'pending'},
             [
-                {'product_name': 'Known Product', 'quantity': '1,5', 'unit_price': '10'},
-                {'product_name': 'Known Service', 'quantity': 2, 'unit_price': 15},
-                {'product_name': 'Manual line', 'quantity': 1, 'unit_price': 0},
+                {'item_type': 'product', 'product_name': 'Known Product', 'quantity': '1,5', 'unit_price': '10'},
+                {'item_type': 'service', 'product_name': 'Known Service', 'quantity': 2, 'unit_price': 15},
             ],
-            visible_row_count=3,
+            visible_row_count=2,
         )
-        self.assertEqual(result['saved'], 3)
-        self.assertEqual(result['inserted'], 3)
-        self.assertEqual([item['item_type'] for item in result['items']], ['product', 'service', 'manual'])
+        self.assertEqual(result['saved'], 2)
+        self.assertEqual(result['inserted'], 2)
+        self.assertEqual([item['item_type'] for item in result['items']], ['product', 'service'])
         self.assertEqual(database.conn.commits, 1)
         self.assertEqual(database.conn.rollbacks, 0)
 
@@ -162,8 +167,8 @@ class NetworkSaleSavingTests(unittest.TestCase):
         result = database.save_sale_with_items(
             {'client_username': 'client', 'date': '2026-07-20', 'tva': 0, 'state': 'pending'},
             [
-                {'id': 101, 'product_name': 'Known Product', 'quantity': 3, 'unit_price': 9},
-                {'product_name': 'Manual line', 'quantity': 1, 'unit_price': 4},
+                {'id': 101, 'item_type': 'product', 'product_name': 'Known Product', 'quantity': 3, 'unit_price': 9},
+                {'item_type': 'service', 'product_name': 'Known Service', 'quantity': 1, 'unit_price': 4},
             ],
             sale_id=7,
             visible_row_count=2,
@@ -180,7 +185,7 @@ class NetworkSaleSavingTests(unittest.TestCase):
         with self.assertRaisesRegex(ValueError, 'does not belong'):
             database.save_sale_with_items(
                 {'client_username': 'client', 'date': '2026-07-20', 'tva': 20, 'state': 'pending'},
-                [{'id': 999, 'product_name': 'Manual', 'quantity': 1, 'unit_price': 1}],
+                [{'id': 999, 'item_type': 'manual', 'product_name': 'Manual', 'quantity': 1, 'unit_price': 1}],
                 sale_id=7,
                 visible_row_count=1,
             )

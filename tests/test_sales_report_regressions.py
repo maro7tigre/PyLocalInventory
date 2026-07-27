@@ -131,9 +131,29 @@ class SalesReportRegressionTests(unittest.TestCase):
         dialog = ReportsDialog(sale, manager)
         data = dialog._extract_sales_data("devis")
         self.assertIn("<td>12.52</td>", data["items"])
-        self.assertIn('<strong class="item-name">Transport</strong><span class="item-detail"> Casablanca to Tanger</span>', data["items"])
+        self.assertIn('<span class="product-item-name">Transport</span><span class="item-detail"> Casablanca to Tanger</span>', data["items"])
+        self.assertNotIn('<strong class="item-name">Transport</strong>', data["items"])
         self.assertNotIn(" — ", data["items"])
         self.assertEqual(data["total_ht"], "125,20")
+
+    def test_report_keeps_service_designation_bold(self):
+        item = SalesItemClass(0, None)
+        item.set_value("item_type", "service")
+        item.set_value("service_id", 8)
+        item.set_value("product_name", "porte de cuisine")
+        item.set_value("quantity", 1)
+        item.set_value("unit_price", 444)
+        sale = _Values({
+            "id": 8, "client_name": "Client", "date": "2026-07-27", "tva": 0
+        })
+        sale.items = [item]
+        sale.database = None
+        profile = _Values({"company name": "Test Company"})
+        manager = type("Manager", (), {"selected_profile": profile})()
+        data = ReportsDialog(sale, manager)._extract_sales_data("devis")
+        self.assertIn(
+            '<strong class="item-name">porte de cuisine</strong>', data["items"]
+        )
 
     def test_sale_form_updates_subtotal_vat_and_total(self):
         dialog = SalesEditDialog(None, None)

@@ -13,12 +13,37 @@ from pathlib import Path
 from datetime import datetime, timedelta
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 import base64
 from decimal import Decimal, InvalidOperation
 import traceback
+import time
+
+
+class _PdfRenderWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, renderer, html_content, output_path):
+        super().__init__()
+        self.renderer = renderer
+        self.html_content = html_content
+        self.output_path = output_path
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        try:
+            self.finished.emit(self.renderer(self.html_content, self.output_path))
+        except Exception as error:
+            self.failed.emit(str(error))
+        finally:
+            print(
+                "[PERFORMANCE] generate_sales_report completed in "
+                f"{time.perf_counter() - started:.2f} seconds"
+            )
 
 
 class ReportsDialog(QDialog):
@@ -64,6 +89,10 @@ class ReportsDialog(QDialog):
         buttons_layout.addWidget(self.bdl_btn)
         
         layout.addLayout(buttons_layout)
+
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
         
         # Cancel button
         cancel_layout = QHBoxLayout()
@@ -89,44 +118,98 @@ class ReportsDialog(QDialog):
     
     def generate_report(self, report_type):
         """Generate report of specified type"""
+        if getattr(self, "_report_thread", None) and self._report_thread.isRunning():
+            return
         try:
             # Disable buttons during generation
             self.devis_btn.setEnabled(False)
             self.bdl_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             
-            # Show progress
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
-            
-            # Generate report directly
-            pdf_path = self._generate_report_sync(report_type)
-            
-            # Restore cursor and enable buttons
-            QApplication.restoreOverrideCursor()
-            self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
-            self.cancel_btn.setEnabled(True)
-            
-            # Handle success - show message but don't close dialog
-            QMessageBox.information(self, "Success", f"Report generated successfully!\n\nSaved to: {pdf_path}")
-            
-            # Open the generated file
-            try:
-                self.open_pdf(pdf_path)
-            except Exception as e:
-                QMessageBox.warning(self, "Warning", f"Report generated but failed to open:\n{str(e)}")
-            
+            self.status_label.setText("Preparing report...")
+            html_content, filepath = self._prepare_report(report_type)
+            self.status_label.setText("Rendering PDF...")
+            self._active_report_type = report_type
+            thread = QThread(self)
+            worker = _PdfRenderWorker(self._html_to_pdf, html_content, filepath)
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            # Connect to QObject-bound slots so PySide queues every widget and
+            # QMessageBox operation onto the GUI thread. A lambda here can run
+            # in the worker thread and make the success dialog unresponsive.
+            worker.finished.connect(self._report_rendered_on_ui)
+            worker.failed.connect(self._report_failed_on_ui)
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            worker.finished.connect(worker.deleteLater)
+            worker.failed.connect(worker.deleteLater)
+            thread.finished.connect(lambda: setattr(self, "_report_thread", None))
+            thread.finished.connect(thread.deleteLater)
+            self._report_thread = thread
+            self._report_worker = worker
+            thread.start()
         except Exception as e:
-            QApplication.restoreOverrideCursor()
-            self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
-            self.cancel_btn.setEnabled(True)
-            details = self._report_context(report_type, getattr(self, '_last_output_path', None), e)
-            self._write_report_log(details)
-            QMessageBox.critical(self, "Report Error", details)
+            self._report_failed(report_type, str(e))
+
+    @Slot(str)
+    def _report_rendered_on_ui(self, pdf_path):
+        self._report_rendered(
+            getattr(self, "_active_report_type", "report"), pdf_path
+        )
+
+    @Slot(str)
+    def _report_failed_on_ui(self, error):
+        self._report_failed(
+            getattr(self, "_active_report_type", "report"), error
+        )
+
+    def _set_report_buttons_enabled(self, enabled):
+        self.devis_btn.setEnabled(enabled)
+        self.bdl_btn.setEnabled(enabled)
+        self.cancel_btn.setEnabled(enabled)
+
+    def _report_rendered(self, report_type, pdf_path):
+        self._set_report_buttons_enabled(True)
+        self.status_label.setText("")
+        self._write_report_log(self._report_context(report_type, pdf_path, None))
+        QMessageBox.information(
+            self, "Success", f"Report generated successfully!\n\nSaved to: {pdf_path}"
+        )
+        try:
+            self.open_pdf(pdf_path)
+        except Exception as error:
+            QMessageBox.warning(
+                self, "Warning", f"Report generated but failed to open:\n{error}"
+            )
+
+    def _report_failed(self, report_type, error):
+        self._set_report_buttons_enabled(True)
+        self.status_label.setText("")
+        details = self._report_context(
+            report_type, getattr(self, "_last_output_path", None), error
+        )
+        self._write_report_log(details)
+        QMessageBox.critical(self, "Report Error", details)
+
+    def closeEvent(self, event):
+        thread = getattr(self, "_report_thread", None)
+        if thread and thread.isRunning():
+            event.ignore()
+            return
+        super().closeEvent(event)
     
     def _generate_report_sync(self, report_type):
         """Synchronously generate report and return PDF path"""
+        html_content, filepath = self._prepare_report(report_type)
+        try:
+            actual_output_path = self._html_to_pdf(html_content, filepath)
+        except Exception as exc:
+            raise RuntimeError(self._report_context(report_type, filepath, exc)) from exc
+        self._write_report_log(self._report_context(report_type, actual_output_path, None))
+        return actual_output_path
+
+    def _prepare_report(self, report_type):
+        """Collect database/UI data on the GUI thread before worker rendering."""
         # Get current profile path
         if not self.profile_manager.selected_profile:
             raise Exception("No profile selected")
@@ -161,15 +244,7 @@ class ReportsDialog(QDialog):
         # Generate HTML content
         html_content = self._generate_html_content(report_type)
         
-        # Convert HTML to PDF with the single supported Chromium renderer.
-        try:
-            actual_output_path = self._html_to_pdf(html_content, filepath)
-        except Exception as exc:
-            raise RuntimeError(self._report_context(report_type, filepath, exc)) from exc
-
-        self._write_report_log(self._report_context(report_type, actual_output_path, None))
-        
-        return actual_output_path
+        return html_content, filepath
 
     def _report_context(self, report_type, path, error):
         database = getattr(self.sales_obj, 'database', None)
@@ -307,6 +382,11 @@ class ReportsDialog(QDialog):
                     print(f"DEBUG: Error getting client contact details: {e}")
 
             sale_notes = self.sales_obj.get_value('notes') or ""
+            department = (
+                self.sales_obj.get_value('created_by_username')
+                or getattr(self.sales_obj.database, 'username', None)
+                or "Legacy / Unassigned"
+            )
 
             # Generate document reference
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
@@ -374,6 +454,11 @@ class ReportsDialog(QDialog):
                     product_name = item.get_value('product_name') or ""
                     item_information = item.get_value('information') or ""
                     product_id = item.get_value('product_id') or ""
+                    service_id = item.get_value('service_id') or ""
+                    item_type = str(item.get_value("item_type") or "").casefold()
+                    is_service = item_type == "service" or (
+                        bool(service_id) and not bool(product_id)
+                    )
                     
                     # If product_name is empty, try to get it from product_id
                     if not product_name:
@@ -431,7 +516,12 @@ class ReportsDialog(QDialog):
                         )
                     elif report_type == 'devis':
                         product_code = html.escape(str(product_id)) if product_id else "-"
-                        designation_html = f'<strong class="item-name">{html.escape(str(product_name))}</strong>'
+                        escaped_name = html.escape(str(product_name))
+                        designation_html = (
+                            f'<strong class="item-name">{escaped_name}</strong>'
+                            if is_service
+                            else f'<span class="product-item-name">{escaped_name}</span>'
+                        )
                         if item_information:
                             designation_html += (
                                 f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
@@ -444,7 +534,12 @@ class ReportsDialog(QDialog):
                             f"<td>{_fmt_fr(subtotal)}</td></tr>"
                         )
                     else:
-                        designation_html = f'<strong class="item-name">{html.escape(str(product_name))}</strong>'
+                        escaped_name = html.escape(str(product_name))
+                        designation_html = (
+                            f'<strong class="item-name">{escaped_name}</strong>'
+                            if is_service
+                            else f'<span class="product-item-name">{escaped_name}</span>'
+                        )
                         if item_information:
                             designation_html += (
                                 f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
@@ -512,6 +607,7 @@ class ReportsDialog(QDialog):
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
                 'date': date,
+                'department': html.escape(str(department)),
                 'document_ref': doc_ref,
                 'client_name': client_name,
                 'client_address': client_address,

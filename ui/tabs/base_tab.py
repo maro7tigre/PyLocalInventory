@@ -16,6 +16,7 @@ from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
 from datetime import datetime
 import re
+import time
 
 
 class BaseTableDelegate(QStyledItemDelegate):
@@ -153,6 +154,7 @@ class BaseTab(QWidget):
         # Store all items for filtering
         self.all_items = []
         self.filtered_items = []
+        self._refreshing = False
         
         self.setup_ui()
         self.refresh_table()
@@ -173,7 +175,11 @@ class BaseTab(QWidget):
         # Search bar
         self.search_bar = AutoCompleteLineEdit(self, self.get_search_options())
         self.search_bar.setPlaceholderText(f"Search {self.section.lower()}...")
-        self.search_bar.textChanged.connect(self.filter_table)
+        self._search_timer = QTimer(self)
+        self._search_timer.setSingleShot(True)
+        self._search_timer.setInterval(250)
+        self._search_timer.timeout.connect(self.filter_table)
+        self.search_bar.textChanged.connect(lambda _text: self._search_timer.start())
         controls_layout.addWidget(self.search_bar)
         
         # Order dropdown
@@ -297,10 +303,14 @@ class BaseTab(QWidget):
     
     def refresh_table(self):
         """Refresh table data from database"""
+        if self._refreshing:
+            return
         if not self.database:
             QMessageBox.warning(self, "Error", "No database connection")
             return
 
+        self._refreshing = True
+        started = time.perf_counter()
         try:
             print(f"🔄 Refreshing {self.section} table...")
             
@@ -308,8 +318,16 @@ class BaseTab(QWidget):
             self.table.setRowCount(0)
             
             # Get items from database
-            items_data = self.database.get_items(self.section)
+            items_data = self.fetch_items()
             self.all_items = []
+            if self.section == "Products":
+                try:
+                    levels = self.database.get_product_stock_levels()
+                    self.database._product_stock_levels = {
+                        int(key): value for key, value in levels.items()
+                    }
+                except Exception as stock_error:
+                    print(f"Could not prefetch product stock: {stock_error}")
             
             print(f"📦 Found {len(items_data)} items in database for {self.section}")
 
@@ -333,16 +351,6 @@ class BaseTab(QWidget):
                                 pass  # Skip invalid parameters
 
                     self.all_items.append(obj)
-                    # For operations (Sales / Imports), refresh external snapshots so renamed
-                    # client/supplier names appear without manual reopen. This will persist
-                    # only if name actually changed (handled inside method).
-                    try:
-                        if (hasattr(obj, 'refresh_external_snapshots') and
-                                self.database.__class__.__name__ != 'RemoteDatabase'):
-                            obj.refresh_external_snapshots()
-                    except Exception as snap_e:
-                        print(f"Snapshot refresh skipped for {self.section} ID {obj.id}: {snap_e}")
-
                 except Exception as e:
                     print(f"Error processing {self.section} item: {e}")
                     continue
@@ -366,6 +374,16 @@ class BaseTab(QWidget):
         except Exception as e:
             print(f"Error refreshing {self.section} table: {e}")
             QMessageBox.critical(self, "Error", f"Failed to refresh {self.section}: {e}")
+        finally:
+            self._refreshing = False
+            print(
+                f"[PERFORMANCE] load_{self.section.lower()} completed in "
+                f"{time.perf_counter() - started:.3f} seconds"
+            )
+
+    def fetch_items(self):
+        """Fetch rows for the tab; ownership-aware tabs may override."""
+        return self.database.get_items(self.section)
     
     def refresh_on_tab_switch(self):
         """Refresh data when tab becomes visible - lighter refresh for better performance"""

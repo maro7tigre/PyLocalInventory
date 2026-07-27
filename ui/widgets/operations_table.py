@@ -1,8 +1,9 @@
 """
 Operations Table Widget - Clean architecture with proper separation of concerns
 """
-from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
-                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit, QStyledItemDelegate)
+from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView,
+                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
+                             QStyledItemDelegate, QComboBox, QInputDialog)
 from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
 from PySide6.QtCore import Qt, Signal, QRegularExpression
 from ui.widgets.preview_widget import PreviewWidget
@@ -30,7 +31,9 @@ class TableDataManager:
             if param_key == 'product_preview':
                 headers.append('Preview')
             elif param_key == 'product_name':
-                headers.append('Product')
+                headers.append('Name')
+            elif param_key == 'item_type':
+                headers.append('Type')
             elif param_key == 'delete_action':
                 headers.append('Delete')
             else:
@@ -107,6 +110,10 @@ class TableDataManager:
         widget = table.cellWidget(row, col)
         if widget and hasattr(widget, 'text'):
             return widget.text().strip()
+        if widget and hasattr(widget, 'currentData'):
+            return str(widget.currentData() or "").strip()
+        if widget and hasattr(widget, 'currentText'):
+            return widget.currentText().strip()
         
         cell_item = table.item(row, col)
         if cell_item:
@@ -159,10 +166,29 @@ class TableRowFactory:
             self._create_preview_cell(table, row, col, item)
         elif param_key == 'product_name':
             self._create_autocomplete_cell(table, row, col, param_key, item)
+        elif param_key == 'item_type':
+            self._create_item_type_cell(table, row, col, item)
         elif self.data_manager.parameter_definitions.get(param_key, {}).get('autocomplete'):
             self._create_autocomplete_cell(table, row, col, param_key, item)
         else:
             self._create_regular_cell(table, row, col, param_key, item)
+
+    def _create_item_type_cell(self, table, row, col, item):
+        selector = QComboBox()
+        selector.addItem("Select type...", "")
+        selector.addItem("Product", "product")
+        selector.addItem("Service", "service")
+        selected = ""
+        if item and hasattr(item, "get_value"):
+            selected = str(item.get_value("item_type") or "")
+            if not selected:
+                selected = "product" if item.get_value("product_id") else (
+                    "service" if item.get_value("service_id") else ""
+                )
+        index = selector.findData(selected)
+        selector.setCurrentIndex(index if index >= 0 else 0)
+        selector.setProperty("row", row)
+        table.setCellWidget(row, col, selector)
     
     def _create_delete_button_cell(self, table, row, col):
         """Create delete button cell"""
@@ -239,7 +265,12 @@ class TableRowFactory:
             autocomplete.setProperty('item_id', getattr(item, 'id', None) or item.get_value('id'))
             autocomplete.setProperty('product_id', item.get_value('product_id'))
             autocomplete.setProperty('service_id', item.get_value('service_id') if 'service_id' in getattr(item, 'parameters', {}) else None)
-            autocomplete.setProperty('item_type', 'product' if item.get_value('product_id') else 'manual')
+            autocomplete.setProperty(
+                'item_type',
+                'product' if item.get_value('product_id') else (
+                    'service' if autocomplete.property('service_id') else 'manual'
+                ),
+            )
         
         table.setCellWidget(row, col, autocomplete)
     
@@ -393,6 +424,32 @@ class TableEventHandler:
                 )
             if widget:
                 widget.setProperty('operation_events_connected', True)
+            try:
+                type_col = self.data_manager.table_columns.index("item_type")
+                selector = self.table.cellWidget(row, type_col)
+                if selector and not selector.property("operation_events_connected"):
+                    selector.currentIndexChanged.connect(
+                        lambda _index, s=selector: self._on_item_type_changed(
+                            int(s.property("row"))
+                        )
+                    )
+                    selector.setProperty("operation_events_connected", True)
+            except (ValueError, AttributeError):
+                pass
+        except (ValueError, AttributeError):
+            pass
+
+    def _on_item_type_changed(self, row):
+        try:
+            name_col = self.data_manager.table_columns.index("product_name")
+            name_widget = self.table.cellWidget(row, name_col)
+            if name_widget:
+                name_widget.setProperty("product_id", None)
+                name_widget.setProperty("service_id", None)
+                name_widget.setProperty("item_type", None)
+                if name_widget.text().strip():
+                    self._handle_product_selection(row, name_widget.text().strip())
+            self.items_changed_callback()
         except (ValueError, AttributeError):
             pass
     
@@ -503,6 +560,17 @@ class TableEventHandler:
     
     def _handle_product_selection(self, row, product_name):
         """Handle product selection and auto-fill"""
+        if "item_type" in self.data_manager.table_columns:
+            selected = self._resolve_sale_catalog_item(row, product_name)
+            self._auto_fill_quantity(row)
+            if selected is None:
+                self._update_row_subtotal(row)
+                return
+            # The typed catalog resolver already stored the immutable ID and
+            # catalog price. Do not run the legacy Product-only price lookup,
+            # which would overwrite Service prices with zero.
+            self._update_row_subtotal(row)
+            return
         temp_item = self.data_manager.item_class(0, self.data_manager.database)
         temp_item.set_value('product_name', product_name)
         
@@ -517,6 +585,88 @@ class TableEventHandler:
         
         # Update subtotal
         self._update_row_subtotal(row)
+
+    @staticmethod
+    def _normalized_name(value):
+        return " ".join(str(value or "").split()).casefold()
+
+    def _resolve_sale_catalog_item(self, row, entered_name):
+        database = self.data_manager.database
+        if not database or not getattr(database, "cursor", None):
+            return None
+        target = self._normalized_name(entered_name)
+        product = service = None
+        try:
+            database.cursor.execute(
+                "SELECT id, name, sale_price FROM products "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                "ORDER BY id LIMIT 2",
+                (target,),
+            )
+            product_row = database.cursor.fetchone()
+            if product_row:
+                product = {
+                    "type": "product", "id": int(product_row[0]),
+                    "name": product_row[1], "price": product_row[2] or 0,
+                }
+            database.cursor.execute(
+                "SELECT id, name, unit_price FROM services "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                "ORDER BY id LIMIT 2",
+                (target,),
+            )
+            service_row = database.cursor.fetchone()
+            if service_row:
+                service = {
+                    "type": "service", "id": int(service_row[0]),
+                    "name": service_row[1], "price": service_row[2] or 0,
+                }
+        except Exception:
+            return None
+
+        type_col = self.data_manager.table_columns.index("item_type")
+        selector = self.table.cellWidget(row, type_col)
+        chosen_type = str(selector.currentData() or "") if selector else ""
+        if product and service and not chosen_type:
+            choice, ok = QInputDialog.getItem(
+                self.table,
+                "Choose Item Type",
+                f"'{entered_name}' exists as both a Product and a Service:",
+                ["Product", "Service"],
+                editable=False,
+            )
+            if not ok:
+                return None
+            chosen_type = choice.casefold()
+        elif product and not service:
+            chosen_type = "product"
+        elif service and not product:
+            chosen_type = "service"
+
+        selected = product if chosen_type == "product" else service if chosen_type == "service" else None
+        if selector and chosen_type:
+            selector.blockSignals(True)
+            selector.setCurrentIndex(selector.findData(chosen_type))
+            selector.blockSignals(False)
+        name_col = self.data_manager.table_columns.index("product_name")
+        name_widget = self.table.cellWidget(row, name_col)
+        if name_widget:
+            name_widget.setProperty("product_id", selected["id"] if selected and chosen_type == "product" else None)
+            name_widget.setProperty("service_id", selected["id"] if selected and chosen_type == "service" else None)
+            name_widget.setProperty("item_type", chosen_type or None)
+            if selected and name_widget.text() != selected["name"]:
+                name_widget.setText(selected["name"])
+        if selected:
+            try:
+                price_col = self.data_manager.table_columns.index("unit_price")
+                price_item = self.table.item(row, price_col) or QTableWidgetItem()
+                if not self.table.item(row, price_col):
+                    self.table.setItem(row, price_col, price_item)
+                if not price_item.text().strip() or self._parse_number(price_item.text()) == 0:
+                    price_item.setText(str(selected["price"]))
+            except ValueError:
+                pass
+        return selected
     
     def _auto_fill_quantity(self, row):
         """Auto-fill quantity with default value"""
@@ -616,6 +766,16 @@ class TableEventHandler:
         product_name = product_widget.text().strip() if product_widget and hasattr(product_widget, 'text') else ''
         if not product_name:
             return None
+        item_type = str(product_widget.property("item_type") or "").casefold()
+        if "item_type" in self.data_manager.table_columns:
+            try:
+                type_col = self.data_manager.table_columns.index("item_type")
+                selector = self.table.cellWidget(row, type_col)
+                item_type = str(selector.currentData() or item_type).casefold()
+            except (ValueError, AttributeError):
+                pass
+        if item_type == "service":
+            return None
         
         # Get quantity from either active editor or cell item
         requested_qty = 0
@@ -642,12 +802,18 @@ class TableEventHandler:
                 requested_qty = 0
         
         # Product ID lookup
-        product_id = None
+        product_id = product_widget.property("product_id")
         try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = %s LIMIT 1", (product_name,))
-            res = db.cursor.fetchone()
-            if res and res[0]:
-                product_id = res[0]
+            if not product_id:
+                db.cursor.execute(
+                    "SELECT ID FROM Products "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 1",
+                    (self._normalized_name(product_name),),
+                )
+                res = db.cursor.fetchone()
+                if res and res[0]:
+                    product_id = res[0]
         except Exception:
             product_id = None
         if not product_id:
@@ -973,8 +1139,17 @@ class OperationsTableWidget(QWidget):
                     item.set_value(key, value)
                 except Exception:
                     pass
+            try:
+                selected_type = str(item_data.get("item_type") or "").casefold()
+                if selected_type == "service":
+                    item.parameters["product_id"]["value"] = None
+                elif selected_type == "product" and "service_id" in item.parameters:
+                    item.parameters["service_id"]["value"] = None
+            except Exception:
+                pass
             # Attempt resolution (non-fatal if fails); include regardless for later handling
-            if hasattr(item, 'get_value') and not item.get_value('product_id'):
+            if (hasattr(item, 'get_value') and not item.get_value('product_id')
+                    and str(item_data.get("item_type") or "").casefold() != "service"):
                 try:
                     if self.data_manager.database and hasattr(self.data_manager.database, 'cursor'):
                         self.data_manager.database.cursor.execute(

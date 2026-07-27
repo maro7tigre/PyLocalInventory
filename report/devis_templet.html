@@ -53,6 +53,7 @@
     .items-table td:nth-child(4), .items-table td:nth-child(5) { text-align: right; white-space: nowrap; }
     .items-table tr { page-break-inside: avoid; break-inside: avoid; }
     .item-name { font-weight: 700; }
+    .product-item-name { font-weight: 400; }
     .item-detail { display: inline; color: #43555a; font-size: 10.5px; font-weight: 400; white-space: normal; }
     .empty-row td { height: 18mm; text-align: center !important; color: #68777a; }
 
@@ -108,6 +109,7 @@
         <div class="document-title">DEVIS N°</div>
         <div class="document-number">{{ document_ref }}</div>
         <div class="document-date"><strong>Date :</strong> {{ date }}</div>
+        <div class="document-date"><strong>Department :</strong> {{ department }}</div>
         <div class="customer-box">
           <div class="customer-caption">Client</div>
           <div class="customer-name">{{ client_name }}</div>

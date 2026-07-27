@@ -6,7 +6,7 @@ that control what connecting clients can read, insert or delete.
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QLineEdit, QPushButton,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QCheckBox, QMessageBox, QInputDialog
+    QCheckBox, QMessageBox, QInputDialog, QFileDialog
 )
 from PySide6.QtCore import Qt
 
@@ -139,6 +139,18 @@ class NetworkDialog(QDialog):
         password_row.addWidget(self.db_password_input)
         form.addLayout(password_row)
 
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(QLabel("PostgreSQL Bin Directory:"))
+        self.db_bin_input = QLineEdit()
+        self.db_bin_input.setPlaceholderText(
+            r"Optional, for example C:\Program Files\PostgreSQL\18\bin"
+        )
+        bin_row.addWidget(self.db_bin_input)
+        browse_bin_btn = QPushButton("Browse...")
+        browse_bin_btn.clicked.connect(self._browse_postgres_bin)
+        bin_row.addWidget(browse_bin_btn)
+        form.addLayout(bin_row)
+
         self.db_status_label = QLabel()
         form.addWidget(self.db_status_label)
 
@@ -161,6 +173,16 @@ class NetworkDialog(QDialog):
         self.db_name_input.setText(str(config.get("maintenance_database", config.get("database", "postgres"))))
         self.db_user_input.setText(str(config.get("user", "")))
         self.db_password_input.setText(str(config.get("password", "")))
+        self.db_bin_input.setText(str(config.get("postgres_bin_dir", "")))
+
+    def _browse_postgres_bin(self):
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select PostgreSQL Bin Directory",
+            self.db_bin_input.text().strip(),
+        )
+        if directory:
+            self.db_bin_input.setText(directory)
 
     def _collect_db_server_config(self):
         try:
@@ -174,6 +196,7 @@ class NetworkDialog(QDialog):
             "maintenance_database": self.db_name_input.text().strip(),
             "user": self.db_user_input.text().strip(),
             "password": self.db_password_input.text(),
+            "postgres_bin_dir": self.db_bin_input.text().strip(),
         }
 
     def _test_db_server_connection(self):

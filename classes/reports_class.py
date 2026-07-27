@@ -45,6 +45,29 @@ class ReportsClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "report_type": {
+                "value": "General",
+                "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
+                "required": False,
+                "default": "General",
+                "options": [
+                    "General", "Sales", "Products", "Services", "Clients",
+                    "Revenue", "Profit", "Activity",
+                ],
+                "type": "string"
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
             "view_details": {
                 "value": None,
                 "display_name": {"en": "Details", "fr": "Détails", "es": "Detalles"},
@@ -63,16 +86,22 @@ class ReportsClass(BaseClass):
                 "id": "r",
                 "department": "r",
                 "date": "r",
+                "report_type": "r",
                 "view_details": "r"
             },
             "dialog": {
                 "department": "rw",
                 "date": "rw",
-                "report": "rw"
+                "report_type": "rw",
+                "report": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r"
             },
             "database": {
                 "department": "rw",
                 "date": "rw",
+                "report_type": "rw",
                 "report": "rw"
             }
         }

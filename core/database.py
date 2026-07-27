@@ -8,6 +8,7 @@ in the app (classes/*.py, ui/**/*.py) that already reference table/column names
 unquoted, so they keep working unchanged against the folded lowercase names.
 """
 import re
+from datetime import datetime
 
 import psycopg2
 from psycopg2 import OperationalError
@@ -139,6 +140,7 @@ class Database:
                 self._ensure_meta_table()
                 self._ensure_user_tables()
                 self._ensure_attachment_tables()
+                self._ensure_payments_table()
                 self._run_one_time_migrations()
 
                 print(f"✓ Connected to database: {database_name}")
@@ -171,6 +173,7 @@ class Database:
             self._ensure_meta_table()
             self._ensure_user_tables()
             self._ensure_attachment_tables()
+            self._ensure_payments_table()
             self._run_one_time_migrations()
 
             print(f"✓ Connected to database schema: {schema_name}")
@@ -313,10 +316,34 @@ class Database:
     def _ensure_additional_columns(self):
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
-            'clients': {'ice': 'TEXT'},
-            'sales': {'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT'},
-            'imports': {'supplier_name': 'TEXT'},
-            'sales_items': {'product_name': 'TEXT'},
+            'clients': {
+                'ice': 'TEXT', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'products': {
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'services': {
+                'unit_price': 'DOUBLE PRECISION', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'sales': {
+                'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT',
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT',
+                'created_at': 'TEXT', 'operation_token': 'TEXT',
+            },
+            'imports': {
+                'supplier_name': 'TEXT', 'supplier_id': 'INTEGER',
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT',
+                'created_at': 'TEXT', 'operation_token': 'TEXT',
+            },
+            'reports': {
+                'report_type': 'TEXT', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'sales_items': {
+                'product_name': 'TEXT', 'service_id': 'INTEGER', 'item_type': 'TEXT',
+            },
             'import_items': {'product_name': 'TEXT'}
         }
         for table, cols in required.items():
@@ -339,6 +366,44 @@ class Database:
             except Exception as e_tab:
                 self.conn.rollback()
                 print(f"Warning: snapshot column check failed for {table}: {e_tab}")
+
+        try:
+            index_statements = (
+                "CREATE INDEX IF NOT EXISTS sales_created_by_idx ON sales(created_by)",
+                "CREATE INDEX IF NOT EXISTS imports_created_by_idx ON imports(created_by)",
+                "CREATE INDEX IF NOT EXISTS reports_created_by_idx ON reports(created_by)",
+                "CREATE INDEX IF NOT EXISTS reports_report_type_idx ON reports(report_type)",
+                "CREATE INDEX IF NOT EXISTS sales_items_sales_id_idx ON sales_items(sales_id)",
+                "CREATE INDEX IF NOT EXISTS sales_items_service_id_idx ON sales_items(service_id)",
+                "CREATE INDEX IF NOT EXISTS import_items_import_id_idx ON import_items(import_id)",
+                "CREATE INDEX IF NOT EXISTS import_items_product_id_idx ON import_items(product_id)",
+                "CREATE INDEX IF NOT EXISTS sales_items_product_id_idx ON sales_items(product_id)",
+                "CREATE INDEX IF NOT EXISTS imports_supplier_id_idx ON imports(supplier_id)",
+                "CREATE INDEX IF NOT EXISTS products_normalized_name_idx "
+                "ON products (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS products_normalized_username_idx "
+                "ON products (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS services_normalized_name_idx "
+                "ON services (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS clients_normalized_username_idx "
+                "ON clients (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS clients_normalized_name_idx "
+                "ON clients (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS suppliers_normalized_username_idx "
+                "ON suppliers (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS suppliers_normalized_name_idx "
+                "ON suppliers (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE UNIQUE INDEX IF NOT EXISTS sales_operation_token_uidx "
+                "ON sales(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS imports_operation_token_uidx "
+                "ON imports(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
+            )
+            for statement in index_statements:
+                self.cursor.execute(statement)
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not create workflow indexes: {exc}")
 
         # Existing installations created this column as INTEGER. PostgreSQL's
         # cast keeps all old values intact. Check first to avoid taking an
@@ -422,6 +487,30 @@ class Database:
         except Exception as e:
             self.conn.rollback()
             print(f"Warning: could not create attachment tables: {e}")
+
+    def _ensure_payments_table(self):
+        """Create the client-account payment table during trusted host startup."""
+        try:
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    sale_id INTEGER,
+                    sales_item_id INTEGER,
+                    amount DOUBLE PRECISION,
+                    date TEXT,
+                    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+                    FOREIGN KEY (sales_item_id) REFERENCES sales_items(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS sales_item_id INTEGER"
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create Payments table: {e}")
 
     # ---------------- Migration & Meta Helpers -----------------
     def _ensure_meta_table(self):
@@ -655,7 +744,149 @@ class Database:
             raise ValueError(f"{field} must be at least {minimum}")
         return number
 
-    def save_sale_with_items(self, sale_data, items, sale_id=None, visible_row_count=None):
+    @staticmethod
+    def _normalize_exact(value):
+        return " ".join(str(value or "").split()).casefold()
+
+    def _find_named_record(self, table, name, record_id=None):
+        if record_id not in (None, "", 0, "0"):
+            self.cursor.execute(f"SELECT id, name FROM {table} WHERE id = %s", (int(record_id),))
+            row = self.cursor.fetchone()
+            if row:
+                return int(row[0]), row[1]
+        self.cursor.execute(
+            f"SELECT id, name FROM {table} "
+            "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+            "ORDER BY id LIMIT 1",
+            (self._normalize_exact(name),),
+        )
+        row = self.cursor.fetchone()
+        return (int(row[0]), row[1]) if row else (None, None)
+
+    @staticmethod
+    def _actor_fields(user):
+        user = user or {}
+        return {
+            "created_by": user.get("id"),
+            "created_by_username": user.get("username") or "Local Admin",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _create_pending_sale_entities(self, pending_entities, user):
+        resolved = {}
+        actor = self._actor_fields(user)
+        for entity in pending_entities or []:
+            if not isinstance(entity, dict):
+                raise ValueError("Pending entity data must be an object")
+            kind = str(entity.get("type") or "").strip().casefold()
+            name = " ".join(str(entity.get("name") or "").split())
+            if kind not in ("client", "product", "service") or not name:
+                raise ValueError("Pending entity type and name are required")
+            key = (kind, self._normalize_exact(name))
+            if key in resolved:
+                continue
+            self.cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{kind}:{self._normalize_exact(name)}",),
+            )
+
+            if kind == "client":
+                username = " ".join(str(entity.get("username") or name).split())
+                self.cursor.execute(
+                    "SELECT id, name FROM clients "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = %s "
+                    "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+                    "ORDER BY id LIMIT 1",
+                    (self._normalize_exact(username), self._normalize_exact(name)),
+                )
+                row = self.cursor.fetchone()
+                if row:
+                    resolved[key] = int(row[0])
+                    continue
+                self.cursor.execute(
+                    "INSERT INTO clients "
+                    "(username, name, client_type, created_by, created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        username, name, entity.get("client_type") or "individual",
+                        actor["created_by"], actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                resolved[key] = int(self.cursor.fetchone()[0])
+                resolved[("client", self._normalize_exact(username))] = resolved[key]
+                continue
+
+            table = "products" if kind == "product" else "services"
+            record_id, _ = self._find_named_record(table, name)
+            if record_id:
+                resolved[key] = record_id
+                continue
+
+            sale_price = self._sale_decimal(
+                entity.get("sale_price", entity.get("unit_price")),
+                f"{kind} {name} price",
+                "0",
+            )
+            if kind == "product":
+                purchase_price = self._sale_decimal(
+                    entity.get("purchase_price", 0), f"product {name} purchase price", "0"
+                )
+                self.cursor.execute(
+                    "INSERT INTO products "
+                    "(name, username, unit_price, sale_price, category, description, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        name, str(entity.get("sku") or name), purchase_price, sale_price,
+                        str(entity.get("category") or ""), str(entity.get("description") or ""),
+                        actor["created_by"], actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                product_id = int(self.cursor.fetchone()[0])
+                initial_quantity = self._sale_decimal(
+                    entity.get("initial_quantity", 0),
+                    f"product {name} initial quantity",
+                    "0",
+                )
+                if initial_quantity:
+                    self.cursor.execute(
+                        "INSERT INTO imports "
+                        "(supplier_username, supplier_name, date, tva, notes, "
+                        "created_by, created_by_username, created_at) "
+                        "VALUES ('', 'Opening Stock', %s, 0, %s, %s, %s, %s) RETURNING id",
+                        (
+                            datetime.now().strftime("%Y-%m-%d"),
+                            f"Opening stock for {name}",
+                            actor["created_by"], actor["created_by_username"], actor["created_at"],
+                        ),
+                    )
+                    opening_import_id = int(self.cursor.fetchone()[0])
+                    self.cursor.execute(
+                        "INSERT INTO import_items "
+                        "(import_id, product_id, product_name, quantity, unit_price) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (opening_import_id, product_id, name, initial_quantity, purchase_price),
+                    )
+                resolved[key] = product_id
+            else:
+                self.cursor.execute(
+                    "INSERT INTO services "
+                    "(service_type, name, unit_price, description, keywords, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('Custom Service', %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        name, sale_price, str(entity.get("description") or ""),
+                        str(entity.get("keywords") or ""), actor["created_by"],
+                        actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                resolved[key] = int(self.cursor.fetchone()[0])
+        return resolved
+
+    def save_sale_with_items(
+        self, sale_data, items, sale_id=None, visible_row_count=None,
+        pending_entities=None, user=None,
+    ):
         """Atomically save one sale header and its complete visible line set."""
         if not isinstance(sale_data, dict):
             raise ValueError("sale_data must be an object")
@@ -686,6 +917,9 @@ class Database:
             except (TypeError, ValueError):
                 raise ValueError(f"Item {index}: IDs must be integers when present")
 
+            requested_type = str(raw.get("item_type") or "").strip().casefold()
+            if requested_type not in ("product", "service", "manual"):
+                requested_type = "product" if product_id else ("service" if service_id else "")
             validated.append({
                 'id': item_id,
                 'product_id': product_id,
@@ -695,30 +929,80 @@ class Database:
                 'quantity': quantity,
                 'unit_price': unit_price,
                 'production': int(raw.get('production') or 0),
-                'item_type': 'product' if product_id else ('service' if service_id else 'manual'),
+                'item_type': requested_type,
             })
 
         try:
-            # Resolve product/service names on the host connection that owns the transaction.
-            for item in validated:
-                if item['product_id'] is None:
-                    self.cursor.execute(
-                        "SELECT id FROM products WHERE LOWER(name) = LOWER(%s) LIMIT 1",
-                        (item['product_name'],),
-                    )
-                    row = self.cursor.fetchone()
-                    item['product_id'] = int(row[0]) if row else None
-                if item['product_id'] is None and item['service_id'] is None:
-                    self.cursor.execute(
-                        "SELECT id FROM services WHERE LOWER(name) = LOWER(%s) LIMIT 1",
-                        (item['product_name'],),
-                    )
-                    row = self.cursor.fetchone()
-                    item['service_id'] = int(row[0]) if row else None
-                item['item_type'] = (
-                    'product' if item['product_id'] else
-                    ('service' if item['service_id'] else 'manual')
+            header_token = str(sale_data.get("operation_token") or "").strip()
+            if not sale_id and header_token:
+                self.cursor.execute(
+                    "SELECT id FROM sales WHERE operation_token = %s", (header_token,)
                 )
+                duplicate = self.cursor.fetchone()
+                if duplicate:
+                    self.cursor.execute(
+                        "SELECT COUNT(*) FROM sales_items WHERE sales_id = %s",
+                        (int(duplicate[0]),),
+                    )
+                    return {
+                        "sale_id": int(duplicate[0]), "saved": int(self.cursor.fetchone()[0]),
+                        "inserted": 0, "updated": 0, "deleted": 0,
+                        "items": [], "transaction": "committed", "duplicate": True,
+                    }
+
+            resolved_pending = self._create_pending_sale_entities(pending_entities, user)
+
+            # Resolve only in the explicitly selected catalog.
+            for item in validated:
+                kind = item["item_type"]
+                if not kind:
+                    product_match = self._find_named_record(
+                        "products", item["product_name"], item["product_id"]
+                    )
+                    service_match = self._find_named_record(
+                        "services", item["product_name"], item["service_id"]
+                    )
+                    if product_match[0] and service_match[0]:
+                        raise ValueError(
+                            f"Choose Product or Service for '{item['product_name']}'"
+                        )
+                    if product_match[0]:
+                        kind = item["item_type"] = "product"
+                        item["product_id"] = product_match[0]
+                    elif service_match[0]:
+                        kind = item["item_type"] = "service"
+                        item["service_id"] = service_match[0]
+                    elif item["id"] is not None:
+                        kind = item["item_type"] = "manual"
+                    else:
+                        raise ValueError(
+                            f"Choose Product or Service for '{item['product_name']}'"
+                        )
+                if kind == "manual":
+                    # Legacy manual lines remain editable, but new lines must
+                    # explicitly select Product or Service.
+                    if item["id"] is None:
+                        raise ValueError(
+                            f"Choose Product or Service for '{item['product_name']}'"
+                        )
+                    continue
+                table = "products" if kind == "product" else "services"
+                selected_id = item["product_id"] if kind == "product" else item["service_id"]
+                record_id, canonical_name = self._find_named_record(
+                    table, item["product_name"], selected_id
+                )
+                if not record_id:
+                    record_id = resolved_pending.get(
+                        (kind, self._normalize_exact(item["product_name"]))
+                    )
+                if not record_id:
+                    raise ValueError(
+                        f"{kind.title()} '{item['product_name']}' does not exist"
+                    )
+                item["product_id"] = record_id if kind == "product" else None
+                item["service_id"] = record_id if kind == "service" else None
+                if canonical_name:
+                    item["product_name"] = canonical_name
 
             sale_cls = self.registered_classes['Sales']
             sale_obj = sale_cls(0, None)
@@ -729,22 +1013,54 @@ class Database:
             }
             if not header:
                 raise ValueError("Sale header contains no storable fields")
+            if sale_id:
+                for protected in (
+                    "created_by", "created_by_username", "created_at", "operation_token"
+                ):
+                    header.pop(protected, None)
 
             # Resolve the relational client ID server-side for every create and
             # edit. The name remains a historical snapshot, but all client-sale
             # views filter exclusively on this immutable database ID.
-            username = (header.get('client_username') or '').strip()
+            username = " ".join(str(header.get('client_username') or '').split())
             if username:
-                self.cursor.execute("SELECT id, name FROM clients WHERE username=%s", (username,))
+                self.cursor.execute(
+                    "SELECT id, name, username FROM clients "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = %s "
+                    "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+                    "ORDER BY id LIMIT 1",
+                    (self._normalize_exact(username), self._normalize_exact(username)),
+                )
                 client_row = self.cursor.fetchone()
-                header['client_id'] = int(client_row[0]) if client_row else None
+                if not client_row:
+                    pending_id = resolved_pending.get(("client", self._normalize_exact(username)))
+                    if pending_id:
+                        self.cursor.execute(
+                            "SELECT id, name, username FROM clients WHERE id=%s", (pending_id,)
+                        )
+                        client_row = self.cursor.fetchone()
+                if not client_row:
+                    raise ValueError(f"Client '{username}' does not exist")
+                header['client_id'] = int(client_row[0])
+                header['client_username'] = client_row[2] or username
                 if client_row:
                     header['client_name'] = client_row[1] or username
             else:
-                header['client_id'] = None
+                raise ValueError("Client is required")
+
+            actor = self._actor_fields(user)
+            if not sale_id:
+                header.update(actor)
 
             if sale_id:
                 sale_id = int(sale_id)
+                if user and not user.get("is_superadmin"):
+                    self.cursor.execute(
+                        "SELECT 1 FROM sales WHERE id=%s AND created_by=%s",
+                        (sale_id, int(user.get("id") or 0)),
+                    )
+                    if not self.cursor.fetchone():
+                        raise PermissionError("This sale belongs to another user")
                 assignments = ', '.join(f"{key} = %s" for key in header)
                 self.cursor.execute(
                     f"UPDATE sales SET {assignments} WHERE id = %s",
@@ -770,23 +1086,27 @@ class Database:
             inserted = updated = 0
             for item in validated:
                 values = (
-                    item['product_id'], item['product_name'], item['information'],
+                    item['product_id'], item['service_id'], item['item_type'],
+                    item['product_name'], item['information'],
                     item['quantity'], item['unit_price'], item['production'],
                 )
                 if item['id'] is not None:
                     if item['id'] not in existing_ids:
                         raise ValueError(f"Item ID {item['id']} does not belong to sale {sale_id}")
                     self.cursor.execute(
-                        "UPDATE sales_items SET product_id=%s, product_name=%s, information=%s, "
-                        "quantity=%s, unit_price=%s, production=%s WHERE id=%s AND sales_id=%s",
+                        "UPDATE sales_items SET product_id=%s, service_id=%s, item_type=%s, "
+                        "product_name=%s, information=%s, quantity=%s, unit_price=%s, "
+                        "production=%s WHERE id=%s AND sales_id=%s",
                         (*values, item['id'], sale_id),
                     )
                     retained_ids.add(item['id'])
                     updated += 1
                 else:
                     self.cursor.execute(
-                        "INSERT INTO sales_items (sales_id, product_id, product_name, information, quantity, unit_price, production) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        "INSERT INTO sales_items "
+                        "(sales_id, product_id, service_id, item_type, product_name, "
+                        "information, quantity, unit_price, production) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (sale_id, *values),
                     )
                     row = self.cursor.fetchone()
@@ -802,6 +1122,35 @@ class Database:
                     (sale_id, list(delete_ids)),
                 )
             deleted = len(delete_ids)
+
+            if str(header.get("state") or "pending") != "on_hold":
+                requested_by_product = {}
+                for item in validated:
+                    if item["item_type"] == "product":
+                        requested_by_product[item["product_id"]] = (
+                            requested_by_product.get(item["product_id"], 0) + item["quantity"]
+                        )
+                for product_id, requested in requested_by_product.items():
+                    self.cursor.execute(
+                        "SELECT COALESCE(SUM(quantity), 0) FROM import_items WHERE product_id=%s",
+                        (product_id,),
+                    )
+                    imported = self.cursor.fetchone()[0] or 0
+                    self.cursor.execute(
+                        """
+                        SELECT COALESCE(SUM(si.quantity), 0)
+                        FROM sales_items si JOIN sales s ON s.id=si.sales_id
+                        WHERE si.product_id=%s AND si.sales_id<>%s
+                          AND (s.state IS NULL OR s.state<>'on_hold')
+                        """,
+                        (product_id, sale_id),
+                    )
+                    sold_elsewhere = self.cursor.fetchone()[0] or 0
+                    if requested > imported - sold_elsewhere:
+                        raise ValueError(
+                            f"Insufficient stock for product ID {product_id}: "
+                            f"requested {requested}, available {imported - sold_elsewhere}"
+                        )
             self.conn.commit()
             return {
                 'sale_id': sale_id,
@@ -815,6 +1164,248 @@ class Database:
                     for item in validated
                 ],
                 'transaction': 'committed',
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_import_with_items(
+        self, import_data, items, import_id=None, visible_row_count=None, user=None
+    ):
+        """Atomically save a supplier purchase and its stock ledger entries."""
+        if not isinstance(import_data, dict) or not isinstance(items, list):
+            raise ValueError("Import header and items must be objects")
+        visible_count = int(
+            visible_row_count if visible_row_count is not None else len(items)
+        )
+        if visible_count > 0 and not items:
+            raise ValueError(
+                f"Import was not saved: {visible_count} visible items were found, "
+                "but the server received 0 valid items."
+            )
+
+        validated = []
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item {index} must be an object")
+            name = " ".join(str(raw.get("product_name") or "").split())
+            if not name:
+                raise ValueError(f"Item {index}: product name is required")
+            quantity = self._sale_decimal(
+                raw.get("quantity"), f"item {index} quantity", "0.001"
+            )
+            unit_price = self._sale_decimal(
+                raw.get("unit_price"), f"item {index} unit price", "0"
+            )
+            try:
+                item_id = int(raw["id"]) if raw.get("id") not in (None, "", 0, "0") else None
+                product_id = (
+                    int(raw["product_id"])
+                    if raw.get("product_id") not in (None, "", 0, "0") else None
+                )
+            except (TypeError, ValueError):
+                raise ValueError(f"Item {index}: IDs must be integers when present")
+            validated.append({
+                "id": item_id, "product_id": product_id, "product_name": name,
+                "quantity": quantity, "unit_price": unit_price,
+                "category": str(raw.get("category") or ""),
+                "description": str(raw.get("description") or ""),
+                "sku": str(raw.get("sku") or raw.get("reference") or ""),
+            })
+
+        try:
+            token = str(import_data.get("operation_token") or "").strip()
+            if not import_id and token:
+                self.cursor.execute(
+                    "SELECT id FROM imports WHERE operation_token=%s", (token,)
+                )
+                duplicate = self.cursor.fetchone()
+                if duplicate:
+                    self.cursor.execute(
+                        "SELECT COUNT(*) FROM import_items WHERE import_id=%s",
+                        (int(duplicate[0]),),
+                    )
+                    return {
+                        "import_id": int(duplicate[0]),
+                        "saved": int(self.cursor.fetchone()[0]),
+                        "inserted": 0, "updated": 0, "deleted": 0,
+                        "created_products": 0, "transaction": "committed",
+                        "duplicate": True,
+                    }
+
+            actor = self._actor_fields(user)
+            created_products = 0
+            for item in validated:
+                product_id = canonical = None
+                if item["product_id"]:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"], item["product_id"]
+                    )
+                if not product_id and item["sku"]:
+                    self.cursor.execute(
+                        "SELECT id, name FROM products "
+                        "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                        "ORDER BY id LIMIT 1",
+                        (self._normalize_exact(item["sku"]),),
+                    )
+                    row = self.cursor.fetchone()
+                    if row:
+                        product_id, canonical = int(row[0]), row[1]
+                if not product_id:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"]
+                    )
+                if not product_id:
+                    self.cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (
+                            f"product-sku:{self._normalize_exact(item['sku'])}"
+                            if item["sku"]
+                            else f"product-name:{self._normalize_exact(item['product_name'])}",
+                        ),
+                    )
+                    if item["sku"]:
+                        self.cursor.execute(
+                            "SELECT id, name FROM products "
+                            "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                            "ORDER BY id LIMIT 1",
+                            (self._normalize_exact(item["sku"]),),
+                        )
+                        row = self.cursor.fetchone()
+                        if row:
+                            product_id, canonical = int(row[0]), row[1]
+                if not product_id:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"]
+                    )
+                if not product_id:
+                    self.cursor.execute(
+                        "INSERT INTO products "
+                        "(name, username, unit_price, sale_price, category, description, "
+                        "created_by, created_by_username, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (
+                            item["product_name"], item["sku"] or item["product_name"],
+                            item["unit_price"], item["unit_price"], item["category"],
+                            item["description"], actor["created_by"],
+                            actor["created_by_username"], actor["created_at"],
+                        ),
+                    )
+                    product_id = int(self.cursor.fetchone()[0])
+                    canonical = item["product_name"]
+                    created_products += 1
+                else:
+                    # Purchase price follows the latest supplier transaction;
+                    # preserve sale price and all unrelated product fields.
+                    self.cursor.execute(
+                        "UPDATE products SET unit_price=%s WHERE id=%s",
+                        (item["unit_price"], product_id),
+                    )
+                item["product_id"] = product_id
+                item["product_name"] = canonical or item["product_name"]
+
+            import_cls = self.registered_classes["Imports"]
+            import_obj = import_cls(0, None)
+            header = {
+                key: import_data[key]
+                for key in import_obj.get_visible_parameters("database")
+                if key in import_data and not import_obj.is_parameter_calculated(key)
+            }
+            supplier_username = " ".join(
+                str(header.get("supplier_username") or "").split()
+            )
+            if not supplier_username:
+                raise ValueError("Supplier is required")
+            self.cursor.execute(
+                "SELECT id, name, username FROM suppliers "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                "ORDER BY id LIMIT 1",
+                (
+                    self._normalize_exact(supplier_username),
+                    self._normalize_exact(supplier_username),
+                ),
+            )
+            supplier = self.cursor.fetchone()
+            if not supplier:
+                raise ValueError(f"Supplier '{supplier_username}' does not exist")
+            header["supplier_id"] = int(supplier[0])
+            header["supplier_name"] = supplier[1] or supplier_username
+            header["supplier_username"] = supplier[2] or supplier_username
+
+            if import_id:
+                import_id = int(import_id)
+                if user and not user.get("is_superadmin"):
+                    self.cursor.execute(
+                        "SELECT 1 FROM imports WHERE id=%s AND created_by=%s",
+                        (import_id, int(user.get("id") or 0)),
+                    )
+                    if not self.cursor.fetchone():
+                        raise PermissionError("This import belongs to another user")
+                for protected in (
+                    "created_by", "created_by_username", "created_at", "operation_token"
+                ):
+                    header.pop(protected, None)
+                assignments = ", ".join(f"{key}=%s" for key in header)
+                self.cursor.execute(
+                    f"UPDATE imports SET {assignments} WHERE id=%s",
+                    [*header.values(), import_id],
+                )
+                if self.cursor.rowcount != 1:
+                    raise ValueError(f"Import {import_id} does not exist")
+            else:
+                header.update(actor)
+                columns = ", ".join(header)
+                placeholders = ", ".join("%s" for _ in header)
+                self.cursor.execute(
+                    f"INSERT INTO imports ({columns}) VALUES ({placeholders}) RETURNING id",
+                    list(header.values()),
+                )
+                import_id = int(self.cursor.fetchone()[0])
+
+            self.cursor.execute(
+                "SELECT id FROM import_items WHERE import_id=%s", (import_id,)
+            )
+            existing_ids = {int(row[0]) for row in self.cursor.fetchall()}
+            retained_ids = set()
+            inserted = updated = 0
+            for item in validated:
+                values = (
+                    item["product_id"], item["product_name"],
+                    item["quantity"], item["unit_price"],
+                )
+                if item["id"] is not None:
+                    if item["id"] not in existing_ids:
+                        raise ValueError(
+                            f"Item ID {item['id']} does not belong to import {import_id}"
+                        )
+                    self.cursor.execute(
+                        "UPDATE import_items SET product_id=%s, product_name=%s, "
+                        "quantity=%s, unit_price=%s WHERE id=%s AND import_id=%s",
+                        (*values, item["id"], import_id),
+                    )
+                    retained_ids.add(item["id"])
+                    updated += 1
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO import_items "
+                        "(import_id, product_id, product_name, quantity, unit_price) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                        (import_id, *values),
+                    )
+                    retained_ids.add(int(self.cursor.fetchone()[0]))
+                    inserted += 1
+            delete_ids = existing_ids - retained_ids
+            if delete_ids:
+                self.cursor.execute(
+                    "DELETE FROM import_items WHERE import_id=%s AND id=ANY(%s)",
+                    (import_id, list(delete_ids)),
+                )
+            self.conn.commit()
+            return {
+                "import_id": import_id, "saved": len(validated),
+                "inserted": inserted, "updated": updated, "deleted": len(delete_ids),
+                "created_products": created_products, "transaction": "committed",
             }
         except Exception:
             self.conn.rollback()
@@ -967,6 +1558,186 @@ class Database:
             print(f"Error getting items from {section}: {e}")
             return []
 
+    def get_items_for_user(
+        self, section, user, owner_id=None, date_from=None, date_to=None,
+        report_type=None,
+    ):
+        """Return ownership-filtered Sales or Reports rows.
+
+        Regular users are always pinned to their authenticated session ID.
+        Super admins may request one owner or leave it empty for all rows.
+        Legacy rows with no owner remain visible only in the all-user admin view.
+        """
+        if section == "Sales_Items":
+            user = user or {}
+            if user.get("is_superadmin"):
+                return self.get_items(section)
+            self.cursor.execute(
+                "SELECT si.* FROM sales_items si JOIN sales s ON s.id=si.sales_id "
+                "WHERE s.created_by=%s ORDER BY si.id",
+                (int(user.get("id") or 0),),
+            )
+            rows = self.cursor.fetchall()
+            columns = [description[0] for description in self.cursor.description]
+            if columns and columns[0].lower() == "id":
+                columns[0] = "ID"
+            return [dict(zip(columns, row)) for row in rows]
+        if section not in ("Sales", "Reports"):
+            return self.get_items(section)
+        user = user or {}
+        is_superadmin = bool(user.get("is_superadmin"))
+        effective_owner = owner_id if is_superadmin else user.get("id")
+        if not is_superadmin and effective_owner is None:
+            return []
+        query = f"SELECT * FROM {section}"
+        params = []
+        if effective_owner not in (None, "", "all"):
+            query += " WHERE created_by=%s"
+            params.append(int(effective_owner))
+        conditions = []
+        if section == "Reports":
+            if report_type not in (None, "", "all"):
+                conditions.append("COALESCE(NULLIF(report_type, ''), 'General')=%s")
+                params.append(str(report_type))
+            date_expression = (
+                "CASE "
+                "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
+                "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
+                "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
+                "ELSE NULL END"
+            )
+            if date_from:
+                conditions.append(f"{date_expression}>=%s::date")
+                params.append(str(date_from))
+            if date_to:
+                conditions.append(f"{date_expression}<=%s::date")
+                params.append(str(date_to))
+        if conditions:
+            query += (" AND " if " WHERE " in query else " WHERE ") + " AND ".join(conditions)
+        query += " ORDER BY id"
+        self.cursor.execute(query, params)
+        rows = self.cursor.fetchall()
+        columns = [description[0] for description in self.cursor.description]
+        if columns and columns[0].lower() == "id":
+            columns[0] = "ID"
+        return [dict(zip(columns, row)) for row in rows]
+
+    def get_product_stock_levels(self):
+        self.cursor.execute(
+            """
+            SELECT p.id,
+                   COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
+            FROM products p
+            LEFT JOIN (
+                SELECT product_id, SUM(quantity) AS quantity
+                FROM import_items GROUP BY product_id
+            ) imported ON imported.product_id=p.id
+            LEFT JOIN (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE s.state IS NULL OR s.state<>'on_hold'
+                GROUP BY si.product_id
+            ) sold ON sold.product_id=p.id
+            """
+        )
+        return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    def get_operation_items_for_user(self, operation_id, section, user):
+        if section != "Sales_Items" or (user or {}).get("is_superadmin"):
+            return self.get_items_by_operation_id(operation_id, section)
+        self.cursor.execute(
+            "SELECT 1 FROM sales WHERE id=%s AND created_by=%s",
+            (int(operation_id), int((user or {}).get("id") or 0)),
+        )
+        if not self.cursor.fetchone():
+            raise PermissionError("This sale belongs to another user")
+        return self.get_items_by_operation_id(operation_id, section)
+
+    def list_report_users(self):
+        self.cursor.execute(
+            "SELECT id, username FROM users ORDER BY LOWER(username), id"
+        )
+        return [{"id": int(row[0]), "username": row[1]} for row in self.cursor.fetchall()]
+
+    def get_reports(
+        self, owner_id=None, date_from=None, date_to=None, report_type=None
+    ):
+        return self.get_items_for_user(
+            "Reports", {"is_superadmin": True, "username": "Local Admin"}, owner_id,
+            date_from, date_to, report_type,
+        )
+
+    def save_report(self, report_id, data):
+        return self.save_report_for_user(
+            report_id, data, {"is_superadmin": True, "username": "Local Admin"}
+        )
+
+    def delete_report(self, report_id):
+        return self.delete_report_for_user(
+            report_id, {"is_superadmin": True, "username": "Local Admin"}
+        )
+
+    def save_report_for_user(self, report_id, data, user):
+        user = user or {}
+        actor = self._actor_fields(user)
+        payload = {
+            "department": actor["created_by_username"],
+            "date": str(data.get("date") or ""),
+            "report_type": str(data.get("report_type") or "General"),
+            "report": str(data.get("report") or "").strip(),
+        }
+        if not payload["date"] or not payload["report"]:
+            raise ValueError("Report date and text are required")
+        try:
+            if report_id:
+                params = [
+                    payload["department"], payload["date"], payload["report_type"],
+                    payload["report"], int(report_id),
+                ]
+                query = (
+                    "UPDATE reports SET department=%s, date=%s, report_type=%s, "
+                    "report=%s WHERE id=%s"
+                )
+                if not user.get("is_superadmin"):
+                    query += " AND created_by=%s"
+                    params.append(int(user.get("id") or 0))
+                self.cursor.execute(query, params)
+                if self.cursor.rowcount != 1:
+                    raise PermissionError("Report not found or belongs to another user")
+                saved_id = int(report_id)
+            else:
+                self.cursor.execute(
+                    "INSERT INTO reports "
+                    "(department, date, report_type, report, created_by, "
+                    "created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        payload["department"], payload["date"], payload["report_type"],
+                        payload["report"], actor["created_by"],
+                        actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                saved_id = int(self.cursor.fetchone()[0])
+            self.conn.commit()
+            return saved_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_report_for_user(self, report_id, user):
+        params = [int(report_id)]
+        query = "DELETE FROM reports WHERE id=%s"
+        if not (user or {}).get("is_superadmin"):
+            query += " AND created_by=%s"
+            params.append(int((user or {}).get("id") or 0))
+        self.cursor.execute(query, params)
+        if self.cursor.rowcount != 1:
+            self.conn.rollback()
+            raise PermissionError("Report not found or belongs to another user")
+        self.conn.commit()
+        return True
+
     def get_items_by_operation_id(self, operation_id, section):
         """Get items for a specific operation (Sales_Items or Import_Items)"""
         if not self.cursor or section not in self.registered_classes:
@@ -997,6 +1768,103 @@ class Database:
             self.conn.rollback()
             print(f"Error getting items from {section} for operation {operation_id}: {e}")
             return []
+
+    def get_client_account(self, client_id, user=None):
+        """Return client account rows through one permission-gated backend API.
+
+        The LAN server exposes this method under Clients/read. This lets a user
+        view a client's account without granting broad Sales table access.
+        """
+        client_id = int(client_id)
+        self.cursor.execute("SELECT id FROM clients WHERE id = %s", (client_id,))
+        if not self.cursor.fetchone():
+            raise ValueError(f"Client {client_id} does not exist")
+
+        owner_clause = ""
+        owner_params = []
+        if user and not user.get("is_superadmin"):
+            owner_clause = " AND s.created_by = %s"
+            owner_params.append(int(user.get("id") or 0))
+        self.cursor.execute(
+            f"""
+            SELECT
+                s.id,
+                COALESCE(s.date, ''),
+                COALESCE(s.state, 'pending'),
+                si.id,
+                COALESCE(si.product_name, ''),
+                COALESCE(si.quantity, 0),
+                COALESCE(si.unit_price, 0),
+                COALESCE(s.tva, 0)
+            FROM sales s
+            JOIN sales_items si ON si.sales_id = s.id
+            WHERE s.client_id = %s{owner_clause}
+            ORDER BY s.id, si.id
+            """,
+            (client_id, *owner_params),
+        )
+        purchase_rows = self.cursor.fetchall()
+        sale_ids = sorted({row[0] for row in purchase_rows})
+        payment_rows = []
+        if sale_ids:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                (sale_ids,),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        return {
+            "purchases": [list(row) for row in purchase_rows],
+            "payments": [list(row) for row in payment_rows],
+        }
+
+    def add_client_payment(
+        self, client_id, sale_id, sales_item_id, amount, date, user=None
+    ):
+        """Record a payment after verifying it belongs to the requested client."""
+        client_id = int(client_id)
+        sale_id = int(sale_id)
+        sales_item_id = int(sales_item_id)
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+
+        try:
+            owner_clause = ""
+            owner_params = []
+            if user and not user.get("is_superadmin"):
+                owner_clause = " AND s.created_by = %s"
+                owner_params.append(int(user.get("id") or 0))
+            self.cursor.execute(
+                f"""
+                SELECT 1
+                FROM sales s
+                JOIN sales_items si ON si.sales_id = s.id
+                WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
+                """,
+                (sale_id, sales_item_id, client_id, *owner_params),
+            )
+            if not self.cursor.fetchone():
+                raise ValueError("The selected purchase does not belong to this client")
+            self.cursor.execute(
+                """
+                INSERT INTO payments (sale_id, sales_item_id, amount, date)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (sale_id, sales_item_id, amount, str(date)),
+            )
+            payment_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return int(payment_id)
+        except Exception:
+            self.conn.rollback()
+            raise
 
     def delete_item(self, item_id, section):
         """Delete item from section"""

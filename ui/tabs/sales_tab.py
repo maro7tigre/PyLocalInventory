@@ -33,7 +33,10 @@ class SalesEditDialog(BaseOperationDialog):
     
     def get_item_columns(self):
         """Override to specify sales item columns"""
-        return ['product_preview', 'product_name', 'information', 'quantity', 'unit_price', 'subtotal', 'delete_action']
+        return [
+            'item_type', 'product_preview', 'product_name', 'information',
+            'quantity', 'unit_price', 'subtotal', 'delete_action'
+        ]
     
     def validate_data(self):
         """Sales-specific validation"""

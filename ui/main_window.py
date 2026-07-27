@@ -589,7 +589,7 @@ class MainWindow(ThemedMainWindow):
         readable_keys = {'home'}
 
         for key, section, factory in entity_tabs:
-            if not self.database.has_permission(section, 'read'):
+            if section != "Reports" and not self.database.has_permission(section, 'read'):
                 print(f"– Skipped {section} tab: no read permission")
                 continue
             try:
@@ -630,12 +630,7 @@ class MainWindow(ThemedMainWindow):
         print(f"   • Registered classes: {len(self.database.registered_classes)}")
         print(f"   • Unified Experience: ✓ All tabs now use BaseTab")
         print(f"   • Operations: Sales & Imports use BaseOperationDialog")
-        for section_name in self.database.registered_classes.keys():
-            try:
-                items_count = len(self.database.get_items(section_name))
-                print(f"   • {section_name}: {items_count} items")
-            except Exception as e:
-                print(f"   • {section_name}: error getting items ({e})")
+        print("   • Startup row-count scan: skipped (tabs load their own data)")
 
     # ──────────────────────────── View menu helpers ────────────────────────────
 
@@ -645,7 +640,7 @@ class MainWindow(ThemedMainWindow):
             return
         mapping = getattr(self, '_tab_key_to_index', {})
         for key, index in mapping.items():
-            visible = self.tab_visibility.get(key, True)
+            visible = True if key == "reports" else self.tab_visibility.get(key, True)
             self.tab_widget.setTabVisible(index, visible)
 
     def _toggle_tab_visible(self, key: str, checked: bool):

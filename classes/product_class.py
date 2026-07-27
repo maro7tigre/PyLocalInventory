@@ -99,6 +99,18 @@ class ProductClass(BaseClass):
                 "type": "int",
                 "method": self.calculate_quantity  # This makes it calculated
             },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
             
         }
         
@@ -150,6 +162,9 @@ class ProductClass(BaseClass):
         """Calculate current stock quantity from imports and sales"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return 0
+        cached = getattr(self.database, "_product_stock_levels", None)
+        if isinstance(cached, dict) and self.id in cached:
+            return cached[self.id]
         
         try:
             # Get total imports for this product

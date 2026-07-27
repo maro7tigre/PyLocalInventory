@@ -35,11 +35,18 @@ class ClientDetailsDialog(QDialog):
         self.client_obj = client_obj
         self.database = database
         self.purchases = []
+        self.account_data = {"purchases": [], "payments": []}
+        self.can_record_payment = bool(
+            database and getattr(database, "has_permission", lambda *_: True)("Sales", "write")
+        )
         self.setWindowTitle(
             f"Client Account - {client_obj.get_value('name') or client_obj.get_value('username')}"
         )
         self.setMinimumSize(1050, 720)
-        self._ensure_payments_table()
+        # Schema changes belong to the trusted host connection, never to a
+        # read-only LAN session. Database.connect() also ensures this table.
+        if database.__class__.__name__ != "RemoteDatabase":
+            self._ensure_payments_table()
         self._setup_ui()
         self.refresh_data()
 
@@ -128,9 +135,13 @@ class ClientDetailsDialog(QDialog):
         root.addWidget(purchases_title)
 
         purchase_help = QLabel(
-            "1. Select one product or service below.  "
-            "2. Enter the amount paid manually.  "
-            "3. Choose the payment date and click Add Payment."
+            (
+                "1. Select one product or service below.  "
+                "2. Enter the amount paid manually.  "
+                "3. Choose the payment date and click Add Payment."
+                if self.can_record_payment
+                else "Read-only view: client details, purchases, and payments cannot be changed."
+            )
         )
         purchase_help.setWordWrap(True)
         purchase_help.setStyleSheet(
@@ -167,6 +178,7 @@ class ClientDetailsDialog(QDialog):
         root.addWidget(self.payments_table, 2)
 
         payment_form = QWidget()
+        self.payment_form = payment_form
         form_layout = QVBoxLayout(payment_form)
         form_layout.setContentsMargins(0, 4, 0, 0)
         form_layout.setSpacing(8)
@@ -210,6 +222,7 @@ class ClientDetailsDialog(QDialog):
         form_layout.addWidget(self.selected_purchase_label)
         form_layout.addLayout(controls)
         root.addWidget(payment_form)
+        payment_form.setVisible(self.can_record_payment)
 
         scroll_area.setWidget(content)
         window_layout.addWidget(scroll_area)
@@ -267,34 +280,12 @@ class ClientDetailsDialog(QDialog):
         return table
 
     def _load_purchases(self):
-        username = self.client_obj.get_value("username") or ""
-        name = self.client_obj.get_value("name") or ""
-        self.database.cursor.execute(
-            """
-            SELECT
-                s.ID,
-                COALESCE(s.date, ''),
-                COALESCE(s.state, 'pending'),
-                si.ID,
-                COALESCE(si.product_name, ''),
-                COALESCE(si.quantity, 0),
-                COALESCE(si.unit_price, 0),
-                COALESCE(s.tva, 0)
-            FROM Sales s
-            JOIN Sales_Items si ON si.sales_id = s.ID
-            WHERE s.client_username = %s
-               OR (COALESCE(s.client_username, '') = '' AND s.client_name = %s)
-            ORDER BY s.ID, si.ID
-            """,
-            (username, name),
-        )
-        rows = self.database.cursor.fetchall()
+        self.account_data = self.database.get_client_account(self.client_obj.id)
+        rows = self.account_data.get("purchases", [])
         purchases = []
-        sale_ids = set()
         for sale_id, date, state, item_id, product, quantity, unit_price, vat in rows:
             total = float(quantity or 0) * float(unit_price or 0)
             total *= 1 + float(vat or 0) / 100
-            sale_ids.add(sale_id)
             purchases.append(
                 {
                     "sale_id": sale_id,
@@ -310,26 +301,17 @@ class ClientDetailsDialog(QDialog):
                 }
             )
 
-        if not sale_ids:
-            return purchases
-
-        placeholders = ",".join("%s" for _ in sale_ids)
-        self.database.cursor.execute(
-            f"""
-            SELECT sale_id, sales_item_id, COALESCE(SUM(amount), 0)
-            FROM Payments
-            WHERE sale_id IN ({placeholders})
-            GROUP BY sale_id, sales_item_id
-            """,
-            list(sale_ids),
-        )
         targeted = {}
         legacy_by_sale = {}
-        for sale_id, item_id, amount in self.database.cursor.fetchall():
+        for _payment_id, sale_id, item_id, _date, amount in self.account_data.get(
+            "payments", []
+        ):
             if item_id is None:
-                legacy_by_sale[sale_id] = float(amount or 0)
+                legacy_by_sale[sale_id] = legacy_by_sale.get(sale_id, 0.0) + float(
+                    amount or 0
+                )
             else:
-                targeted[item_id] = float(amount or 0)
+                targeted[item_id] = targeted.get(item_id, 0.0) + float(amount or 0)
 
         for purchase in purchases:
             purchase["paid"] = min(targeted.get(purchase["item_id"], 0.0), purchase["total"])
@@ -397,32 +379,26 @@ class ClientDetailsDialog(QDialog):
                 self.purchases_table.setItem(row, col, item)
 
     def _populate_payments(self):
-        sale_ids = sorted({purchase["sale_id"] for purchase in self.purchases})
-        if not sale_ids:
+        rows = self.account_data.get("payments", [])
+        if not rows:
             self.payments_table.setRowCount(0)
             return
 
-        placeholders = ",".join("%s" for _ in sale_ids)
-        self.database.cursor.execute(
-            f"""
-            SELECT p.ID, p.sale_id, p.date, p.amount,
-                   COALESCE(
-                       si.product_name,
-                       (SELECT STRING_AGG(all_items.product_name, ', ')
-                        FROM Sales_Items all_items
-                        WHERE all_items.sales_id = p.sale_id),
-                       'Sale payment'
-                   )
-            FROM Payments p
-            LEFT JOIN Sales_Items si ON si.ID = p.sales_item_id
-            WHERE p.sale_id IN ({placeholders})
-            ORDER BY p.ID DESC
-            """,
-            sale_ids,
-        )
-        rows = self.database.cursor.fetchall()
+        product_by_item = {
+            purchase["item_id"]: purchase["product"] for purchase in self.purchases
+        }
+        products_by_sale = {}
+        for purchase in self.purchases:
+            products_by_sale.setdefault(purchase["sale_id"], []).append(
+                purchase["product"]
+            )
         self.payments_table.setRowCount(len(rows))
-        for row_index, (payment_id, sale_id, date, amount, products) in enumerate(rows):
+        for row_index, (payment_id, sale_id, item_id, date, amount) in enumerate(rows):
+            products = product_by_item.get(item_id)
+            if not products:
+                products = ", ".join(
+                    product for product in products_by_sale.get(sale_id, []) if product
+                ) or "Sale payment"
             values = [f"#{payment_id}", f"#{sale_id}", date, _format_money(amount), products or "-"]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
@@ -462,6 +438,11 @@ class ClientDetailsDialog(QDialog):
         self.add_payment_button.setEnabled(True)
 
     def add_payment(self):
+        if not self.can_record_payment:
+            QMessageBox.information(
+                self, "Read-Only Access", "You don't have permission to record payments."
+            )
+            return
         selected_row = self.purchases_table.currentRow()
         if selected_row < 0 or selected_row >= len(self.purchases):
             QMessageBox.information(
@@ -499,16 +480,14 @@ class ClientDetailsDialog(QDialog):
 
         date = self.date_input.date().toString("dd-MM-yyyy")
         try:
-            self.database.cursor.execute(
-                """
-                INSERT INTO Payments (sale_id, sales_item_id, amount, date)
-                VALUES (%s, %s, %s, %s)
-                """,
-                (purchase["sale_id"], purchase["item_id"], amount, date),
+            self.database.add_client_payment(
+                self.client_obj.id,
+                purchase["sale_id"],
+                purchase["item_id"],
+                amount,
+                date,
             )
-            self.database.conn.commit()
         except Exception as error:
-            self.database.conn.rollback()
             QMessageBox.critical(self, "Payment Error", f"Could not save payment:\n{error}")
             return
 

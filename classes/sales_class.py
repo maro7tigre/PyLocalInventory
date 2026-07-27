@@ -80,6 +80,22 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
+            "operation_token": {
+                "value": "", "display_name": {"en": "Operation Token"},
+                "required": False, "default": "", "type": "string"
+            },
             "items": {
                 "display_name": {"en": "Items", "fr": "Articles", "es": "Artículos"},
                 "required": False,
@@ -139,7 +155,11 @@ class SalesClass(BaseClass):
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",
-                "notes": "rw"
+                "notes": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r",
+                "operation_token": "r"
                 # Note: items are stored separately in Sales_Items table
             },
             "report": {
@@ -162,19 +182,20 @@ class SalesClass(BaseClass):
         """Get all items for this sales operation"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return []
+        if hasattr(self, "items"):
+            return self.items
         
         try:
-            # Get all sales items for this sales operation
-            self.database.cursor.execute("SELECT ID FROM Sales_Items WHERE sales_id = %s", (self.id,))
-            item_ids = self.database.cursor.fetchall()
-            
             items = []
-            for (item_id,) in item_ids:
-                item = SalesItemClass(item_id, self.database)
-                if item.load_database_data():
-                    items.append(item)
-            
-            return items
+            for row in self.database.get_items_by_operation_id(self.id, "Sales_Items"):
+                item = SalesItemClass(row.get("ID", 0), self.database)
+                for key, value in row.items():
+                    parameter = "id" if key == "ID" else key
+                    if parameter in item.parameters and not item.is_parameter_calculated(parameter):
+                        item.set_value(parameter, value)
+                items.append(item)
+            self.items = items
+            return self.items
             
         except Exception as e:
             print(f"Error getting sales items for sales {self.id}: {e}")

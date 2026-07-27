@@ -51,6 +51,9 @@ _ATTACHMENT_METHODS = {
     'update_attachment': ('write', None),
     'delete_attachment': ('delete', None),
 }
+_CLIENT_ACCOUNT_METHODS = {'get_client_account', 'add_client_payment'}
+_REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
+_PRODUCT_READ_METHODS = {'get_product_stock_levels'}
 _ALWAYS_ALLOWED = {'begin_transaction', 'commit_transaction', 'rollback_transaction'}
 _ACTION_FOR_KIND = {'read': 'read', 'write': 'write', 'delete': 'delete'}
 
@@ -88,6 +91,40 @@ def _check_permission(user, method, args, kwargs):
     if method == 'save_sale_with_items':
         if not user['permissions'].get('Sales', {}).get('write'):
             return False, "You don't have write access to Sales"
+        pending = args[4] if len(args) > 4 and isinstance(args[4], list) else []
+        required = {
+            "client": "Clients", "product": "Products", "service": "Services"
+        }
+        for entity in pending:
+            section = required.get(str(entity.get("type") or "").casefold())
+            if section and not user["permissions"].get(section, {}).get("write"):
+                return False, f"You don't have write access to {section}"
+        return True, None
+
+    if method == 'save_import_with_items':
+        if not user['permissions'].get('Imports', {}).get('write'):
+            return False, "You don't have write access to Imports"
+        items = args[1] if len(args) > 1 and isinstance(args[1], list) else []
+        if items and not user['permissions'].get('Products', {}).get('write'):
+            return False, "You don't have permission to create or update Products"
+        return True, None
+
+    if method in _REPORT_METHODS:
+        if method in ('get_reports',):
+            return True, None
+        if method == 'list_report_users':
+            return (
+                (True, None) if user["is_superadmin"]
+                else (False, "Only a Super Admin can list report users")
+            )
+        needed = 'delete' if method == 'delete_report' else 'write'
+        if not user['permissions'].get('Reports', {}).get(needed):
+            return False, f"You don't have {needed} access to Reports"
+        return True, None
+
+    if method in _PRODUCT_READ_METHODS:
+        if not user['permissions'].get('Products', {}).get('read'):
+            return False, "You don't have read access to Products"
         return True, None
 
     if method == 'cursor.execute':
@@ -98,6 +135,8 @@ def _check_permission(user, method, args, kwargs):
         section = SECTION_GROUP.get(table) if table else None
         if not section:
             return False, f"No permission mapping for table '{table}' - contact your admin"
+        if section == "Reports" and kind == "read":
+            return False, "Reports must be read through the ownership-filtered API"
         needed = _ACTION_FOR_KIND[kind]
         if not user['permissions'].get(section, {}).get(needed):
             return False, f"You don't have {needed} access to {section}"
@@ -108,8 +147,18 @@ def _check_permission(user, method, args, kwargs):
         section = args[idx] if len(args) > idx else kwargs.get('section')
         mapped = SECTION_GROUP.get(section, section)
         needed = _ACTION_FOR_KIND[kind]
+        if method == "get_items" and mapped == "Reports":
+            return True, None
         if not user['permissions'].get(mapped, {}).get(needed):
             return False, f"You don't have {needed} access to {mapped}"
+        return True, None
+
+    if method in _CLIENT_ACCOUNT_METHODS:
+        if not user['permissions'].get('Clients', {}).get('read'):
+            return False, "You don't have read access to Clients"
+        if (method == 'add_client_payment'
+                and not user['permissions'].get('Sales', {}).get('write')):
+            return False, "You don't have write access to Sales"
         return True, None
 
     if method in _ATTACHMENT_METHODS:
@@ -236,7 +285,7 @@ class DatabaseServer:
             pass
         self._pool.putconn(request_db.conn)
 
-    def _dispatch(self, method, args, kwargs):
+    def _dispatch(self, method, args, kwargs, user=None):
         request_db = self._borrow_database()
         try:
             if method == 'cursor.execute':
@@ -265,9 +314,44 @@ class DatabaseServer:
                 return None
 
             if method == 'save_sale_with_items':
-                return request_db.save_sale_with_items(*args, **kwargs)
+                return request_db.save_sale_with_items(*args, **kwargs, user=user)
 
-            if method in _SECTION_METHODS or method in _ATTACHMENT_METHODS or method in _ALWAYS_ALLOWED:
+            if method == 'save_import_with_items':
+                return request_db.save_import_with_items(*args, **kwargs, user=user)
+
+            if method == 'get_reports':
+                owner_id = args[0] if args else None
+                date_from = args[1] if len(args) > 1 else None
+                date_to = args[2] if len(args) > 2 else None
+                report_type = args[3] if len(args) > 3 else None
+                return request_db.get_items_for_user(
+                    "Reports", user, owner_id, date_from, date_to, report_type
+                )
+            if method == 'list_report_users':
+                return request_db.list_report_users()
+            if method == 'save_report':
+                return request_db.save_report_for_user(*args, user=user)
+            if method == 'delete_report':
+                return request_db.delete_report_for_user(*args, user=user)
+            if method == 'get_product_stock_levels':
+                return request_db.get_product_stock_levels()
+            if method in _CLIENT_ACCOUNT_METHODS:
+                return getattr(request_db, method)(*args, **kwargs, user=user)
+
+            if method == 'get_items' and args and args[0] in ('Sales', 'Sales_Items', 'Reports'):
+                return request_db.get_items_for_user(args[0], user)
+            if method == 'get_items_by_operation_id' and len(args) > 1:
+                return request_db.get_operation_items_for_user(args[0], args[1], user)
+            if method == 'add_item' and len(args) > 1 and args[1] == 'Reports':
+                return request_db.save_report_for_user(None, args[0], user)
+            if method == 'update_item' and len(args) > 2 and args[2] == 'Reports':
+                return bool(request_db.save_report_for_user(args[0], args[1], user))
+            if method == 'delete_item' and len(args) > 1 and args[1] == 'Reports':
+                return request_db.delete_report_for_user(args[0], user)
+
+            if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
+                    or method in _CLIENT_ACCOUNT_METHODS or method in _REPORT_METHODS
+                    or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED):
                 return getattr(request_db, method)(*args, **kwargs)
 
             raise ValueError(f"Method not allowed over network: {method}")
@@ -330,6 +414,7 @@ class DatabaseServer:
                 token = server_obj.sessions.create(user)
                 self._send_json(200, {
                     'token': token,
+                    'user_id': user['id'],
                     'username': user['username'],
                     'is_superadmin': user['is_superadmin'],
                     'permissions': user['permissions'],
@@ -363,7 +448,7 @@ class DatabaseServer:
                     return self._send_json(403, {'error': reason})
 
                 try:
-                    result = server_obj._dispatch(method, args, kwargs)
+                    result = server_obj._dispatch(method, args, kwargs, user=user)
                 except ValueError as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation=failed transaction=rollback error={e}")

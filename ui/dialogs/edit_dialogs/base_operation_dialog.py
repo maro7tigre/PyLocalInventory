@@ -14,6 +14,7 @@ from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import os
+import uuid
 from core.runtime_paths import user_data_root
 
 
@@ -31,6 +32,9 @@ class BaseOperationDialog(QDialog):
         self.operation_id = operation_id
         self.database = database
         self.parameter_widgets = {}
+        self.pending_entities = []
+        self.operation_token = uuid.uuid4().hex
+        self._saving = False
         
         # Create or load operation object
         if operation_id:
@@ -304,6 +308,21 @@ class BaseOperationDialog(QDialog):
         return errors
     
     def save_changes(self):
+        """Prevent double-clicks from starting the same transaction twice."""
+        if self._saving:
+            return
+        self._saving = True
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving...")
+        try:
+            self._save_changes_impl()
+        finally:
+            if self.result() == QDialog.Rejected:
+                self._saving = False
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
+
+    def _save_changes_impl(self):
         """Save operation and items to database (simple, reliable)"""
         # Validate first
         errors = self.validate_data()
@@ -376,6 +395,23 @@ class BaseOperationDialog(QDialog):
                     f"deleted: {result.get('deleted', 0)}."
                 )
                 self.accept()
+                self._refresh_related_tabs("Sales", "Products", "Clients")
+                return
+
+            if self.operation_obj.section == 'Imports':
+                action = "updated" if self.operation_id else "created"
+                result = self._save_import_atomically()
+                self.operation_id = result["import_id"]
+                self.operation_obj.id = result["import_id"]
+                self.operation_obj.set_value("id", result["import_id"])
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Import {action} successfully. {result['saved']} items saved.\n"
+                    f"Products created: {result.get('created_products', 0)}.",
+                )
+                self.accept()
+                self._refresh_related_tabs("Imports", "Products")
                 return
 
             success = self.operation_obj.save_to_database()
@@ -480,7 +516,10 @@ class BaseOperationDialog(QDialog):
             service_id = item.get('service_id')
             item['product_id'] = product_id
             item['service_id'] = service_id
-            item['item_type'] = 'product' if product_id else ('service' if service_id else 'manual')
+            item['item_type'] = str(
+                item.get('item_type')
+                or ('product' if product_id else ('service' if service_id else ''))
+            ).casefold()
             item['is_new'] = not bool(item.get('id'))
             prepared.append(item)
 
@@ -489,6 +528,9 @@ class BaseOperationDialog(QDialog):
             for key in self.operation_obj.get_visible_parameters('database')
             if not self.operation_obj.is_parameter_calculated(key)
         }
+        header["operation_token"] = (
+            self.operation_obj.get_value("operation_token") or self.operation_token
+        )
         self._write_sale_save_log(
             f"mode={self.database.__class__.__name__} host={getattr(self.database, 'host', 'local')} "
             f"port={getattr(self.database, 'port', 'local')} visible_rows={len(raw_items)} "
@@ -497,7 +539,7 @@ class BaseOperationDialog(QDialog):
             f"notes_present={bool(header.get('notes'))} items={prepared}"
         )
         result = self.database.save_sale_with_items(
-            header, prepared, self.operation_id, len(raw_items)
+            header, prepared, self.operation_id, len(raw_items), self.pending_entities
         )
         if not isinstance(result, dict) or result.get('transaction') != 'committed':
             raise RuntimeError(f"Host returned an invalid sale-save result: {result!r}")
@@ -508,6 +550,39 @@ class BaseOperationDialog(QDialog):
             f"saved={result.get('saved')} transaction={result.get('transaction')}"
         )
         return result
+
+    def _save_import_atomically(self):
+        raw_items = self.items_table.get_current_table_data()
+        prepared = []
+        for raw in raw_items:
+            item = dict(raw)
+            item.pop("row_index", None)
+            prepared.append(item)
+        header = {
+            key: self.operation_obj.get_value(key)
+            for key in self.operation_obj.get_visible_parameters("database")
+            if not self.operation_obj.is_parameter_calculated(key)
+        }
+        header["operation_token"] = (
+            self.operation_obj.get_value("operation_token") or self.operation_token
+        )
+        result = self.database.save_import_with_items(
+            header, prepared, self.operation_id, len(raw_items)
+        )
+        if not isinstance(result, dict) or result.get("transaction") != "committed":
+            raise RuntimeError(f"Host returned an invalid import-save result: {result!r}")
+        return result
+
+    def _refresh_related_tabs(self, *sections):
+        main_window = self._get_main_window()
+        tab_widget = getattr(main_window, "tab_widget", None) if main_window else None
+        if not tab_widget:
+            return
+        wanted = set(sections)
+        for index in range(tab_widget.count()):
+            tab = tab_widget.widget(index)
+            if getattr(tab, "section", None) in wanted and hasattr(tab, "refresh_table"):
+                tab.refresh_table()
 
     @staticmethod
     def _write_sale_save_log(message):
@@ -548,145 +623,160 @@ class BaseOperationDialog(QDialog):
 
     # -------------------- Missing References Handling -------------------- #
     def _handle_missing_references(self):
-        """Detect missing client/supplier or products and prompt user to create them.
+        """Collect confirmed missing entities without writing them yet.
 
-        Returns True if it's OK to proceed with saving (after creating if user agreed),
-        False if the user cancelled.
+        The backend creates these pending records in the same transaction as
+        the sale. Cancelling the dialog therefore leaves no orphan records.
         """
         try:
             if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-                return True, True  # Can't verify without DB
+                return True, False
 
-            mw = self._get_main_window()
-
-            missing_clients = []
-            missing_suppliers = []
-            missing_products = []
-
-            # Determine operation type
+            self.pending_entities = []
             op_section = getattr(self.operation_obj, 'section', '')
+            if op_section == "Imports":
+                supplier = self._safe_widget_value("supplier_username")
+                if not supplier or not self._entity_exists("Suppliers", supplier):
+                    QMessageBox.warning(
+                        self, "Unknown Supplier",
+                        f"Supplier '{supplier or ''}' does not exist. Create the supplier first."
+                    )
+                    return False, False
+                return True, False
 
-            # Check main entity username (respecting per-type warning flags)
-            if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
-                if getattr(mw, 'warn_missing_client', True) if mw else True:
-                    client_username = self._safe_widget_value('client_username')
-                    if client_username and not self._entity_exists('Clients', client_username):
-                        missing_clients.append(client_username)
-            elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
-                if getattr(mw, 'warn_missing_supplier', True) if mw else True:
-                    supplier_username = self._safe_widget_value('supplier_username')
-                    if supplier_username and not self._entity_exists('Suppliers', supplier_username):
-                        missing_suppliers.append(supplier_username)
+            if op_section != "Sales":
+                return True, False
 
-            # Check products from items table (only those not already present)
-            if getattr(mw, 'warn_missing_product', True) if mw else True:
-                try:
-                    raw_names = self.items_table.get_all_entered_product_names()
-                    for product_name in raw_names:
-                        if product_name and not self._product_exists(product_name):
-                            if not any(self._normalize_name(product_name) == self._normalize_name(existing)
-                                       for existing in missing_products):
-                                missing_products.append(product_name)
-                except Exception as e:
-                    print(f"Error collecting raw product names: {e}")
-
-            if not (missing_clients or missing_suppliers or missing_products):
-                return True, True  # Nothing missing
-
-            allow_unresolved = False
-            for item_name in missing_products:
-                box = QMessageBox(self)
-                box.setIcon(QMessageBox.Question)
-                box.setWindowTitle("Unknown Item")
-                box.setText(
-                    f"'{item_name}' does not exist in Products or Services.\n"
-                    "Where would you like to save it?"
+            client_value = " ".join(str(self._safe_widget_value("client_username") or "").split())
+            if not client_value:
+                QMessageBox.warning(self, "Missing Client", "A client is required.")
+                return False, False
+            if not self._entity_exists("Clients", client_value):
+                if not self.database.has_permission("Clients", "write"):
+                    QMessageBox.warning(
+                        self, "Permission Denied",
+                        "You don't have permission to create clients."
+                    )
+                    return False, False
+                if QMessageBox.question(
+                    self, "Create Client",
+                    f"This client does not exist:\n{client_value}\n\nCreate it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
+                    return False, False
+                from PySide6.QtWidgets import QInputDialog
+                display_name, ok = QInputDialog.getText(
+                    self, "Client Details", "Client name:", text=client_value
                 )
-                product_btn = box.addButton("Save as Product", QMessageBox.AcceptRole)
-                service_btn = box.addButton("Save as Service", QMessageBox.AcceptRole)
-                continue_btn = box.addButton("Continue without saving", QMessageBox.DestructiveRole)
-                cancel_btn = box.addButton(QMessageBox.Cancel)
-                box.exec()
-                clicked = box.clickedButton()
-                if clicked == product_btn:
-                    self._create_product(item_name)
-                elif clicked == service_btn:
-                    self._create_service(item_name)
-                elif clicked == continue_btn:
-                    allow_unresolved = True
-                else:
-                    try:
-                        names = self.items_table.get_all_entered_product_names()
-                        row = next(i for i, value in enumerate(names) if self._normalize_name(value) == self._normalize_name(item_name))
-                        column = self.items_table.data_manager.table_columns.index('product_name')
-                        widget = self.items_table.table.cellWidget(row, column)
-                        if widget:
-                            widget.setFocus()
-                    except Exception:
-                        pass
+                display_name = " ".join(display_name.split())
+                if not ok or not display_name:
+                    return False, False
+                self.pending_entities.append({
+                    "type": "client", "username": client_value, "name": display_name,
+                    "client_type": "individual",
+                })
+
+            rows = self.items_table.get_current_table_data()
+            for row_index, item in enumerate(rows):
+                name = " ".join(str(item.get("product_name") or "").split())
+                if not name:
+                    QMessageBox.warning(self, "Missing Item", "Every sale line needs a name.")
+                    return False, False
+                item_type = str(item.get("item_type") or "").casefold()
+                if item_type not in ("product", "service"):
+                    from PySide6.QtWidgets import QInputDialog
+                    choice, ok = QInputDialog.getItem(
+                        self, "Choose Item Type",
+                        f"Create or use '{name}' as:", ["Product", "Service"],
+                        editable=False,
+                    )
+                    if not ok:
+                        return False, False
+                    item_type = choice.casefold()
+                    self._set_row_item_type(int(item.get("row_index", row_index + 1)) - 1, item_type)
+
+                exists = self._catalog_entity_exists(item_type, name)
+                if exists:
+                    continue
+                section = "Products" if item_type == "product" else "Services"
+                if not self.database.has_permission(section, "write"):
+                    QMessageBox.warning(
+                        self, "Permission Denied",
+                        f"You don't have permission to create {section.lower()}."
+                    )
+                    return False, False
+                if QMessageBox.question(
+                    self, f"Create {item_type.title()}",
+                    f"This {item_type} does not exist:\n{name}\n\nCreate it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
                     return False, False
 
-            # Unknown items were handled individually above.
-            missing_products = []
-            if not (missing_clients or missing_suppliers):
-                return True, allow_unresolved
-
-            # Build message
-            msg_lines = ["Some referenced entries do not exist:"]
-            if missing_clients:
-                msg_lines.append(f" - Clients: {', '.join(missing_clients)}")
-            if missing_suppliers:
-                msg_lines.append(f" - Suppliers: {', '.join(missing_suppliers)}")
-            if missing_products:
-                msg_lines.append(f" - Products: {', '.join(missing_products)}")
-            msg_lines.append("")
-            msg_lines.append("Choose an action:")
-            msg_lines.append(" - Create & Continue: auto-create missing entries")
-            msg_lines.append(" - Ignore: continue without creating (snapshots stored)")
-            msg_lines.append(" - Cancel: go back and edit")
-
-            from PySide6.QtWidgets import QMessageBox
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("Missing References")
-            box.setText("\n".join(msg_lines))
-            create_btn = box.addButton("Create & Continue", QMessageBox.AcceptRole)
-            ignore_btn = box.addButton("Ignore", QMessageBox.DestructiveRole)
-            box.addButton(QMessageBox.Cancel)
-            box.exec()
-
-            clicked = box.clickedButton()
-            if clicked == create_btn:
-                # Create missing ones
-                for username in missing_clients:
-                    self._create_client(username)
-                for username in missing_suppliers:
-                    self._create_supplier(username)
-                for product_name in missing_products:
-                    self._create_product(product_name)
-            elif clicked == ignore_btn:
-                # Ensure snapshots for client/supplier name reflect entered username (even if entity absent)
                 try:
-                    if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
-                        uname = self._safe_widget_value('client_username')
-                        # set client_name parameter value directly on operation object
-                        self.operation_obj.set_value('client_name', uname)
-                    elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
-                        uname = self._safe_widget_value('supplier_username')
-                        self.operation_obj.set_value('supplier_name', uname)
-                except Exception as e:
-                    print(f"Error setting snapshot names on ignore: {e}")
-                # For products, product_name already captured in item rows; nothing extra needed
-                # Allow unresolved product IDs (they stay NULL) -> second flag True
-                return True, True
-            else:
-                return False, False  # Cancel
-
-            # After creation path: unresolved not allowed (we created them)
-            return True, True
+                    price = Decimal(str(item.get("unit_price", 0)))
+                    quantity = Decimal(str(item.get("quantity", 0)))
+                except InvalidOperation:
+                    QMessageBox.warning(self, "Invalid Item", f"Invalid quantity or price for {name}.")
+                    return False, False
+                if price < 0 or quantity <= 0:
+                    QMessageBox.warning(
+                        self, "Invalid Item",
+                        f"{name}: quantity must be greater than zero and price cannot be negative."
+                    )
+                    return False, False
+                pending = {
+                    "type": item_type, "name": name, "unit_price": str(price),
+                    "sale_price": str(price),
+                }
+                if item_type == "product":
+                    from PySide6.QtWidgets import QInputDialog
+                    initial, ok = QInputDialog.getDouble(
+                        self, "Initial Product Stock",
+                        f"Initial stock for '{name}':", float(quantity), 0.001,
+                        999999999.0, 3,
+                    )
+                    if not ok or Decimal(str(initial)) < quantity:
+                        QMessageBox.warning(
+                            self, "Insufficient Initial Stock",
+                            "Initial stock must cover the quantity in this sale."
+                        )
+                        return False, False
+                    purchase_price, ok = QInputDialog.getDouble(
+                        self, "Product Purchase Price",
+                        f"Purchase cost for '{name}':", 0.0, 0.0, 999999999.0, 2,
+                    )
+                    if not ok:
+                        return False, False
+                    pending.update({
+                        "initial_quantity": str(initial),
+                        "purchase_price": str(purchase_price),
+                    })
+                self.pending_entities.append(pending)
+            return True, False
         except Exception as e:
             print(f"Error handling missing references: {e}")
-            return True, True  # Fail-open so user can still save
+            QMessageBox.critical(self, "Validation Error", str(e))
+            return False, False
+
+    def _set_row_item_type(self, row, item_type):
+        try:
+            column = self.items_table.data_manager.table_columns.index("item_type")
+            selector = self.items_table.table.cellWidget(row, column)
+            if selector:
+                selector.setCurrentIndex(selector.findData(item_type))
+        except (ValueError, AttributeError):
+            pass
+
+    def _catalog_entity_exists(self, item_type, name):
+        table = "Products" if item_type == "product" else "Services"
+        target = self._normalize_name(name)
+        self.database.cursor.execute(
+            f"SELECT name FROM {table} WHERE name IS NOT NULL"
+        )
+        return any(
+            self._normalize_name(row[0]) == target
+            for row in self.database.cursor.fetchall()
+        )
 
     def _validate_stock(self, items_objects):
         """Return a list of error strings for any sale item that exceeds available stock.
@@ -742,9 +832,15 @@ class BaseOperationDialog(QDialog):
 
     def _entity_exists(self, table, username):
         try:
-            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE username = %s", (username,))
-            res = self.database.cursor.fetchone()
-            return res and res[0] > 0
+            normalized = self._normalize_name(username)
+            self.database.cursor.execute(
+                f"SELECT username, name FROM {table} "
+                "WHERE username IS NOT NULL OR name IS NOT NULL"
+            )
+            return any(
+                normalized in (self._normalize_name(row[0]), self._normalize_name(row[1]))
+                for row in self.database.cursor.fetchall()
+            )
         except Exception as e:
             print(f"Error checking existence in {table}: {e}")
             return True  # Avoid blocking

@@ -38,6 +38,22 @@ class SalesItemClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
+            "service_id": {
+                "value": None,
+                "display_name": {"en": "Service ID", "fr": "ID Service", "es": "ID Servicio"},
+                "required": False,
+                "default": None,
+                "options": [],
+                "type": "int"
+            },
+            "item_type": {
+                "value": "product",
+                "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
+                "required": True,
+                "default": "product",
+                "options": ["product", "service"],
+                "type": "string"
+            },
             "product_name": {
                 "value": "",
                 "display_name": {"en": "Product", "fr": "Produit", "es": "Producto"},
@@ -120,7 +136,7 @@ class SalesItemClass(BaseClass):
         # Define where parameters can be used and their permissions
         self.available_parameters = {
             "table": {
-                "product_preview": "r",
+                "item_type": "rw",
                 "product_name": "rw",
                 "product_description": "rw",
                 "information": "rw",
@@ -140,6 +156,8 @@ class SalesItemClass(BaseClass):
             "database": {
                 "sales_id": "rw",
                 "product_id": "rw",
+                "service_id": "rw",
+                "item_type": "rw",
                 "product_name": "rw",  # snapshot of name at time of operation
                 "information": "rw",
                 "quantity": "rw",
@@ -306,6 +324,14 @@ class SalesItemClass(BaseClass):
     
     def set_value(self, param_key, value):
         """Override set_value to handle product selection updates and connected parameters"""
+        if param_key == "item_type":
+            normalized = str(value or "").casefold()
+            super().set_value("item_type", normalized)
+            if normalized == "product":
+                self.parameters["service_id"]["value"] = None
+            elif normalized == "service":
+                self.parameters["product_id"]["value"] = None
+            return
         # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:
             name_clean = value.strip()

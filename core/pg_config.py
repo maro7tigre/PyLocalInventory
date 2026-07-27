@@ -19,6 +19,7 @@ DEFAULT_CONFIG = {
     "database": "lamidap",
     "user": "",
     "password": "",
+    "postgres_bin_dir": "",
 }
 
 

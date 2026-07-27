@@ -89,6 +89,7 @@ class RemoteDatabase:
         self._token = None
         self.permissions = {}
         self.is_superadmin = False
+        self.current_user_id = None
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
@@ -146,6 +147,8 @@ class RemoteDatabase:
         self._password = None
         self.permissions = data.get('permissions', {})
         self.is_superadmin = data.get('is_superadmin', False)
+        self.current_user_id = data.get('user_id')
+        self.username = data.get('username') or self.username
         return True
 
     def _call(self, method, args=None, kwargs=None):

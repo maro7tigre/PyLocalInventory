@@ -20,6 +20,9 @@ class ClientsTab(BaseTab):
         self.view_client_btn = BlueButton("View Client")
         self.view_client_btn.setToolTip("View purchases, payments, and remaining balance")
         self.view_client_btn.setMinimumHeight(20)
+        self.view_client_btn.setEnabled(
+            bool(self.database and self.database.has_permission("Clients", "read"))
+        )
         self.view_client_btn.setStyleSheet(
             self.view_client_btn.styleSheet()
             + "\nQPushButton { font-size: 14px; padding: 5px 10px; }"
@@ -48,6 +51,11 @@ class ClientsTab(BaseTab):
 
     def view_client(self):
         """Open the account view for the selected client."""
+        if not self.database or not self.database.has_permission("Clients", "read"):
+            QMessageBox.information(
+                self, "Access Denied", "You don't have permission to view clients."
+            )
+            return
         try:
             client_id = self.get_selected_id()
             if client_id is None:

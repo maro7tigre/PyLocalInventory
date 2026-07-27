@@ -1,6 +1,11 @@
 """Reusable client/sale attachment section with no host path exposure."""
 import base64
 import os
+import shutil
+import subprocess
+import sys
+import tempfile
+from datetime import datetime
 from pathlib import Path
 
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize
@@ -8,6 +13,46 @@ from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QI
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
     QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView)
+
+
+def _scan_with_windows_wia(output_path):
+    """Open the Windows WIA scanner UI and save one scanned page as PNG."""
+    powershell = shutil.which('powershell.exe') or shutil.which('powershell')
+    if not powershell:
+        raise RuntimeError('Windows PowerShell is required for scanner integration.')
+
+    escaped_output = str(output_path).replace("'", "''")
+    script = f"""
+$ErrorActionPreference = 'Stop'
+$dialog = New-Object -ComObject WIA.CommonDialog
+$device = $dialog.ShowSelectDevice(1, $true, $false)
+if ($null -eq $device) {{ exit 2 }}
+$item = $device.Items.Item(1)
+$pngFormat = '{{B96B3CAF-0728-11D3-9D7B-0000F81EF32E}}'
+$image = $dialog.ShowTransfer($item, $pngFormat, $false)
+if ($null -eq $image) {{ exit 2 }}
+$image.SaveFile('{escaped_output}')
+"""
+    encoded_script = base64.b64encode(script.encode('utf-16le')).decode('ascii')
+    return subprocess.run(
+        [powershell, '-NoProfile', '-NonInteractive', '-STA', '-EncodedCommand', encoded_script],
+        capture_output=True,
+        text=True,
+        timeout=600,
+        creationflags=getattr(subprocess, 'CREATE_NO_WINDOW', 0),
+        check=False,
+    )
+
+
+def _scanned_image_as_png(path):
+    """Normalize scanner-specific BMP/JPEG/PNG output to an actual PNG."""
+    image = QImage.fromData(Path(path).read_bytes())
+    if image.isNull():
+        raise RuntimeError('Windows returned an unsupported or invalid scanner image.')
+    buffer = QBuffer()
+    if not buffer.open(QIODevice.WriteOnly) or not image.save(buffer, 'PNG'):
+        raise RuntimeError('The scanned image could not be converted to PNG.')
+    return bytes(buffer.data())
 
 
 class AttachmentPanel(QWidget):
@@ -34,8 +79,13 @@ class AttachmentPanel(QWidget):
         for label, slot in [('Add files', self.add_files), ('Paste image', self.paste_image)]:
             button = QPushButton(label); button.clicked.connect(slot); tools.addWidget(button)
         self.scan_button = QPushButton('Scan document')
-        self.scan_button.setEnabled(False)
-        self.scan_button.setToolTip('Scanner integration is not installed in this build.')
+        self.scan_button.clicked.connect(self.scan_document)
+        self.scan_button.setEnabled(sys.platform == 'win32')
+        self.scan_button.setToolTip(
+            'Scan one page using a Windows WIA-compatible scanner.'
+            if sys.platform == 'win32'
+            else 'Direct scanner integration is available only on Windows.'
+        )
         tools.addWidget(self.scan_button)
         if self.entity_type == 'sale':
             button = QPushButton('Copy client files'); button.clicked.connect(self.copy_from_client); tools.addWidget(button)
@@ -246,7 +296,40 @@ class AttachmentPanel(QWidget):
             raise RuntimeError(f'Added to the sale, but could not add it to the client: {exc}') from exc
 
     def scan_document(self):
-        QMessageBox.information(self, 'Scan document', 'Direct WIA/TWAIN scanning requires an installed scanner bridge. Use “Add files” to attach a scanned PDF or image.')
+        if sys.platform != 'win32':
+            QMessageBox.information(
+                self,
+                'Scan document',
+                'Direct scanner integration is currently available only on Windows.',
+            )
+            return
+
+        try:
+            with tempfile.TemporaryDirectory(prefix='pylocalinventory-scan-') as temp_dir:
+                scan_path = Path(temp_dir) / 'scan.png'
+                result = _scan_with_windows_wia(scan_path)
+                if result.returncode == 2:
+                    return
+                if result.returncode != 0:
+                    detail = (result.stderr or result.stdout or '').strip()
+                    raise RuntimeError(detail or 'Windows could not complete the scan.')
+                if not scan_path.is_file() or scan_path.stat().st_size == 0:
+                    raise RuntimeError('The scanner completed without producing an image.')
+
+                filename = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
+                self._upload_bytes(filename, _scanned_image_as_png(scan_path))
+            self.refresh()
+            QMessageBox.information(self, 'Scan document', 'The scanned page was added successfully.')
+        except subprocess.TimeoutExpired:
+            QMessageBox.warning(self, 'Scan document', 'The scanner did not finish within 10 minutes.')
+        except Exception as exc:
+            QMessageBox.warning(
+                self,
+                'Scan document',
+                'Unable to scan the document.\n\n'
+                f'{exc}\n\n'
+                'Make sure the scanner is connected, powered on, and available through Windows Image Acquisition (WIA).',
+            )
 
     def copy_from_client(self):
         """Duplicate chosen permanent client files into the current sale."""

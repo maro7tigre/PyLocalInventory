@@ -322,7 +322,13 @@ class ProductClass(BaseClass):
                 success = self.database.update_item(self.id, data, "Products")
             else:
                 # Add new product
-                success = self.database.add_item(data, "Products")
+                new_id = self.database.add_item(data, "Products")
+                if new_id:
+                    self.id = int(new_id)
+                    self.parameters["id"]["value"] = self.id
+                    success = True
+                else:
+                    success = False
                 
             return success
             

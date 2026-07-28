@@ -111,6 +111,21 @@ def _check_permission(user, method, args, kwargs):
             return False, "You don't have permission to create or update Products"
         return True, None
 
+    if method == 'save_product_with_opening_stock':
+        if not user['permissions'].get('Products', {}).get('write'):
+            return False, "You don't have write access to Products"
+        initial_quantity = args[1] if len(args) > 1 else kwargs.get(
+            "initial_quantity", 0
+        )
+        try:
+            has_opening_stock = float(str(initial_quantity).replace(",", ".")) > 0
+        except (TypeError, ValueError):
+            has_opening_stock = True
+        if (has_opening_stock
+                and not user['permissions'].get('Imports', {}).get('write')):
+            return False, "Opening stock requires write access to Imports"
+        return True, None
+
     if method in _REPORT_METHODS:
         if method in ('get_reports',):
             return True, None
@@ -321,6 +336,11 @@ class DatabaseServer:
             if method == 'save_import_with_items':
                 return request_db.save_import_with_items(*args, **kwargs, user=user)
 
+            if method == 'save_product_with_opening_stock':
+                return request_db.save_product_with_opening_stock(
+                    *args, **kwargs, user=user
+                )
+
             if method == 'get_reports':
                 owner_id = args[0] if args else None
                 date_from = args[1] if len(args) > 1 else None
@@ -353,7 +373,8 @@ class DatabaseServer:
 
             if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
                     or method in _CLIENT_ACCOUNT_METHODS or method in _REPORT_METHODS
-                    or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED):
+                    or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED
+                    or method == 'save_product_with_opening_stock'):
                 return getattr(request_db, method)(*args, **kwargs)
 
             raise ValueError(f"Method not allowed over network: {method}")

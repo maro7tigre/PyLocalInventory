@@ -883,6 +883,95 @@ class Database:
                 resolved[key] = int(self.cursor.fetchone()[0])
         return resolved
 
+    def save_product_with_opening_stock(self, product_data, initial_quantity=0, user=None):
+        """Create a product and its opening-stock ledger entry atomically."""
+        if not isinstance(product_data, dict):
+            raise ValueError("Product data must be an object")
+
+        quantity = self._sale_decimal(
+            initial_quantity, "initial product quantity", "0"
+        )
+        product_cls = self.registered_classes.get("Products")
+        if product_cls is None:
+            raise ValueError("Products are not registered")
+
+        product_obj = product_cls(0, None)
+        allowed = product_obj.get_visible_parameters("database")
+        data = {
+            key: product_data[key]
+            for key in allowed
+            if key in product_data and not product_obj.is_parameter_calculated(key)
+        }
+        name = " ".join(str(data.get("name") or "").split())
+        username = " ".join(str(data.get("username") or name).split())
+        if not name:
+            raise ValueError("Product name is required")
+        if not username:
+            raise ValueError("Product username is required")
+        data["name"] = name
+        data["username"] = username
+
+        try:
+            self.cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"product-username:{self._normalize_exact(username)}",),
+            )
+            self.cursor.execute(
+                "SELECT 1 FROM products "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "LIMIT 1",
+                (self._normalize_exact(username),),
+            )
+            if self.cursor.fetchone():
+                raise ValueError(f"Product username '{username}' already exists")
+
+            actor = self._actor_fields(user)
+            for key, value in actor.items():
+                if key in allowed and not data.get(key):
+                    data[key] = value
+
+            columns = list(data)
+            self.cursor.execute(
+                f"INSERT INTO products ({', '.join(columns)}) "
+                f"VALUES ({', '.join('%s' for _ in columns)}) RETURNING id",
+                list(data.values()),
+            )
+            product_id = int(self.cursor.fetchone()[0])
+
+            if quantity > 0:
+                self.cursor.execute(
+                    "INSERT INTO imports "
+                    "(supplier_username, supplier_name, date, tva, notes, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('', 'Opening Stock', %s, 0, %s, %s, %s, %s) RETURNING id",
+                    (
+                        datetime.now().strftime("%Y-%m-%d"),
+                        f"Opening stock for {name}",
+                        actor["created_by"], actor["created_by_username"],
+                        actor["created_at"],
+                    ),
+                )
+                opening_import_id = int(self.cursor.fetchone()[0])
+                self.cursor.execute(
+                    "INSERT INTO import_items "
+                    "(import_id, product_id, product_name, quantity, unit_price) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        opening_import_id, product_id, name, quantity,
+                        self._sale_decimal(data.get("unit_price"), "unit price", "0"),
+                    ),
+                )
+
+            self.conn.commit()
+            return {
+                "product_id": product_id,
+                "opening_quantity": str(quantity),
+                "transaction": "committed",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def save_sale_with_items(
         self, sale_data, items, sale_id=None, visible_row_count=None,
         pending_entities=None, user=None,

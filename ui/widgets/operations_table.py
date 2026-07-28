@@ -175,10 +175,9 @@ class TableRowFactory:
 
     def _create_item_type_cell(self, table, row, col, item):
         selector = QComboBox()
-        selector.addItem("Select type...", "")
         selector.addItem("Product", "product")
         selector.addItem("Service", "service")
-        selected = ""
+        selected = "product"
         if item and hasattr(item, "get_value"):
             selected = str(item.get_value("item_type") or "")
             if not selected:
@@ -265,10 +264,13 @@ class TableRowFactory:
             autocomplete.setProperty('item_id', getattr(item, 'id', None) or item.get_value('id'))
             autocomplete.setProperty('product_id', item.get_value('product_id'))
             autocomplete.setProperty('service_id', item.get_value('service_id') if 'service_id' in getattr(item, 'parameters', {}) else None)
+            stored_type = str(item.get_value("item_type") or "").casefold()
             autocomplete.setProperty(
                 'item_type',
-                'product' if item.get_value('product_id') else (
-                    'service' if autocomplete.property('service_id') else 'manual'
+                stored_type or (
+                    'product' if item.get_value('product_id') else (
+                        'service' if autocomplete.property('service_id') else 'product'
+                    )
                 ),
             )
         
@@ -386,6 +388,7 @@ class TableEventHandler:
         self.empty_row_manager = empty_row_manager
         self.items_changed_callback = items_changed_callback
         self._updating = False
+        self._stock_cache = {}
     
     def setup_event_connections(self):
         """Setup event connections"""
@@ -657,6 +660,11 @@ class TableEventHandler:
             if selected and name_widget.text() != selected["name"]:
                 name_widget.setText(selected["name"])
         if selected:
+            if chosen_type == "product":
+                # Stock changes outside this dialog are irrelevant while the
+                # line is being typed. Cache it to avoid synchronous SQL on
+                # every quantity keystroke.
+                self._stock_cache.pop(int(selected["id"]), None)
             try:
                 price_col = self.data_manager.table_columns.index("unit_price")
                 price_item = self.table.item(row, price_col) or QTableWidgetItem()
@@ -786,18 +794,18 @@ class TableEventHandler:
                 row in qty_delegate.active_editors):
                 # Use editor text for real-time evaluation
                 editor = qty_delegate.active_editors[row]
-                requested_qty = float(editor.text()) if editor.text().strip() else 0
+                requested_qty = self._parse_number(editor.text())
             else:
                 # Use cell item text
                 qty_item = self.table.item(row, qty_col)
                 if qty_item:
-                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+                    requested_qty = self._parse_number(qty_item.text())
         except (ValueError, AttributeError):
             # Fallback to cell item if editor access fails
             try:
                 qty_item = self.table.item(row, qty_col)
                 if qty_item:
-                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+                    requested_qty = self._parse_number(qty_item.text())
             except ValueError:
                 requested_qty = 0
         
@@ -819,8 +827,11 @@ class TableEventHandler:
         if not product_id:
             return (requested_qty, None, False, product_name)
         try:
-            product_obj = ProductClass(product_id, db)
-            stock_available = product_obj.calculate_quantity()
+            cache_key = int(product_id)
+            if cache_key not in self._stock_cache:
+                product_obj = ProductClass(cache_key, db)
+                self._stock_cache[cache_key] = product_obj.calculate_quantity()
+            stock_available = self._stock_cache[cache_key]
         except Exception:
             stock_available = None
         if stock_available is None:
@@ -912,7 +923,9 @@ class QuantityDelegate(QStyledItemDelegate):
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
         editor.setValidator(QRegularExpressionValidator(
-            QRegularExpression(r"^(?:\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
+            # Empty text must remain an intermediate valid state so users can
+            # select the default "1", delete it, and type a replacement.
+            QRegularExpression(r"^(?:|\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
         ))
         row = index.row()
         self.active_editors[row] = editor  # Store reference
@@ -932,7 +945,10 @@ class QuantityDelegate(QStyledItemDelegate):
         editor.setText(str(value) if value is not None else "")
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.text(), Qt.EditRole)
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "1"
+        model.setData(index, value, Qt.EditRole)
         # After committing, trigger validation so cell styling updates
         row = index.row()
         # Small delay to ensure the editor is fully closed before validation

@@ -155,6 +155,7 @@ class BaseTab(QWidget):
         self.all_items = []
         self.filtered_items = []
         self._refreshing = False
+        self._dialog_open = False
         
         self.setup_ui()
         self.refresh_table()
@@ -797,6 +798,8 @@ class BaseTab(QWidget):
     
     def add_item(self):
         """Add new item"""
+        if self._dialog_open:
+            return
         if not self.can_write:
             QMessageBox.information(
                 self, "Read-Only Access",
@@ -804,6 +807,8 @@ class BaseTab(QWidget):
             )
             return
 
+        self._dialog_open = True
+        self.add_btn.setEnabled(False)
         try:
             dialog = self.dialog_class(None, self.database, self.parent_widget)
             if dialog.exec():
@@ -813,9 +818,14 @@ class BaseTab(QWidget):
             QMessageBox.warning(self, "Error", f"Could not import dialog: {e}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to add {self.section[:-1].lower()}: {e}")
+        finally:
+            self._dialog_open = False
+            self.add_btn.setEnabled(self.can_write)
     
     def edit_item(self):
         """Edit selected item"""
+        if self._dialog_open:
+            return
         if not self.can_write:
             QMessageBox.information(
                 self, "Read-Only Access",
@@ -828,6 +838,8 @@ class BaseTab(QWidget):
             QMessageBox.warning(self, "Error", f"Please select a {self.section[:-1].lower()} to edit")
             return
         
+        self._dialog_open = True
+        self.edit_btn.setEnabled(False)
         try:
             dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
             if dialog.exec():
@@ -837,6 +849,9 @@ class BaseTab(QWidget):
             QMessageBox.warning(self, "Error", f"Could not import dialog: {e}")
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to edit {self.section[:-1].lower()}: {e}")
+        finally:
+            self._dialog_open = False
+            self.edit_btn.setEnabled(self.can_write)
     
     def delete_item(self):
         """Delete selected item"""

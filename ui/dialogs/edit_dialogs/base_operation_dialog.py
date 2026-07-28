@@ -249,13 +249,17 @@ class BaseOperationDialog(QDialog):
     def update_totals(self):
         """Update total calculation displays"""
         try:
-            # Get current items
-            items = self.items_table.get_items_data()
-            
-            # Calculate subtotal
+            # Read the visible cells directly. Building model objects here used
+            # to resolve every product/service against PostgreSQL whenever a
+            # quantity changed, which made rapid editing feel frozen.
+            rows = self.items_table.get_current_table_data()
             subtotal = sum(
-                (Decimal(str(item.get_value('subtotal') or 0)) for item in items),
-                Decimal("0")
+                (
+                    Decimal(str(row.get("quantity") or 0))
+                    * Decimal(str(row.get("unit_price") or 0))
+                    for row in rows
+                ),
+                Decimal("0"),
             )
             
             # Get VAT percentage

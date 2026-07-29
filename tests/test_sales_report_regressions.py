@@ -94,6 +94,23 @@ class _CatalogDatabase:
         self.cursor = _CatalogCursor()
 
 
+class _NoSelectionRpcCursor:
+    def execute(self, *_args, **_kwargs):
+        raise AssertionError("Sale entry attempted a synchronous network query")
+
+
+class _RemoteCatalogDatabase:
+    def __init__(self):
+        self.cursor = _NoSelectionRpcCursor()
+        self.sale_catalog = {
+            "products": [{
+                "id": 11, "name": "Known Product", "price": "25",
+                "preview_image": None, "stock": "80",
+            }],
+            "services": [],
+        }
+
+
 class SalesReportRegressionTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -212,7 +229,7 @@ class SalesReportRegressionTests(unittest.TestCase):
     def test_product_can_be_selected_before_typing_exact_quantity(self):
         table_widget = OperationsTableWidget(
             SalesItemClass,
-            database=_CatalogDatabase(),
+            database=_RemoteCatalogDatabase(),
             columns=[
                 "item_type", "product_name", "quantity",
                 "unit_price", "subtotal", "delete_action",

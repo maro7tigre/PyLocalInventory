@@ -558,9 +558,6 @@ class MainWindow(ThemedMainWindow):
         
         tab_widget = QTabWidget()
         
-        # Connect tab change signal to refresh the newly selected tab
-        tab_widget.currentChanged.connect(self.on_tab_changed)
-        
         # Store reference to tab widget for later access
         self.tab_widget = tab_widget
 
@@ -623,6 +620,10 @@ class MainWindow(ThemedMainWindow):
             home_tab.update_quick_actions_visibility(self.tab_visibility)
 
         self.main_layout.addWidget(tab_widget)
+
+        # Connecting before addTab() refreshed Home while the remaining tabs
+        # were still being built, doubling startup work on network clients.
+        tab_widget.currentChanged.connect(self.on_tab_changed)
         
         # Debug info
         print(f"\n📊 Database Status:")

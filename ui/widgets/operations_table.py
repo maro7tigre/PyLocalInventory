@@ -651,33 +651,56 @@ class TableEventHandler:
             return None
         target = self._normalized_name(entered_name)
         product = service = None
-        try:
-            database.cursor.execute(
-                "SELECT id, name, sale_price FROM products "
-                "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
-                "ORDER BY id LIMIT 2",
-                (target,),
-            )
-            product_row = database.cursor.fetchone()
-            if product_row:
-                product = {
-                    "type": "product", "id": int(product_row[0]),
-                    "name": product_row[1], "price": product_row[2] or 0,
-                }
-            database.cursor.execute(
-                "SELECT id, name, unit_price FROM services "
-                "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
-                "ORDER BY id LIMIT 2",
-                (target,),
-            )
-            service_row = database.cursor.fetchone()
-            if service_row:
-                service = {
-                    "type": "service", "id": int(service_row[0]),
-                    "name": service_row[1], "price": service_row[2] or 0,
-                }
-        except Exception:
-            return None
+        remote_catalog = getattr(database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            for record in remote_catalog.get("products", []):
+                if self._normalized_name(record.get("name")) == target:
+                    product = {
+                        "type": "product", "id": int(record["id"]),
+                        "name": record["name"], "price": record.get("price") or 0,
+                    }
+                    break
+            for record in remote_catalog.get("services", []):
+                candidates = [
+                    record.get("name"),
+                    *str(record.get("keywords") or "").replace(
+                        "\n", ","
+                    ).replace(";", ",").split(","),
+                ]
+                if any(self._normalized_name(value) == target for value in candidates):
+                    service = {
+                        "type": "service", "id": int(record["id"]),
+                        "name": record["name"], "price": record.get("price") or 0,
+                    }
+                    break
+        else:
+            try:
+                database.cursor.execute(
+                    "SELECT id, name, sale_price FROM products "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                product_row = database.cursor.fetchone()
+                if product_row:
+                    product = {
+                        "type": "product", "id": int(product_row[0]),
+                        "name": product_row[1], "price": product_row[2] or 0,
+                    }
+                database.cursor.execute(
+                    "SELECT id, name, unit_price FROM services "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                service_row = database.cursor.fetchone()
+                if service_row:
+                    service = {
+                        "type": "service", "id": int(service_row[0]),
+                        "name": service_row[1], "price": service_row[2] or 0,
+                    }
+            except Exception:
+                return None
 
         type_col = self.data_manager.table_columns.index("item_type")
         selector = self.table.cellWidget(row, type_col)
@@ -860,6 +883,35 @@ class TableEventHandler:
                     requested_qty = self._parse_number(qty_item.text())
             except ValueError:
                 requested_qty = 0
+
+        remote_catalog = getattr(db, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            product_id = product_widget.property("product_id")
+            target_name = self._normalized_name(product_name)
+            record = next(
+                (
+                    candidate
+                    for candidate in remote_catalog.get("products", [])
+                    if (
+                        product_id
+                        and int(candidate.get("id") or 0) == int(product_id)
+                    ) or self._normalized_name(candidate.get("name")) == target_name
+                ),
+                None,
+            )
+            if not record:
+                return (requested_qty, None, False, product_name)
+            product_widget.setProperty("product_id", int(record["id"]))
+            try:
+                stock_available = Decimal(str(record.get("stock") or 0))
+            except (InvalidOperation, ValueError):
+                stock_available = None
+            if stock_available is None:
+                return (requested_qty, None, False, product_name)
+            return (
+                requested_qty, stock_available,
+                Decimal(str(requested_qty)) > stock_available, product_name,
+            )
         
         # Product ID lookup
         product_id = product_widget.property("product_id")

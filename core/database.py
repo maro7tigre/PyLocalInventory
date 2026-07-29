@@ -8,12 +8,15 @@ in the app (classes/*.py, ui/**/*.py) that already reference table/column names
 unquoted, so they keep working unchanged against the folded lowercase names.
 """
 import re
+import logging
 from datetime import datetime
 
 import psycopg2
 from psycopg2 import OperationalError
 
 from core.pg_config import load_server_config
+
+logger = logging.getLogger(__name__)
 
 
 class Database:
@@ -84,6 +87,8 @@ class Database:
             dbname=self._maintenance_database_name(pg_config),
             user=pg_config.get('user'),
             password=pg_config.get('password'),
+            connect_timeout=5,
+            application_name="PyLocalInventory",
         )
 
     def _ensure_profile_database(self, pg_config, database_name):
@@ -128,6 +133,8 @@ class Database:
                     dbname=database_name,
                     user=pg_config.get('user'),
                     password=pg_config.get('password'),
+                    connect_timeout=5,
+                    application_name="PyLocalInventory",
                 )
                 self.cursor = self.conn.cursor()
                 self.database_name = database_name
@@ -157,6 +164,8 @@ class Database:
                 dbname=pg_config.get('database'),
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
+                connect_timeout=5,
+                application_name="PyLocalInventory",
             )
             self.cursor = self.conn.cursor()
 
@@ -181,10 +190,12 @@ class Database:
 
         except OperationalError as e:
             self.last_error = str(e)
+            logger.exception("PostgreSQL connection failed")
             print(f"✗ Failed to connect to database: {e}")
             return False
         except Exception as e:
             self.last_error = str(e)
+            logger.exception("Database initialization failed")
             print(f"✗ Failed to connect to database: {e}")
             return False
 
@@ -1866,6 +1877,174 @@ class Database:
             """
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    def get_sale_catalog(self, include_products=True, include_services=True):
+        """Return the sale-entry catalog and stock in a small number of queries."""
+        catalog = {"products": [], "services": []}
+        if include_products:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.name, p.sale_price, p.preview_image,
+                       COALESCE(imported.quantity, 0)
+                       - COALESCE(sold.quantity, 0) AS stock
+                FROM products p
+                LEFT JOIN (
+                    SELECT product_id, SUM(quantity) AS quantity
+                    FROM import_items GROUP BY product_id
+                ) imported ON imported.product_id=p.id
+                LEFT JOIN (
+                    SELECT si.product_id, SUM(si.quantity) AS quantity
+                    FROM sales_items si
+                    JOIN sales s ON s.id=si.sales_id
+                    WHERE s.state IS NULL OR s.state<>'on_hold'
+                    GROUP BY si.product_id
+                ) sold ON sold.product_id=p.id
+                WHERE p.name IS NOT NULL AND p.name<>''
+                ORDER BY LOWER(p.name), p.id
+                """
+            )
+            catalog["products"] = [
+                {
+                    "id": int(row[0]), "name": row[1],
+                    "price": str(row[2] or 0), "preview_image": row[3],
+                    "stock": str(row[4] or 0),
+                }
+                for row in self.cursor.fetchall()
+            ]
+        if include_services:
+            self.cursor.execute(
+                "SELECT id, name, unit_price, keywords FROM services "
+                "WHERE name IS NOT NULL AND name<>'' ORDER BY LOWER(name), id"
+            )
+            catalog["services"] = [
+                {
+                    "id": int(row[0]), "name": row[1],
+                    "price": str(row[2] or 0), "keywords": row[3] or "",
+                }
+                for row in self.cursor.fetchall()
+            ]
+        return catalog
+
+    def get_dashboard_snapshot(self):
+        """Return dashboard data in three bounded queries for LAN clients."""
+        self.cursor.execute(
+            """
+            SELECT
+              (SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
+               FROM sales s JOIN sales_items si ON si.sales_id=s.id
+               WHERE (s.state IS NULL OR s.state<>'on_hold')
+                 AND LEFT(s.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
+              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
+               FROM imports i JOIN import_items ii ON ii.import_id=i.id
+               WHERE LEFT(i.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
+              (SELECT COUNT(*) FROM products),
+              (SELECT COUNT(*) FROM clients),
+              (SELECT COUNT(*) FROM suppliers)
+            """
+        )
+        totals = self.cursor.fetchone() or (0, 0, 0, 0, 0)
+        self.cursor.execute(
+            """
+            WITH imported AS (
+              SELECT product_id, SUM(quantity) quantity
+              FROM import_items GROUP BY product_id
+            ), sold AS (
+              SELECT si.product_id, SUM(si.quantity) quantity
+              FROM sales_items si JOIN sales s ON s.id=si.sales_id
+              WHERE s.state IS NULL OR s.state<>'on_hold'
+              GROUP BY si.product_id
+            ), stock AS (
+              SELECT p.name, p.username,
+                     COALESCE(imported.quantity,0)-COALESCE(sold.quantity,0) quantity,
+                     COALESCE(p.stock_alert,0) alert
+              FROM products p
+              LEFT JOIN imported ON imported.product_id=p.id
+              LEFT JOIN sold ON sold.product_id=p.id
+            )
+            SELECT name, username, quantity, alert, COUNT(*) OVER()
+            FROM stock
+            WHERE quantity <= CASE WHEN alert > 0 THEN alert ELSE 5 END
+            ORDER BY quantity, name
+            LIMIT 50
+            """
+        )
+        low_rows = self.cursor.fetchall()
+        self.cursor.execute(
+            """
+            SELECT activity_type, activity_date, amount, description
+            FROM (
+              SELECT 'Sales' activity_type, s.date activity_date,
+                     COALESCE(SUM(si.quantity*si.unit_price*(1+s.tva/100)),0) amount,
+                     'Sale to ' || COALESCE(s.client_username,'') description,
+                     s.id
+              FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id
+              WHERE s.state IS NULL OR s.state<>'on_hold'
+              GROUP BY s.id, s.date, s.client_username, s.tva
+              UNION ALL
+              SELECT 'Imports', i.date,
+                     COALESCE(SUM(ii.quantity*ii.unit_price*(1+i.tva/100)),0),
+                     'Import from ' || COALESCE(i.supplier_username,''), i.id
+              FROM imports i LEFT JOIN import_items ii ON ii.import_id=i.id
+              GROUP BY i.id, i.date, i.supplier_username, i.tva
+            ) activity
+            ORDER BY activity_date DESC, id DESC
+            LIMIT 5
+            """
+        )
+        activity_rows = self.cursor.fetchall()
+        self.cursor.execute(
+            """
+            SELECT month_key,
+                   COALESCE(SUM(sales_amount),0),
+                   COALESCE(SUM(import_amount),0)
+            FROM (
+              SELECT LEFT(s.date,7) month_key,
+                     SUM(si.quantity*si.unit_price*(1+s.tva/100)) sales_amount,
+                     0 import_amount
+              FROM sales s JOIN sales_items si ON si.sales_id=s.id
+              WHERE (s.state IS NULL OR s.state<>'on_hold')
+                AND LEFT(s.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+              GROUP BY LEFT(s.date,7)
+              UNION ALL
+              SELECT LEFT(i.date,7), 0,
+                     SUM(ii.quantity*ii.unit_price*(1+i.tva/100))
+              FROM imports i JOIN import_items ii ON ii.import_id=i.id
+              WHERE LEFT(i.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+              GROUP BY LEFT(i.date,7)
+            ) monthly
+            GROUP BY month_key
+            ORDER BY month_key
+            """
+        )
+        monthly_rows = self.cursor.fetchall()
+        return {
+            "sales_total": str(totals[0] or 0),
+            "imports_total": str(totals[1] or 0),
+            "products_count": int(totals[2] or 0),
+            "clients_count": int(totals[3] or 0),
+            "suppliers_count": int(totals[4] or 0),
+            "low_stock_count": int(low_rows[0][4] if low_rows else 0),
+            "low_stock_products": [
+                {
+                    "name": row[0] or row[1] or "Unknown Product",
+                    "username": row[1] or "",
+                    "stock": str(row[2] or 0),
+                    "alert": str(row[3] or 0),
+                }
+                for row in low_rows
+            ],
+            "recent_activities": [
+                {
+                    "type": row[0], "date": row[1],
+                    "amount": str(row[2] or 0), "description": row[3] or "",
+                }
+                for row in activity_rows
+            ],
+            "monthly": {
+                row[0]: {"sales": str(row[1] or 0), "imports": str(row[2] or 0)}
+                for row in monthly_rows
+            },
+        }
 
     def get_operation_items_for_user(self, operation_id, section, user):
         if section != "Sales_Items" or (user or {}).get("is_superadmin"):

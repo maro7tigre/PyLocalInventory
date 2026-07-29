@@ -309,21 +309,32 @@ class SalesTab(BaseTab):
 
     def populate_table_with_items(self, items):
         """Populate table with custom state/progress rendering."""
-        self.table.setRowCount(len(items))
-        for row, obj in enumerate(items):
-            try:
-                for col, column_key in enumerate(self.table_columns):
-                    if column_key == 'check_progress':
-                        self._set_check_progress_cell(row, col, obj)
-                    elif column_key == 'state':
-                        self._set_state_cell(row, col, obj)
-                    elif column_key == 'progress':
-                        self._set_progress_cell(row, col, obj)
-                    else:
-                        self.set_table_cell(row, col, column_key, obj)
-            except Exception as e:
-                print(f"Error processing Sales row {row}: {e}")
-        self.table.resizeRowsToContents()
+        sorting_enabled = self.table.isSortingEnabled()
+        signals_blocked = self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
+        self.table.setSortingEnabled(False)
+        try:
+            self.table.setRowCount(len(items))
+            for row, obj in enumerate(items):
+                try:
+                    for col, column_key in enumerate(self.table_columns):
+                        if column_key == 'check_progress':
+                            self._set_check_progress_cell(row, col, obj)
+                        elif column_key == 'state':
+                            self._set_state_cell(row, col, obj)
+                        elif column_key == 'progress':
+                            self._set_progress_cell(row, col, obj)
+                        else:
+                            self.set_table_cell(row, col, column_key, obj)
+                except Exception as e:
+                    print(f"Error processing Sales row {row}: {e}")
+            if len(items) <= 300:
+                self.table.resizeRowsToContents()
+        finally:
+            self.table.setSortingEnabled(sorting_enabled)
+            self.table.blockSignals(signals_blocked)
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
 
     def _set_check_progress_cell(self, row, col, obj):
         from PySide6.QtWidgets import QPushButton

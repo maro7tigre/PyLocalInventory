@@ -15,7 +15,10 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import os
 import uuid
+import logging
 from core.runtime_paths import user_data_root
+
+logger = logging.getLogger(__name__)
 
 
 class BaseOperationDialog(QDialog):
@@ -506,6 +509,11 @@ class BaseOperationDialog(QDialog):
                 QMessageBox.critical(self, "Error", "Failed to save operation")
                 
         except Exception as e:
+            logger.exception(
+                "Operation save failed section=%s operation_id=%s",
+                getattr(self.operation_obj, "section", "unknown"),
+                self.operation_id,
+            )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
 
     def _save_sale_atomically(self):
@@ -583,10 +591,15 @@ class BaseOperationDialog(QDialog):
         if not tab_widget:
             return
         wanted = set(sections)
+        current_tab = tab_widget.currentWidget()
         for index in range(tab_widget.count()):
             tab = tab_widget.widget(index)
-            if getattr(tab, "section", None) in wanted and hasattr(tab, "refresh_table"):
+            if getattr(tab, "section", None) not in wanted:
+                continue
+            if tab is current_tab and hasattr(tab, "refresh_table"):
                 tab.refresh_table()
+            elif hasattr(tab, "mark_dirty"):
+                tab.mark_dirty()
 
     @staticmethod
     def _write_sale_save_log(message):
@@ -596,7 +609,7 @@ class BaseOperationDialog(QDialog):
             with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
                 stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] ui {message}\n")
         except OSError:
-            pass
+            logger.exception("Could not write sale diagnostic log")
     
     def apply_theme(self):
         """Apply dark theme"""

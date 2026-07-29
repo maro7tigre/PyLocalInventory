@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel,
                                QStyledItemDelegate, QLineEdit, QComboBox, QStyle,
                                QApplication, QStyleOptionViewItem)
 from PySide6.QtGui import QFont
-from PySide6.QtCore import Qt, QSize, QTimer
+from PySide6.QtCore import Qt, QSize, QTimer, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import RedButton, BlueButton, GreenButton
 from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingTextEdit
@@ -18,6 +18,30 @@ from datetime import datetime
 from decimal import Decimal
 import re
 import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+
+class _RemoteTableFetchWorker(QObject):
+    finished = Signal(object, object, float)
+    failed = Signal(str, float)
+
+    def __init__(self, fetcher, stock_fetcher=None):
+        super().__init__()
+        self.fetcher = fetcher
+        self.stock_fetcher = stock_fetcher
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        try:
+            items = self.fetcher()
+            levels = self.stock_fetcher() if self.stock_fetcher else None
+            self.finished.emit(items, levels, started)
+        except Exception as error:
+            logger.exception("Remote table fetch failed")
+            self.failed.emit(str(error), started)
 
 
 class BaseTableDelegate(QStyledItemDelegate):
@@ -157,9 +181,14 @@ class BaseTab(QWidget):
         self.filtered_items = []
         self._refreshing = False
         self._dialog_open = False
+        self._loaded_once = False
+        self._needs_refresh = True
+        self._last_refresh_at = 0.0
         
         self.setup_ui()
-        self.refresh_table()
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._wait_for_refresh_thread)
     
     def setup_ui(self):
         """Setup tab interface"""
@@ -311,6 +340,10 @@ class BaseTab(QWidget):
             QMessageBox.warning(self, "Error", "No database connection")
             return
 
+        if self.database.__class__.__name__ == "RemoteDatabase":
+            self._start_remote_refresh()
+            return
+
         self._refreshing = True
         started = time.perf_counter()
         try:
@@ -364,6 +397,9 @@ class BaseTab(QWidget):
 
             # Apply current filter and repopulate table
             self.filter_table()
+            self._loaded_once = True
+            self._needs_refresh = False
+            self._last_refresh_at = time.monotonic()
             
             print(f"✓ {self.section} table refresh complete")
 
@@ -374,29 +410,143 @@ class BaseTab(QWidget):
             print(f"No read permission for {self.section}, leaving table empty: {e}")
             self.table.setRowCount(0)
         except Exception as e:
+            logger.exception("Failed to refresh section=%s", self.section)
             print(f"Error refreshing {self.section} table: {e}")
             QMessageBox.critical(self, "Error", f"Failed to refresh {self.section}: {e}")
         finally:
             self._refreshing = False
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "load_%s completed in %.3f seconds rows=%d",
+                self.section.lower(), elapsed, len(self.all_items),
+            )
             print(
                 f"[PERFORMANCE] load_{self.section.lower()} completed in "
-                f"{time.perf_counter() - started:.3f} seconds"
+                f"{elapsed:.3f} seconds"
             )
+
+    def _start_remote_refresh(self):
+        """Fetch LAN data on a worker; all Qt updates remain on this thread."""
+        self._refreshing = True
+        self.refresh_btn.setEnabled(False)
+        fetcher = self.background_fetcher()
+        stock_fetcher = (
+            self.database.get_product_stock_levels
+            if self.section == "Products" else None
+        )
+        thread = QThread(self)
+        worker = _RemoteTableFetchWorker(fetcher, stock_fetcher)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._remote_refresh_finished)
+        worker.failed.connect(self._remote_refresh_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_refresh_thread", None))
+        self._refresh_thread = thread
+        self._refresh_worker = worker
+        thread.start()
+
+    @Slot(object, object, float)
+    def _remote_refresh_finished(self, items_data, levels, started):
+        try:
+            self.all_items = []
+            if levels is not None:
+                self.database._product_stock_levels = {
+                    int(key): value for key, value in levels.items()
+                }
+            for item_data in items_data:
+                try:
+                    obj = self.object_class(item_data.get('ID', 0), self.database)
+                    for key, value in item_data.items():
+                        if key in obj.parameters and not obj.is_parameter_calculated(key):
+                            param_key = 'id' if key == 'ID' else key
+                            try:
+                                if param_key in obj.parameters:
+                                    obj.set_value(param_key, value)
+                            except (KeyError, ValueError):
+                                logger.warning(
+                                    "Invalid remote value section=%s field=%s id=%s",
+                                    self.section, param_key, item_data.get("ID"),
+                                )
+                    self.all_items.append(obj)
+                except Exception:
+                    logger.exception(
+                        "Failed processing remote section=%s id=%s",
+                        self.section, item_data.get("ID"),
+                    )
+            self.search_bar.update_options(self.get_search_options())
+            self.filter_table()
+            self._loaded_once = True
+            self._needs_refresh = False
+            self._last_refresh_at = time.monotonic()
+        except Exception as error:
+            logger.exception("Failed applying remote section=%s", self.section)
+            QMessageBox.critical(
+                self, "Error", f"Failed to refresh {self.section}: {error}"
+            )
+        finally:
+            self._finish_remote_refresh(started)
+
+    @Slot(str, float)
+    def _remote_refresh_failed(self, error, started):
+        logger.error("Remote refresh failed section=%s error=%s", self.section, error)
+        QMessageBox.critical(
+            self, "Connection Error",
+            f"Failed to load {self.section} from the host:\n{error}",
+        )
+        self._finish_remote_refresh(started)
+
+    def _finish_remote_refresh(self, started):
+        self._refreshing = False
+        self.refresh_btn.setEnabled(True)
+        elapsed = time.perf_counter() - started
+        logger.log(
+            logging.WARNING if elapsed >= 0.5 else logging.INFO,
+            "load_%s completed in %.3f seconds rows=%d mode=client",
+            self.section.lower(), elapsed, len(self.all_items),
+        )
+
+    def _wait_for_refresh_thread(self):
+        """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
+        thread = getattr(self, "_refresh_thread", None)
+        if thread and thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            if not thread.wait(11000):
+                logger.error(
+                    "Remote refresh thread did not stop section=%s", self.section
+                )
+
+    def background_fetcher(self):
+        """Capture a UI-free request before the worker thread starts."""
+        database = self.database
+        section = self.section
+        return lambda: database.get_items(section)
 
     def fetch_items(self):
         """Fetch rows for the tab; ownership-aware tabs may override."""
         return self.database.get_items(self.section)
     
     def refresh_on_tab_switch(self):
-        """Refresh data when tab becomes visible - lighter refresh for better performance"""
+        """Load lazily and avoid repeating blocking network refreshes."""
         try:
             # Only refresh if database is connected
             if self.database and hasattr(self.database, 'conn') and self.database.conn:
-                # Refresh table to get latest data including quantity updates from operations
-                self.refresh_table()
-                print(f"✓ Refreshed {self.section} tab data")
+                stale = time.monotonic() - self._last_refresh_at >= 30.0
+                if not self._loaded_once or self._needs_refresh or stale:
+                    self.refresh_table()
+                    print(f"✓ Refreshed {self.section} tab data")
         except Exception as e:
             print(f"Error refreshing {self.section} tab on switch: {e}")
+
+    def mark_dirty(self):
+        """Request one refresh the next time this tab becomes visible."""
+        self._needs_refresh = True
     
     def set_table_cell(self, row, col, column_key, obj):
         """Set table cell value based on parameter type"""
@@ -697,6 +847,8 @@ class BaseTab(QWidget):
     def filter_table(self):
         """Filter and sort table based on search and order criteria"""
         if not self.all_items:
+            self.filtered_items = []
+            self.populate_table_with_items([])
             return
         
         search_text = self.search_bar.text().strip()
@@ -716,27 +868,42 @@ class BaseTab(QWidget):
     
     def populate_table_with_items(self, items):
         """Populate table with given items"""
-        self.table.setRowCount(len(items))
-        
-        for row, obj in enumerate(items):
-            try:
-                # Set table data
-                for col, column_key in enumerate(self.table_columns):
-                    self.set_table_cell(row, col, column_key, obj)
-            except Exception as e:
-                print(f"Error processing {self.section} row {row}: {e}")
-                # Fallback: show basic data
-                for col, column_key in enumerate(self.table_columns):
-                    try:
-                        value = obj.get_value(column_key) if hasattr(obj, 'get_value') else ""
-                        item = QTableWidgetItem(str(value))
-                        item.setData(Qt.UserRole, value)
-                        item.setData(Qt.UserRole + 1, obj.id if hasattr(obj, 'id') else 0)
-                        self.table.setItem(row, col, item)
-                    except:
-                        item = QTableWidgetItem("Error")
-                        self.table.setItem(row, col, item)
-        self.table.resizeRowsToContents()
+        sorting_enabled = self.table.isSortingEnabled()
+        signals_blocked = self.table.blockSignals(True)
+        self.table.setUpdatesEnabled(False)
+        self.table.setSortingEnabled(False)
+        try:
+            self.table.setRowCount(len(items))
+            for row, obj in enumerate(items):
+                try:
+                    for col, column_key in enumerate(self.table_columns):
+                        self.set_table_cell(row, col, column_key, obj)
+                except Exception:
+                    logger.exception(
+                        "Failed rendering section=%s row=%d", self.section, row
+                    )
+                    for col, column_key in enumerate(self.table_columns):
+                        try:
+                            value = obj.get_value(column_key) if hasattr(obj, 'get_value') else ""
+                            item = QTableWidgetItem(str(value))
+                            item.setData(Qt.UserRole, value)
+                            item.setData(Qt.UserRole + 1, obj.id if hasattr(obj, 'id') else 0)
+                            self.table.setItem(row, col, item)
+                        except Exception:
+                            logger.exception(
+                                "Failed fallback cell section=%s row=%d column=%s",
+                                self.section, row, column_key,
+                            )
+                            self.table.setItem(row, col, QTableWidgetItem("Error"))
+            # Content measurement is disproportionately expensive on very
+            # large tables; those use the configured 70px default row height.
+            if len(items) <= 300:
+                self.table.resizeRowsToContents()
+        finally:
+            self.table.setSortingEnabled(sorting_enabled)
+            self.table.blockSignals(signals_blocked)
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
     
     def get_preview_category(self):
         """Override in subclasses to specify preview category"""

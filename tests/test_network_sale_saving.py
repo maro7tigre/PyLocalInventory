@@ -99,6 +99,8 @@ class _SchemaCursor:
 class _SchemaConnection:
     def __init__(self):
         self.commits = 0
+        self.rollbacks = 0
+        self.closed = False
         self.cursor_instance = _SchemaCursor()
 
     def cursor(self):
@@ -106,6 +108,9 @@ class _SchemaConnection:
 
     def commit(self):
         self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
 
 
 class _Pool:
@@ -116,7 +121,7 @@ class _Pool:
         return self.connection
 
     def putconn(self, connection):
-        pass
+        self.returned = connection
 
 
 class NetworkSaleSavingTests(unittest.TestCase):
@@ -129,6 +134,8 @@ class NetworkSaleSavingTests(unittest.TestCase):
         server._pool = _Pool(connection)
         server._dispatch('cursor.execute', ['CREATE TABLE IF NOT EXISTS Payments (id INTEGER)', []], {})
         self.assertEqual(connection.commits, 1)
+        self.assertEqual(connection.rollbacks, 1)
+        self.assertIs(server._pool.returned, connection)
 
     def test_remote_request_serializes_decimal_lines(self):
         remote = RemoteDatabase(None, 'host-pc', 8765, 'user', 'password')

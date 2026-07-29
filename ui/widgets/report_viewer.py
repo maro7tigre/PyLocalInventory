@@ -9,6 +9,9 @@ from PySide6.QtGui import QFont, QTextDocument
 from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
 from ui.widgets.themed_widgets import BlueButton, GreenButton
 import html
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ReportViewerWidget(QWidget):
@@ -20,6 +23,7 @@ class ReportViewerWidget(QWidget):
         self.report_data = []
         self.headers = []
         self.summary_text = ""
+        self._printing = False
         
         self.setup_ui()
         self.apply_theme()
@@ -76,15 +80,21 @@ class ReportViewerWidget(QWidget):
         self.summary_text = summary or ""
         
         # Update table
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(data))
-        
-        # Fill table with data
-        for row, item in enumerate(data):
-            for col, value in enumerate(item):
-                self.table.setItem(row, col, QTableWidgetItem(str(value)))
-        self.table.resizeRowsToContents()
+        self.table.setUpdatesEnabled(False)
+        signals_blocked = self.table.blockSignals(True)
+        try:
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            self.table.setRowCount(len(data))
+            for row, item in enumerate(data):
+                for col, value in enumerate(item):
+                    self.table.setItem(row, col, QTableWidgetItem(str(value)))
+            if len(data) <= 300:
+                self.table.resizeRowsToContents()
+        finally:
+            self.table.blockSignals(signals_blocked)
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
         
         # Update summary if provided
         if summary:
@@ -107,6 +117,10 @@ class ReportViewerWidget(QWidget):
     
     def print_report(self):
         """Print through this PC's standard dialog and default printer."""
+        if self._printing:
+            return
+        self._printing = True
+        self.print_btn.setEnabled(False)
         try:
             if not QPrinterInfo.availablePrinterNames():
                 QMessageBox.warning(
@@ -145,9 +159,13 @@ class ReportViewerWidget(QWidget):
             if dialog.exec() == QPrintDialog.Accepted:
                 document.print_(printer)
         except Exception as error:
+            logger.exception("Report printing failed title=%s", self.title)
             QMessageBox.critical(
                 self, "Print Error", f"Could not print this report:\n{error}"
             )
+        finally:
+            self._printing = False
+            self.print_btn.setEnabled(True)
     
     def apply_theme(self):
         """Apply dark theme styling"""

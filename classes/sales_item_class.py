@@ -178,6 +178,35 @@ class SalesItemClass(BaseClass):
         """Return product and service keywords for autocomplete (non-empty)."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            options = []
+            seen = set()
+            service_keywords = []
+            for record in remote_catalog.get("products", []):
+                value = str(record.get("name") or "").strip()
+                if value and value.casefold() not in seen:
+                    seen.add(value.casefold())
+                    options.append(value)
+            for record in remote_catalog.get("services", []):
+                values = [
+                    record.get("name"),
+                    *self._split_keywords(record.get("keywords") or ""),
+                ]
+                service_keywords.extend(self._split_keywords(
+                    record.get("keywords") or ""
+                ))
+                for value in values:
+                    value = str(value or "").strip()
+                    if value and value.casefold() not in seen:
+                        seen.add(value.casefold())
+                        options.append(value)
+            self._catalog_cache[id(self.database)] = {
+                "loaded_at": time.monotonic(),
+                "products": list(options),
+                "service_keywords": list(dict.fromkeys(service_keywords)),
+            }
+            return options
         cache_key = id(self.database)
         cached = self._catalog_cache.get(cache_key)
         if cached and time.monotonic() - cached['loaded_at'] < 60:
@@ -226,6 +255,13 @@ class SalesItemClass(BaseClass):
         """Return service keywords for the line-item information autocomplete."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            return list(dict.fromkeys(
+                keyword
+                for record in remote_catalog.get("services", [])
+                for keyword in self._split_keywords(record.get("keywords") or "")
+            ))
 
         cache_key = id(self.database)
         cached = self._catalog_cache.get(cache_key)
@@ -400,6 +436,17 @@ class SalesItemClass(BaseClass):
         """Get product data by name including ID and sale price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return None
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            target = " ".join(str(product_name or "").split()).casefold()
+            for record in remote_catalog.get("products", []):
+                if " ".join(str(record.get("name") or "").split()).casefold() == target:
+                    return {
+                        "id": int(record["id"]),
+                        "sale_price": record.get("price") or 0,
+                        "preview_image": record.get("preview_image"),
+                    }
+            return None
         
         try:
             self.database.cursor.execute(
@@ -425,6 +472,20 @@ class SalesItemClass(BaseClass):
 
         value_clean = (value or '').strip()
         if not value_clean:
+            return None
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            target = value_clean.casefold()
+            for record in remote_catalog.get("services", []):
+                candidates = [
+                    record.get("name"),
+                    *self._split_keywords(record.get("keywords") or ""),
+                ]
+                if any(
+                    target == str(candidate or "").strip().casefold()
+                    for candidate in candidates
+                ):
+                    return record.get("name")
             return None
 
         try:

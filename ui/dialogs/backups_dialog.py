@@ -8,6 +8,7 @@ import os
 import re
 import shutil
 import time
+import logging
 from datetime import datetime
 
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
@@ -15,6 +16,7 @@ from ui.widgets.cards_list import GridCardsList
 from core import pg_backup
 from core.attachments import attachment_backup_root
 
+logger = logging.getLogger(__name__)
 
 class _BackupCreateWorker(QObject):
     finished = Signal(bool)
@@ -31,11 +33,17 @@ class _BackupCreateWorker(QObject):
         try:
             self.finished.emit(bool(self.callback()))
         except Exception as error:
+            logger.exception("Backup worker failed operation=%s", self.operation)
             self.failed.emit(str(error))
         finally:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "%s completed in %.3f seconds", self.operation, elapsed,
+            )
             print(
                 f"[PERFORMANCE] {self.operation} completed in "
-                f"{time.perf_counter() - started:.2f} seconds"
+                f"{elapsed:.2f} seconds"
             )
 
 
@@ -54,11 +62,19 @@ class _BackupDownloadWorker(QObject):
         try:
             self.finished.emit(self.database.download_backup(self.destination))
         except Exception as error:
+            logger.exception(
+                "Network backup download failed destination=%s", self.destination
+            )
             self.failed.emit(str(error))
         finally:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "network_backup_download completed in %.3f seconds", elapsed,
+            )
             print(
                 "[PERFORMANCE] network_backup_download completed in "
-                f"{time.perf_counter() - started:.2f} seconds"
+                f"{elapsed:.2f} seconds"
             )
 
 class BackupsDialog(QDialog):

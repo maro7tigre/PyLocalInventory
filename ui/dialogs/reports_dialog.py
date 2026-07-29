@@ -20,7 +20,9 @@ import base64
 from decimal import Decimal, InvalidOperation
 import traceback
 import time
+import logging
 
+logger = logging.getLogger(__name__)
 
 class _PdfRenderWorker(QObject):
     finished = Signal(str)
@@ -38,11 +40,17 @@ class _PdfRenderWorker(QObject):
         try:
             self.finished.emit(self.renderer(self.html_content, self.output_path))
         except Exception as error:
+            logger.exception("PDF rendering failed output=%s", self.output_path)
             self.failed.emit(str(error))
         finally:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "generate_sales_report completed in %.3f seconds", elapsed,
+            )
             print(
                 "[PERFORMANCE] generate_sales_report completed in "
-                f"{time.perf_counter() - started:.2f} seconds"
+                f"{elapsed:.2f} seconds"
             )
 
 
@@ -149,6 +157,7 @@ class ReportsDialog(QDialog):
             self._report_worker = worker
             thread.start()
         except Exception as e:
+            logger.exception("Report preparation failed type=%s", report_type)
             self._report_failed(report_type, str(e))
 
     @Slot(str)
@@ -178,6 +187,7 @@ class ReportsDialog(QDialog):
         try:
             self.open_pdf(pdf_path)
         except Exception as error:
+            logger.exception("Generated report could not be opened path=%s", pdf_path)
             QMessageBox.warning(
                 self, "Warning", f"Report generated but failed to open:\n{error}"
             )
@@ -266,13 +276,7 @@ class ReportsDialog(QDialog):
 
     @staticmethod
     def _write_report_log(message):
-        try:
-            log_path = os.path.join(user_data_root(), 'logs', 'report_operations.log')
-            os.makedirs(os.path.dirname(log_path), exist_ok=True)
-            with open(log_path, 'a', encoding='utf-8') as stream:
-                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}]\n{message}\n\n")
-        except Exception as log_error:
-            print(f"Could not write report diagnostic log: {log_error}")
+        logger.info("Report operation\n%s", message)
     
     def _cleanup_old_reports(self, reports_dir):
         """Delete reports older than 48 hours"""

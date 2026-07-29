@@ -2,15 +2,39 @@
 Home tab - Beautiful dashboard with charts, statistics, and quick actions
 """
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, 
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QApplication,
     QPushButton, QFrame, QScrollArea, QSizePolicy, QSpacerItem
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, Slot, QPointF
 from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor, QLinearGradient
 from PySide6.QtCharts import QChart, QChartView, QPieSeries, QBarSeries, QBarSet, QLineSeries, QValueAxis, QBarCategoryAxis
 from datetime import datetime, timedelta
+from decimal import Decimal
+import time
+import logging
 
 from ui.widgets.themed_widgets import GreenButton, BlueButton, OrangeButton, RedButton
+
+logger = logging.getLogger(__name__)
+
+
+class _DashboardWorker(QObject):
+    finished = Signal(object, float)
+    failed = Signal(str, float)
+
+    def __init__(self, database):
+        super().__init__()
+        self.database = database
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        try:
+            self.finished.emit(self.database.get_dashboard_snapshot(), started)
+        except Exception as error:
+            logger.exception("Remote dashboard load failed")
+            self.failed.emit(str(error), started)
+
 
 class StatCard(QFrame):
     """Beautiful statistic card widget"""
@@ -154,11 +178,18 @@ class HomeTab(QWidget):
         self.language = (language or 'en').lower()
         self.stat_cards = {}
         self.charts = {}
+        self._dashboard_snapshot = None
+        self._dashboard_thread = None
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_statistics)
         self.refresh_timer.start(30000)  # Refresh every 30 seconds
         self.setup_ui()
-        self.refresh_statistics()
+        # setup_ui already populated the two detail lists once.
+        self.refresh_statistics(force=True, refresh_lists=False)
+        self._last_full_refresh_at = time.monotonic()
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._wait_for_dashboard_thread)
 
     def _t(self):
         """Lightweight translations for Home tab UI strings."""
@@ -432,9 +463,13 @@ class HomeTab(QWidget):
             month_name = date.strftime("%b")
             months.append(month_name)
             
-            # Get sales and imports for this month
-            sales_total = self.get_monthly_total('Sales', date.year, date.month)
-            imports_total = self.get_monthly_total('Imports', date.year, date.month)
+            # LAN clients receive all six months in one background snapshot.
+            if self.database.__class__.__name__ == "RemoteDatabase":
+                sales_total = 0.0
+                imports_total = 0.0
+            else:
+                sales_total = self.get_monthly_total('Sales', date.year, date.month)
+                imports_total = self.get_monthly_total('Imports', date.year, date.month)
             profit = sales_total - imports_total
             
             sales_data.append(sales_total)
@@ -510,6 +545,9 @@ class HomeTab(QWidget):
         chart_view.setStyleSheet("background-color: transparent; border: 2px solid #555555; border-radius: 8px;")
         
         self.charts['monthly_comparison'] = chart_view
+        self._monthly_sales_set = sales_set
+        self._monthly_imports_set = imports_set
+        self._monthly_profit_series = profit_series
         parent_layout.addWidget(chart_view)
     
     def create_low_stock_section(self, parent_layout):
@@ -592,7 +630,20 @@ class HomeTab(QWidget):
                 w.setParent(None)
             layout.removeItem(item)
         # Rebuild
-        low_stock_products = self.get_low_stock_products()
+        if self.database.__class__.__name__ == "RemoteDatabase":
+            low_stock_products = (
+                (self._dashboard_snapshot or {}).get("low_stock_products", [])
+            )
+            low_stock_products = [
+                {
+                    **product,
+                    "stock": int(Decimal(str(product.get("stock") or 0))),
+                    "alert": int(Decimal(str(product.get("alert") or 0))),
+                }
+                for product in low_stock_products
+            ]
+        else:
+            low_stock_products = self.get_low_stock_products()
         if not low_stock_products:
             no_issues = QLabel(self._t()("low_stock_ok"))
             no_issues.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 8px;")
@@ -707,7 +758,16 @@ class HomeTab(QWidget):
             if widget:
                 widget.setParent(None)
 
-        recent_activities = self.get_recent_activities()
+        if self.database.__class__.__name__ == "RemoteDatabase":
+            recent_activities = (
+                (self._dashboard_snapshot or {}).get("recent_activities", [])
+            )
+            recent_activities = [
+                {**activity, "amount": float(activity.get("amount") or 0)}
+                for activity in recent_activities
+            ]
+        else:
+            recent_activities = self.get_recent_activities()
 
         if not recent_activities:
             no_activity = QLabel(self._t()("no_recent_activity"))
@@ -777,11 +837,16 @@ class HomeTab(QWidget):
         
         return item_frame
     
-    def refresh_statistics(self):
+    def refresh_statistics(self, force=False, refresh_lists=True):
         """Refresh all statistics and charts"""
+        if not force and not self.isVisible():
+            return
         if not self.database or not self.database.conn:
             return
-        
+        if self.database.__class__.__name__ == "RemoteDatabase":
+            self._start_remote_dashboard_refresh()
+            return
+        started = time.perf_counter()
         try:
             # Update stat cards
             current_month = datetime.now().month
@@ -807,8 +872,9 @@ class HomeTab(QWidget):
             if 'low_stock' in self.stat_cards:
                 self.stat_cards['low_stock'].update_value(low_stock_count, "At/Below alert")
             # Refresh the detailed list
-            self._populate_low_stock_products()
-            self._populate_recent_activities()
+            if refresh_lists:
+                self._populate_low_stock_products()
+                self._populate_recent_activities()
             
             # Clients count
             clients_count = self.get_table_count('Clients')
@@ -823,7 +889,82 @@ class HomeTab(QWidget):
             print("✓ Dashboard statistics refreshed")
             
         except Exception as e:
+            logger.exception("Dashboard refresh failed")
             print(f"Error refreshing statistics: {e}")
+        finally:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "dashboard_refresh completed in %.3f seconds", elapsed,
+            )
+
+    def _start_remote_dashboard_refresh(self):
+        if self._dashboard_thread and self._dashboard_thread.isRunning():
+            return
+        thread = QThread(self)
+        worker = _DashboardWorker(self.database)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._remote_dashboard_finished)
+        worker.failed.connect(self._remote_dashboard_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda: setattr(self, "_dashboard_thread", None))
+        self._dashboard_thread = thread
+        self._dashboard_worker = worker
+        thread.start()
+
+    @Slot(object, float)
+    def _remote_dashboard_finished(self, snapshot, started):
+        self._dashboard_snapshot = dict(snapshot or {})
+        values = self._dashboard_snapshot
+        cards = (
+            ("total_sales", f"{float(values.get('sales_total', 0)):.0f} MAD", "This month"),
+            ("total_imports", f"{float(values.get('imports_total', 0)):.0f} MAD", "This month"),
+            ("products_count", values.get("products_count", 0), "In inventory"),
+            ("low_stock", values.get("low_stock_count", 0), "At/Below alert"),
+            ("clients_count", values.get("clients_count", 0), "Active clients"),
+            ("suppliers_count", values.get("suppliers_count", 0), "Active suppliers"),
+        )
+        for key, value, subtitle in cards:
+            if key in self.stat_cards:
+                self.stat_cards[key].update_value(value, subtitle)
+        self._populate_low_stock_products()
+        self._populate_recent_activities()
+        monthly = values.get("monthly", {})
+        for index, offset in enumerate(range(5, -1, -1)):
+            date = datetime.now() - timedelta(days=offset * 30)
+            row = monthly.get(date.strftime("%Y-%m"), {})
+            sales = float(row.get("sales", 0))
+            imports = float(row.get("imports", 0))
+            self._monthly_sales_set.replace(index, sales)
+            self._monthly_imports_set.replace(index, -imports)
+            self._monthly_profit_series.replace(
+                index, QPointF(index, sales - imports)
+            )
+        elapsed = time.perf_counter() - started
+        logger.log(
+            logging.WARNING if elapsed >= 0.5 else logging.INFO,
+            "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
+        )
+
+    @Slot(str, float)
+    def _remote_dashboard_failed(self, error, started):
+        logger.error(
+            "Remote dashboard refresh failed after %.3fs error=%s",
+            time.perf_counter() - started, error,
+        )
+
+    def _wait_for_dashboard_thread(self):
+        thread = self._dashboard_thread
+        if thread and thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            if not thread.wait(11000):
+                logger.error("Remote dashboard thread did not stop")
     
     def get_monthly_total(self, table_name, year, month):
         """Get total amount for a specific month"""
@@ -1112,14 +1253,15 @@ class HomeTab(QWidget):
 
     def refresh_on_tab_switch(self):
         """Called when this tab becomes active - refresh all data"""
+        now = time.monotonic()
+        if now - getattr(self, "_last_full_refresh_at", 0.0) < 30.0:
+            return
         self.refresh_statistics()
-        # Ensure list is in sync when user returns
-        self._populate_low_stock_products()
-        self._populate_recent_activities()
         # Re-apply quick-actions visibility in case it changed while away
         mw = self.parent()
         while mw and not hasattr(mw, 'tab_visibility'):
             mw = mw.parent() if callable(getattr(mw, 'parent', None)) else None
         if mw:
             self.update_quick_actions_visibility(mw.tab_visibility)
+        self._last_full_refresh_at = now
         print("✓ Home tab refreshed on switch")

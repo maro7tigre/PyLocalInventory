@@ -9,6 +9,9 @@ from PySide6.QtCore import Qt
 from ui.widgets.themed_widgets import GreenButton, RedButton
 # Import will be done locally to avoid circular imports
 import os
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class BaseEditDialog(QDialog):
@@ -27,6 +30,7 @@ class BaseEditDialog(QDialog):
         self.data_object = data_object
         self.ui_config = ui_config or {}
         self.parameter_widgets = {}
+        self._saving = False
         
         # Set dialog properties
         self.setWindowTitle(f"Edit {self.data_object.section}")
@@ -186,6 +190,8 @@ class BaseEditDialog(QDialog):
     
     def save_changes(self):
         """Validate and save changes"""
+        if self._saving:
+            return
         # Validate data
         errors = self.validate_data()
         
@@ -210,6 +216,8 @@ class BaseEditDialog(QDialog):
                 return
         
         # Update data object
+        self._saving = True
+        self.save_btn.setEnabled(False)
         try:
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             
@@ -227,7 +235,15 @@ class BaseEditDialog(QDialog):
             self.accept()  # Close dialog successfully
             
         except Exception as e:
+            logger.exception(
+                "Failed saving section=%s",
+                getattr(self.data_object, "section", "unknown"),
+            )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
+        finally:
+            if self.result() != QDialog.Accepted:
+                self._saving = False
+                self.save_btn.setEnabled(True)
     
     def apply_theme(self):
         """Apply dark theme"""

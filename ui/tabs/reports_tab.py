@@ -70,6 +70,20 @@ class ReportsTab(BaseTab):
             report_type = None
         return self.database.get_reports(owner_id, date_from, date_to, report_type)
 
+    def background_fetcher(self):
+        """Capture filter widgets on the GUI thread before network loading."""
+        owner_id = self.user_filter.currentData() if self.user_filter else None
+        use_dates = self.date_filter_enabled.isChecked()
+        date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
+        date_to = self.date_to.date().toString("yyyy-MM-dd") if use_dates else None
+        report_type = self.type_filter.currentText()
+        if report_type == "All types":
+            report_type = None
+        database = self.database
+        return lambda: database.get_reports(
+            owner_id, date_from, date_to, report_type
+        )
+
     def details_callback(self, obj_id):
         """Show full report text in a read-only popup"""
         try:

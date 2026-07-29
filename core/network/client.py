@@ -15,6 +15,7 @@ import urllib.request
 import time
 import os
 import zipfile
+import logging
 from decimal import Decimal
 from datetime import datetime
 from core.runtime_paths import user_data_root
@@ -24,6 +25,7 @@ from core.network.protocol import (
 )
 from core.user_manager import SECTION_GROUP
 
+logger = logging.getLogger(__name__)
 
 class RemoteProfile:
     """Read-only report branding supplied by the connected host."""
@@ -102,6 +104,9 @@ class RemoteDatabase:
         self.is_superadmin = False
         self.current_user_id = None
         self.remote_profile = None
+        # ``None`` means an older host did not provide a login snapshot, so
+        # callers can retain the legacy RPC fallback for compatibility.
+        self.sale_catalog = None
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
@@ -142,8 +147,13 @@ class RemoteDatabase:
                 raise AuthError("Invalid username or password")
             raise RemoteError(f"Host rejected the connection ({e.code})")
         except (TimeoutError, socket.timeout):
+            logger.warning("Login timed out host=%s port=%s", self.host, self.port)
             raise ConnectionFailedError("Connection timed out")
         except urllib.error.URLError as e:
+            logger.warning(
+                "Login connection failure host=%s port=%s error=%s",
+                self.host, self.port, getattr(e, "reason", e),
+            )
             reason = getattr(e, "reason", None)
             if isinstance(reason, (TimeoutError, socket.timeout)):
                 raise ConnectionFailedError("Connection timed out")
@@ -153,6 +163,10 @@ class RemoteDatabase:
         except (json.JSONDecodeError, KeyError):
             raise RemoteError("Server returned an invalid response")
         except Exception:
+            logger.exception(
+                "Unexpected login network error host=%s port=%s",
+                self.host, self.port,
+            )
             raise ConnectionFailedError("Network error")
 
         self._token = data['token']
@@ -162,6 +176,7 @@ class RemoteDatabase:
         self.current_user_id = data.get('user_id')
         self.username = data.get('username') or self.username
         self.remote_profile = RemoteProfile(data.get("profile") or {})
+        self.sale_catalog = data.get("sale_catalog")
         return True
 
     def _call(self, method, args=None, kwargs=None):
@@ -208,6 +223,10 @@ class RemoteDatabase:
         except (AuthError, PermissionDeniedError, RemoteError):
             raise
         except Exception as e:
+            logger.warning(
+                "LAN RPC connection failure method=%s host=%s port=%s error=%s",
+                method, self.host, self.port, e,
+            )
             if method == 'save_sale_with_items':
                 self._write_network_log(
                     f"response_url={url} http_status=unavailable connection_error={e}"
@@ -215,17 +234,11 @@ class RemoteDatabase:
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
         elapsed_ms = (time.perf_counter() - started) * 1000
-        if elapsed_ms >= 250:
-            try:
-                log_dir = os.path.join(user_data_root(), 'logs')
-                os.makedirs(log_dir, exist_ok=True)
-                with open(os.path.join(log_dir, 'network_timing.log'), 'a', encoding='utf-8') as stream:
-                    stream.write(
-                        f"{datetime.now().isoformat(timespec='seconds')} method={method} "
-                        f"duration_ms={elapsed_ms:.1f} host={self.host}:{self.port}\n"
-                    )
-            except OSError:
-                pass
+        logger.log(
+            logging.WARNING if elapsed_ms >= 500 else logging.INFO,
+            "LAN RPC method=%s host=%s port=%s duration_ms=%.1f",
+            method, self.host, self.port, elapsed_ms,
+        )
         result = data.get('result')
         if method == 'save_sale_with_items':
             self._write_network_log(
@@ -319,7 +332,7 @@ class RemoteDatabase:
             with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
                 stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] client {message}\n")
         except OSError:
-            pass
+            logger.exception("Could not write network sale diagnostic log")
 
     def __getattr__(self, name):
         # Reached only for attributes not set in __init__: add_item, update_item,

@@ -26,6 +26,8 @@ import threading
 import os
 import shutil
 import tempfile
+import logging
+import time
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
@@ -38,6 +40,8 @@ from core.pg_config import load_server_config
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
 from core.runtime_paths import user_data_root
+
+logger = logging.getLogger(__name__)
 
 # method name -> (kind, index into `args` holding the section name)
 _SECTION_METHODS = {
@@ -60,7 +64,10 @@ _CLIENT_ACCOUNT_METHODS = {
 }
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels'}
-_ALWAYS_ALLOWED = {'begin_transaction', 'commit_transaction', 'rollback_transaction'}
+_ALWAYS_ALLOWED = {
+    'begin_transaction', 'commit_transaction', 'rollback_transaction',
+    'get_dashboard_snapshot',
+}
 _ACTION_FOR_KIND = {'read': 'read', 'write': 'write', 'delete': 'delete'}
 
 
@@ -231,6 +238,8 @@ class DatabaseServer:
                 dbname=database_name,
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
+                connect_timeout=5,
+                application_name="PyLocalInventory-LAN",
             )
         else:
             schema_name = selected_profile.schema_name or Database._profile_schema_name(
@@ -247,6 +256,8 @@ class DatabaseServer:
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
                 options=f'-c search_path={schema_name}',
+                connect_timeout=5,
+                application_name="PyLocalInventory-LAN",
             )
 
         self._httpd = ThreadingHTTPServer(('0.0.0.0', self.port), self._make_handler())
@@ -284,20 +295,50 @@ class DatabaseServer:
         never shared across threads - while reusing Database's/UserManager's
         existing SQL logic unchanged."""
         conn = self._pool.getconn()
-        request_db = Database(profile_manager=None)
-        request_db.registered_classes = self.database.registered_classes
-        request_db.database_name = self.database_name
-        request_db.schema_name = self.schema_name
-        request_db.conn = conn
-        request_db.cursor = conn.cursor()
-        return request_db
+        try:
+            request_db = Database(profile_manager=None)
+            request_db.registered_classes = self.database.registered_classes
+            request_db.database_name = self.database_name
+            request_db.schema_name = self.schema_name
+            request_db.conn = conn
+            request_db.cursor = conn.cursor()
+            return request_db
+        except Exception:
+            logger.exception("Failed to initialize pooled request database")
+            try:
+                self._pool.putconn(conn, close=True)
+            except Exception:
+                logger.exception("Failed to discard unusable pooled connection")
+            raise
 
     def _return_database(self, request_db):
+        connection = request_db.conn
         try:
             request_db.cursor.close()
         except Exception:
-            pass
-        self._pool.putconn(request_db.conn)
+            logger.exception("Failed to close pooled request cursor")
+        try:
+            # PostgreSQL starts a transaction even for SELECT. Reset it before
+            # returning the connection so it cannot remain idle in transaction.
+            if connection and not getattr(connection, "closed", False):
+                rollback = getattr(connection, "rollback", None)
+                if callable(rollback):
+                    rollback()
+                self._pool.putconn(connection)
+            else:
+                try:
+                    self._pool.putconn(connection, close=True)
+                except TypeError:
+                    self._pool.putconn(connection)
+        except Exception:
+            logger.exception("Failed to reset pooled database connection")
+            try:
+                try:
+                    self._pool.putconn(connection, close=True)
+                except TypeError:
+                    self._pool.putconn(connection)
+            except Exception:
+                logger.exception("Failed to discard broken pooled connection")
 
     def _create_client_backup_archive(self, work_dir):
         """Create a verified host-side archive for an authenticated client."""
@@ -401,6 +442,38 @@ class DatabaseServer:
                 return request_db.delete_report_for_user(*args, user=user)
             if method == 'get_product_stock_levels':
                 return request_db.get_product_stock_levels()
+            if method == 'get_dashboard_snapshot':
+                snapshot = request_db.get_dashboard_snapshot()
+                if not user.get("is_superadmin"):
+                    permissions = user.get("permissions", {})
+                    readable = lambda section: bool(
+                        permissions.get(section, {}).get("read")
+                    )
+                    if not readable("Sales"):
+                        snapshot["sales_total"] = "0"
+                        snapshot["recent_activities"] = [
+                            row for row in snapshot["recent_activities"]
+                            if row.get("type") != "Sales"
+                        ]
+                        for row in snapshot["monthly"].values():
+                            row["sales"] = "0"
+                    if not readable("Imports"):
+                        snapshot["imports_total"] = "0"
+                        snapshot["recent_activities"] = [
+                            row for row in snapshot["recent_activities"]
+                            if row.get("type") != "Imports"
+                        ]
+                        for row in snapshot["monthly"].values():
+                            row["imports"] = "0"
+                    if not readable("Products"):
+                        snapshot["products_count"] = 0
+                        snapshot["low_stock_count"] = 0
+                        snapshot["low_stock_products"] = []
+                    if not readable("Clients"):
+                        snapshot["clients_count"] = 0
+                    if not readable("Suppliers"):
+                        snapshot["suppliers_count"] = 0
+                return snapshot
             if method in _CLIENT_ACCOUNT_METHODS:
                 return getattr(request_db, method)(*args, **kwargs, user=user)
 
@@ -436,7 +509,7 @@ class DatabaseServer:
             with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
                 stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] server {message}\n")
         except OSError:
-            pass
+            logger.exception("Could not write server sale diagnostic log")
 
     def _make_handler(self):
         server_obj = self
@@ -505,11 +578,30 @@ class DatabaseServer:
             def _handle_login(self):
                 body = self._read_json()
                 request_db = server_obj._borrow_database()
+                catalog = {"products": [], "services": []}
                 try:
                     user_manager = UserManager(request_db)
                     user = user_manager.verify_login(
                         body.get('username', ''), body.get('password', '')
                     )
+                    if user:
+                        permissions = user.get("permissions", {})
+                        sales_access = (
+                            permissions.get("Sales", {}).get("read")
+                            or permissions.get("Sales", {}).get("write")
+                        )
+                        catalog = request_db.get_sale_catalog(
+                            include_products=bool(
+                                user.get("is_superadmin")
+                                or sales_access
+                                or permissions.get("Products", {}).get("read")
+                            ),
+                            include_services=bool(
+                                user.get("is_superadmin")
+                                or sales_access
+                                or permissions.get("Services", {}).get("read")
+                            ),
+                        )
                 finally:
                     server_obj._return_database(request_db)
 
@@ -534,6 +626,7 @@ class DatabaseServer:
                     'is_superadmin': user['is_superadmin'],
                     'permissions': user['permissions'],
                     'profile': profile_values,
+                    'sale_catalog': catalog,
                 })
 
             def _handle_rpc(self):
@@ -564,6 +657,7 @@ class DatabaseServer:
                     return self._send_json(403, {'error': reason})
 
                 try:
+                    started = time.perf_counter()
                     result = server_obj._dispatch(method, args, kwargs, user=user)
                 except ValueError as e:
                     if method == 'save_sale_with_items':
@@ -572,7 +666,17 @@ class DatabaseServer:
                 except Exception as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation_or_transaction=rollback error={e}")
+                    logger.exception(
+                        "LAN RPC failed method=%s user=%s",
+                        method, user.get("username"),
+                    )
                     return self._send_json(500, {'error': str(e)})
+                elapsed = time.perf_counter() - started
+                logger.log(
+                    logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                    "LAN RPC method=%s user=%s duration=%.3fs",
+                    method, user.get("username"), elapsed,
+                )
                 if method == 'save_sale_with_items':
                     server_obj._write_sales_log(f"validation=ok transaction=commit result={result}")
                 self._send_json(200, {'result': result})

@@ -782,8 +782,12 @@ class MainWindow(ThemedMainWindow):
     
     def open_backups_dialog(self):
         """Open backups management dialog"""
-        # Check if profile is selected before opening backups
-        if not self.profile_manager or not self.profile_manager.selected_profile:
+        # Network clients intentionally have no local business profile. Their
+        # backup dialog downloads a host-generated archive to this PC.
+        if (
+            self.connection_mode != "client"
+            and (not self.profile_manager or not self.profile_manager.selected_profile)
+        ):
             QMessageBox.warning(self, "No Profile Selected", 
                               "Please select a profile before accessing backups.")
             return

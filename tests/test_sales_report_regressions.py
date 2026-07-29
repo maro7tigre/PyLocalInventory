@@ -20,6 +20,8 @@ from ui.dialogs.client_details_dialog import ClientDetailsDialog
 from ui.tabs.sales_tab import SalesEditDialog
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from ui.widgets.autocomplete_widgets import AutoExpandingTextEdit
+from ui.widgets.operations_table import OperationsTableWidget
+from ui.widgets.report_viewer import ReportViewerWidget
 
 
 class _Values:
@@ -53,6 +55,43 @@ class _PaymentDatabase:
     def __init__(self):
         self.cursor = _PaymentCursor()
         self.conn = _PaymentConnection()
+
+
+class _CatalogCursor:
+    def __init__(self):
+        self._rows = []
+
+    def execute(self, sql, params=()):
+        normalized = " ".join(sql.lower().split())
+        if normalized.startswith("select id, name, sale_price from products"):
+            self._rows = [(11, "Known Product", Decimal("25"))]
+        elif normalized.startswith("select id, name, unit_price from services"):
+            self._rows = []
+        elif normalized.startswith("select name from products"):
+            self._rows = [("Known Product",)]
+        elif normalized.startswith("select name, keywords from services"):
+            self._rows = []
+        elif normalized.startswith("select keywords from services"):
+            self._rows = []
+        elif normalized.startswith("select sum(quantity) from import_items"):
+            self._rows = [(Decimal("80"),)]
+        elif normalized.startswith("select sum(si.quantity)"):
+            self._rows = [(Decimal("0"),)]
+        else:
+            self._rows = []
+        return self
+
+    def fetchone(self):
+        return self._rows.pop(0) if self._rows else None
+
+    def fetchall(self):
+        rows, self._rows = self._rows, []
+        return rows
+
+
+class _CatalogDatabase:
+    def __init__(self):
+        self.cursor = _CatalogCursor()
 
 
 class SalesReportRegressionTests(unittest.TestCase):
@@ -170,6 +209,50 @@ class SalesReportRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.vat_widget), 25.04)
         self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_widget), 150.24)
 
+    def test_product_can_be_selected_before_typing_exact_quantity(self):
+        table_widget = OperationsTableWidget(
+            SalesItemClass,
+            database=_CatalogDatabase(),
+            columns=[
+                "item_type", "product_name", "quantity",
+                "unit_price", "subtotal", "delete_action",
+            ],
+            highlight_stock_exceed=True,
+        )
+        columns = table_widget.data_manager.table_columns
+        name = table_widget.table.cellWidget(0, columns.index("product_name"))
+        table_widget.show()
+        name.setText("Known Product")
+        table_widget.event_handler._on_product_selection_finished(0)
+        self.app.processEvents()
+
+        quantity_col = columns.index("quantity")
+        delegate = table_widget.table.itemDelegateForColumn(quantity_col)
+        editor = delegate.active_editors.get(0)
+        self.assertIsNotNone(editor)
+        QTest.keyClicks(editor, "4")
+        QTest.keyClick(editor, Qt.Key_Tab)
+        self.app.processEvents()
+
+        quantity_item = table_widget.table.item(0, quantity_col)
+        self.assertTrue(quantity_item.flags() & Qt.ItemIsEditable)
+        row = table_widget.get_current_table_data()[0]
+        self.assertEqual(row["quantity"], Decimal("4"))
+        self.assertNotEqual(row["quantity"], Decimal("4000"))
+        self.assertEqual(quantity_item.text(), "4")
+
+        table_widget.row_factory._create_regular_cell(
+            table_widget.table, 0, quantity_col, "quantity",
+            _Values({"quantity": Decimal("4.000")}),
+        )
+        self.assertEqual(table_widget.table.item(0, quantity_col).text(), "4")
+        table_widget.row_factory._create_regular_cell(
+            table_widget.table, 0, quantity_col, "quantity",
+            _Values({"quantity": Decimal("10.000")}),
+        )
+        self.assertEqual(table_widget.table.item(0, quantity_col).text(), "10")
+        table_widget.close()
+
     def test_connected_client_report_is_created_in_local_writable_directory(self):
         RemoteDatabase = type("RemoteDatabase", (), {})
         sale = _Values({"id": 9, "client_name": "Network Client"})
@@ -192,6 +275,39 @@ class SalesReportRegressionTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(output))
             self.assertEqual(os.path.dirname(output), local_dir)
             self.assertIn("connected client", dialog._report_context("devis", output, None))
+
+    def test_connected_client_uses_host_report_profile_without_local_profile(self):
+        RemoteDatabase = type("RemoteDatabase", (), {})
+        remote = RemoteDatabase()
+        remote.username = "network-user"
+        remote.remote_profile = _Values({"company name": "Host Company"})
+        sale = _Values({"id": 10, "client_name": "Network Client"})
+        sale.database = remote
+        manager = type("Manager", (), {"selected_profile": None})()
+        dialog = ReportsDialog(sale, manager)
+        dialog._generate_html_content = lambda _kind: "<html>host profile</html>"
+        dialog._html_to_pdf = lambda _html, output: output
+
+        with tempfile.TemporaryDirectory() as local_dir, patch(
+            "ui.dialogs.reports_dialog.local_reports_dir", return_value=local_dir
+        ), patch.object(dialog, "_cleanup_old_reports"):
+            _html, output = dialog._prepare_report("devis")
+        self.assertIs(dialog._active_profile, remote.remote_profile)
+        self.assertEqual(os.path.dirname(output), local_dir)
+        dialog.close()
+
+    def test_printing_without_a_local_printer_fails_gracefully(self):
+        viewer = ReportViewerWidget("Stock")
+        viewer.set_report_data(["Product", "Quantity"], [["Known Product", 4]])
+        with patch(
+            "ui.widgets.report_viewer.QPrinterInfo.availablePrinterNames",
+            return_value=[],
+        ), patch(
+            "ui.widgets.report_viewer.QMessageBox.warning"
+        ) as warning:
+            viewer.print_report()
+        warning.assert_called_once()
+        viewer.close()
 
 
 if __name__ == "__main__":

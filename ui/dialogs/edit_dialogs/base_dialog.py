@@ -156,7 +156,7 @@ class BaseEditDialog(QDialog):
             # Check type-specific constraints
             param_type = param_info.get('type', 'string')
             
-            if param_type in ['int', 'float'] and value is not None:
+            if param_type in ['int', 'float', 'decimal'] and value is not None:
                 try:
                     num_value = float(value)
                     

@@ -1,7 +1,9 @@
 """
 Payment receipt dialog - printable receipt display.
 """
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser, QMessageBox
+)
 from PySide6.QtGui import QTextDocument
 import os
 
@@ -78,8 +80,17 @@ class ReceiptDialog(QDialog):
 
     def _print_receipt(self):
         try:
-            from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+            from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
+            if not QPrinterInfo.availablePrinterNames():
+                QMessageBox.warning(
+                    self, "No Printer",
+                    "No printer is installed or available on this computer.",
+                )
+                return
             printer = QPrinter(QPrinter.HighResolution)
+            default_printer = QPrinterInfo.defaultPrinter()
+            if not default_printer.isNull():
+                printer.setPrinterName(default_printer.printerName())
             dlg = QPrintDialog(printer, self)
             if dlg.exec() == QPrintDialog.Accepted:
                 doc = QTextDocument()
@@ -87,3 +98,6 @@ class ReceiptDialog(QDialog):
                 doc.print_(printer)
         except Exception as e:
             print(f"Print error: {e}")
+            QMessageBox.critical(
+                self, "Print Error", f"Could not print this receipt:\n{e}"
+            )

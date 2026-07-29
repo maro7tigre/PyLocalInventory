@@ -1,6 +1,8 @@
 import os
 import tempfile
 import unittest
+import io
+import zipfile
 from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -10,6 +12,7 @@ from PySide6.QtWidgets import QDialog, QWidget
 
 from classes.client_class import ClientClass
 from core import pg_backup
+from core.network.client import RemoteDatabase as NetworkRemoteDatabase
 from core.network.server import _check_permission
 from ui.dialogs.client_details_dialog import ClientDetailsDialog
 from ui.dialogs.backups_dialog import BackupsDialog
@@ -162,6 +165,56 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
             self.assertTrue(os.path.isfile(copied))
             dialog.close()
             parent.close()
+
+    def test_network_client_backup_does_not_require_local_profile(self):
+        parent = QWidget()
+        parent.profile_manager = type(
+            "ProfileManager", (), {"selected_profile": None}
+        )()
+        parent.database = type(
+            "RemoteBackupDatabase", (), {"download_backup": lambda *_args: None}
+        )()
+        dialog = BackupsDialog(parent)
+        self.assertTrue(dialog.remote_mode)
+        self.assertTrue(dialog.download_btn.isEnabled())
+        dialog.close()
+        parent.close()
+
+    def test_network_backup_download_is_validated_and_atomically_saved(self):
+        payload = io.BytesIO()
+        with zipfile.ZipFile(payload, "w") as archive:
+            archive.writestr("database/test.backup", b"PGDMP-test")
+        data = payload.getvalue()
+
+        class Response:
+            status = 200
+
+            def __init__(self):
+                self.offset = 0
+
+            def __enter__(self):
+                return self
+
+            def __exit__(self, *_args):
+                return False
+
+            def read(self, size=-1):
+                if self.offset >= len(data):
+                    return b""
+                end = len(data) if size < 0 else min(len(data), self.offset + size)
+                chunk = data[self.offset:end]
+                self.offset = end
+                return chunk
+
+        remote = NetworkRemoteDatabase(None, "host-pc", 8765, "admin", "secret")
+        remote._token = "test-token"
+        with tempfile.TemporaryDirectory() as directory:
+            destination = os.path.join(directory, "shared.zip")
+            with patch("urllib.request.urlopen", return_value=Response()):
+                result = remote.download_backup(destination)
+            self.assertEqual(result, destination)
+            self.assertTrue(zipfile.is_zipfile(destination))
+            self.assertFalse(os.path.exists(destination + ".part"))
 
 
 if __name__ == "__main__":

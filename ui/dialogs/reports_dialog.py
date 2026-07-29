@@ -211,11 +211,13 @@ class ReportsDialog(QDialog):
     def _prepare_report(self, report_type):
         """Collect database/UI data on the GUI thread before worker rendering."""
         # Get current profile path
-        if not self.profile_manager.selected_profile:
-            raise Exception("No profile selected")
-        
-        profile = self.profile_manager.selected_profile
         database = getattr(self.sales_obj, 'database', None)
+        profile = getattr(self.profile_manager, "selected_profile", None)
+        if not profile:
+            profile = getattr(database, "remote_profile", None)
+        if not profile:
+            raise Exception("The host did not provide report profile details")
+        self._active_profile = profile
         application_username = getattr(database, 'username', None) or 'DefaultUser'
         reports_dir = local_reports_dir(application_username)
         
@@ -341,7 +343,16 @@ class ReportsDialog(QDialog):
                 return format(number.normalize(), "f") if number != number.to_integral() else str(int(number))
 
             # Get profile data
-            profile = self.profile_manager.selected_profile
+            profile = (
+                getattr(self, "_active_profile", None)
+                or getattr(self.profile_manager, "selected_profile", None)
+                or getattr(
+                    getattr(self.sales_obj, "database", None),
+                    "remote_profile", None,
+                )
+            )
+            if not profile:
+                raise RuntimeError("Report profile details are unavailable")
             company_name = profile.get_value("company name") or "Your Company"
             company_phone = profile.get_value("phone") or ""
             company_address = profile.get_value("address") or ""

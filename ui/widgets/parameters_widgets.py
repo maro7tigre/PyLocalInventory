@@ -24,6 +24,19 @@ except ImportError:
 import shutil
 
 
+class AdaptiveDecimalSpinBox(QDoubleSpinBox):
+    """Show only meaningful decimal digits while retaining decimal input."""
+
+    def textFromValue(self, value):
+        text = f"{value:.{self.decimals()}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    def valueFromText(self, text):
+        return float(str(text).strip().replace(",", ".") or 0)
+
+
 class NumericWidget(QWidget):
     """Widget for int/float parameters with validation"""
     
@@ -39,7 +52,7 @@ class NumericWidget(QWidget):
         param_type = param_info.get('type', 'int')
         
         if param_type in ('float', 'decimal'):
-            self.spinbox = QDoubleSpinBox()
+            self.spinbox = AdaptiveDecimalSpinBox()
             self.spinbox.setDecimals(param_info.get('precision', 2))
         else:
             self.spinbox = QSpinBox()

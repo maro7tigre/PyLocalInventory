@@ -2,10 +2,13 @@
 Report Viewer Widget - displays reports in a table format with print/export capabilities
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
-                               QTableWidgetItem, QHeaderView, QLabel, QTextEdit)
+                               QTableWidgetItem, QHeaderView, QLabel, QTextEdit,
+                               QMessageBox)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextDocument
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
 from ui.widgets.themed_widgets import BlueButton, GreenButton
+import html
 
 
 class ReportViewerWidget(QWidget):
@@ -103,9 +106,48 @@ class ReportViewerWidget(QWidget):
         print(f"Exporting report: {self.title}")
     
     def print_report(self):
-        """Print report (placeholder)"""
-        # TODO: Implement print functionality
-        print(f"Printing report: {self.title}")
+        """Print through this PC's standard dialog and default printer."""
+        try:
+            if not QPrinterInfo.availablePrinterNames():
+                QMessageBox.warning(
+                    self, "No Printer",
+                    "No printer is installed or available on this computer.",
+                )
+                return
+            printer = QPrinter(QPrinter.HighResolution)
+            default_printer = QPrinterInfo.defaultPrinter()
+            if not default_printer.isNull():
+                printer.setPrinterName(default_printer.printerName())
+
+            rows = [
+                "<tr>" + "".join(
+                    f"<th>{html.escape(str(header))}</th>"
+                    for header in self.headers
+                ) + "</tr>"
+            ]
+            rows.extend(
+                "<tr>" + "".join(
+                    f"<td>{html.escape(str(value))}</td>" for value in row
+                ) + "</tr>"
+                for row in self.report_data
+            )
+            summary = (
+                f"<p><b>Summary:</b><br>{html.escape(self.summary_text)}</p>"
+                if self.summary_text else ""
+            )
+            document = QTextDocument(self)
+            document.setHtml(
+                f"<h2>{html.escape(self.title)}</h2>{summary}"
+                "<table border='1' cellspacing='0' cellpadding='4'>"
+                + "".join(rows) + "</table>"
+            )
+            dialog = QPrintDialog(printer, self)
+            if dialog.exec() == QPrintDialog.Accepted:
+                document.print_(printer)
+        except Exception as error:
+            QMessageBox.critical(
+                self, "Print Error", f"Could not print this report:\n{error}"
+            )
     
     def apply_theme(self):
         """Apply dark theme styling"""

@@ -57,8 +57,9 @@ class ImportItemClass(BaseClass):
                 "required": True,
                 "default": 1,
                 "options": [],
-                "type": "int",
-                "min": 1
+                "type": "decimal",
+                "precision": 3,
+                "min": 0.001
             },
             "unit_price": {
                 "value": 0.0,

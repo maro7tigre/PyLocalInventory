@@ -405,25 +405,29 @@ class Database:
             self.conn.rollback()
             print(f"Warning: could not create workflow indexes: {exc}")
 
-        # Existing installations created this column as INTEGER. PostgreSQL's
-        # cast keeps all old values intact. Check first to avoid taking an
-        # unnecessary table lock every time another LAN client starts.
-        try:
-            self.cursor.execute(
-                "SELECT data_type, numeric_precision, numeric_scale "
-                "FROM information_schema.columns WHERE table_schema=current_schema() "
-                "AND table_name='sales_items' AND column_name='quantity'"
-            )
-            column = self.cursor.fetchone()
-            if column and column != ('numeric', 15, 3):
+        # Existing installations created these columns as INTEGER.
+        # PostgreSQL's cast keeps all old values intact. Check first to avoid
+        # taking an unnecessary table lock on every startup.
+        for table in ("sales_items", "import_items"):
+            try:
                 self.cursor.execute(
-                    "ALTER TABLE sales_items ALTER COLUMN quantity TYPE NUMERIC(15, 3) "
-                    "USING quantity::NUMERIC(15, 3)"
+                    "SELECT data_type, numeric_precision, numeric_scale "
+                    "FROM information_schema.columns WHERE table_schema=current_schema() "
+                    "AND table_name=%s AND column_name='quantity'",
+                    (table,),
                 )
-            self.conn.commit()
-        except Exception as exc:
-            self.conn.rollback()
-            print(f"Warning: could not migrate sales_items.quantity to decimal: {exc}")
+                column = self.cursor.fetchone()
+                if column and column != ('numeric', 15, 3):
+                    self.cursor.execute(
+                        f"ALTER TABLE {table} ALTER COLUMN quantity "
+                        "TYPE NUMERIC(15, 3) USING quantity::NUMERIC(15, 3)"
+                    )
+                self.conn.commit()
+            except Exception as exc:
+                self.conn.rollback()
+                print(
+                    f"Warning: could not migrate {table}.quantity to decimal: {exc}"
+                )
 
         # Client IDs were historically only resolved in memory. Backfill the
         # stable relation from usernames once, then index it for client views.
@@ -972,6 +976,125 @@ class Database:
             self.conn.rollback()
             raise
 
+    def update_product_with_stock(self, product_id, product_data, target_quantity, user=None):
+        """Update a product and set its ledger-derived stock in one transaction.
+
+        Product stock is intentionally not duplicated in ``products``.  A
+        stock-adjustment import records only the difference between the
+        requested quantity and the current imports-minus-sales balance.
+        """
+        if not isinstance(product_data, dict):
+            raise ValueError("Product data must be an object")
+        try:
+            product_id = int(product_id)
+        except (TypeError, ValueError):
+            raise ValueError("Product ID must be an integer")
+        quantity = self._sale_decimal(
+            target_quantity, "product stock quantity", "0"
+        )
+
+        product_cls = self.registered_classes.get("Products")
+        if product_cls is None:
+            raise ValueError("Products are not registered")
+        product_obj = product_cls(0, None)
+        allowed = product_obj.get_visible_parameters("database")
+        data = {
+            key: product_data[key]
+            for key in allowed
+            if key in product_data and not product_obj.is_parameter_calculated(key)
+        }
+        name = " ".join(str(data.get("name") or "").split())
+        username = " ".join(str(data.get("username") or name).split())
+        if not name:
+            raise ValueError("Product name is required")
+        if not username:
+            raise ValueError("Product username is required")
+        data["name"] = name
+        data["username"] = username
+
+        try:
+            # This row lock serializes quantity edits with concurrent sales,
+            # whose stock validation locks the same product rows below.
+            self.cursor.execute(
+                "SELECT id FROM products WHERE id=%s FOR UPDATE", (product_id,)
+            )
+            if not self.cursor.fetchone():
+                raise ValueError(f"Product {product_id} does not exist")
+            self.cursor.execute(
+                "SELECT 1 FROM products "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "AND id<>%s LIMIT 1",
+                (self._normalize_exact(username), product_id),
+            )
+            if self.cursor.fetchone():
+                raise ValueError(f"Product username '{username}' already exists")
+
+            assignments = ", ".join(f"{key}=%s" for key in data)
+            self.cursor.execute(
+                f"UPDATE products SET {assignments} WHERE id=%s",
+                [*data.values(), product_id],
+            )
+            if self.cursor.rowcount != 1:
+                raise ValueError(f"Product {product_id} does not exist")
+
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(quantity), 0) "
+                "FROM import_items WHERE product_id=%s",
+                (product_id,),
+            )
+            imported = self.cursor.fetchone()[0] or 0
+            self.cursor.execute(
+                """
+                SELECT COALESCE(SUM(si.quantity), 0)
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE si.product_id=%s
+                  AND (s.state IS NULL OR s.state<>'on_hold')
+                """,
+                (product_id,),
+            )
+            sold = self.cursor.fetchone()[0] or 0
+            current = imported - sold
+            adjustment = quantity - current
+
+            if adjustment:
+                actor = self._actor_fields(user)
+                self.cursor.execute(
+                    "INSERT INTO imports "
+                    "(supplier_username, supplier_name, date, tva, notes, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('', 'Stock Adjustment', %s, 0, %s, %s, %s, %s) "
+                    "RETURNING id",
+                    (
+                        datetime.now().strftime("%Y-%m-%d"),
+                        f"Stock adjusted from {current} to {quantity} for {name}",
+                        actor["created_by"], actor["created_by_username"],
+                        actor["created_at"],
+                    ),
+                )
+                adjustment_import_id = int(self.cursor.fetchone()[0])
+                self.cursor.execute(
+                    "INSERT INTO import_items "
+                    "(import_id, product_id, product_name, quantity, unit_price) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        adjustment_import_id, product_id, name, adjustment,
+                        self._sale_decimal(data.get("unit_price"), "unit price", "0"),
+                    ),
+                )
+
+            self.conn.commit()
+            return {
+                "product_id": product_id,
+                "previous_quantity": str(current),
+                "quantity": str(quantity),
+                "adjustment": str(adjustment),
+                "transaction": "committed",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def save_sale_with_items(
         self, sale_data, items, sale_id=None, visible_row_count=None,
         pending_entities=None, user=None,
@@ -1219,7 +1342,19 @@ class Database:
                         requested_by_product[item["product_id"]] = (
                             requested_by_product.get(item["product_id"], 0) + item["quantity"]
                         )
-                for product_id, requested in requested_by_product.items():
+                # Stable lock order prevents two multi-product sales from
+                # deadlocking when their line order differs.
+                for product_id in sorted(requested_by_product):
+                    requested = requested_by_product[product_id]
+                    # Serialize stock checks for the same product. Without this
+                    # lock, two client PCs could both validate against the same
+                    # pre-sale balance and oversell it.
+                    self.cursor.execute(
+                        "SELECT id FROM products WHERE id=%s FOR UPDATE",
+                        (product_id,),
+                    )
+                    if not self.cursor.fetchone():
+                        raise ValueError(f"Product {product_id} does not exist")
                     self.cursor.execute(
                         "SELECT COALESCE(SUM(quantity), 0) FROM import_items WHERE product_id=%s",
                         (product_id,),

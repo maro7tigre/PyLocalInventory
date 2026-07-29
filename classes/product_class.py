@@ -96,7 +96,8 @@ class ProductClass(BaseClass):
             "quantity": {
                 "display_name": {"en": "Stock Quantity", "fr": "Quantité en Stock", "es": "Cantidad en Stock"},
                 "required": False,
-                "type": "int",
+                "type": "decimal",
+                "precision": 3,
                 "method": self.calculate_quantity  # This makes it calculated
             },
             "created_by": {
@@ -182,7 +183,9 @@ class ProductClass(BaseClass):
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0
             
-            return int(total_imports - total_sales)
+            # Keep the database's exact numeric value. Converting to int here
+            # silently truncated legitimate decimal sale quantities.
+            return total_imports - total_sales
         except Exception as e:
             print(f"Error calculating quantity for product {self.id}: {e}")
             return 0

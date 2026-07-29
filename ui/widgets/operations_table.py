@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstrac
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
                              QStyledItemDelegate, QComboBox, QInputDialog)
 from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
-from PySide6.QtCore import Qt, Signal, QRegularExpression
+from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer
 from ui.widgets.preview_widget import PreviewWidget
 from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
@@ -251,6 +251,8 @@ class TableRowFactory:
             )
         autocomplete.setPlaceholderText(param_info.get('display_name', {}).get('en', param_key.replace('_', ' ')))
         autocomplete.setProperty('row', row)  # Store row for callbacks
+        if hasattr(autocomplete, "setTabChangesFocus"):
+            autocomplete.setTabChangesFocus(True)
         if hasattr(autocomplete, '_adjust_height'):
             autocomplete._adjust_height()
         
@@ -283,6 +285,14 @@ class TableRowFactory:
             raw_value = item.get_value(param_key)
             if param_key == 'subtotal':
                 value = f"{float(raw_value or 0):,.2f}".replace(",", " ")
+            elif param_key == 'quantity':
+                # NUMERIC(15,3) may return Decimal("4.000"). In locales where
+                # a dot is a thousands separator that looks like 4000, even
+                # though the stored value is four. Display the canonical value.
+                decimal_value = Decimal(str(raw_value or 0))
+                value = format(decimal_value, "f")
+                if "." in value:
+                    value = value.rstrip("0").rstrip(".")
             else:
                 value = str(raw_value or "")
         elif param_key == 'quantity':
@@ -389,14 +399,25 @@ class TableEventHandler:
         self.items_changed_callback = items_changed_callback
         self._updating = False
         self._stock_cache = {}
+        self._table_events_connected = False
     
     def setup_event_connections(self):
         """Setup event connections"""
-        self.table.itemChanged.connect(self._on_item_changed)
+        if not self._table_events_connected:
+            self.table.itemChanged.connect(self._on_item_changed)
+            self.table.cellClicked.connect(self._on_cell_clicked)
+            self._table_events_connected = True
         
         # Connect autocomplete widgets
         for row in range(self.table.rowCount()):
             self._connect_row_widgets(row)
+
+    def _on_cell_clicked(self, row, column):
+        try:
+            if self.data_manager.table_columns[column] == "quantity":
+                QTimer.singleShot(0, lambda r=row: self._begin_quantity_edit(r))
+        except (IndexError, ValueError):
+            pass
     
     def _connect_row_widgets(self, row):
         """Connect widgets in a specific row"""
@@ -560,6 +581,37 @@ class TableEventHandler:
             self.empty_row_manager.ensure_single_empty_row()
             self._reconnect_all_widgets()
             self.items_changed_callback()
+            # Bridge the widget-backed product name to the item-backed
+            # quantity delegate. This makes Tab and a single click reliably
+            # enter quantity editing instead of merely selecting the row.
+            QTimer.singleShot(
+                0, lambda r=row: self._begin_quantity_edit(r, select_all=True)
+            )
+
+    def _begin_quantity_edit(self, row, select_all=False):
+        try:
+            quantity_col = self.data_manager.table_columns.index("quantity")
+            item = self.table.item(row, quantity_col)
+            if item is None or not (item.flags() & Qt.ItemIsEditable):
+                return
+            self.table.setCurrentCell(row, quantity_col)
+            delegate = self.table.itemDelegateForColumn(quantity_col)
+            editor = (
+                delegate.active_editors.get(row)
+                if hasattr(delegate, "active_editors") else None
+            )
+            if editor is None:
+                self.table.editItem(item)
+                editor = (
+                    delegate.active_editors.get(row)
+                    if hasattr(delegate, "active_editors") else None
+                )
+            if isinstance(editor, QLineEdit):
+                editor.setFocus()
+            if select_all and isinstance(editor, QLineEdit):
+                editor.selectAll()
+        except (ValueError, IndexError):
+            pass
     
     def _handle_product_selection(self, row, product_name):
         """Handle product selection and auto-fill"""
@@ -1037,7 +1089,7 @@ class OperationsTableWidget(QWidget):
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
         self.table.setWordWrap(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.table.verticalHeader().setDefaultSectionSize(45)
         

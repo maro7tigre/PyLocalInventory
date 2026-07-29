@@ -15,6 +15,7 @@ from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingT
 from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
 from datetime import datetime
+from decimal import Decimal
 import re
 import time
 
@@ -454,6 +455,18 @@ class BaseTab(QWidget):
                 
                 self.table.setItem(row, col, item)
             
+            elif param_type == 'decimal':
+                decimal_value = Decimal(str(value or 0))
+                formatted_value = format(decimal_value, "f")
+                if "." in formatted_value:
+                    formatted_value = formatted_value.rstrip("0").rstrip(".")
+                item = QTableWidgetItem(formatted_value)
+                item.setData(Qt.UserRole, value)
+                item.setData(Qt.UserRole + 1, obj.id)
+                if not self.is_column_editable(column_key):
+                    item.setFlags(item.flags() & ~Qt.ItemIsEditable)
+                self.table.setItem(row, col, item)
+
             elif param_type == 'int':
                 # Format integer values
                 formatted_value = str(int(value)) if value is not None else "0"

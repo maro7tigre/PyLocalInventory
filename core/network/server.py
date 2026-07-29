@@ -24,12 +24,16 @@ import secrets
 import socket
 import threading
 import os
+import shutil
+import tempfile
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 from psycopg2.pool import ThreadedConnectionPool
 
 from core.database import Database
+from core import pg_backup
+from core.attachments import attachment_backup_root
 from core.pg_config import load_server_config
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
@@ -111,19 +115,12 @@ def _check_permission(user, method, args, kwargs):
             return False, "You don't have permission to create or update Products"
         return True, None
 
-    if method == 'save_product_with_opening_stock':
+    if method in ('save_product_with_opening_stock', 'update_product_with_stock'):
         if not user['permissions'].get('Products', {}).get('write'):
             return False, "You don't have write access to Products"
-        initial_quantity = args[1] if len(args) > 1 else kwargs.get(
-            "initial_quantity", 0
-        )
-        try:
-            has_opening_stock = float(str(initial_quantity).replace(",", ".")) > 0
-        except (TypeError, ValueError):
-            has_opening_stock = True
-        if (has_opening_stock
-                and not user['permissions'].get('Imports', {}).get('write')):
-            return False, "Opening stock requires write access to Imports"
+        # Opening/adjustment stock is part of the product write itself. The
+        # backend owns the ledger entry, so users do not need separate access
+        # to create arbitrary supplier imports.
         return True, None
 
     if method in _REPORT_METHODS:
@@ -302,6 +299,49 @@ class DatabaseServer:
             pass
         self._pool.putconn(request_db.conn)
 
+    def _create_client_backup_archive(self, work_dir):
+        """Create a verified host-side archive for an authenticated client."""
+        bundle_dir = os.path.join(work_dir, "PyLocalInventory_Backup")
+        os.makedirs(bundle_dir)
+        if self.database_name:
+            dump_file = pg_backup.backup_database(self.database_name, bundle_dir)
+        else:
+            dump_file = pg_backup.backup_schema(self.schema_name, bundle_dir)
+        if not os.path.isfile(dump_file) or os.path.getsize(dump_file) <= 0:
+            raise RuntimeError("The host created an invalid database backup")
+
+        profile_manager = getattr(self.database, "profile_manager", None)
+        profile = getattr(profile_manager, "selected_profile", None)
+        profile_dir = (
+            os.path.dirname(profile.config_path)
+            if profile and getattr(profile, "config_path", None) else None
+        )
+        if profile_dir and os.path.isdir(profile_dir):
+            for name in os.listdir(profile_dir):
+                if name in ("backups", "attachments"):
+                    continue
+                source = os.path.join(profile_dir, name)
+                destination = os.path.join(bundle_dir, name)
+                if os.path.isfile(source):
+                    shutil.copy2(source, destination)
+                elif os.path.isdir(source):
+                    shutil.copytree(source, destination)
+
+        attachments = attachment_backup_root(self.database)
+        if attachments.exists():
+            shutil.copytree(
+                attachments, os.path.join(bundle_dir, "attachments"),
+                dirs_exist_ok=True,
+            )
+
+        archive_base = os.path.join(
+            work_dir, f"PyLocalInventory_{datetime.now():%Y%m%d_%H%M%S}"
+        )
+        archive_path = shutil.make_archive(archive_base, "zip", bundle_dir)
+        if not os.path.isfile(archive_path) or os.path.getsize(archive_path) <= 0:
+            raise RuntimeError("The host created an empty backup archive")
+        return archive_path
+
     def _dispatch(self, method, args, kwargs, user=None):
         request_db = self._borrow_database()
         try:
@@ -340,6 +380,10 @@ class DatabaseServer:
                 return request_db.save_product_with_opening_stock(
                     *args, **kwargs, user=user
                 )
+            if method == 'update_product_with_stock':
+                return request_db.update_product_with_stock(
+                    *args, **kwargs, user=user
+                )
 
             if method == 'get_reports':
                 owner_id = args[0] if args else None
@@ -374,7 +418,10 @@ class DatabaseServer:
             if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
                     or method in _CLIENT_ACCOUNT_METHODS or method in _REPORT_METHODS
                     or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED
-                    or method == 'save_product_with_opening_stock'):
+                    or method in (
+                        'save_product_with_opening_stock',
+                        'update_product_with_stock',
+                    )):
                 return getattr(request_db, method)(*args, **kwargs)
 
             raise ValueError(f"Method not allowed over network: {method}")
@@ -421,6 +468,40 @@ class DatabaseServer:
                 except Exception as e:
                     self._send_json(500, {'error': str(e)})
 
+            def do_GET(self):
+                if self.path != "/backup":
+                    return self._send_json(404, {"error": "not found"})
+                auth_header = self.headers.get("Authorization") or ""
+                token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
+                user = server_obj.sessions.get(token) if token else None
+                if not user:
+                    return self._send_json(401, {"error": "Authentication required"})
+                # A database backup contains every section plus account data.
+                # Restrict it to the role that already administers the host.
+                if not user.get("is_superadmin"):
+                    return self._send_json(
+                        403, {"error": "Only a Super Admin can create a full backup"}
+                    )
+                response_started = False
+                try:
+                    with tempfile.TemporaryDirectory() as work_dir:
+                        archive_path = server_obj._create_client_backup_archive(work_dir)
+                        size = os.path.getsize(archive_path)
+                        filename = os.path.basename(archive_path)
+                        self.send_response(200)
+                        self.send_header("Content-Type", "application/zip")
+                        self.send_header("Content-Length", str(size))
+                        self.send_header(
+                            "Content-Disposition", f'attachment; filename="{filename}"'
+                        )
+                        self.end_headers()
+                        response_started = True
+                        with open(archive_path, "rb") as stream:
+                            shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
+                except Exception as error:
+                    if not response_started:
+                        self._send_json(500, {"error": str(error)})
+
             def _handle_login(self):
                 body = self._read_json()
                 request_db = server_obj._borrow_database()
@@ -435,12 +516,24 @@ class DatabaseServer:
                 if not user:
                     return self._send_json(401, {'error': 'Invalid username or password'})
                 token = server_obj.sessions.create(user)
+                selected_profile = getattr(
+                    getattr(server_obj.database, "profile_manager", None),
+                    "selected_profile", None,
+                )
+                profile_values = {}
+                if selected_profile:
+                    for key in (
+                        "company name", "address", "email", "phone",
+                        "report footer", "currency",
+                    ):
+                        profile_values[key] = selected_profile.get_value(key)
                 self._send_json(200, {
                     'token': token,
                     'user_id': user['id'],
                     'username': user['username'],
                     'is_superadmin': user['is_superadmin'],
                     'permissions': user['permissions'],
+                    'profile': profile_values,
                 })
 
             def _handle_rpc(self):

@@ -14,6 +14,7 @@ import urllib.error
 import urllib.request
 import time
 import os
+import zipfile
 from decimal import Decimal
 from datetime import datetime
 from core.runtime_paths import user_data_root
@@ -22,6 +23,16 @@ from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
 )
 from core.user_manager import SECTION_GROUP
+
+
+class RemoteProfile:
+    """Read-only report branding supplied by the connected host."""
+
+    def __init__(self, values=None):
+        self._values = dict(values or {})
+
+    def get_value(self, key):
+        return self._values.get(key)
 
 
 class RemoteCursor:
@@ -90,6 +101,7 @@ class RemoteDatabase:
         self.permissions = {}
         self.is_superadmin = False
         self.current_user_id = None
+        self.remote_profile = None
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
@@ -149,6 +161,7 @@ class RemoteDatabase:
         self.is_superadmin = data.get('is_superadmin', False)
         self.current_user_id = data.get('user_id')
         self.username = data.get('username') or self.username
+        self.remote_profile = RemoteProfile(data.get("profile") or {})
         return True
 
     def _call(self, method, args=None, kwargs=None):
@@ -219,6 +232,71 @@ class RemoteDatabase:
                 f"response_url={url} http_status={http_status} validation=ok result={self._json_safe(result)}"
             )
         return result
+
+    def download_backup(self, destination):
+        """Stream a host-generated backup to this PC using an atomic rename."""
+        if not self._token:
+            raise AuthError("Not connected")
+        destination = os.path.abspath(os.fspath(destination))
+        parent = os.path.dirname(destination)
+        if not os.path.isdir(parent):
+            raise ValueError("Choose an existing destination folder")
+        partial = destination + ".part"
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}/backup",
+            headers={"Authorization": f"Bearer {self._token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as response:
+                with open(partial, "wb") as stream:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+            if not os.path.isfile(partial) or os.path.getsize(partial) <= 0:
+                raise RuntimeError("The host returned an empty backup")
+            if not zipfile.is_zipfile(partial):
+                raise RuntimeError("The downloaded backup archive is invalid")
+            with zipfile.ZipFile(partial) as archive:
+                dumps = [
+                    item for item in archive.infolist()
+                    if item.filename.lower().endswith((".backup", ".dump"))
+                    and item.file_size > 0
+                ]
+                if not dumps:
+                    raise RuntimeError(
+                        "The downloaded archive does not contain a database backup"
+                    )
+                bad_member = archive.testzip()
+                if bad_member:
+                    raise RuntimeError(
+                        f"The downloaded backup is corrupted at {bad_member}"
+                    )
+            os.replace(partial, destination)
+            return destination
+        except urllib.error.HTTPError as error:
+            try:
+                message = json.loads(error.read().decode("utf-8")).get(
+                    "error", str(error)
+                )
+            except Exception:
+                message = str(error)
+            if error.code == 401:
+                raise AuthError(message)
+            if error.code == 403:
+                raise PermissionDeniedError(message)
+            raise RemoteError(message)
+        except (AuthError, PermissionDeniedError, RemoteError):
+            raise
+        except Exception:
+            if os.path.exists(partial):
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass
+            raise
 
     @classmethod
     def _json_safe(cls, value):

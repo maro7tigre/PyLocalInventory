@@ -2,7 +2,7 @@
 Backup management dialog - create and restore database backups
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QHBoxLayout, 
-                               QMessageBox, QInputDialog, QLineEdit)
+                               QMessageBox, QInputDialog, QLineEdit, QFileDialog)
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 import os
 import re
@@ -38,6 +38,29 @@ class _BackupCreateWorker(QObject):
                 f"{time.perf_counter() - started:.2f} seconds"
             )
 
+
+class _BackupDownloadWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+
+    def __init__(self, database, destination):
+        super().__init__()
+        self.database = database
+        self.destination = destination
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        try:
+            self.finished.emit(self.database.download_backup(self.destination))
+        except Exception as error:
+            self.failed.emit(str(error))
+        finally:
+            print(
+                "[PERFORMANCE] network_backup_download completed in "
+                f"{time.perf_counter() - started:.2f} seconds"
+            )
+
 class BackupsDialog(QDialog):
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -51,6 +74,7 @@ class BackupsDialog(QDialog):
         self.backups_dir = None
         self.selected_backup = None
         self._backup_running = False
+        self.remote_mode = False
         
         # Load configuration - if this fails, dialog will close
         if not self.load_config(parent):
@@ -80,6 +104,9 @@ class BackupsDialog(QDialog):
             }
         """)
         
+        if self.remote_mode:
+            return self._setup_remote_ui()
+
         # Main vertical layout
         layout = QVBoxLayout()
 
@@ -121,6 +148,10 @@ class BackupsDialog(QDialog):
     
     def load_config(self, parent):
         """Load configuration from parent"""
+        database = getattr(parent, "database", None)
+        if database and hasattr(database, "download_backup"):
+            self.remote_mode = True
+            return True
         if hasattr(parent, 'profile_manager') and parent.profile_manager.selected_profile:
             self.current_profile = parent.profile_manager.selected_profile
             self.profile_dir = os.path.dirname(self.current_profile.config_path)
@@ -133,6 +164,98 @@ class BackupsDialog(QDialog):
             QMessageBox.warning(self, "Error", "No profile selected. Please select a profile first.")
             self.reject()
             return False
+
+    def _setup_remote_ui(self):
+        """Client-PC backup UI; the host creates the dump, this PC stores it."""
+        self.setMinimumSize(460, 220)
+        layout = QVBoxLayout(self)
+        header = QLabel("Download Shared Database Backup")
+        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(header)
+        detail = QLabel(
+            "The host will create a consistent database backup and send it "
+            "to a folder you choose on this computer."
+        )
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #9ecbff;")
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.download_btn = GreenButton("Choose Destination")
+        self.download_btn.clicked.connect(self._choose_remote_destination)
+        buttons.addWidget(self.download_btn)
+        self.close_btn = RedButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.close_btn)
+        layout.addLayout(buttons)
+
+    def _choose_remote_destination(self):
+        if self._backup_running:
+            return
+        default_name = f"PyLocalInventory_{datetime.now():%Y-%m-%d_%H-%M-%S}.zip"
+        default_path = os.path.join(
+            os.path.expanduser("~/Documents"), default_name
+        )
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Save Shared Database Backup", default_path,
+            "ZIP backup (*.zip)",
+        )
+        if not destination:
+            return
+        if not destination.lower().endswith(".zip"):
+            destination += ".zip"
+        self._backup_running = True
+        self.download_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.status_label.setText("Creating backup on host and downloading…")
+        thread = QThread(self)
+        worker = _BackupDownloadWorker(
+            getattr(self.parent(), "database"), destination
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._remote_backup_finished)
+        worker.failed.connect(self._remote_backup_failed)
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        self._backup_thread = thread
+        self._backup_worker = worker
+        thread.start()
+
+    @Slot(str)
+    def _remote_backup_finished(self, destination):
+        self._backup_running = False
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.information(
+            self, "Backup Created",
+            f"The shared database backup was validated and saved to:\n{destination}",
+        )
+
+    @Slot(str)
+    def _remote_backup_failed(self, error):
+        self._backup_running = False
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.critical(self, "Backup Failed", error)
+
+    def closeEvent(self, event):
+        if self._backup_running:
+            QMessageBox.information(
+                self, "Backup in Progress",
+                "Wait for the current backup operation to finish before closing.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
     
     def refresh_backups_list(self):
         """Reload backups from filesystem and update cards list"""

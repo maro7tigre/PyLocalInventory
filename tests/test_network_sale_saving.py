@@ -39,6 +39,8 @@ class _Cursor:
         self.rowcount = 1
         if normalized.startswith('select id, name from products'):
             self.fetchone_value = (11, 'Known Product') if str(params[0]).lower() == 'known product' else None
+        elif normalized.startswith('select id from products where id=') and normalized.endswith('for update'):
+            self.fetchone_value = (int(params[0]),)
         elif normalized.startswith('select id, name from services'):
             self.fetchone_value = (22, 'Known Service') if str(params[0]).lower() == 'known service' else None
         elif normalized.startswith('select id, name, username from clients'):
@@ -196,6 +198,27 @@ class NetworkSaleSavingTests(unittest.TestCase):
         database = _database()
         with self.assertRaisesRegex(ValueError, 'received 0 valid items'):
             database.save_sale_with_items({}, [], visible_row_count=2)
+
+    def test_insufficient_stock_rolls_back_sale_and_lines(self):
+        database = _database()
+        with self.assertRaisesRegex(ValueError, "Insufficient stock"):
+            database.save_sale_with_items(
+                {
+                    "client_username": "client", "date": "2026-07-20",
+                    "tva": 0, "state": "pending",
+                },
+                [{
+                    "item_type": "product", "product_name": "Known Product",
+                    "quantity": 101, "unit_price": 10,
+                }],
+                visible_row_count=1,
+            )
+        self.assertEqual(database.conn.commits, 0)
+        self.assertEqual(database.conn.rollbacks, 1)
+        self.assertTrue(any(
+            sql.startswith("select id from products") and sql.endswith("for update")
+            for sql, _params in database.cursor.statements
+        ))
 
 
 if __name__ == '__main__':

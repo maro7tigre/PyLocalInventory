@@ -581,6 +581,24 @@ class BaseTab(QWidget):
                     limit=limit,
                     offset=offset,
                 )
+                # If the optimized summary path unexpectedly returns no rows,
+                # fall back to the generic get_items call so the UI still shows
+                # records while we debug the root cause.
+                if not items:
+                    try:
+                        logger.warning("Summary query returned no rows, falling back to get_items for section=%s", section)
+                        items = database.get_items(
+                            section,
+                            search_text=search_text,
+                            search_columns=self.get_searchable_fields(),
+                            order_by=self._order_by_field(order_option),
+                            order_dir=self._order_direction(order_option),
+                            limit=limit,
+                            offset=offset,
+                        )
+                    except Exception:
+                        # Keep original empty result if fallback fails
+                        pass
             else:
                 items = database.get_items(
                     section,
@@ -611,7 +629,7 @@ class BaseTab(QWidget):
         """Fetch rows for the tab; ownership-aware tabs may override."""
         if hasattr(self.database, 'get_operation_summary_items') and self.section in ('Sales', 'Imports'):
             try:
-                return self.database.get_operation_summary_items(
+                items = self.database.get_operation_summary_items(
                     self.section,
                     search_text=search_text,
                     search_columns=self.get_searchable_fields(),
@@ -620,6 +638,20 @@ class BaseTab(QWidget):
                     limit=limit,
                     offset=offset,
                 )
+                if not items:
+                    try:
+                        logger.warning("Summary fetch empty, falling back to get_items for section=%s", self.section)
+                        return self.database.get_items(
+                            self.section,
+                            search_text=search_text,
+                            search_columns=self.get_searchable_fields(),
+                            order_by=self._order_by_field(order_option),
+                            order_dir=self._order_direction(order_option),
+                            limit=limit,
+                            offset=offset,
+                        )
+                    except Exception:
+                        return items
             except TypeError:
                 pass
         if hasattr(self.database, 'get_items'):

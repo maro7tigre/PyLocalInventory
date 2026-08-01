@@ -66,7 +66,8 @@ class AttachmentPanel(QWidget):
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
         # The client window now focuses solely on that client's sales. Client
-        # attachment controls remain available only in sale attachment dialogs.
+        # For clients, show the sales list (attachments for sales are opened
+        # per-sale). Do not show a separate Attachments tab here.
         if self.entity_type == 'client':
             self._setup_client_sales(layout)
             self.refresh_sales()
@@ -102,6 +103,8 @@ class AttachmentPanel(QWidget):
         self.client_sales_table = None
         self.client_sales_empty = None
         self.refresh()
+
+    # Note: client attachments UI removed — sales view handles per-sale attachments
 
     def _setup_client_sales(self, layout):
         self.client_sales_table = None
@@ -195,7 +198,25 @@ class AttachmentPanel(QWidget):
         self.client_sales_table.setRowCount(0)
         self.client_sales_empty.setVisible(False)
         try:
+            # Prefer DB API by client_id; fall back to username lookup when
+            # client_id-linked rows are missing (legacy/imported data may lack client_id).
             sales = self.database.get_client_sales(self.entity_id)
+            if not sales:
+                try:
+                    # Attempt to resolve username and fetch by matching sales.client_username
+                    self.database.cursor.execute("SELECT username FROM clients WHERE id=%s", (self.entity_id,))
+                    row = self.database.cursor.fetchone()
+                    if row:
+                        username = row[0]
+                        if username:
+                            self.database.cursor.execute(
+                                "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id WHERE LOWER(COALESCE(NULLIF(s.client_username, ''), '')) = LOWER(%s) GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC",
+                                (username,)
+                            )
+                            sales = [list(r) for r in self.database.cursor.fetchall()]
+                except Exception:
+                    # if fallback fails, ignore and continue with empty list
+                    sales = []
         except Exception as exc:
             QMessageBox.warning(self, 'Client sales', f'Could not load this client\'s sales: {exc}')
             sales = []
@@ -278,14 +299,27 @@ class AttachmentPanel(QWidget):
         if self.entity_type != 'sale':
             return
         try:
-            self.database.cursor.execute(
-                'SELECT c.id FROM sales s JOIN clients c ON c.username=s.client_username WHERE s.id=%s',
-                (self.entity_id,)
-            )
+            # First try to mirror via explicit sales.client_id (reliable).
+            self.database.cursor.execute('SELECT client_id, client_username FROM sales WHERE id=%s', (self.entity_id,))
             row = self.database.cursor.fetchone()
-            if not row:
-                raise ValueError('The sale has no linked client; the file was added only to this sale.')
-            self.database.upload_attachment('client', int(row[0]), filename, encoded)
+            client_id = None
+            if row:
+                client_id = int(row[0]) if row[0] not in (None, '', 0) else None
+                username = str(row[1] or '').strip()
+            else:
+                username = ''
+            if client_id:
+                self.database.upload_attachment('client', client_id, filename, encoded)
+                return
+            # Fallback to matching by username for legacy sales without client_id
+            if username:
+                sql = "SELECT id FROM clients WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = LOWER(%s) ORDER BY id LIMIT 1"
+                self.database.cursor.execute(sql, (self.database._normalize_exact(username),))
+                crow = self.database.cursor.fetchone()
+                if crow:
+                    self.database.upload_attachment('client', int(crow[0]), filename, encoded)
+                    return
+            raise ValueError('The sale has no linked client; the file was added only to this sale.')
         except Exception as exc:
             # Preserve the successful sale upload while giving a useful action
             # message if old/imported sales are not linked to a client.
@@ -294,6 +328,14 @@ class AttachmentPanel(QWidget):
             except Exception:
                 pass
             raise RuntimeError(f'Added to the sale, but could not add it to the client: {exc}') from exc
+
+    def _setup_client_attachments(self, layout):
+        # Attachment tab removed; keep placeholder for backward compatibility.
+        pass
+
+    def _refresh_client_attachments(self):
+        # Attachments tab removed; no dynamic refresh required here.
+        return
 
     def scan_document(self):
         if sys.platform != 'win32':

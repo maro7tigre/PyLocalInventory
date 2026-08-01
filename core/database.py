@@ -2462,6 +2462,8 @@ class Database:
         if user and not user.get("is_superadmin"):
             owner_clause = " AND s.created_by=%s"
             params.append(int(user.get("id") or 0))
+
+        # Primary lookup: sales linked by client_id
         self.cursor.execute(
             f"""
             SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''),
@@ -2475,7 +2477,44 @@ class Database:
             """,
             params,
         )
-        return [list(row) for row in self.cursor.fetchall()]
+        rows = [list(row) for row in self.cursor.fetchall()]
+        if rows:
+            return rows
+
+        # Fallback for legacy/imported sales where client_id wasn't populated:
+        # resolve client's username and match against sales.client_username normalized value.
+        try:
+            self.cursor.execute(
+                "SELECT username FROM clients WHERE id=%s",
+                (client_id,)
+            )
+            cres = self.cursor.fetchone()
+            if not cres:
+                return []
+            username = str(cres[0] or '').strip()
+            if not username:
+                return []
+            norm = self._normalize_exact(username)
+            owner_clause2 = ""
+            params2 = [norm]
+            if user and not user.get("is_superadmin"):
+                owner_clause2 = " AND s.created_by=%s"
+                params2.append(int(user.get("id") or 0))
+            sql = (
+                "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), "
+                "COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
+                "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s)"
+                f"{owner_clause2} GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC"
+            )
+            self.cursor.execute(sql, params2)
+            return [list(row) for row in self.cursor.fetchall()]
+        except Exception:
+            try:
+                self.conn.rollback()
+            except Exception:
+                pass
+            return []
 
     def add_client_payment(
         self, client_id, sale_id, sales_item_id, amount, date, user=None

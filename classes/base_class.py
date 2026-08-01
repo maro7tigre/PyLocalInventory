@@ -21,6 +21,9 @@ class BaseClass:
             
             # Check if it's a calculated parameter
             if 'method' in param_info and param_info['method'] is not None:
+                # Prefer an injected cached value if one exists.
+                if param_info.get('value') is not None:
+                    return param_info['value']
                 try:
                     return param_info['method']()
                 except Exception as e:
@@ -115,7 +118,13 @@ class BaseClass:
                 self.set_value(key, value)
             except (KeyError, ValueError) as e:
                 print(f"Warning: Could not set {key}={value}: {e}")
-    
+
+    def set_raw_value(self, param_key, value):
+        """Set a parameter value directly, bypassing calculated checks."""
+        if param_key not in self.parameters:
+            raise KeyError(f"Parameter '{param_key}' not found in {self.section} class.")
+        self.parameters[param_key]["value"] = value
+
     def get_display_name(self, param_key, language=None):
         """Get localized display name for parameter.
         If language is not provided, try to read it from attached database; fallback to 'en'.

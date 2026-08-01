@@ -30,6 +30,7 @@ class _Cursor:
         self.next_sale_id = 42
         self.next_item_id = 1000
         self.statements = []
+        self.description = None
 
     def execute(self, sql, params=()):
         normalized = ' '.join(sql.lower().split())
@@ -37,6 +38,7 @@ class _Cursor:
         self.fetchone_value = None
         self.fetchall_value = []
         self.rowcount = 1
+        self.description = None
         if normalized.startswith('select id, name from products'):
             self.fetchone_value = (11, 'Known Product') if str(params[0]).lower() == 'known product' else None
         elif normalized.startswith('select id from products where id=') and normalized.endswith('for update'):
@@ -53,6 +55,16 @@ class _Cursor:
             self.fetchone_value = (self.next_sale_id,)
         elif normalized.startswith('select id from sales_items'):
             self.fetchall_value = [(item_id,) for item_id in self.existing]
+        elif normalized.startswith('select * from sales'):
+            self.description = [
+                ('id',), ('state',), ('client_id',), ('client_username',), ('date',),
+                ('tva',), ('notes',), ('created_by',), ('created_by_username',),
+                ('created_at',), ('operation_token',),
+            ]
+            self.fetchall_value = [
+                (1, 'pending', 33, 'client', '2026-07-24', 20.0, '', 1, 'user1', '2026-07-24', ''),
+                (2, 'pending', 34, 'client2', '2026-07-25', 0.0, '', 2, 'user2', '2026-07-25', ''),
+            ]
         elif normalized.startswith('insert into sales_items'):
             self.next_item_id += 1
             self.fetchone_value = (self.next_item_id,)
@@ -226,6 +238,21 @@ class NetworkSaleSavingTests(unittest.TestCase):
             sql.startswith("select id from products") and sql.endswith("for update")
             for sql, _params in database.cursor.statements
         ))
+
+    def test_get_items_for_user_returns_all_sales(self):
+        database = _database()
+        database.cursor.fetchall_value = [
+            (1, 'pending', 33, 'client', '2026-07-24', 20.0, '', 1, 'user1', '2026-07-24', ''),
+            (2, 'pending', 34, 'client2', '2026-07-25', 0.0, '', 1, 'user2', '2026-07-25', ''),
+        ]
+        database.cursor.description = [
+            ('id',), ('state',), ('client_id',), ('client_username',), ('date',),
+            ('tva',), ('notes',), ('created_by',), ('created_by_username',),
+            ('created_at',), ('operation_token',),
+        ]
+        user = {'is_superadmin': False, 'id': 7}
+        result = database.get_items_for_user('Sales', user)
+        self.assertEqual(len(result), 2)
 
 
 if __name__ == '__main__':

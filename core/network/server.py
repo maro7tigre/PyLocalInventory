@@ -50,6 +50,7 @@ _SECTION_METHODS = {
     'delete_item': ('delete', 1),               # delete_item(item_id, section)
     'get_items': ('read', 0),                   # get_items(section)
     'get_items_by_operation_id': ('read', 1),   # get_items_by_operation_id(operation_id, section)
+    'get_operation_summary_items': ('read', 0),  # get operation summaries for Sales/Imports
 }
 _ATTACHMENT_METHODS = {
     'list_attachments': ('read', 0),
@@ -63,7 +64,7 @@ _CLIENT_ACCOUNT_METHODS = {
     'get_client_account', 'get_client_sales', 'add_client_payment'
 }
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
-_PRODUCT_READ_METHODS = {'get_product_stock_levels'}
+_PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
 _ALWAYS_ALLOWED = {
     'begin_transaction', 'commit_transaction', 'rollback_transaction',
     'get_dashboard_snapshot',
@@ -184,11 +185,11 @@ def _check_permission(user, method, args, kwargs):
 
     if method in _ATTACHMENT_METHODS:
         kind, index = _ATTACHMENT_METHODS[method]
-        # Attachment id alone cannot reveal scope cheaply before dispatch; both
-        # supported scopes are customer business data, so require access to both.
         if index is None:
-            permitted = all(user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind])
-                            for section in ('Clients', 'Sales'))
+            permitted = any(
+                user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind])
+                for section in ('Clients', 'Sales')
+            )
         else:
             entity = args[index] if len(args) > index else ''
             section = 'Clients' if entity == 'client' else 'Sales' if entity == 'sale' else None
@@ -427,13 +428,7 @@ class DatabaseServer:
                 )
 
             if method == 'get_reports':
-                owner_id = args[0] if args else None
-                date_from = args[1] if len(args) > 1 else None
-                date_to = args[2] if len(args) > 2 else None
-                report_type = args[3] if len(args) > 3 else None
-                return request_db.get_items_for_user(
-                    "Reports", user, owner_id, date_from, date_to, report_type
-                )
+                return request_db.get_reports(**kwargs)
             if method == 'list_report_users':
                 return request_db.list_report_users()
             if method == 'save_report':
@@ -478,7 +473,13 @@ class DatabaseServer:
                 return getattr(request_db, method)(*args, **kwargs, user=user)
 
             if method == 'get_items' and args and args[0] in ('Sales', 'Sales_Items', 'Reports'):
-                return request_db.get_items_for_user(args[0], user)
+                return request_db.get_items_for_user(
+                    args[0], user, **kwargs
+                )
+            if method == 'get_operation_summary_items' and args and args[0] in ('Sales', 'Imports'):
+                return request_db.get_operation_summary_items(
+                    *args, user=user, **kwargs
+                )
             if method == 'get_items_by_operation_id' and len(args) > 1:
                 return request_db.get_operation_items_for_user(args[0], args[1], user)
             if method == 'add_item' and len(args) > 1 and args[1] == 'Reports':

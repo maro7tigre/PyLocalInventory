@@ -132,7 +132,6 @@ class SalesTab(BaseTab):
         options = set()
         for obj in self.all_items:
             try:
-                # Add client usernames, client names, and products
                 client_username = obj.get_value('client_username')
                 client_name = obj.get_value('client_name')
                 information = obj.get_value('information')
@@ -145,18 +144,7 @@ class SalesTab(BaseTab):
                 if information:
                     options.add(str(information))
                 if date:
-                    # Add formatted date
                     options.add(str(date))
-                
-                # Add products from sales items if available
-                if hasattr(obj, 'items') and obj.items:
-                    for item in obj.items:
-                        try:
-                            product_name = item.get_value('product_name')
-                            if product_name:
-                                options.add(str(product_name))
-                        except:
-                            pass
             except:
                 pass
         
@@ -199,24 +187,13 @@ class SalesTab(BaseTab):
             client_name = obj.get_value('client_name') or ""
             information = obj.get_value('information') or ""
             
-            if (search_lower in client_username.lower() or 
+            return (
+                search_lower in client_username.lower() or 
                 search_lower in client_name.lower() or
-                search_lower in information.lower()):
-                return True
-            
-            # Check products in sales items
-            if hasattr(obj, 'items') and obj.items:
-                for item in obj.items:
-                    try:
-                        product_name = item.get_value('product_name') or ""
-                        if search_lower in product_name.lower():
-                            return True
-                    except:
-                        pass
+                search_lower in information.lower()
+            )
         except:
-            pass
-        
-        return False
+            return False
     
     def _matches_date_search(self, obj, date_search):
         """Check if sales matches date search criteria"""
@@ -386,9 +363,18 @@ class SalesTab(BaseTab):
         self.table.setCellWidget(row, col, container)
 
     def _set_progress_cell(self, row, col, obj):
-        items = obj.get_sales_items()
-        total_target = sum(float(item.get_value('quantity') or 0) for item in items)
-        total_prod = sum(int(item.get_value('production') or 0) for item in items)
+        total_target = float(obj.get_value('total_quantity') or 0)
+        total_prod = float(obj.get_value('total_production') or 0)
+        if total_target <= 0:
+            # Fallback for legacy rows or if summary fields were not loaded
+            try:
+                items = obj.get_sales_items()
+                total_target = sum(float(item.get_value('quantity') or 0) for item in items)
+                total_prod = sum(float(item.get_value('production') or 0) for item in items)
+            except Exception:
+                total_target = 0
+                total_prod = 0
+
         pct = min(int(total_prod / total_target * 100), 100) if total_target > 0 else 0
 
         if pct >= 100:

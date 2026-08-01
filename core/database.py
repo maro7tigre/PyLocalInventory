@@ -1769,13 +1769,57 @@ class Database:
             print(f"Error updating item in {section}: {e}")
             return False
 
-    def get_items(self, section):
-        """Get all items from section"""
+    def get_items(
+        self, section, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None
+    ):
+        """Get items from section, optionally filtered, sorted, and paginated."""
         if not self.cursor or section not in self.registered_classes:
             return []
 
         try:
-            self.cursor.execute(f"SELECT * FROM {section}")
+            query = f"SELECT * FROM {section}"
+            params = []
+            conditions = []
+
+            if search_text and search_columns:
+                search_term = f"%{search_text.lower()}%"
+                clauses = []
+                for col in search_columns:
+                    clauses.append(
+                        f"LOWER(COALESCE(CAST({col} AS text), '')) LIKE %s"
+                    )
+                    params.append(search_term)
+                if clauses:
+                    conditions.append("(" + " OR ".join(clauses) + ")")
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            if order_by:
+                direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+                if order_by == 'date':
+                    date_expression = (
+                        "CASE "
+                        "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
+                        "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
+                        "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
+                        "ELSE NULL END"
+                    )
+                    query += f" ORDER BY {date_expression} {direction}"
+                else:
+                    query += f" ORDER BY {order_by} {direction}"
+            else:
+                query += " ORDER BY id"
+
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(int(limit))
+                if offset is not None:
+                    query += " OFFSET %s"
+                    params.append(int(offset))
+
+            self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
 
             # Get column names - Postgres folds unquoted columns to lowercase,
@@ -1785,7 +1829,6 @@ class Database:
             if columns and columns[0].lower() == 'id':
                 columns[0] = 'ID'
 
-            # Convert to list of dictionaries
             return [dict(zip(columns, row)) for row in rows]
 
         except Exception as e:
@@ -1793,9 +1836,113 @@ class Database:
             print(f"Error getting items from {section}: {e}")
             return []
 
+    def get_operation_summary_items(
+        self, section, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None,
+        user=None,
+    ):
+        """Get Sales and Imports rows with precomputed totals and summaries."""
+        if section not in ('Sales', 'Imports'):
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+            )
+
+        base_table = section.lower()
+        item_table = 'sales_items' if section == 'Sales' else 'import_items'
+        foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
+        tva_source = 's.tva' if section == 'Sales' else 'i.tva'
+
+        query = (
+            f"SELECT s.*, "
+            f"COALESCE(summary.subtotal, 0) AS subtotal, "
+            f"COALESCE(summary.total_price, 0) AS total_price, "
+            f"COALESCE(summary.information, '') AS information, "
+            f"COALESCE(summary.total_quantity, 0) AS total_quantity, "
+            f"COALESCE(summary.total_production, 0) AS total_production "
+            f"FROM {base_table} s "
+            f"LEFT JOIN ("
+            f"  SELECT si.{foreign_key}, "
+            f"         SUM(si.quantity * si.unit_price) AS subtotal, "
+            f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
+            f"         COALESCE(STRING_AGG(COALESCE(si.information, ''), ', ' ORDER BY si.id), '') AS information, "
+            f"         COALESCE(SUM(si.quantity), 0) AS total_quantity, "
+            f"         COALESCE(SUM(si.production), 0) AS total_production "
+            f"  FROM {item_table} si "
+            f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
+            f"  GROUP BY si.{foreign_key} "
+            f") summary ON summary.{foreign_key} = s.id "
+        )
+        params = []
+        conditions = []
+
+        if section == 'Sales' and user is not None and not bool(user.get('is_superadmin')):
+            conditions.append("s.created_by=%s")
+            params.append(int(user.get('id') or 0))
+
+        if search_text and search_columns:
+            search_term = f"%{search_text.lower()}%"
+            clauses = []
+            for col in search_columns:
+                if col == 'information':
+                    clauses.append("LOWER(COALESCE(summary.information, '')) LIKE %s")
+                else:
+                    clauses.append(
+                        f"LOWER(COALESCE(CAST(s.{col} AS text), '')) LIKE %s"
+                    )
+                params.append(search_term)
+            if clauses:
+                conditions.append("(" + " OR ".join(clauses) + ")")
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        if order_by:
+            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+            if order_by == 'date':
+                date_expression = (
+                    "CASE "
+                    "WHEN s.date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(s.date, 'DD-MM-YYYY') "
+                    "WHEN s.date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(s.date, 'YYYY-MM-DD') "
+                    "WHEN s.date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(s.date, 'DD/MM/YYYY') "
+                    "ELSE NULL END"
+                )
+                query += f" ORDER BY {date_expression} {direction}"
+            elif order_by in ('subtotal', 'total_price', 'information', 'total_quantity', 'total_production'):
+                query += f" ORDER BY {order_by} {direction}"
+            else:
+                query += f" ORDER BY s.{order_by} {direction}"
+        else:
+            query += " ORDER BY s.id"
+
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+            if offset is not None:
+                query += " OFFSET %s"
+                params.append(int(offset))
+
+        try:
+            self.cursor.execute(query, params)
+            rows = self.cursor.fetchall()
+            columns = [description[0] for description in self.cursor.description]
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+            return [dict(zip(columns, row)) for row in rows]
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Error getting operation summary items for {section}: {e}")
+            return []
+
     def get_items_for_user(
         self, section, user, owner_id=None, date_from=None, date_to=None,
-        report_type=None,
+        report_type=None, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None,
     ):
         """Return ownership-filtered Sales or Reports rows.
 
@@ -1804,32 +1951,49 @@ class Database:
         Legacy rows with no owner remain visible only in the all-user admin view.
         """
         if section == "Sales_Items":
-            user = user or {}
-            if user.get("is_superadmin"):
-                return self.get_items(section)
-            self.cursor.execute(
-                "SELECT si.* FROM sales_items si JOIN sales s ON s.id=si.sales_id "
-                "WHERE s.created_by=%s ORDER BY si.id",
-                (int(user.get("id") or 0),),
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
             )
-            rows = self.cursor.fetchall()
-            columns = [description[0] for description in self.cursor.description]
-            if columns and columns[0].lower() == "id":
-                columns[0] = "ID"
-            return [dict(zip(columns, row)) for row in rows]
+        if section == "Sales":
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+            )
         if section not in ("Sales", "Reports"):
-            return self.get_items(section)
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+            )
         user = user or {}
         is_superadmin = bool(user.get("is_superadmin"))
         effective_owner = owner_id if is_superadmin else user.get("id")
         if not is_superadmin and effective_owner is None:
             return []
+
         query = f"SELECT * FROM {section}"
         params = []
-        if effective_owner not in (None, "", "all"):
-            query += " WHERE created_by=%s"
-            params.append(int(effective_owner))
         conditions = []
+
+        if effective_owner not in (None, "", "all"):
+            conditions.append("created_by=%s")
+            params.append(int(effective_owner))
+
         if section == "Reports":
             if report_type not in (None, "", "all"):
                 conditions.append("COALESCE(NULLIF(report_type, ''), 'General')=%s")
@@ -1842,14 +2006,49 @@ class Database:
                 "ELSE NULL END"
             )
             if date_from:
-                conditions.append(f"{date_expression}>=%s::date")
+                conditions.append(f"{date_expression} >= %s::date")
                 params.append(str(date_from))
             if date_to:
-                conditions.append(f"{date_expression}<=%s::date")
+                conditions.append(f"{date_expression} <= %s::date")
                 params.append(str(date_to))
+
+        if search_text and search_columns:
+            search_term = f"%{search_text.lower()}%"
+            clauses = []
+            for col in search_columns:
+                clauses.append(
+                    f"LOWER(COALESCE(CAST({col} AS text), '')) LIKE %s"
+                )
+                params.append(search_term)
+            if clauses:
+                conditions.append("(" + " OR ".join(clauses) + ")")
+
         if conditions:
-            query += (" AND " if " WHERE " in query else " WHERE ") + " AND ".join(conditions)
-        query += " ORDER BY id"
+            query += " WHERE " + " AND ".join(conditions)
+
+        if order_by:
+            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+            if order_by == 'date':
+                date_expression = (
+                    "CASE "
+                    "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
+                    "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
+                    "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
+                    "ELSE NULL END"
+                )
+                query += f" ORDER BY {date_expression} {direction}"
+            else:
+                query += f" ORDER BY {order_by} {direction}"
+        else:
+            query += " ORDER BY id"
+
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+            if offset is not None:
+                query += " OFFSET %s"
+                params.append(int(offset))
+
         self.cursor.execute(query, params)
         rows = self.cursor.fetchall()
         columns = [description[0] for description in self.cursor.description]
@@ -1875,6 +2074,31 @@ class Database:
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             """
+        )
+        return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    def get_product_stock_levels_for_product_ids(self, product_ids):
+        if not product_ids:
+            return {}
+        self.cursor.execute(
+            """
+            SELECT p.id,
+                   COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
+            FROM products p
+            LEFT JOIN (
+                SELECT product_id, SUM(quantity) AS quantity
+                FROM import_items GROUP BY product_id
+            ) imported ON imported.product_id=p.id
+            LEFT JOIN (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE s.state IS NULL OR s.state<>'on_hold'
+                GROUP BY si.product_id
+            ) sold ON sold.product_id=p.id
+            WHERE p.id = ANY(%s)
+            """,
+            (product_ids,)
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
 
@@ -2047,14 +2271,6 @@ class Database:
         }
 
     def get_operation_items_for_user(self, operation_id, section, user):
-        if section != "Sales_Items" or (user or {}).get("is_superadmin"):
-            return self.get_items_by_operation_id(operation_id, section)
-        self.cursor.execute(
-            "SELECT 1 FROM sales WHERE id=%s AND created_by=%s",
-            (int(operation_id), int((user or {}).get("id") or 0)),
-        )
-        if not self.cursor.fetchone():
-            raise PermissionError("This sale belongs to another user")
         return self.get_items_by_operation_id(operation_id, section)
 
     def list_report_users(self):
@@ -2064,11 +2280,23 @@ class Database:
         return [{"id": int(row[0]), "username": row[1]} for row in self.cursor.fetchall()]
 
     def get_reports(
-        self, owner_id=None, date_from=None, date_to=None, report_type=None
+        self, owner_id=None, date_from=None, date_to=None, report_type=None,
+        search_text=None, search_columns=None, order_by=None, order_dir='asc',
+        limit=None, offset=None,
     ):
         return self.get_items_for_user(
-            "Reports", {"is_superadmin": True, "username": "Local Admin"}, owner_id,
-            date_from, date_to, report_type,
+            "Reports",
+            {"is_superadmin": True, "username": "Local Admin"},
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+            search_text=search_text,
+            search_columns=search_columns,
+            order_by=order_by,
+            order_dir=order_dir,
+            limit=limit,
+            offset=offset,
         )
 
     def save_report(self, report_id, data):

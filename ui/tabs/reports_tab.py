@@ -60,7 +60,7 @@ class ReportsTab(BaseTab):
         self.date_to.setEnabled(enabled)
         self.refresh_table()
 
-    def fetch_items(self):
+    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None):
         owner_id = self.user_filter.currentData() if self.user_filter else None
         use_dates = self.date_filter_enabled.isChecked()
         date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
@@ -68,7 +68,18 @@ class ReportsTab(BaseTab):
         report_type = self.type_filter.currentText()
         if report_type == "All types":
             report_type = None
-        return self.database.get_reports(owner_id, date_from, date_to, report_type)
+        return self.database.get_reports(
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+            search_text=search_text,
+            search_columns=self.get_searchable_fields(),
+            order_by=self._order_by_field(order_option),
+            order_dir=self._order_direction(order_option),
+            limit=limit,
+            offset=offset,
+        )
 
     def background_fetcher(self):
         """Capture filter widgets on the GUI thread before network loading."""
@@ -79,9 +90,22 @@ class ReportsTab(BaseTab):
         report_type = self.type_filter.currentText()
         if report_type == "All types":
             report_type = None
+        search_text = self.search_bar.text().strip()
+        order_option = self.order_combo.currentText()
+        limit = self.page_size + 1
+        offset = self.current_page * self.page_size
         database = self.database
         return lambda: database.get_reports(
-            owner_id, date_from, date_to, report_type
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+            search_text=search_text,
+            search_columns=self.get_searchable_fields(),
+            order_by=self._order_by_field(order_option),
+            order_dir=self._order_direction(order_option),
+            limit=limit,
+            offset=offset,
         )
 
     def details_callback(self, obj_id):

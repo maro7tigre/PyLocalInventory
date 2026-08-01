@@ -85,6 +85,18 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
         self.assertFalse(allowed)
         self.assertIn("ownership-filtered", reason)
 
+    def test_sale_attachment_download_allowed_with_sales_read(self):
+        user = {
+            "is_superadmin": False,
+            "permissions": {
+                "Clients": {"read": False, "write": False, "delete": False},
+                "Sales": {"read": True, "write": False, "delete": False},
+                "Reports": {"read": True, "write": False, "delete": False},
+            },
+        }
+        allowed, _ = _check_permission(user, "download_attachment", [42], {})
+        self.assertTrue(allowed)
+
     def test_read_only_client_dialog_loads_and_hides_payment_controls(self):
         database = RemoteDatabase(can_record_payment=False)
         client = ClientClass(7, database)

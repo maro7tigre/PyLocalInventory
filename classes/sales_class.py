@@ -122,6 +122,20 @@ class SalesClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_total_tva
             },
+            "total_quantity": {
+                "value": 0,
+                "display_name": {"en": "Total Quantity", "fr": "Quantité Totale", "es": "Cantidad Total"},
+                "required": False,
+                "default": 0,
+                "type": "int"
+            },
+            "total_production": {
+                "value": 0,
+                "display_name": {"en": "Total Production", "fr": "Production Totale", "es": "Producción Total"},
+                "required": False,
+                "default": 0,
+                "type": "int"
+            },
             "total_price": {
                 "display_name": {"en": "Total Price", "fr": "Prix Total", "es": "Precio Total"},
                 "required": False,

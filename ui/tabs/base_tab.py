@@ -14,6 +14,7 @@ from ui.widgets.preview_widget import PreviewWidget
 from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingTextEdit
 from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
+from core.database import Database
 from datetime import datetime
 from decimal import Decimal
 import re
@@ -24,21 +25,33 @@ logger = logging.getLogger(__name__)
 
 
 class _RemoteTableFetchWorker(QObject):
-    finished = Signal(object, object, float)
+    finished = Signal(object, object, object, float, int)
     failed = Signal(str, float)
 
-    def __init__(self, fetcher, stock_fetcher=None):
+    def __init__(self, fetcher):
         super().__init__()
         self.fetcher = fetcher
-        self.stock_fetcher = stock_fetcher
 
     @Slot()
     def run(self):
         started = time.perf_counter()
         try:
-            items = self.fetcher()
-            levels = self.stock_fetcher() if self.stock_fetcher else None
-            self.finished.emit(items, levels, started)
+            result = self.fetcher()
+            metrics = {}
+            refresh_id = None
+            if isinstance(result, tuple):
+                if len(result) == 5:
+                    items, levels, metrics, refresh_id, memory_info = result
+                elif len(result) == 4:
+                    items, levels, metrics, refresh_id = result
+                elif len(result) == 3:
+                    items, levels, metrics = result
+                else:
+                    items, levels = result
+            else:
+                items = result
+                levels = None
+            self.finished.emit(items, levels, metrics, started, refresh_id)
         except Exception as error:
             logger.exception("Remote table fetch failed")
             self.failed.emit(str(error), started)
@@ -176,7 +189,7 @@ class BaseTab(QWidget):
         self.can_write = self.database.has_permission(self.section, 'write') if self.database else True
         self.can_delete = self.database.has_permission(self.section, 'delete') if self.database else True
 
-        # Store all items for filtering
+        # Store current page of items for filtering/rendering
         self.all_items = []
         self.filtered_items = []
         self._refreshing = False
@@ -184,7 +197,14 @@ class BaseTab(QWidget):
         self._loaded_once = False
         self._needs_refresh = True
         self._last_refresh_at = 0.0
-        
+        self._refresh_id = 0
+        self._refresh_thread = None
+        self._refresh_worker = None
+
+        self.page_size = 100
+        self.current_page = 0
+        self._has_more_rows = False
+
         self.setup_ui()
         app = QApplication.instance()
         if app:
@@ -260,7 +280,29 @@ class BaseTab(QWidget):
         self.refresh_btn.setMinimumHeight(20)
         self.refresh_btn.clicked.connect(self.refresh_table)
         controls_layout.addWidget(self.refresh_btn)
-        
+
+        self.prev_page_btn = BlueButton("< Prev")
+        self.prev_page_btn.setMinimumHeight(20)
+        self.prev_page_btn.clicked.connect(self.go_to_previous_page)
+        controls_layout.addWidget(self.prev_page_btn)
+
+        self.page_label = QLabel("Page 1")
+        self.page_label.setStyleSheet("font-size: 14px; padding: 0 8px;")
+        self.page_label.setMinimumWidth(80)
+        controls_layout.addWidget(self.page_label)
+
+        self.next_page_btn = BlueButton("Next >")
+        self.next_page_btn.setMinimumHeight(20)
+        self.next_page_btn.clicked.connect(self.go_to_next_page)
+        controls_layout.addWidget(self.next_page_btn)
+
+        self.page_size_combo = QComboBox()
+        self.page_size_combo.addItems(["25", "50", "100", "200"])
+        self.page_size_combo.setCurrentText(str(self.page_size))
+        self.page_size_combo.currentTextChanged.connect(self.on_page_size_changed)
+        self.page_size_combo.setMinimumWidth(80)
+        controls_layout.addWidget(self.page_size_combo)
+
         self.add_additional_toolbar_buttons(controls_layout)
         
         layout.addLayout(controls_layout)
@@ -333,110 +375,66 @@ class BaseTab(QWidget):
         return self.parameter_definitions.get(column_key, {})
     
     def refresh_table(self):
-        """Refresh table data from database"""
+        """Refresh table data from database."""
         if self._refreshing:
             return
         if not self.database:
             QMessageBox.warning(self, "Error", "No database connection")
             return
 
+        self._refresh_id += 1
+        refresh_id = self._refresh_id
+        self.table.setRowCount(0)
+
         if self.database.__class__.__name__ == "RemoteDatabase":
-            self._start_remote_refresh()
+            self._start_remote_refresh(refresh_id)
             return
 
-        self._refreshing = True
-        started = time.perf_counter()
-        try:
-            print(f"🔄 Refreshing {self.section} table...")
-            
-            # Clear table first
-            self.table.setRowCount(0)
-            
-            # Get items from database
-            items_data = self.fetch_items()
-            self.all_items = []
-            if self.section == "Products":
-                try:
-                    levels = self.database.get_product_stock_levels()
-                    self.database._product_stock_levels = {
-                        int(key): value for key, value in levels.items()
-                    }
-                except Exception as stock_error:
-                    print(f"Could not prefetch product stock: {stock_error}")
-            
-            print(f"📦 Found {len(items_data)} items in database for {self.section}")
+        self._start_local_refresh(refresh_id)
+        return
 
-            for item_data in items_data:
-                # Create object instance to get calculated values
-                try:
-                    obj = self.object_class(item_data.get('ID', 0), self.database)
+    def _create_worker_database(self):
+        """Create an independent database connection for background refreshes."""
+        if self.database is None:
+            return None
+        if self.database.__class__.__name__ == 'RemoteDatabase':
+            return self.database
 
-                    # Load data from database
-                    for key, value in item_data.items():
-                        if key in obj.parameters and not obj.is_parameter_calculated(key):
-                            # Map database field names to parameter names
-                            param_key = key
-                            if key == 'ID':
-                                param_key = 'id'
+        worker_db = Database(self.database.profile_manager)
+        worker_db.language = getattr(self.database, 'language', 'en')
+        worker_db.registered_classes = self.database.registered_classes
+        if getattr(self.database, 'profile_manager', None):
+            if not worker_db.connect():
+                raise RuntimeError("Failed to connect worker database")
+        return worker_db
 
-                            try:
-                                if param_key in obj.parameters:
-                                    obj.set_value(param_key, value)
-                            except (KeyError, ValueError):
-                                pass  # Skip invalid parameters
-
-                    self.all_items.append(obj)
-                except Exception as e:
-                    print(f"Error processing {self.section} item: {e}")
-                    continue
-
-            print(f"✓ Loaded {len(self.all_items)} objects for {self.section}")
-            
-            # Update search options
-            self.search_bar.update_options(self.get_search_options())
-
-            # Apply current filter and repopulate table
-            self.filter_table()
-            self._loaded_once = True
-            self._needs_refresh = False
-            self._last_refresh_at = time.monotonic()
-            
-            print(f"✓ {self.section} table refresh complete")
-
-        except PermissionDeniedError as e:
-            # MainWindow already hides this tab when the user has no read
-            # permission, so this only fires if access was revoked mid-session
-            # - fail quietly with an empty table rather than an alarming dialog.
-            print(f"No read permission for {self.section}, leaving table empty: {e}")
-            self.table.setRowCount(0)
-        except Exception as e:
-            logger.exception("Failed to refresh section=%s", self.section)
-            print(f"Error refreshing {self.section} table: {e}")
-            QMessageBox.critical(self, "Error", f"Failed to refresh {self.section}: {e}")
-        finally:
-            self._refreshing = False
-            elapsed = time.perf_counter() - started
-            logger.log(
-                logging.WARNING if elapsed >= 0.5 else logging.INFO,
-                "load_%s completed in %.3f seconds rows=%d",
-                self.section.lower(), elapsed, len(self.all_items),
-            )
-            print(
-                f"[PERFORMANCE] load_{self.section.lower()} completed in "
-                f"{elapsed:.3f} seconds"
-            )
-
-    def _start_remote_refresh(self):
-        """Fetch LAN data on a worker; all Qt updates remain on this thread."""
+    def _start_remote_refresh(self, refresh_id):
+        """Fetch data on a worker thread; all Qt updates remain on the main thread."""
         self._refreshing = True
         self.refresh_btn.setEnabled(False)
-        fetcher = self.background_fetcher()
-        stock_fetcher = (
-            self.database.get_product_stock_levels
-            if self.section == "Products" else None
-        )
+        fetcher = self.background_fetcher(refresh_id)
+        self._start_refresh(fetcher, refresh_id, mode='client')
+
+    def _start_local_refresh(self, refresh_id):
+        """Fetch data on a worker thread using a dedicated local database connection."""
+        self._refreshing = True
+        self.refresh_btn.setEnabled(False)
+        try:
+            worker_db = self._create_worker_database()
+        except Exception as error:
+            self._refreshing = False
+            self.refresh_btn.setEnabled(True)
+            logger.exception("Failed to create worker database for section=%s", self.section)
+            QMessageBox.critical(
+                self, "Error", f"Cannot start local background refresh: {error}"
+            )
+            return
+        fetcher = self.background_fetcher(refresh_id, database=worker_db)
+        self._start_refresh(fetcher, refresh_id, worker_db=worker_db, mode='local')
+
+    def _start_refresh(self, fetcher, refresh_id, worker_db=None, mode='local'):
         thread = QThread(self)
-        worker = _RemoteTableFetchWorker(fetcher, stock_fetcher)
+        worker = _RemoteTableFetchWorker(fetcher)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._remote_refresh_finished)
@@ -447,50 +445,86 @@ class BaseTab(QWidget):
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda: setattr(self, "_refresh_thread", None))
+        if worker_db is not None:
+            thread.finished.connect(lambda: worker_db.close())
         self._refresh_thread = thread
         self._refresh_worker = worker
+        self._refresh_mode = mode
         thread.start()
 
-    @Slot(object, object, float)
-    def _remote_refresh_finished(self, items_data, levels, started):
+    def _apply_refresh_results(self, items_data, levels, metrics, started, refresh_id):
+        if refresh_id != self._refresh_id:
+            logger.info(
+                "Discarding stale refresh result section=%s refresh_id=%s current_id=%s",
+                self.section, refresh_id, self._refresh_id,
+            )
+            return
+
+        self.all_items = []
+        if levels is not None:
+            self.database._product_stock_levels = {
+                int(key): value for key, value in levels.items()
+            }
+
+        if len(items_data) > self.page_size:
+            self._has_more_rows = True
+            items_data = items_data[:self.page_size]
+        else:
+            self._has_more_rows = False
+
+        object_prep_start = time.perf_counter()
+        for item_data in items_data:
+            try:
+                obj = self.object_class(item_data.get('ID', 0), self.database)
+                for key, value in item_data.items():
+                    if key in obj.parameters:
+                        param_key = 'id' if key == 'ID' else key
+                        try:
+                            obj.set_raw_value(param_key, value)
+                        except (KeyError, ValueError):
+                            logger.warning(
+                                "Invalid refresh value section=%s field=%s id=%s",
+                                self.section, param_key, item_data.get("ID"),
+                            )
+                self.all_items.append(obj)
+            except Exception:
+                logger.exception(
+                    "Failed processing section=%s id=%s",
+                    self.section, item_data.get("ID"),
+                )
+        object_prep_duration = (time.perf_counter() - object_prep_start) * 1000
+        metrics = metrics or {}
+        metrics['object_prep_ms'] = object_prep_duration
+
+        self.search_bar.update_options(self.get_search_options())
+        self.filtered_items = list(self.all_items)
+        render_start = time.perf_counter()
+        self.populate_table_with_items(self.filtered_items)
+        render_duration = (time.perf_counter() - render_start) * 1000
+        metrics['render_ms'] = render_duration
+
+        self._loaded_once = True
+        self._needs_refresh = False
+        self._last_refresh_at = time.monotonic()
+        self._update_paging_controls()
+
+        metrics['rows'] = len(self.all_items)
+        logger.info(
+            "refresh_metrics section=%s refresh_id=%s rows=%d metrics=%s",
+            self.section, refresh_id, len(self.all_items), metrics,
+        )
+
+    @Slot(object, object, object, float, int)
+    def _remote_refresh_finished(self, items_data, levels, metrics, started, refresh_id):
         try:
-            self.all_items = []
-            if levels is not None:
-                self.database._product_stock_levels = {
-                    int(key): value for key, value in levels.items()
-                }
-            for item_data in items_data:
-                try:
-                    obj = self.object_class(item_data.get('ID', 0), self.database)
-                    for key, value in item_data.items():
-                        if key in obj.parameters and not obj.is_parameter_calculated(key):
-                            param_key = 'id' if key == 'ID' else key
-                            try:
-                                if param_key in obj.parameters:
-                                    obj.set_value(param_key, value)
-                            except (KeyError, ValueError):
-                                logger.warning(
-                                    "Invalid remote value section=%s field=%s id=%s",
-                                    self.section, param_key, item_data.get("ID"),
-                                )
-                    self.all_items.append(obj)
-                except Exception:
-                    logger.exception(
-                        "Failed processing remote section=%s id=%s",
-                        self.section, item_data.get("ID"),
-                    )
-            self.search_bar.update_options(self.get_search_options())
-            self.filter_table()
-            self._loaded_once = True
-            self._needs_refresh = False
-            self._last_refresh_at = time.monotonic()
+            self._apply_refresh_results(items_data, levels, metrics, started, refresh_id)
         except Exception as error:
-            logger.exception("Failed applying remote section=%s", self.section)
+            logger.exception("Failed applying section=%s", self.section)
             QMessageBox.critical(
                 self, "Error", f"Failed to refresh {self.section}: {error}"
             )
         finally:
-            self._finish_remote_refresh(started)
+            self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
 
     @Slot(str, float)
     def _remote_refresh_failed(self, error, started):
@@ -499,16 +533,21 @@ class BaseTab(QWidget):
             self, "Connection Error",
             f"Failed to load {self.section} from the host:\n{error}",
         )
-        self._finish_remote_refresh(started)
+        self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
 
-    def _finish_remote_refresh(self, started):
+    def _finish_refresh(self, started, mode='client'):
         self._refreshing = False
         self.refresh_btn.setEnabled(True)
         elapsed = time.perf_counter() - started
+        rows = len(self.all_items)
         logger.log(
             logging.WARNING if elapsed >= 0.5 else logging.INFO,
-            "load_%s completed in %.3f seconds rows=%d mode=client",
-            self.section.lower(), elapsed, len(self.all_items),
+            "load_%s completed in %.3f seconds rows=%d mode=%s",
+            self.section.lower(), elapsed, rows, mode,
+        )
+        print(
+            f"[PERFORMANCE] load_{self.section.lower()} page={self.current_page + 1} "
+            f"completed in {elapsed:.3f} seconds mode={mode} rows={rows}"
         )
 
     def _wait_for_refresh_thread(self):
@@ -522,20 +561,85 @@ class BaseTab(QWidget):
                     "Remote refresh thread did not stop section=%s", self.section
                 )
 
-    def background_fetcher(self):
-        """Capture a UI-free request before the worker thread starts."""
-        database = self.database
+    def background_fetcher(self, refresh_id=None, database=None):
+        """Capture filter and paging state before the worker thread starts."""
+        database = database or self.database
         section = self.section
-        return lambda: database.get_items(section)
+        search_text = self.search_bar.text().strip()
+        order_option = self.order_combo.currentText()
+        limit = self.page_size + 1
+        offset = self.current_page * self.page_size
 
-    def fetch_items(self):
+        def fetch():
+            if hasattr(database, 'get_operation_summary_items') and section in ('Sales', 'Imports'):
+                items = database.get_operation_summary_items(
+                    section,
+                    search_text=search_text,
+                    search_columns=self.get_searchable_fields(),
+                    order_by=self._order_by_field(order_option),
+                    order_dir=self._order_direction(order_option),
+                    limit=limit,
+                    offset=offset,
+                )
+            else:
+                items = database.get_items(
+                    section,
+                    search_text=search_text,
+                    search_columns=self.get_searchable_fields(),
+                    order_by=self._order_by_field(order_option),
+                    order_dir=self._order_direction(order_option),
+                    limit=limit,
+                    offset=offset,
+                )
+
+            levels = None
+            if section == 'Products':
+                product_ids = [int(item.get('ID')) for item in items if item.get('ID') is not None]
+                if hasattr(database, 'get_product_stock_levels_for_product_ids'):
+                    try:
+                        levels = database.get_product_stock_levels_for_product_ids(product_ids)
+                    except Exception:
+                        levels = database.get_product_stock_levels()
+                else:
+                    levels = database.get_product_stock_levels()
+
+            return items, levels, {}, refresh_id
+
+        return fetch
+
+    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None):
         """Fetch rows for the tab; ownership-aware tabs may override."""
-        return self.database.get_items(self.section)
+        if hasattr(self.database, 'get_operation_summary_items') and self.section in ('Sales', 'Imports'):
+            try:
+                return self.database.get_operation_summary_items(
+                    self.section,
+                    search_text=search_text,
+                    search_columns=self.get_searchable_fields(),
+                    order_by=self._order_by_field(order_option),
+                    order_dir=self._order_direction(order_option),
+                    limit=limit,
+                    offset=offset,
+                )
+            except TypeError:
+                pass
+        if hasattr(self.database, 'get_items'):
+            try:
+                return self.database.get_items(
+                    self.section,
+                    search_text=search_text,
+                    search_columns=self.get_searchable_fields(),
+                    order_by=self._order_by_field(order_option),
+                    order_dir=self._order_direction(order_option),
+                    limit=limit,
+                    offset=offset,
+                )
+            except TypeError:
+                return self.database.get_items(self.section)
+        return []
     
     def refresh_on_tab_switch(self):
         """Load lazily and avoid repeating blocking network refreshes."""
         try:
-            # Only refresh if database is connected
             if self.database and hasattr(self.database, 'conn') and self.database.conn:
                 stale = time.monotonic() - self._last_refresh_at >= 30.0
                 if not self._loaded_once or self._needs_refresh or stale:
@@ -547,6 +651,50 @@ class BaseTab(QWidget):
     def mark_dirty(self):
         """Request one refresh the next time this tab becomes visible."""
         self._needs_refresh = True
+
+    def on_page_size_changed(self, value):
+        try:
+            self.page_size = int(value)
+        except (ValueError, TypeError):
+            self.page_size = 100
+        self.current_page = 0
+        self.refresh_table()
+
+    def go_to_previous_page(self):
+        if self.current_page <= 0:
+            return
+        self.current_page -= 1
+        self.refresh_table()
+
+    def go_to_next_page(self):
+        if not self._has_more_rows:
+            return
+        self.current_page += 1
+        self.refresh_table()
+
+    def _update_paging_controls(self):
+        self.page_label.setText(f"Page {self.current_page + 1}")
+        self.prev_page_btn.setEnabled(self.current_page > 0)
+        self.next_page_btn.setEnabled(self._has_more_rows)
+
+    def _order_by_field(self, order_option):
+        if not order_option or order_option == "Default":
+            return None
+        if " ↑" in order_option:
+            return order_option.replace(" ↑", "").lower().replace(" ", "_")
+        if " ↓" in order_option:
+            return order_option.replace(" ↓", "").lower().replace(" ", "_")
+        return order_option.lower().replace(" ", "_")
+
+    def _order_direction(self, order_option):
+        if not order_option or order_option == "Default":
+            return 'asc'
+        return 'desc' if " ↓" in order_option else 'asc'
+
+    def filter_table(self):
+        """Refresh the current page when the user changes search or order."""
+        self.current_page = 0
+        self.refresh_table()
     
     def set_table_cell(self, row, col, column_key, obj):
         """Set table cell value based on parameter type"""

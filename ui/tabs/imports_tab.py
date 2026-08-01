@@ -63,7 +63,6 @@ class ImportsTab(BaseTab):
         options = set()
         for obj in self.all_items:
             try:
-                # Add supplier usernames, supplier names, and products
                 supplier_username = obj.get_value('supplier_username')
                 supplier_name = obj.get_value('supplier_name')
                 date = obj.get_value('date')
@@ -73,18 +72,7 @@ class ImportsTab(BaseTab):
                 if supplier_name:
                     options.add(str(supplier_name))
                 if date:
-                    # Add formatted date
                     options.add(str(date))
-                
-                # Add products from import items if available
-                if hasattr(obj, 'items') and obj.items:
-                    for item in obj.items:
-                        try:
-                            product_name = item.get_value('product_name')
-                            if product_name:
-                                options.add(str(product_name))
-                        except:
-                            pass
             except:
                 pass
         
@@ -116,33 +104,19 @@ class ImportsTab(BaseTab):
         
         search_lower = search_text.lower()
         
-        # Check for date search patterns first
         date_search = self.parse_date_search(search_text)
         if date_search:
             return self._matches_date_search(obj, date_search)
         
-        # Check supplier username, supplier name, and products
         try:
             supplier_username = obj.get_value('supplier_username') or ""
             supplier_name = obj.get_value('supplier_name') or ""
-            
-            if (search_lower in supplier_username.lower() or 
-                search_lower in supplier_name.lower()):
-                return True
-            
-            # Check products in import items
-            if hasattr(obj, 'items') and obj.items:
-                for item in obj.items:
-                    try:
-                        product_name = item.get_value('product_name') or ""
-                        if search_lower in product_name.lower():
-                            return True
-                    except:
-                        pass
+            return (
+                search_lower in supplier_username.lower() or 
+                search_lower in supplier_name.lower()
+            )
         except:
-            pass
-        
-        return False
+            return False
     
     def _matches_date_search(self, obj, date_search):
         """Check if import matches date search criteria"""

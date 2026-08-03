@@ -1,5 +1,6 @@
 """Reusable client/sale attachment section with no host path exposure."""
 import base64
+import logging
 import os
 import shutil
 import subprocess
@@ -7,6 +8,8 @@ import sys
 import tempfile
 from datetime import datetime
 from pathlib import Path
+
+logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon
@@ -198,25 +201,10 @@ class AttachmentPanel(QWidget):
         self.client_sales_table.setRowCount(0)
         self.client_sales_empty.setVisible(False)
         try:
-            # Prefer DB API by client_id; fall back to username lookup when
-            # client_id-linked rows are missing (legacy/imported data may lack client_id).
+            # get_client_sales() already matches by both client_id and by
+            # username against sales.client_username, so it returns the full
+            # set of this client's sales in one call.
             sales = self.database.get_client_sales(self.entity_id)
-            if not sales:
-                try:
-                    # Attempt to resolve username and fetch by matching sales.client_username
-                    self.database.cursor.execute("SELECT username FROM clients WHERE id=%s", (self.entity_id,))
-                    row = self.database.cursor.fetchone()
-                    if row:
-                        username = row[0]
-                        if username:
-                            self.database.cursor.execute(
-                                "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id WHERE LOWER(COALESCE(NULLIF(s.client_username, ''), '')) = LOWER(%s) GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC",
-                                (username,)
-                            )
-                            sales = [list(r) for r in self.database.cursor.fetchall()]
-                except Exception:
-                    # if fallback fails, ignore and continue with empty list
-                    sales = []
         except Exception as exc:
             QMessageBox.warning(self, 'Client sales', f'Could not load this client\'s sales: {exc}')
             sales = []
@@ -437,13 +425,20 @@ class AttachmentPanel(QWidget):
         if not selected: return
         record = selected[0]
         if record['mime_type'] == 'application/pdf': return self.open_selected()
-        image = QImage.fromData(self._bytes(record))
+        try:
+            image = QImage.fromData(self._bytes(record))
+        except Exception as exc:
+            logger.exception("Preview download failed for attachment %s", record.get('id'))
+            QMessageBox.warning(self, 'Preview', f"Could not download '{record['display_name']}':\n{exc}")
+            return
         if image.isNull(): return QMessageBox.warning(self, 'Preview', 'This image cannot be previewed.')
         dialog = QDialog(self); dialog.setWindowTitle(record['display_name']); dialog.resize(900, 700)
         label = QLabel(); label.setPixmap(QPixmap.fromImage(image).scaled(850, 650, Qt.KeepAspectRatio, Qt.SmoothTransformation)); label.setAlignment(Qt.AlignCenter)
         scroll = QScrollArea(); scroll.setWidget(label); scroll.setWidgetResizable(True); QVBoxLayout(dialog).addWidget(scroll); dialog.exec()
 
     def _export(self, record, directory=None):
+        """Download this attachment to a local file. Raises on failure -
+        callers decide how to present that (each action has its own wording)."""
         target = Path(directory) / record['original_filename'] if directory else None
         if not target:
             filename, _ = QFileDialog.getSaveFileName(self, 'Save attachment', record['original_filename'])
@@ -454,27 +449,59 @@ class AttachmentPanel(QWidget):
 
     def open_selected(self):
         for record in self._selected():
-            path = self._export(record, os.getenv('TEMP') or '.')
+            try:
+                path = self._export(record, os.getenv('TEMP') or '.')
+            except Exception as exc:
+                logger.exception("Open failed for attachment %s", record.get('id'))
+                QMessageBox.warning(self, 'Open', f"Could not open '{record['display_name']}':\n{exc}")
+                continue
             if path: QDesktopServices.openUrl(path.as_uri())
 
     def export_selected(self):
-        for record in self._selected(): self._export(record)
+        for record in self._selected():
+            try:
+                self._export(record)
+            except Exception as exc:
+                logger.exception("Export failed for attachment %s", record.get('id'))
+                QMessageBox.warning(self, 'Export', f"Could not save '{record['display_name']}':\n{exc}")
 
     def print_selected(self):
         for record in self._selected():
-            path = self._export(record, os.getenv('TEMP') or '.')
+            try:
+                path = self._export(record, os.getenv('TEMP') or '.')
+            except Exception as exc:
+                logger.exception("Print download failed for attachment %s", record.get('id'))
+                QMessageBox.warning(self, 'Print', f"Could not download '{record['display_name']}':\n{exc}")
+                continue
             try: os.startfile(str(path), 'print')
-            except Exception as exc: QMessageBox.warning(self, 'Print', f'Could not print {record["display_name"]}: {exc}')
+            except Exception as exc:
+                logger.exception("Print failed for attachment %s", record.get('id'))
+                QMessageBox.warning(self, 'Print', f'Could not print {record["display_name"]}: {exc}')
 
     def rename_selected(self):
         selected = self._selected()
         if len(selected) != 1: return
         record = selected[0]; name, ok = QInputDialog.getText(self, 'Attachment details', 'Display name:', QLineEdit.Normal, record['display_name'])
         if ok and name.strip():
-            self.database.update_attachment(record['id'], name.strip()); self.refresh()
+            try:
+                self.database.update_attachment(record['id'], name.strip())
+            except Exception as exc:
+                logger.exception("Rename failed for attachment %s", record.get('id'))
+                QMessageBox.warning(self, 'Rename', f"Could not rename '{record['display_name']}':\n{exc}")
+                return
+            self.refresh()
 
     def delete_selected(self):
         selected = self._selected()
-        if selected and QMessageBox.question(self, 'Delete attachment', f'Delete {len(selected)} selected attachment(s)?') == QMessageBox.Yes:
-            for record in selected: self.database.delete_attachment(record['id'])
-            self.refresh()
+        if not selected or QMessageBox.question(self, 'Delete attachment', f'Delete {len(selected)} selected attachment(s)?') != QMessageBox.Yes:
+            return
+        errors = []
+        for record in selected:
+            try:
+                self.database.delete_attachment(record['id'])
+            except Exception as exc:
+                logger.exception("Delete failed for attachment %s", record.get('id'))
+                errors.append(f"{record['display_name']}: {exc}")
+        self.refresh()
+        if errors:
+            QMessageBox.warning(self, 'Some files were not deleted', '\n'.join(errors))

@@ -15,6 +15,17 @@ class ClientsTab(BaseTab):
     def __init__(self, database=None, parent=None):
         super().__init__(ClientClass, ClientEditDialog, database, parent)
 
+    def refresh_on_tab_switch(self):
+        """Clients are shared/edited by other users concurrently, so always
+        reload from the database on switch instead of relying on BaseTab's
+        30s staleness cache — otherwise a collaborator's additions/edits stay
+        invisible until the cache happens to expire."""
+        try:
+            if self.database and hasattr(self.database, 'conn') and self.database.conn:
+                self.refresh_table()
+        except Exception as e:
+            print(f"Error refreshing {self.section} tab on switch: {e}")
+
     def add_additional_toolbar_buttons(self, layout):
         """Add the client account view command."""
         self.view_client_btn = BlueButton("View Client")
@@ -62,12 +73,12 @@ class ClientsTab(BaseTab):
                 QMessageBox.information(self, "No Selection", "Please select a client first.")
                 return
 
-            client = next((item for item in self.all_items if item.id == client_id), None)
-            if client is None:
-                client = ClientClass(client_id, self.database)
-                if not client.load_database_data():
-                    QMessageBox.warning(self, "Client Error", "Could not load the selected client.")
-                    return
+            # Always load fresh from the database instead of reusing the cached
+            # row object, so changes made by other users show up immediately.
+            client = ClientClass(client_id, self.database)
+            if not client.load_database_data():
+                QMessageBox.warning(self, "Client Error", "Could not load the selected client.")
+                return
 
             dialog = ClientDetailsDialog(client, self.database, self)
             dialog.showMaximized()
@@ -77,8 +88,8 @@ class ClientsTab(BaseTab):
 
     def details_callback(self, obj_id):
         """Open client details from any future details cell."""
-        client = next((item for item in self.all_items if item.id == obj_id), None)
-        if client:
+        client = ClientClass(obj_id, self.database)
+        if client.load_database_data():
             dialog = ClientDetailsDialog(client, self.database, self)
             dialog.showMaximized()
             dialog.exec()

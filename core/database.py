@@ -2407,15 +2407,31 @@ class Database:
         view a client's account without granting broad Sales table access.
         """
         client_id = int(client_id)
-        self.cursor.execute("SELECT id FROM clients WHERE id = %s", (client_id,))
-        if not self.cursor.fetchone():
+        self.cursor.execute("SELECT id, username FROM clients WHERE id = %s", (client_id,))
+        client_row = self.cursor.fetchone()
+        if not client_row:
             raise ValueError(f"Client {client_id} does not exist")
+        norm = self._normalize_exact(client_row[1]) if client_row[1] else None
 
         owner_clause = ""
         owner_params = []
         if user and not user.get("is_superadmin"):
             owner_clause = " AND s.created_by = %s"
             owner_params.append(int(user.get("id") or 0))
+
+        # Match by client_id as well as by the client's username against
+        # sales.client_username: see get_client_sales() for why client_id
+        # alone can miss sales that still belong to this client.
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            match_params = [client_id, norm]
+        else:
+            match_clause = "s.client_id=%s"
+            match_params = [client_id]
+
         self.cursor.execute(
             f"""
             SELECT
@@ -2429,10 +2445,10 @@ class Database:
                 COALESCE(s.tva, 0)
             FROM sales s
             JOIN sales_items si ON si.sales_id = s.id
-            WHERE s.client_id = %s{owner_clause}
+            WHERE {match_clause}{owner_clause}
             ORDER BY s.id, si.id
             """,
-            (client_id, *owner_params),
+            (*match_params, *owner_params),
         )
         purchase_rows = self.cursor.fetchall()
         sale_ids = sorted({row[0] for row in purchase_rows})
@@ -2455,59 +2471,54 @@ class Database:
         }
 
     def get_client_sales(self, client_id, user=None):
-        """Return aggregate sale rows for a client through an ownership-safe API."""
+        """Return aggregate sale rows for a client through an ownership-safe API.
+
+        Matches sales both by client_id and by the client's username against
+        sales.client_username, since a sale's client_id can get zeroed out
+        independently of its client_name snapshot (e.g. when the linked
+        client record is temporarily unresolved) while still belonging to
+        this client. Matching only one of the two hides real sales."""
         client_id = int(client_id)
+
+        try:
+            self.cursor.execute("SELECT username FROM clients WHERE id=%s", (client_id,))
+            cres = self.cursor.fetchone()
+            username = str(cres[0] or '').strip() if cres else ''
+        except Exception:
+            username = ''
+
+        norm = self._normalize_exact(username) if username else None
+
         owner_clause = ""
-        params = [client_id]
+        owner_params = []
         if user and not user.get("is_superadmin"):
             owner_clause = " AND s.created_by=%s"
-            params.append(int(user.get("id") or 0))
+            owner_params = [int(user.get("id") or 0)]
 
-        # Primary lookup: sales linked by client_id
-        self.cursor.execute(
-            f"""
-            SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''),
-                   COALESCE(s.tva, 0),
-                   COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal
-            FROM sales s
-            LEFT JOIN sales_items si ON si.sales_id=s.id
-            WHERE s.client_id=%s{owner_clause}
-            GROUP BY s.id, s.notes, s.date, s.tva
-            ORDER BY s.date DESC, s.id DESC
-            """,
-            params,
-        )
-        rows = [list(row) for row in self.cursor.fetchall()]
-        if rows:
-            return rows
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            params = [client_id, norm] + owner_params
+        else:
+            match_clause = "s.client_id=%s"
+            params = [client_id] + owner_params
 
-        # Fallback for legacy/imported sales where client_id wasn't populated:
-        # resolve client's username and match against sales.client_username normalized value.
         try:
             self.cursor.execute(
-                "SELECT username FROM clients WHERE id=%s",
-                (client_id,)
+                f"""
+                SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''),
+                       COALESCE(s.tva, 0),
+                       COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal
+                FROM sales s
+                LEFT JOIN sales_items si ON si.sales_id=s.id
+                WHERE {match_clause}{owner_clause}
+                GROUP BY s.id, s.notes, s.date, s.tva
+                ORDER BY s.date DESC, s.id DESC
+                """,
+                params,
             )
-            cres = self.cursor.fetchone()
-            if not cres:
-                return []
-            username = str(cres[0] or '').strip()
-            if not username:
-                return []
-            norm = self._normalize_exact(username)
-            owner_clause2 = ""
-            params2 = [norm]
-            if user and not user.get("is_superadmin"):
-                owner_clause2 = " AND s.created_by=%s"
-                params2.append(int(user.get("id") or 0))
-            sql = (
-                "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), "
-                "COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
-                "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
-                "WHERE LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s)"
-                f"{owner_clause2} GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC"
-            )
-            self.cursor.execute(sql, params2)
             return [list(row) for row in self.cursor.fetchall()]
         except Exception:
             try:

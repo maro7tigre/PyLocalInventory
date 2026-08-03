@@ -1841,7 +1841,16 @@ class Database:
         order_by=None, order_dir='asc', limit=None, offset=None,
         user=None,
     ):
-        """Get Sales and Imports rows with precomputed totals and summaries."""
+        """Get Sales and Imports rows with precomputed totals and summaries.
+
+        Sales are company-wide, not per-creator: this must return the exact
+        same rows get_items_for_user('Sales', ...) does (no created_by
+        filter) - see get_client_sales()/get_client_account() for the same
+        policy and why an inconsistent filter here previously made this
+        summary query silently return zero rows for any non-superadmin user
+        viewing sales someone else created, forced through the
+        get_items(...) fallback in ui/tabs/base_tab.py's fetch().
+        """
         if section not in ('Sales', 'Imports'):
             return self.get_items(
                 section,
@@ -1856,7 +1865,10 @@ class Database:
         base_table = section.lower()
         item_table = 'sales_items' if section == 'Sales' else 'import_items'
         foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
-        tva_source = 's.tva' if section == 'Sales' else 'i.tva'
+        # The inner summary subquery joins base_table under alias "i" (see
+        # below), never "s" - "s" is only in scope in the outer query. Both
+        # sections must reference the inner join's own alias here.
+        tva_source = 'i.tva'
 
         query = (
             f"SELECT s.*, "
@@ -1880,10 +1892,6 @@ class Database:
         )
         params = []
         conditions = []
-
-        if section == 'Sales' and user is not None and not bool(user.get('is_superadmin')):
-            conditions.append("s.created_by=%s")
-            params.append(int(user.get('id') or 0))
 
         if search_text and search_columns:
             search_term = f"%{search_text.lower()}%"
@@ -1927,17 +1935,29 @@ class Database:
                 query += " OFFSET %s"
                 params.append(int(offset))
 
+        mode = 'remote' if user is not None else 'local'
         try:
             self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
             columns = [description[0] for description in self.cursor.description]
             if columns and columns[0].lower() == 'id':
                 columns[0] = 'ID'
-            return [dict(zip(columns, row)) for row in rows]
-        except Exception as e:
+            result = [dict(zip(columns, row)) for row in rows]
+        except Exception:
             self.conn.rollback()
-            print(f"Error getting operation summary items for {section}: {e}")
+            logger.exception(
+                "get_operation_summary_items failed: mode=%s section=%s user_id=%s "
+                "sql_params=%s",
+                mode, section, user.get('id') if user else None, params,
+            )
             return []
+        logger.info(
+            "get_operation_summary_items: mode=%s section=%s user_id=%s role_id=%s "
+            "sql_params=%s row_count=%s",
+            mode, section, user.get('id') if user else None,
+            user.get('role_id') if user else None, params, len(result),
+        )
+        return result
 
     def get_items_for_user(
         self, section, user, owner_id=None, date_from=None, date_to=None,
@@ -2405,23 +2425,34 @@ class Database:
 
         The LAN server exposes this method under Clients/read. This lets a user
         view a client's account without granting broad Sales table access.
+
+        Sales are company-wide data, not per-creator data: the main Sales tab
+        (get_items_for_user) never filters Sales/Sales_Items by created_by -
+        only Reports gets that treatment. This method must return the exact
+        same authorized Sales, so it does not filter by created_by either;
+        access is controlled solely by the Clients:read permission check the
+        LAN server already enforces before calling this method.
         """
         client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
         self.cursor.execute("SELECT id, username FROM clients WHERE id = %s", (client_id,))
         client_row = self.cursor.fetchone()
         if not client_row:
+            logger.warning(
+                "get_client_account: client not found client_id=%s mode=%s user_id=%s",
+                client_id, mode, user_id,
+            )
             raise ValueError(f"Client {client_id} does not exist")
         norm = self._normalize_exact(client_row[1]) if client_row[1] else None
 
-        owner_clause = ""
-        owner_params = []
-        if user and not user.get("is_superadmin"):
-            owner_clause = " AND s.created_by = %s"
-            owner_params.append(int(user.get("id") or 0))
-
         # Match by client_id as well as by the client's username against
-        # sales.client_username: see get_client_sales() for why client_id
-        # alone can miss sales that still belong to this client.
+        # sales.client_username: a sale's client_id can get zeroed out
+        # independently of its client_name/client_username snapshot (e.g.
+        # when the linked client record was temporarily unresolved) while
+        # still belonging to this client. Matching only one of the two hides
+        # real sales - see get_client_sales() for the same pattern.
         if norm:
             match_clause = (
                 "(s.client_id=%s OR "
@@ -2432,24 +2463,14 @@ class Database:
             match_clause = "s.client_id=%s"
             match_params = [client_id]
 
-        self.cursor.execute(
-            f"""
-            SELECT
-                s.id,
-                COALESCE(s.date, ''),
-                COALESCE(s.state, 'pending'),
-                si.id,
-                COALESCE(si.product_name, ''),
-                COALESCE(si.quantity, 0),
-                COALESCE(si.unit_price, 0),
-                COALESCE(s.tva, 0)
-            FROM sales s
-            JOIN sales_items si ON si.sales_id = s.id
-            WHERE {match_clause}{owner_clause}
-            ORDER BY s.id, si.id
-            """,
-            (*match_params, *owner_params),
+        sql = (
+            "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
+            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0) "
+            "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
+            f"WHERE {match_clause} ORDER BY s.id, si.id"
         )
+        self.cursor.execute(sql, tuple(match_params))
         purchase_rows = self.cursor.fetchall()
         sale_ids = sorted({row[0] for row in purchase_rows})
         payment_rows = []
@@ -2465,6 +2486,12 @@ class Database:
             )
             payment_rows = self.cursor.fetchall()
 
+        logger.info(
+            "get_client_account: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sql_params=%s sale_count=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, client_id, match_params,
+            len(sale_ids), len(purchase_rows), len(payment_rows),
+        )
         return {
             "purchases": [list(row) for row in purchase_rows],
             "payments": [list(row) for row in payment_rows],
@@ -2477,55 +2504,62 @@ class Database:
         sales.client_username, since a sale's client_id can get zeroed out
         independently of its client_name snapshot (e.g. when the linked
         client record is temporarily unresolved) while still belonging to
-        this client. Matching only one of the two hides real sales."""
+        this client. Matching only one of the two hides real sales.
+
+        Sales are company-wide data, not per-creator data: the main Sales tab
+        (get_items_for_user) never filters Sales/Sales_Items by created_by -
+        only Reports gets that treatment. This method must return the exact
+        same authorized Sales as that tab, so it does not filter by
+        created_by either; access is controlled solely by the Clients:read
+        permission check the LAN server already enforces before calling this
+        method.
+        """
         client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
 
-        try:
-            self.cursor.execute("SELECT username FROM clients WHERE id=%s", (client_id,))
-            cres = self.cursor.fetchone()
-            username = str(cres[0] or '').strip() if cres else ''
-        except Exception:
-            username = ''
-
+        self.cursor.execute("SELECT username FROM clients WHERE id=%s", (client_id,))
+        cres = self.cursor.fetchone()
+        username = str(cres[0] or '').strip() if cres else ''
         norm = self._normalize_exact(username) if username else None
-
-        owner_clause = ""
-        owner_params = []
-        if user and not user.get("is_superadmin"):
-            owner_clause = " AND s.created_by=%s"
-            owner_params = [int(user.get("id") or 0)]
 
         if norm:
             match_clause = (
                 "(s.client_id=%s OR "
                 "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
             )
-            params = [client_id, norm] + owner_params
+            params = [client_id, norm]
         else:
             match_clause = "s.client_id=%s"
-            params = [client_id] + owner_params
+            params = [client_id]
 
+        sql = (
+            "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), "
+            "COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
+            "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
+            f"WHERE {match_clause} GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC"
+        )
         try:
-            self.cursor.execute(
-                f"""
-                SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''),
-                       COALESCE(s.tva, 0),
-                       COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal
-                FROM sales s
-                LEFT JOIN sales_items si ON si.sales_id=s.id
-                WHERE {match_clause}{owner_clause}
-                GROUP BY s.id, s.notes, s.date, s.tva
-                ORDER BY s.date DESC, s.id DESC
-                """,
-                params,
-            )
-            return [list(row) for row in self.cursor.fetchall()]
+            self.cursor.execute(sql, params)
+            rows = [list(row) for row in self.cursor.fetchall()]
         except Exception:
+            logger.exception(
+                "get_client_sales failed: mode=%s user_id=%s role_id=%s client_id=%s sql_params=%s",
+                mode, user_id, role_id, client_id, params,
+            )
             try:
                 self.conn.rollback()
             except Exception:
-                pass
-            return []
+                logger.exception("get_client_sales: rollback after failed query also failed")
+            raise
+
+        logger.info(
+            "get_client_sales: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sql_params=%s sale_count=%s",
+            mode, user_id, role_id, client_id, params, len(rows),
+        )
+        return rows
 
     def add_client_payment(
         self, client_id, sale_id, sales_item_id, amount, date, user=None

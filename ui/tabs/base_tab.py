@@ -598,7 +598,9 @@ class BaseTab(QWidget):
                         )
                     except Exception:
                         # Keep original empty result if fallback fails
-                        pass
+                        logger.exception(
+                            "get_items fallback also failed for section=%s", section
+                        )
             else:
                 items = database.get_items(
                     section,

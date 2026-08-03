@@ -532,10 +532,28 @@ class MainWindow(ThemedMainWindow):
         self.last_network_host = host
         self.network_port = port_num
         self._client_connected = True
-        host_build = remote_db.host_build_id or "unknown (older host build)"
+        host_build = remote_db.host_build_id
+        if host_build == APP_BUILD_ID:
+            status = "compatible"
+        elif host_build is None:
+            status = "MISMATCH — host build unknown (host predates build-id reporting)"
+        else:
+            status = "MISMATCH — host and this client are on different builds"
         self.setWindowTitle(
-            f"PyLocalInventory — build {APP_BUILD_ID} — connected to {host}:{port_num} (host build {host_build})"
+            f"PyLocalInventory — build {APP_BUILD_ID} — connected to {host}:{port_num} "
+            f"(host build {host_build or 'unknown'}, {status})"
         )
+        if host_build != APP_BUILD_ID:
+            QMessageBox.warning(
+                self,
+                "Host build mismatch",
+                f"This client is running build:\n  {APP_BUILD_ID}\n\n"
+                f"But the host at {host}:{port_num} reports:\n  {host_build or 'unknown (older build)'}\n\n"
+                "A fix present in this client's build may not be active on the host "
+                "until the host application is restarted on the latest deployed code. "
+                "If you're troubleshooting a bug that should already be fixed, redeploy "
+                "and restart the host first.",
+            )
         self.refresh_app()
 
     def _show_login_error(self, message):

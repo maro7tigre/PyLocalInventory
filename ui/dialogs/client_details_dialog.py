@@ -1,5 +1,7 @@
 """Client account view with purchases, payments, and balance tracking."""
 
+import logging
+
 from PySide6.QtCore import QDate, Qt
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
@@ -21,6 +23,8 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from ui.widgets.preview_widget import PreviewWidget
+
+logger = logging.getLogger(__name__)
 
 
 def _format_money(value):
@@ -331,7 +335,22 @@ class ClientDetailsDialog(QDialog):
         return purchases
 
     def refresh_data(self):
-        self.purchases = self._load_purchases()
+        mode = 'remote' if self.database.__class__.__name__ == 'RemoteDatabase' else 'local'
+        try:
+            self.purchases = self._load_purchases()
+        except Exception as exc:
+            logger.exception(
+                "View Client refresh failed: client_id=%s mode=%s",
+                self.client_obj.id, mode,
+            )
+            QMessageBox.warning(
+                self,
+                "Client Account",
+                f"Could not refresh this client's account from the host:\n{exc}\n\n"
+                "Showing the most recently loaded data.",
+            )
+            # Keep whatever self.purchases already held - a failed refresh
+            # must not blank out data that was already on screen.
         self._populate_purchases()
         self._populate_payments()
 

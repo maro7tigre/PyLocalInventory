@@ -198,11 +198,28 @@ def _check_permission(user, method, args, kwargs):
         return True, None
 
     if method in _CLIENT_ACCOUNT_METHODS:
+        client_id = args[0] if args else None
         if not user['permissions'].get('Clients', {}).get('read'):
+            logger.warning(
+                "Permission denied (client account): build_id=%s user_id=%s role_id=%s "
+                "method=%s client_id=%s needed=Clients:read mode=remote",
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+            )
             return False, "You don't have read access to Clients"
         if (method == 'add_client_payment'
                 and not user['permissions'].get('Sales', {}).get('write')):
+            logger.warning(
+                "Permission denied (client account): build_id=%s user_id=%s role_id=%s "
+                "method=%s client_id=%s needed=Sales:write mode=remote",
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+            )
             return False, "You don't have write access to Sales"
+        logger.info(
+            "Permission granted (client account): build_id=%s user_id=%s role_id=%s "
+            "method=%s client_id=%s permission_filter=Clients:read-only "
+            "(no created_by ownership filter applied) mode=remote",
+            APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+        )
         return True, None
 
     if method in _ATTACHMENT_METHODS:

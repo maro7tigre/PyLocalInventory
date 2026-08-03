@@ -154,13 +154,28 @@ def _check_permission(user, method, args, kwargs):
         kind, table = classify_sql(sql)
         if kind == 'schema':
             return True, None
-        section = SECTION_GROUP.get(table) if table else None
+        # Case-insensitive, schema-qualifier-aware lookup: raw SQL call sites
+        # across the codebase are inconsistent about writing 'sales' vs
+        # 'Sales', and both name the same physical (lowercase-folded) table.
+        section = UserManager.section_for_table(table) if table else None
         if not section:
+            logger.warning(
+                "Permission denied (no section mapping): user_id=%s role_id=%s "
+                "is_superadmin=%s method=%s table=%r normalized_section=%s mode=remote",
+                user.get('id'), user.get('role_id'), user.get('is_superadmin'),
+                method, table, section,
+            )
             return False, f"No permission mapping for table '{table}' - contact your admin"
         if section == "Reports" and kind == "read":
             return False, "Reports must be read through the ownership-filtered API"
         needed = _ACTION_FOR_KIND[kind]
         if not user['permissions'].get(section, {}).get(needed):
+            logger.warning(
+                "Permission denied (insufficient access): user_id=%s role_id=%s "
+                "is_superadmin=%s method=%s table=%r normalized_section=%s needed=%s mode=remote",
+                user.get('id'), user.get('role_id'), user.get('is_superadmin'),
+                method, table, section, needed,
+            )
             return False, f"You don't have {needed} access to {section}"
         return True, None
 

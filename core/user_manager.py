@@ -27,6 +27,14 @@ SECTION_GROUP = {
     'Reports': 'Reports',
 }
 
+# Postgres identifiers used in raw SQL (core/database.py, ui/**) are unquoted
+# and get folded to lowercase by the parser, and call sites are inconsistent
+# about the case they type ('sales' vs 'Sales'). Both forms hit the same
+# physical table, so the permission lookup must be case-insensitive too, or a
+# lowercase-cased query for a perfectly valid table (e.g. `FROM sales`) gets
+# rejected as "no permission mapping" even though 'Sales' is a mapped section.
+_SECTION_GROUP_CASEFOLD = {key.casefold(): value for key, value in SECTION_GROUP.items()}
+
 MATRIX_SECTIONS = ['Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports', 'Reports']
 
 _EMPTY_PERMISSIONS = {'read': False, 'write': False, 'delete': False}
@@ -182,4 +190,15 @@ class UserManager:
 
     @staticmethod
     def section_for_table(table_name):
-        return SECTION_GROUP.get(table_name)
+        """Resolve a raw-SQL table name to its canonical permission section.
+
+        Accepts any case ('sales', 'Sales') and an optional schema qualifier
+        ('public.sales') so every valid spelling of a mapped table resolves
+        to the same section - this is an exact, case-insensitive match
+        against SECTION_GROUP's own keys, never fuzzy/substring matching, so
+        an unmapped or unrelated table still correctly returns None.
+        """
+        if not table_name:
+            return None
+        bare = str(table_name).rsplit('.', 1)[-1]
+        return _SECTION_GROUP_CASEFOLD.get(bare.casefold())

@@ -286,11 +286,11 @@ class AttachmentPanel(QWidget):
         self.database.upload_attachment(self.entity_type, self.entity_id, filename, encoded)
         if self.entity_type != 'sale':
             return
+        client_id = None
         try:
             # First try to mirror via explicit sales.client_id (reliable).
             self.database.cursor.execute('SELECT client_id, client_username FROM sales WHERE id=%s', (self.entity_id,))
             row = self.database.cursor.fetchone()
-            client_id = None
             if row:
                 client_id = int(row[0]) if row[0] not in (None, '', 0) else None
                 username = str(row[1] or '').strip()
@@ -311,6 +311,13 @@ class AttachmentPanel(QWidget):
         except Exception as exc:
             # Preserve the successful sale upload while giving a useful action
             # message if old/imported sales are not linked to a client.
+            logger.exception(
+                "Sale-to-client attachment mirror failed: user_id=%s mode=%s "
+                "operation=mirror_sale_attachment_to_client sale_id=%s client_id=%s",
+                getattr(self.database, 'current_user_id', None),
+                'remote' if hasattr(self.database, 'host') else 'local',
+                self.entity_id, client_id,
+            )
             try:
                 self.database.conn.rollback()
             except Exception:

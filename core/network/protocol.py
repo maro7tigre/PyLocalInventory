@@ -46,17 +46,20 @@ def classify_sql(sql):
     if first_word in _SCHEMA_VERBS:
         return 'schema', None
 
+    # Captures an optional "schema." prefix too (e.g. "public.sales"), so a
+    # schema-qualified table name isn't truncated to just the schema part
+    # before the caller gets a chance to resolve its permission section.
     if first_word == 'SELECT':
-        m = re.search(r'\bFROM\s+[\'"`]?(\w+)', stripped, re.IGNORECASE)
+        m = re.search(r'\bFROM\s+[\'"`]?(\w+(?:\.\w+)?)', stripped, re.IGNORECASE)
         return 'read', (m.group(1) if m else None)
     if first_word == 'INSERT':
-        m = re.search(r'\bINTO\s+[\'"`]?(\w+)', stripped, re.IGNORECASE)
+        m = re.search(r'\bINTO\s+[\'"`]?(\w+(?:\.\w+)?)', stripped, re.IGNORECASE)
         return 'write', (m.group(1) if m else None)
     if first_word == 'UPDATE':
-        m = re.search(r'\bUPDATE\s+[\'"`]?(\w+)', stripped, re.IGNORECASE)
+        m = re.search(r'\bUPDATE\s+[\'"`]?(\w+(?:\.\w+)?)', stripped, re.IGNORECASE)
         return 'write', (m.group(1) if m else None)
     if first_word == 'DELETE':
-        m = re.search(r'\bFROM\s+[\'"`]?(\w+)', stripped, re.IGNORECASE)
+        m = re.search(r'\bFROM\s+[\'"`]?(\w+(?:\.\w+)?)', stripped, re.IGNORECASE)
         return 'delete', (m.group(1) if m else None)
 
     # Anything else unrecognized: treat as schema/internal rather than guessing

@@ -44,6 +44,7 @@ from core.password import PasswordManager
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
+from core.build_info import APP_BUILD_ID
 from core.user_settings import (
     load_settings,
     remember_profile_enabled,
@@ -60,7 +61,7 @@ from core.user_settings import (
 class MainWindow(ThemedMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("PyLocalInventory")
+        self.setWindowTitle(f"PyLocalInventory — build {APP_BUILD_ID}")
         self.setMinimumSize(1000, 700)
         
         # Load application settings
@@ -531,6 +532,10 @@ class MainWindow(ThemedMainWindow):
         self.last_network_host = host
         self.network_port = port_num
         self._client_connected = True
+        host_build = remote_db.host_build_id or "unknown (older host build)"
+        self.setWindowTitle(
+            f"PyLocalInventory — build {APP_BUILD_ID} — connected to {host}:{port_num} (host build {host_build})"
+        )
         self.refresh_app()
 
     def _show_login_error(self, message):

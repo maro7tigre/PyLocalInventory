@@ -9,13 +9,14 @@ from core.runtime_paths import resource_path
 from ui.main_window import MainWindow
 from ui.theme import apply_dark_theme
 from core.logging_config import setup_logging
+from core.build_info import APP_BUILD_ID
 
 
 def main():
     """Application entry point"""
     log_file = setup_logging()
     logger = logging.getLogger(__name__)
-    logger.info("Application startup log=%s", log_file)
+    logger.info("Application startup build_id=%s log=%s", APP_BUILD_ID, log_file)
     app = QApplication(sys.argv)
     app.setApplicationName("PyLocalInventory")
     app.setWindowIcon(QIcon(resource_path("logo.png")))

@@ -40,6 +40,7 @@ from core.pg_config import load_server_config
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
 from core.runtime_paths import user_data_root
+from core.build_info import APP_BUILD_ID
 
 logger = logging.getLogger(__name__)
 
@@ -160,9 +161,9 @@ def _check_permission(user, method, args, kwargs):
         section = UserManager.section_for_table(table) if table else None
         if not section:
             logger.warning(
-                "Permission denied (no section mapping): user_id=%s role_id=%s "
+                "Permission denied (no section mapping): build_id=%s user_id=%s role_id=%s "
                 "is_superadmin=%s method=%s table=%r normalized_section=%s mode=remote",
-                user.get('id'), user.get('role_id'), user.get('is_superadmin'),
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), user.get('is_superadmin'),
                 method, table, section,
             )
             return False, f"No permission mapping for table '{table}' - contact your admin"
@@ -171,12 +172,18 @@ def _check_permission(user, method, args, kwargs):
         needed = _ACTION_FOR_KIND[kind]
         if not user['permissions'].get(section, {}).get(needed):
             logger.warning(
-                "Permission denied (insufficient access): user_id=%s role_id=%s "
+                "Permission denied (insufficient access): build_id=%s user_id=%s role_id=%s "
                 "is_superadmin=%s method=%s table=%r normalized_section=%s needed=%s mode=remote",
-                user.get('id'), user.get('role_id'), user.get('is_superadmin'),
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), user.get('is_superadmin'),
                 method, table, section, needed,
             )
             return False, f"You don't have {needed} access to {section}"
+        if table and table.rsplit('.', 1)[-1].casefold() in ('sales', 'clients'):
+            logger.info(
+                "Permission granted: build_id=%s user_id=%s method=%s table=%r "
+                "normalized_section=%s needed=%s mode=remote",
+                APP_BUILD_ID, user.get('id'), method, table, section, needed,
+            )
         return True, None
 
     if method in _SECTION_METHODS:
@@ -279,6 +286,10 @@ class DatabaseServer:
         self._httpd = ThreadingHTTPServer(('0.0.0.0', self.port), self._make_handler())
         self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
         self._thread.start()
+        logger.info(
+            "LAN server started: build_id=%s port=%s database_name=%s schema_name=%s",
+            APP_BUILD_ID, self.port, self.database_name, self.schema_name,
+        )
 
     def stop(self):
         if self._httpd:
@@ -635,6 +646,12 @@ class DatabaseServer:
                         "report footer", "currency",
                     ):
                         profile_values[key] = selected_profile.get_value(key)
+                logger.info(
+                    "Login accepted: user_id=%s username=%s role_id=%s is_superadmin=%s "
+                    "build_id=%s remote_addr=%s",
+                    user['id'], user['username'], user.get('role_id'), user['is_superadmin'],
+                    APP_BUILD_ID, self.client_address[0] if self.client_address else None,
+                )
                 self._send_json(200, {
                     'token': token,
                     'user_id': user['id'],
@@ -643,6 +660,7 @@ class DatabaseServer:
                     'permissions': user['permissions'],
                     'profile': profile_values,
                     'sale_catalog': catalog,
+                    'build_id': APP_BUILD_ID,
                 })
 
             def _handle_rpc(self):

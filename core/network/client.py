@@ -24,8 +24,14 @@ from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
 )
 from core.user_manager import SECTION_GROUP
+from core.build_info import APP_BUILD_ID
 
 logger = logging.getLogger(__name__)
+
+_ATTACHMENT_RPC_METHODS = {
+    'list_attachments', 'upload_attachment', 'download_attachment',
+    'get_attachment_thumbnail', 'update_attachment', 'delete_attachment',
+}
 
 class RemoteProfile:
     """Read-only report branding supplied by the connected host."""
@@ -107,6 +113,9 @@ class RemoteDatabase:
         # ``None`` means an older host did not provide a login snapshot, so
         # callers can retain the legacy RPC fallback for compatibility.
         self.sale_catalog = None
+        # ``None`` means the host we connected to is running a build from
+        # before build-id reporting existed - i.e. it predates this fix.
+        self.host_build_id = None
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
@@ -177,6 +186,21 @@ class RemoteDatabase:
         self.username = data.get('username') or self.username
         self.remote_profile = RemoteProfile(data.get("profile") or {})
         self.sale_catalog = data.get("sale_catalog")
+        # Absent on a host running a build from before build-id reporting -
+        # i.e. that host has not been redeployed with this fix.
+        self.host_build_id = data.get('build_id')
+        if self.host_build_id != APP_BUILD_ID:
+            logger.warning(
+                "Build mismatch: this client build_id=%s host=%s port=%s reports "
+                "host_build_id=%s user=%s - if a fix isn't taking effect, redeploy "
+                "the host and/or this client to matching builds.",
+                APP_BUILD_ID, self.host, self.port, self.host_build_id, self.username,
+            )
+        else:
+            logger.info(
+                "Build match: client and host=%s:%s both on build_id=%s user=%s",
+                self.host, self.port, APP_BUILD_ID, self.username,
+            )
         return True
 
     def _call(self, method, args=None, kwargs=None):
@@ -236,9 +260,24 @@ class RemoteDatabase:
         elapsed_ms = (time.perf_counter() - started) * 1000
         logger.log(
             logging.WARNING if elapsed_ms >= 500 else logging.INFO,
-            "LAN RPC method=%s host=%s port=%s duration_ms=%.1f",
-            method, self.host, self.port, elapsed_ms,
+            "LAN RPC method=%s host=%s port=%s duration_ms=%.1f build_id=%s host_build_id=%s",
+            method, self.host, self.port, elapsed_ms, APP_BUILD_ID, self.host_build_id,
         )
+        if method in _ATTACHMENT_RPC_METHODS or method == 'cursor.execute':
+            # Extra trace for the exact operation family the sale->client
+            # attachment mirror error comes from - entity/table context
+            # without ever logging the base64 file payload itself.
+            if method == 'cursor.execute':
+                sql_preview = (str(safe_args[0]) if safe_args else '')[:160]
+                detail = f"sql={sql_preview!r}"
+            else:
+                entity_type = safe_args[0] if len(safe_args) > 0 else None
+                entity_id = safe_args[1] if len(safe_args) > 1 else None
+                detail = f"entity_type={entity_type} entity_id={entity_id}"
+            logger.info(
+                "Attachment-path RPC detail: method=%s user=%s user_id=%s build_id=%s host_build_id=%s %s",
+                method, self.username, self.current_user_id, APP_BUILD_ID, self.host_build_id, detail,
+            )
         result = data.get('result')
         if method == 'save_sale_with_items':
             self._write_network_log(

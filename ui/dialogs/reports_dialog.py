@@ -593,16 +593,17 @@ class ReportsDialog(QDialog):
                 total_ht = 0
             
             # Calculate financial totals for devis
-            total_remise = 0  # No discount system implemented yet
+            total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
             total_regle = 0   # Amount already paid (could be from payments table if exists)
-            net_a_payer = total_ht - total_remise - total_regle
+            net_ht = total_ht - total_remise
+            net_a_payer = net_ht - total_regle
             
             # Calculate TVA and Total TTC based on sales record
             # Get the TVA percentage from the sales object (0 or 20)
             tva_percent = self.sales_obj.get_value('tva') or 0
             tva_rate = _decimal(tva_percent) / Decimal("100")
-            tva_amount = total_ht * tva_rate
-            total_ttc = total_ht + tva_amount
+            tva_amount = net_ht * tva_rate
+            total_ttc = net_ht + tva_amount
             
             # The templates own the table structure so print engines can repeat
             # its header and paginate rows naturally.

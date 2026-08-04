@@ -91,6 +91,13 @@ class SalesClass(BaseClass):
                 "true_value": 20.0,
                 "false_value": 0.0
             },
+            "remise": {
+                "value": 0.0,
+                "display_name": {"en": "Remise", "fr": "Remise", "es": "Descuento"},
+                "required": False,
+                "default": 0.0,
+                "type": "float"
+            },
             "notes": {
                 "value": "",
                 "display_name": {"en": "Notes", "fr": "Notes", "es": "Notas"},
@@ -173,6 +180,7 @@ class SalesClass(BaseClass):
                 "notes": "r",
                 "date": "r",
                 "subtotal": "r",
+                "remise": "r",
                 "total_price": "r"
             },
             "dialog": {
@@ -190,6 +198,7 @@ class SalesClass(BaseClass):
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "tva": "rw",
+                "remise": "rw",
                 "notes": "rw",
                 "created_by": "r",
                 "created_by_username": "r",
@@ -207,6 +216,7 @@ class SalesClass(BaseClass):
                 "client_id": "r",
                 "date": "r",
                 "tva": "r",
+                "remise": "r",
                 "subtotal": "r",
                 "total_tva": "r",
                 "total_price": "r",
@@ -264,14 +274,18 @@ class SalesClass(BaseClass):
         """Calculate total VAT amount"""
         from decimal import Decimal
         subtotal = self.calculate_subtotal()
+        remise = Decimal(str(self.get_value('remise') or 0))
         tva_percent = self.get_value('tva') or 0
-        return Decimal(str(subtotal)) * (Decimal(str(tva_percent)) / Decimal("100"))
+        total_ht = subtotal - remise
+        return total_ht * (Decimal(str(tva_percent)) / Decimal("100"))
     
     def calculate_total_price(self):
         """Calculate total price including VAT"""
         subtotal = self.calculate_subtotal()
+        remise = Decimal(str(self.get_value('remise') or 0))
         tva_amount = self.calculate_total_tva()
-        return subtotal + tva_amount
+        total_ht = subtotal - remise
+        return total_ht + tva_amount
     
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this sales operation"""

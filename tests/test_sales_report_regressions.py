@@ -224,7 +224,7 @@ class SalesReportRegressionTests(unittest.TestCase):
         self.assertEqual(table.item(0, columns.index("subtotal")).text(), "125.20")
         self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.subtotal_widget), 125.20)
         self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.vat_widget), 25.04)
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_widget), 150.24)
+        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_ttc_widget), 150.24)
 
     def test_product_can_be_selected_before_typing_exact_quantity(self):
         table_widget = OperationsTableWidget(

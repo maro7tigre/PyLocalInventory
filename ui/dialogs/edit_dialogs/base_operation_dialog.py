@@ -197,16 +197,48 @@ class BaseOperationDialog(QDialog):
         
         # Create total widgets
         self.subtotal_widget = self.create_total_widget("Subtotal", "MAD")
+        
+        # Remise is an editable input for Sales operations
+        if getattr(self.operation_obj, 'section', '') == 'Sales':
+            from PySide6.QtWidgets import QDoubleSpinBox
+            self.remise_spinbox = QDoubleSpinBox()
+            self.remise_spinbox.setRange(0.0, 999999999.0)
+            self.remise_spinbox.setDecimals(2)
+            self.remise_spinbox.setSuffix(" MAD")
+            self.remise_spinbox.setMinimumHeight(30)
+            self.remise_spinbox.setStyleSheet("""
+                QDoubleSpinBox {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                    padding: 5px;
+                }
+                QDoubleSpinBox:focus {
+                    border: 1px solid #4CAF50;
+                }
+            """)
+            self.remise_spinbox.valueChanged.connect(lambda _: self.update_totals())
+        else:
+            self.remise_spinbox = None
+        
+        self.total_ht_widget = self.create_total_widget("Total HT", "MAD")
         self.vat_widget = self.create_total_widget("VAT Amount", "MAD") 
-        self.total_widget = self.create_total_widget("Total Price", "MAD")
+        self.total_ttc_widget = self.create_total_widget("Total TTC", "MAD")
         
         # Add to layout
         totals_layout.addWidget(QLabel("Subtotal:"))
         totals_layout.addWidget(self.subtotal_widget)
-        totals_layout.addWidget(QLabel("VAT:"))
+        
+        if self.remise_spinbox is not None:
+            totals_layout.addWidget(QLabel("Remise:"))
+            totals_layout.addWidget(self.remise_spinbox)
+        
+        totals_layout.addWidget(QLabel("Total HT:"))
+        totals_layout.addWidget(self.total_ht_widget)
+        totals_layout.addWidget(QLabel("TVA:"))
         totals_layout.addWidget(self.vat_widget)
-        totals_layout.addWidget(QLabel("Total:"))
-        totals_layout.addWidget(self.total_widget)
+        totals_layout.addWidget(QLabel("Total TTC:"))
+        totals_layout.addWidget(self.total_ttc_widget)
         totals_layout.addStretch()
         
         parent_layout.addWidget(totals_widget)
@@ -258,6 +290,11 @@ class BaseOperationDialog(QDialog):
         for param_key, widget in self.parameter_widgets.items():
             current_value = self.operation_obj.get_value(param_key)
             ParameterWidgetFactory.set_widget_value(widget, current_value)
+        
+        # Load remise value if the spinbox exists
+        if self.remise_spinbox is not None:
+            remise_value = self.operation_obj.get_value('remise') or 0.0
+            self.remise_spinbox.setValue(float(remise_value))
     
     def update_totals(self):
         """Update total calculation displays"""
@@ -285,14 +322,24 @@ class BaseOperationDialog(QDialog):
                 except (InvalidOperation, ValueError, TypeError):
                     vat_percent = Decimal("0")
             
-            # Calculate totals
-            vat_amount = subtotal * (vat_percent / Decimal("100"))
-            total = subtotal + vat_amount
+            # Get Remise value
+            remise = Decimal("0")
+            if self.remise_spinbox is not None:
+                try:
+                    remise = Decimal(str(self.remise_spinbox.value() or 0))
+                except (InvalidOperation, ValueError, TypeError):
+                    remise = Decimal("0")
+            
+            # Calculate totals: Total HT = Subtotal - Remise, TVA = Total HT * rate, Total TTC = Total HT + TVA
+            total_ht = subtotal - remise
+            vat_amount = total_ht * (vat_percent / Decimal("100"))
+            total_ttc = total_ht + vat_amount
             
             # Update displays
             ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
+            ParameterWidgetFactory.set_widget_value(self.total_ht_widget, total_ht)
             ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
-            ParameterWidgetFactory.set_widget_value(self.total_widget, total)
+            ParameterWidgetFactory.set_widget_value(self.total_ttc_widget, total_ttc)
             
         except Exception as e:
             print(f"Error updating totals: {e}")
@@ -363,6 +410,11 @@ class BaseOperationDialog(QDialog):
             for param_key, widget in self.parameter_widgets.items():
                 value = ParameterWidgetFactory.get_widget_value(widget)
                 self.operation_obj.set_value(param_key, value)
+            
+            # Set remise value from spinbox if it exists
+            if self.remise_spinbox is not None:
+                self.operation_obj.set_value('remise', float(self.remise_spinbox.value()))
+            
             # For snapshots: if client_name/supplier_name empty set from username
             try:
                 if getattr(self.operation_obj, 'section', '') == 'Sales':

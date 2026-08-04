@@ -366,6 +366,7 @@ class Database:
                 # Historical sales are books-only: they never touch stock.
                 # Default FALSE so every existing sale stays a normal sale.
                 'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
+                'remise': 'DOUBLE PRECISION',
             },
             'imports': {
                 'supplier_name': 'TEXT', 'supplier_id': 'INTEGER',

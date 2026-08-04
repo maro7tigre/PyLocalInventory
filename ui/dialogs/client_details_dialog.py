@@ -286,10 +286,32 @@ class ClientDetailsDialog(QDialog):
     def _load_purchases(self):
         self.account_data = self.database.get_client_account(self.client_obj.id)
         rows = self.account_data.get("purchases", [])
+
+        # First pass: collect raw subtotals per sale to distribute remise
+        sale_raw_totals = {}
+        for row in rows:
+            sale_id = row[0]
+            quantity = row[5]
+            unit_price = row[6]
+            remise = row[8] if len(row) > 8 else 0
+            raw = float(quantity or 0) * float(unit_price or 0)
+            entry = sale_raw_totals.setdefault(sale_id, {'raw': 0.0, 'remise': 0.0})
+            entry['raw'] += raw
+            entry['remise'] = float(remise or 0)
+
         purchases = []
-        for sale_id, date, state, item_id, product, quantity, unit_price, vat in rows:
-            total = float(quantity or 0) * float(unit_price or 0)
-            total *= 1 + float(vat or 0) / 100
+        for sale_id, date, state, item_id, product, quantity, unit_price, vat, remise in rows:
+            raw = float(quantity or 0) * float(unit_price or 0)
+            vat_rate = float(vat or 0) / 100.0
+            sale_info = sale_raw_totals.get(sale_id, {'raw': 0.0, 'remise': 0.0})
+            sale_raw = sale_info['raw']
+            sale_remise = sale_info['remise']
+            if sale_raw > 0:
+                item_remise_share = sale_remise * (raw / sale_raw)
+            else:
+                item_remise_share = 0.0
+            total_ht = raw - item_remise_share
+            total = total_ht * (1 + vat_rate)
             purchases.append(
                 {
                     "sale_id": sale_id,

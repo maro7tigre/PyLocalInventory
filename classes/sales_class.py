@@ -4,6 +4,49 @@ Example showing new parameter types: date, table
 """
 from classes.base_class import BaseClass
 from classes.sales_item_class import SalesItemClass
+from decimal import Decimal, ROUND_HALF_UP
+
+
+def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
+    """Centralized monetary calculation for sales.
+
+    Parameters
+    ----------
+    raw_subtotal : Decimal|float
+        Sum of all Sale Item line totals (before any discount).
+    remise : Decimal|float
+        Discount amount.
+    tva_rate : Decimal|float
+        VAT percentage, e.g. 20 for 20 %.
+
+    Returns
+    -------
+    dict with keys: original_subtotal, remise, total_ht, vat_amount, total_ttc
+    All values are Decimal rounded to 2 decimal places.
+    """
+    original = Decimal(str(raw_subtotal or 0)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    disc = Decimal(str(remise or 0)).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    rate = Decimal(str(tva_rate or 0))
+    total_ht = (original - disc).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    vat_amount = (total_ht * rate / Decimal("100")).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    total_ttc = (total_ht + vat_amount).quantize(
+        Decimal("0.01"), rounding=ROUND_HALF_UP
+    )
+    return {
+        "original_subtotal": original,
+        "remise": disc,
+        "total_ht": total_ht,
+        "vat_amount": vat_amount,
+        "total_ttc": total_ttc,
+    }
 
 
 class SalesClass(BaseClass):
@@ -180,7 +223,6 @@ class SalesClass(BaseClass):
                 "notes": "r",
                 "date": "r",
                 "subtotal": "r",
-                "remise": "r",
                 "total_price": "r"
             },
             "dialog": {
@@ -229,10 +271,10 @@ class SalesClass(BaseClass):
     
     def get_sales_items(self):
         """Get all items for this sales operation"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return []
         if hasattr(self, "items"):
             return self.items
+        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+            return []
         
         try:
             items = []
@@ -250,10 +292,22 @@ class SalesClass(BaseClass):
             print(f"Error getting sales items for sales {self.id}: {e}")
             return []
     
-    def calculate_subtotal(self):
-        """Calculate subtotal from all items"""
+    def _raw_subtotal(self):
+        """Internal: sum of all Sale Item line totals before any discount."""
         items = self.get_sales_items()
         return sum(item.get_value('subtotal') or 0 for item in items)
+
+    def calculate_subtotal(self):
+        """Discounted Total HT shown in the Sales table Subtotal column.
+
+        Subtotal (displayed) = Original Subtotal - Remise
+        """
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self.get_value('remise') or 0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ht'])
 
     def get_sale_information(self):
         """Summarize item information values for display in the sales table."""
@@ -269,23 +323,24 @@ class SalesClass(BaseClass):
         except Exception as e:
             print(f"Error getting sale information for sales {self.id}: {e}")
             return ""
-    
+
     def calculate_total_tva(self):
-        """Calculate total VAT amount"""
-        from decimal import Decimal
-        subtotal = self.calculate_subtotal()
-        remise = Decimal(str(self.get_value('remise') or 0))
-        tva_percent = self.get_value('tva') or 0
-        total_ht = subtotal - remise
-        return total_ht * (Decimal(str(tva_percent)) / Decimal("100"))
-    
+        """Calculate total VAT amount (centralized)."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self.get_value('remise') or 0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['vat_amount'])
+
     def calculate_total_price(self):
-        """Calculate total price including VAT"""
-        subtotal = self.calculate_subtotal()
-        remise = Decimal(str(self.get_value('remise') or 0))
-        tva_amount = self.calculate_total_tva()
-        total_ht = subtotal - remise
-        return total_ht + tva_amount
+        """Calculate total price including VAT (centralized)."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self.get_value('remise') or 0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
     
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this sales operation"""

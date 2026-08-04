@@ -359,6 +359,7 @@ class BaseOperationDialog(QDialog):
                     errors.append(f"{display_name} is required")
         
         # Check if we have at least one entered row (even if product not yet created)
+        raw_rows = []
         try:
             raw_rows = self.items_table.get_current_table_data()
             if not raw_rows:
@@ -368,6 +369,22 @@ class BaseOperationDialog(QDialog):
             items = self.items_table.get_items_data()
             if not items:
                 errors.append("Please add at least one item")
+
+        # Validate Remise for Sales operations
+        if (getattr(self.operation_obj, 'section', '') == 'Sales'
+                and self.remise_spinbox is not None):
+            remise = self.remise_spinbox.value()
+            if remise < 0:
+                errors.append("Remise cannot be negative")
+            raw_subtotal = sum(
+                Decimal(str(row.get("quantity") or 0))
+                * Decimal(str(row.get("unit_price") or 0))
+                for row in raw_rows
+            )
+            if remise > 0 and raw_subtotal > 0 and Decimal(str(remise)) > raw_subtotal:
+                errors.append(
+                    f"Remise ({remise:,.2f}) cannot exceed the subtotal ({float(raw_subtotal):,.2f})"
+                )
         
         return errors
     

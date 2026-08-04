@@ -592,18 +592,17 @@ class ReportsDialog(QDialog):
                 items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
                 total_ht = 0
             
-            # Calculate financial totals for devis
+            # Calculate financial totals for devis using centralized function
             total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
-            total_regle = 0   # Amount already paid (could be from payments table if exists)
-            net_ht = total_ht - total_remise
-            net_a_payer = net_ht - total_regle
-            
-            # Calculate TVA and Total TTC based on sales record
-            # Get the TVA percentage from the sales object (0 or 20)
             tva_percent = self.sales_obj.get_value('tva') or 0
-            tva_rate = _decimal(tva_percent) / Decimal("100")
-            tva_amount = net_ht * tva_rate
-            total_ttc = net_ht + tva_amount
+
+            from classes.sales_class import calculate_sale_totals
+            totals = calculate_sale_totals(total_ht, total_remise, tva_percent)
+            net_ht = totals['total_ht']
+            tva_amount = totals['vat_amount']
+            total_ttc = totals['total_ttc']
+            total_regle = Decimal("0")
+            net_a_payer = total_ttc
             
             # The templates own the table structure so print engines can repeat
             # its header and paginate rows naturally.
@@ -635,9 +634,9 @@ class ReportsDialog(QDialog):
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
                 'table_frame_class': 'fill-page' if rendered_rows <= 8 else '',
-                # New financial fields for devis
+                # Financial fields for devis / facture
                 'total_remise': _fmt_fr(total_remise),
-                'total_ht': _fmt_fr(total_ht),
+                'total_ht': _fmt_fr(net_ht),
                 'total_regle': _fmt_fr(total_regle),
                 'net_a_payer': _fmt_fr(net_a_payer),
                 # BDL specific pricing fields

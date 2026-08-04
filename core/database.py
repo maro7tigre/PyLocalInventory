@@ -2614,7 +2614,8 @@ class Database:
         sql = (
             "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
             "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
-            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0) "
+            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
+            "COALESCE(s.remise, 0) "
             "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
             f"WHERE {match_clause} ORDER BY s.id, si.id"
         )

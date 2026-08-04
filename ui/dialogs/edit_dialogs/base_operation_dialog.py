@@ -11,6 +11,7 @@ from PySide6.QtGui import QFont
 from ui.widgets.themed_widgets import GreenButton, RedButton
 from ui.widgets.operations_table import OperationsTableWidget
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
+from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
 import os
@@ -117,6 +118,15 @@ class BaseOperationDialog(QDialog):
             )
             
             self.parameter_widgets[param_key] = widget
+            
+            # Historical-sale flag: one labelled checkbox, no extra form label.
+            # Label text is part of the product requirement.
+            if param_key == 'is_historical':
+                checkbox = getattr(widget, 'checkbox', None)
+                if checkbox is not None:
+                    checkbox.setText("Historical Sale \u2014 Do not affect current stock")
+                form_layout.addRow(widget)
+                continue
 
             # If this is the TVA field, refresh totals live when it changes
             if param_key == 'tva':
@@ -367,8 +377,9 @@ class BaseOperationDialog(QDialog):
             # Save operation to database first (ensures ID exists)
             if self.operation_obj.section == 'Sales':
                 items_objects = self.items_table.get_items_data()
+                is_historical = bool(self.operation_obj.get_value('is_historical'))
                 sale_state = self.operation_obj.get_value('state') or 'pending'
-                if sale_state != 'on_hold':
+                if not is_historical and sale_state != 'on_hold':
                     stock_errors = self._validate_stock(items_objects)
                     mw = self._get_main_window()
                     warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
@@ -383,6 +394,8 @@ class BaseOperationDialog(QDialog):
                         )
                         if reply != QMessageBox.StandardButton.Yes:
                             return
+                if not self._confirm_sale_summary():
+                    return
                 action = "updated" if self.operation_id else "created"
                 result = self._save_sale_atomically()
                 self.operation_id = result['sale_id']
@@ -478,7 +491,8 @@ class BaseOperationDialog(QDialog):
                 # Stock validation for sales (skip on_hold — those don't deduct stock)
                 if self.operation_obj.section == 'Sales':
                     sale_state = self.operation_obj.get_value('state') or 'pending'
-                    if sale_state != 'on_hold':
+                    is_historical = bool(self.operation_obj.get_value('is_historical'))
+                    if not is_historical and sale_state != 'on_hold':
                         stock_errors = self._validate_stock(items_objects)
                         mw = self._get_main_window()
                         warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
@@ -516,6 +530,52 @@ class BaseOperationDialog(QDialog):
             )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
 
+    def _confirm_sale_summary(self):
+        """Show the required pre-save summary and ask for confirmation."""
+        try:
+            is_historical = bool(self.operation_obj.get_value('is_historical'))
+            new_products = sum(
+                1 for e in self.pending_entities
+                if str(e.get("type") or "").casefold() == "product"
+            )
+            new_services = sum(
+                1 for e in self.pending_entities
+                if str(e.get("type") or "").casefold() == "service"
+            )
+            kept_only = 0
+            try:
+                rows = self.items_table.get_current_table_data()
+                kept_only = sum(
+                    1 for row in rows
+                    if str(row.get("item_type") or "").casefold() == "manual"
+                )
+            except Exception:
+                pass
+            lines = [
+                "Please review this sale before saving:",
+                "",
+                f"  \u2022 Historical Sale: {'Yes' if is_historical else 'No'}",
+                (
+                    "  \u2022 Stock impact: None (no deduction, no validation)"
+                    if is_historical
+                    else "  \u2022 Stock impact: Normal (deducts stock once)"
+                ),
+                f"  \u2022 New Products to create: {new_products}",
+                f"  \u2022 New Services to create: {new_services}",
+                f"  \u2022 Items kept only in this Sale: {kept_only}",
+                "",
+                "Save this sale?",
+            ]
+            return (
+                QMessageBox.question(
+                    self, "Confirm Sale", "\n".join(lines),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                == QMessageBox.Yes
+            )
+        except Exception:
+            return True
+
     def _save_sale_atomically(self):
         """Send the complete visible sale and line set in one database operation."""
         raw_items = self.items_table.get_current_table_data()
@@ -542,6 +602,9 @@ class BaseOperationDialog(QDialog):
         }
         header["operation_token"] = (
             self.operation_obj.get_value("operation_token") or self.operation_token
+        )
+        header["is_historical"] = bool(
+            self.operation_obj.get_value("is_historical")
         )
         self._write_sale_save_log(
             f"mode={self.database.__class__.__name__} host={getattr(self.database, 'host', 'local')} "
@@ -597,7 +660,7 @@ class BaseOperationDialog(QDialog):
             if getattr(tab, "section", None) not in wanted:
                 continue
             if tab is current_tab and hasattr(tab, "refresh_table"):
-                tab.refresh_table()
+                tab.refresh_table(force=True)
             elif hasattr(tab, "mark_dirty"):
                 tab.mark_dirty()
 
@@ -694,81 +757,109 @@ class BaseOperationDialog(QDialog):
                 })
 
             rows = self.items_table.get_current_table_data()
+            unknown_items = []
             for row_index, item in enumerate(rows):
                 name = " ".join(str(item.get("product_name") or "").split())
                 if not name:
                     QMessageBox.warning(self, "Missing Item", "Every sale line needs a name.")
                     return False, False
                 item_type = str(item.get("item_type") or "").casefold()
-                if item_type not in ("product", "service"):
-                    from PySide6.QtWidgets import QInputDialog
-                    choice, ok = QInputDialog.getItem(
-                        self, "Choose Item Type",
-                        f"Create or use '{name}' as:", ["Product", "Service"],
-                        editable=False,
-                    )
-                    if not ok:
-                        return False, False
-                    item_type = choice.casefold()
-                    self._set_row_item_type(int(item.get("row_index", row_index + 1)) - 1, item_type)
-
-                exists = self._catalog_entity_exists(item_type, name)
-                if exists:
+                if item_type not in ("product", "service", "manual"):
+                    item_type = ""
+                # Keep-only lines are snapshots: no catalog link, no creation.
+                if item_type == "manual":
                     continue
-                section = "Products" if item_type == "product" else "Services"
-                if not self.database.has_permission(section, "write"):
-                    QMessageBox.warning(
-                        self, "Permission Denied",
-                        f"You don't have permission to create {section.lower()}."
-                    )
-                    return False, False
-                if QMessageBox.question(
-                    self, f"Create {item_type.title()}",
-                    f"This {item_type} does not exist:\n{name}\n\nCreate it?",
-                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
-                ) != QMessageBox.Yes:
-                    return False, False
+                if item_type == "product" and self._catalog_entity_exists("product", name):
+                    continue
+                if item_type == "service" and self._catalog_entity_exists("service", name):
+                    continue
+                if not item_type and (
+                    self._catalog_entity_exists("product", name)
+                    or self._catalog_entity_exists("service", name)
+                ):
+                    continue
+                unknown_items.append({
+                    "name": name,
+                    "item_type": item_type,
+                    "quantity": item.get("quantity", 0),
+                    "unit_price": item.get("unit_price", 0),
+                    "table_row": int(item.get("row_index", row_index + 1)) - 1,
+                })
 
-                try:
-                    price = Decimal(str(item.get("unit_price", 0)))
-                    quantity = Decimal(str(item.get("quantity", 0)))
-                except InvalidOperation:
-                    QMessageBox.warning(self, "Invalid Item", f"Invalid quantity or price for {name}.")
+            if unknown_items:
+                dialog = UnknownItemReviewDialog(unknown_items, self)
+                if dialog.exec() != QDialog.Accepted:
                     return False, False
-                if price < 0 or quantity <= 0:
-                    QMessageBox.warning(
-                        self, "Invalid Item",
-                        f"{name}: quantity must be greater than zero and price cannot be negative."
-                    )
-                    return False, False
-                pending = {
-                    "type": item_type, "name": name, "unit_price": str(price),
-                    "sale_price": str(price),
-                }
-                if item_type == "product":
-                    from PySide6.QtWidgets import QInputDialog
-                    initial, ok = QInputDialog.getDouble(
-                        self, "Initial Product Stock",
-                        f"Initial stock for '{name}':", float(quantity), 0.001,
-                        999999999.0, 3,
-                    )
-                    if not ok or Decimal(str(initial)) < quantity:
+                decisions = dialog.get_decisions()
+                for decision, unknown in zip(decisions, unknown_items):
+                    name = decision["name"]
+                    action = decision["action"]
+                    if action == "cancel":
                         QMessageBox.warning(
-                            self, "Insufficient Initial Stock",
-                            "Initial stock must cover the quantity in this sale."
+                            self, "Editing Required",
+                            f"Edit '{name}' before saving the sale, then try again.",
                         )
                         return False, False
-                    purchase_price, ok = QInputDialog.getDouble(
-                        self, "Product Purchase Price",
-                        f"Purchase cost for '{name}':", 0.0, 0.0, 999999999.0, 2,
-                    )
-                    if not ok:
+                    self._set_row_item_type(unknown["table_row"], action)
+                    if action == "manual":
+                        continue
+                    section = "Products" if action == "product" else "Services"
+                    if not self.database.has_permission(section, "write"):
+                        QMessageBox.warning(
+                            self, "Permission Denied",
+                            f"You don't have permission to create {section.lower()}."
+                        )
                         return False, False
-                    pending.update({
-                        "initial_quantity": str(initial),
-                        "purchase_price": str(purchase_price),
-                    })
-                self.pending_entities.append(pending)
+
+                    try:
+                        price = Decimal(str(unknown.get("unit_price", 0)))
+                        quantity = Decimal(str(unknown.get("quantity", 0)))
+                    except InvalidOperation:
+                        QMessageBox.warning(
+                            self, "Invalid Item", f"Invalid quantity or price for {name}."
+                        )
+                        return False, False
+                    if price < 0 or quantity <= 0:
+                        QMessageBox.warning(
+                            self, "Invalid Item",
+                            f"{name}: quantity must be greater than zero and price cannot be negative."
+                        )
+                        return False, False
+                    pending = {
+                        "type": action, "name": name, "unit_price": str(price),
+                        "sale_price": str(price),
+                    }
+                    if action == "product":
+                        is_historical = bool(self.operation_obj.get_value("is_historical"))
+                        from PySide6.QtWidgets import QInputDialog
+                        # Historical products start at zero real stock unless the
+                        # user enters a real opening quantity.
+                        initial, ok = QInputDialog.getDouble(
+                            self, "Initial Product Stock",
+                            f"Initial stock for '{name}':",
+                            0.0 if is_historical else float(quantity),
+                            0.0 if is_historical else 0.001,
+                            999999999.0, 3,
+                        )
+                        if not ok:
+                            return False, False
+                        if not is_historical and Decimal(str(initial)) < quantity:
+                            QMessageBox.warning(
+                                self, "Insufficient Initial Stock",
+                                "Initial stock must cover the quantity in this sale."
+                            )
+                            return False, False
+                        purchase_price, ok = QInputDialog.getDouble(
+                            self, "Product Purchase Price",
+                            f"Purchase cost for '{name}':", 0.0, 0.0, 999999999.0, 2,
+                        )
+                        if not ok:
+                            return False, False
+                        pending.update({
+                            "initial_quantity": str(initial),
+                            "purchase_price": str(purchase_price),
+                        })
+                    self.pending_entities.append(pending)
             return True, False
         except Exception as e:
             print(f"Error handling missing references: {e}")
@@ -827,6 +918,7 @@ class BaseOperationDialog(QDialog):
                     JOIN Sales s ON si.sales_id = s.ID
                     WHERE si.product_id = %s
                       AND (s.state IS NULL OR s.state != 'on_hold')
+                      AND (s.is_historical IS NULL OR NOT s.is_historical)
                       AND si.sales_id != %s
                 """, (product_id, current_sale_id))
                 sold_elsewhere = cursor.fetchone()[0] or 0

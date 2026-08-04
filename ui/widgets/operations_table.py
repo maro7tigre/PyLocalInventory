@@ -175,8 +175,18 @@ class TableRowFactory:
 
     def _create_item_type_cell(self, table, row, col, item):
         selector = QComboBox()
-        selector.addItem("Product", "product")
-        selector.addItem("Service", "service")
+        # Build from the class options so the "Keep only in Sale" (manual)
+        # choice only appears for Sale item tables.
+        labels = {
+            "product": "Product",
+            "service": "Service",
+            "manual": "Keep only in Sale",
+        }
+        options = self.data_manager.parameter_definitions.get(
+            "item_type", {}
+        ).get("options", ["product", "service"])
+        for option in options:
+            selector.addItem(labels.get(option, option.title()), option)
         selected = "product"
         if item and hasattr(item, "get_value"):
             selected = str(item.get_value("item_type") or "")
@@ -649,6 +659,16 @@ class TableEventHandler:
         database = self.data_manager.database
         if not database or not getattr(database, "cursor", None):
             return None
+        # "Keep only in this Sale" lines stay snapshot-only: never resolve or
+        # link them to a catalog record.
+        try:
+            type_col = self.data_manager.table_columns.index("item_type")
+        except ValueError:
+            type_col = None
+        if type_col is not None:
+            selector = self.table.cellWidget(row, type_col)
+            if selector and str(selector.currentData() or "") == "manual":
+                return None
         target = self._normalized_name(entered_name)
         product = service = None
         remote_catalog = getattr(database, "sale_catalog", None)
@@ -857,7 +877,7 @@ class TableEventHandler:
                 item_type = str(selector.currentData() or item_type).casefold()
             except (ValueError, AttributeError):
                 pass
-        if item_type == "service":
+        if item_type in ("service", "manual"):
             return None
         
         # Get quantity from either active editor or cell item

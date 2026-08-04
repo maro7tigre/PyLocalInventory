@@ -80,7 +80,7 @@ class CatalogSelectorTests(unittest.TestCase):
         self.assertIsNone(widget.event_handler.get_row_stock_state(0))
         widget.close()
 
-    def test_type_selector_has_only_product_and_service(self):
+    def test_type_selector_offers_product_service_and_keep_only(self):
         widget = OperationsTableWidget(
             SalesItemClass,
             database=_Database(),
@@ -89,10 +89,10 @@ class CatalogSelectorTests(unittest.TestCase):
         type_col = widget.data_manager.table_columns.index("item_type")
         selector = widget.table.cellWidget(0, type_col)
 
-        self.assertEqual(selector.count(), 2)
+        self.assertEqual(selector.count(), 3)
         self.assertEqual(
             [selector.itemData(index) for index in range(selector.count())],
-            ["product", "service"],
+            ["product", "service", "manual"],
         )
         widget.close()
 

@@ -61,7 +61,7 @@ from core.user_settings import (
 class MainWindow(ThemedMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle(f"PyLocalInventory — build {APP_BUILD_ID}")
+        self.setWindowTitle("PyLocalInventory")
         self.setMinimumSize(1000, 700)
         
         # Load application settings
@@ -533,16 +533,7 @@ class MainWindow(ThemedMainWindow):
         self.network_port = port_num
         self._client_connected = True
         host_build = remote_db.host_build_id
-        if host_build == APP_BUILD_ID:
-            status = "compatible"
-        elif host_build is None:
-            status = "MISMATCH — host build unknown (host predates build-id reporting)"
-        else:
-            status = "MISMATCH — host and this client are on different builds"
-        self.setWindowTitle(
-            f"PyLocalInventory — build {APP_BUILD_ID} — connected to {host}:{port_num} "
-            f"(host build {host_build or 'unknown'}, {status})"
-        )
+        self.setWindowTitle("PyLocalInventory")
         if host_build != APP_BUILD_ID:
             QMessageBox.warning(
                 self,
@@ -647,6 +638,18 @@ class MainWindow(ThemedMainWindow):
         # Connecting before addTab() refreshed Home while the remaining tabs
         # were still being built, doubling startup work on network clients.
         tab_widget.currentChanged.connect(self.on_tab_changed)
+
+        # Startup preload: warm the session cache of every readable entity tab
+        # (first ~page_size records each). Every refresh runs on its own
+        # background thread, so the window stays responsive and the first visit
+        # to any tab renders from the cache instead of waiting on a fetch.
+        for i in range(1, tab_widget.count()):
+            widget = tab_widget.widget(i)
+            if hasattr(widget, 'refresh_table'):
+                try:
+                    widget.refresh_table()
+                except Exception as error:
+                    print(f"✗ Preload failed for {tab_widget.tabText(i)}: {error}")
         
         # Debug info
         print(f"\n📊 Database Status:")

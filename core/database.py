@@ -18,6 +18,27 @@ from core.pg_config import load_server_config
 
 logger = logging.getLogger(__name__)
 
+# Sort columns allowed to appear directly in ORDER BY / keyset WHERE clauses.
+# UI-generated text must be validated against this set before it ever reaches
+# SQL - never interpolate arbitrary user input into ORDER BY.
+_ORDER_COLUMNS = {
+    'id', 'username', 'name', 'description', 'keywords', 'client_username',
+    'client_name', 'supplier_username', 'supplier_name', 'date',
+    'unit_price', 'sale_price', 'quantity', 'category', 'ice',
+    'subtotal', 'total_price', 'information', 'total_quantity',
+    'total_production', 'department', 'report_type', 'created_by',
+    'created_at', 'report', 'is_historical', 'state', 'notes',
+}
+
+# Subset of _ORDER_COLUMNS whose values are numeric. Sort expressions for
+# these are wrapped in COALESCE(..., 0) (text columns in COALESCE(..., ''))
+# so the composite keyset row comparison (sort_expr, id) never hits NULL,
+# which would silently drop rows sharing a NULL sort value.
+_ORDER_NUMERIC_COLUMNS = {
+    'id', 'unit_price', 'sale_price', 'quantity', 'ice', 'subtotal',
+    'total_price', 'total_quantity', 'total_production', 'created_by',
+}
+
 
 class Database:
     """Database that integrates with parameter class system"""
@@ -342,6 +363,9 @@ class Database:
                 'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT',
                 'created_by': 'INTEGER', 'created_by_username': 'TEXT',
                 'created_at': 'TEXT', 'operation_token': 'TEXT',
+                # Historical sales are books-only: they never touch stock.
+                # Default FALSE so every existing sale stays a normal sale.
+                'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
             },
             'imports': {
                 'supplier_name': 'TEXT', 'supplier_id': 'INTEGER',
@@ -763,6 +787,17 @@ class Database:
     def _normalize_exact(value):
         return " ".join(str(value or "").split()).casefold()
 
+    @staticmethod
+    def _parse_bool_flag(value):
+        """Interpret a boolean flag that may arrive as bool, 0/1, or a string."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
     def _find_named_record(self, table, name, record_id=None):
         if record_id not in (None, "", 0, "0"):
             self.cursor.execute(f"SELECT id, name FROM {table} WHERE id = %s", (int(record_id),))
@@ -1061,6 +1096,7 @@ class Database:
                 JOIN sales s ON s.id=si.sales_id
                 WHERE si.product_id=%s
                   AND (s.state IS NULL OR s.state<>'on_hold')
+                  AND (s.is_historical IS NULL OR NOT s.is_historical)
                 """,
                 (product_id,),
             )
@@ -1173,6 +1209,8 @@ class Database:
                         "items": [], "transaction": "committed", "duplicate": True,
                     }
 
+            is_historical = self._parse_bool_flag(sale_data.get("is_historical"))
+
             resolved_pending = self._create_pending_sale_entities(pending_entities, user)
 
             # Resolve only in the explicitly selected catalog.
@@ -1202,12 +1240,9 @@ class Database:
                             f"Choose Product or Service for '{item['product_name']}'"
                         )
                 if kind == "manual":
-                    # Legacy manual lines remain editable, but new lines must
-                    # explicitly select Product or Service.
-                    if item["id"] is None:
-                        raise ValueError(
-                            f"Choose Product or Service for '{item['product_name']}'"
-                        )
+                    # Snapshot-only line ("Keep only in this Sale"): the typed
+                    # name is stored with no Product/Service link and never
+                    # affects stock. New lines are allowed as well.
                     continue
                 table = "products" if kind == "product" else "services"
                 selected_id = item["product_id"] if kind == "product" else item["service_id"]
@@ -1236,6 +1271,11 @@ class Database:
             }
             if not header:
                 raise ValueError("Sale header contains no storable fields")
+            # is_historical lives on a real BOOLEAN column that is not managed
+            # by the parameter-class schema builder; inject it explicitly so
+            # creates and edits persist (and can switch) the flag.
+            if "is_historical" in sale_data:
+                header["is_historical"] = self._parse_bool_flag(sale_data["is_historical"])
             if sale_id:
                 for protected in (
                     "created_by", "created_by_username", "created_at", "operation_token"
@@ -1346,7 +1386,7 @@ class Database:
                 )
             deleted = len(delete_ids)
 
-            if str(header.get("state") or "pending") != "on_hold":
+            if not is_historical and str(header.get("state") or "pending") != "on_hold":
                 requested_by_product = {}
                 for item in validated:
                     if item["item_type"] == "product":
@@ -1377,6 +1417,7 @@ class Database:
                         FROM sales_items si JOIN sales s ON s.id=si.sales_id
                         WHERE si.product_id=%s AND si.sales_id<>%s
                           AND (s.state IS NULL OR s.state<>'on_hold')
+                          AND (s.is_historical IS NULL OR NOT s.is_historical)
                         """,
                         (product_id, sale_id),
                     )
@@ -1769,11 +1810,106 @@ class Database:
             print(f"Error updating item in {section}: {e}")
             return False
 
+    @staticmethod
+    def _order_column_expression(order_by, prefix=''):
+        """Resolve a validated sort column to a SQL expression (None for id).
+
+        ``prefix`` scopes a plain column name for join-based queries (e.g. 's.'
+        for sales) but the date sort is special-cased to a CASE expression.
+        Returned expressions are NULL-safe so composite keyset comparisons
+        never evaluate against a NULL sort value.
+        """
+        if not order_by or str(order_by).casefold() == 'id':
+            return None
+        column = str(order_by)
+        if column not in _ORDER_COLUMNS:
+            return None
+        if column == 'date':
+            return Database._date_sort_expression(prefix)
+        expr = f"{prefix}{column}"
+        if column in _ORDER_NUMERIC_COLUMNS:
+            return f"COALESCE({expr}, 0)"
+        return f"COALESCE({expr}, '')"
+
+    @staticmethod
+    def _date_sort_expression(prefix=''):
+        """Order expression parsing the dd-mm-yyyy / yyyy-mm-dd date text stored
+        in the ``date`` column into a real Postgres date for correct ordering.
+        Unparseable/empty dates sort to 1900-01-01 so the keyset cursor value
+        stays type-compatible with the comparison expression."""
+        col = f"{prefix}date"
+        return (
+            "CASE "
+            f"WHEN {col} ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}$' THEN TO_DATE({col}, 'DD-MM-YYYY') "
+            f"WHEN {col} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN TO_DATE({col}, 'YYYY-MM-DD') "
+            f"WHEN {col} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN TO_DATE({col}, 'DD/MM/YYYY') "
+            "ELSE DATE '1900-01-01' END"
+        )
+
+    @staticmethod
+    def _keyset_sort_value(order_by, after_sort):
+        """Normalize a keyset cursor value so it can be cast to the same type as
+        the ORDER BY expression (dates are stored as display text)."""
+        if order_by != 'date' or after_sort is None:
+            return after_sort
+        text = str(after_sort).strip()
+        for fmt in ('%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y'):
+            try:
+                return datetime.strptime(text, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return '1900-01-01'
+
+    @staticmethod
+    def _keyset_condition(order_expr, direction, after_id, after_sort):
+        """Build (sql_fragment, params) for keyset pagination on (order_expr, id).
+
+        Uses a composite row comparison so duplicate sort values still page
+        deterministically through the unique ``id`` tie-breaker. Returns a
+        fragment of ``None`` when no cursor is supplied (first batch).
+        """
+        if after_id is None:
+            return None, []
+        op = '>' if str(direction).casefold().startswith('a') else '<'
+        last_id = int(after_id)
+        if order_expr and order_expr != 'id':
+            fragment = f"({order_expr}, id) {op} (%s, %s)"
+            return fragment, [after_sort, last_id]
+        return f"id {op} %s", [last_id]
+
+    @staticmethod
+    def _summary_order_expression(order_by):
+        """Resolve a validated sort column to a SQL expression usable both in
+        ORDER BY and in the keyset WHERE clause for the Sales/Imports summary
+        query (SELECT aliases are not visible inside WHERE)."""
+        if not order_by or str(order_by).casefold() == 'id':
+            return None
+        column = str(order_by)
+        if column not in _ORDER_COLUMNS:
+            return None
+        summary_columns = {
+            'subtotal': 'COALESCE(summary.subtotal, 0)',
+            'total_price': 'COALESCE(summary.total_price, 0)',
+            'information': "COALESCE(summary.information, '')",
+            'total_quantity': 'COALESCE(summary.total_quantity, 0)',
+            'total_production': 'COALESCE(summary.total_production, 0)',
+        }
+        if column in summary_columns:
+            return summary_columns[column]
+        return Database._order_column_expression(column, prefix='s.')
+
     def get_items(
         self, section, search_text=None, search_columns=None,
-        order_by=None, order_dir='asc', limit=None, offset=None
+        order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None
     ):
-        """Get items from section, optionally filtered, sorted, and paginated."""
+        """Get items from section, optionally filtered, sorted, and paginated.
+
+        ``after_id`` / ``after_sort`` implement keyset (seek) pagination: the
+        next batch is the first batch of rows after the previous batch's last
+        row in the same stable ORDER BY (sort column, id). This avoids the
+        deep-OFFSET slowdown and duplicate/skipped rows on large tables.
+        """
         if not self.cursor or section not in self.registered_classes:
             return []
 
@@ -1793,22 +1929,21 @@ class Database:
                 if clauses:
                     conditions.append("(" + " OR ".join(clauses) + ")")
 
+            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+            order_expr = self._order_column_expression(order_by)
+            cursor_value = self._keyset_sort_value(order_by, after_sort)
+            keyset_fragment, keyset_params = self._keyset_condition(
+                order_expr, direction, after_id, cursor_value
+            )
+            if keyset_fragment:
+                conditions.append(keyset_fragment)
+                params.extend(keyset_params)
+
             if conditions:
                 query += " WHERE " + " AND ".join(conditions)
 
-            if order_by:
-                direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
-                if order_by == 'date':
-                    date_expression = (
-                        "CASE "
-                        "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
-                        "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
-                        "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
-                        "ELSE NULL END"
-                    )
-                    query += f" ORDER BY {date_expression} {direction}"
-                else:
-                    query += f" ORDER BY {order_by} {direction}"
+            if order_expr:
+                query += f" ORDER BY {order_expr} {direction}, id {direction}"
             else:
                 query += " ORDER BY id"
 
@@ -1839,6 +1974,7 @@ class Database:
     def get_operation_summary_items(
         self, section, search_text=None, search_columns=None,
         order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None,
         user=None,
     ):
         """Get Sales and Imports rows with precomputed totals and summaries.
@@ -1860,6 +1996,8 @@ class Database:
                 order_dir=order_dir,
                 limit=limit,
                 offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
             )
 
         base_table = section.lower()
@@ -1907,24 +2045,21 @@ class Database:
             if clauses:
                 conditions.append("(" + " OR ".join(clauses) + ")")
 
+        direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+        order_expr = self._summary_order_expression(order_by)
+        cursor_value = self._keyset_sort_value(order_by, after_sort)
+        keyset_fragment, keyset_params = self._keyset_condition(
+            order_expr, direction, after_id, cursor_value
+        )
+        if keyset_fragment:
+            conditions.append(keyset_fragment)
+            params.extend(keyset_params)
+
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
 
-        if order_by:
-            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
-            if order_by == 'date':
-                date_expression = (
-                    "CASE "
-                    "WHEN s.date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(s.date, 'DD-MM-YYYY') "
-                    "WHEN s.date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(s.date, 'YYYY-MM-DD') "
-                    "WHEN s.date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(s.date, 'DD/MM/YYYY') "
-                    "ELSE NULL END"
-                )
-                query += f" ORDER BY {date_expression} {direction}"
-            elif order_by in ('subtotal', 'total_price', 'information', 'total_quantity', 'total_production'):
-                query += f" ORDER BY {order_by} {direction}"
-            else:
-                query += f" ORDER BY s.{order_by} {direction}"
+        if order_expr:
+            query += f" ORDER BY {order_expr} {direction}, s.id {direction}"
         else:
             query += " ORDER BY s.id"
 
@@ -1963,6 +2098,7 @@ class Database:
         self, section, user, owner_id=None, date_from=None, date_to=None,
         report_type=None, search_text=None, search_columns=None,
         order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None,
     ):
         """Return ownership-filtered Sales or Reports rows.
 
@@ -1979,6 +2115,8 @@ class Database:
                 order_dir=order_dir,
                 limit=limit,
                 offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
             )
         if section == "Sales":
             return self.get_items(
@@ -1989,6 +2127,8 @@ class Database:
                 order_dir=order_dir,
                 limit=limit,
                 offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
             )
         if section not in ("Sales", "Reports"):
             return self.get_items(
@@ -1999,6 +2139,8 @@ class Database:
                 order_dir=order_dir,
                 limit=limit,
                 offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
             )
         user = user or {}
         is_superadmin = bool(user.get("is_superadmin"))
@@ -2043,22 +2185,21 @@ class Database:
             if clauses:
                 conditions.append("(" + " OR ".join(clauses) + ")")
 
+        direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+        order_expr = self._order_column_expression(order_by)
+        cursor_value = self._keyset_sort_value(order_by, after_sort)
+        keyset_fragment, keyset_params = self._keyset_condition(
+            order_expr, direction, after_id, cursor_value
+        )
+        if keyset_fragment:
+            conditions.append(keyset_fragment)
+            params.extend(keyset_params)
+
         if conditions:
             query += " WHERE " + " AND ".join(conditions)
 
-        if order_by:
-            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
-            if order_by == 'date':
-                date_expression = (
-                    "CASE "
-                    "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
-                    "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
-                    "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
-                    "ELSE NULL END"
-                )
-                query += f" ORDER BY {date_expression} {direction}"
-            else:
-                query += f" ORDER BY {order_by} {direction}"
+        if order_expr:
+            query += f" ORDER BY {order_expr} {direction}, id {direction}"
         else:
             query += " ORDER BY id"
 
@@ -2091,6 +2232,7 @@ class Database:
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
                 WHERE s.state IS NULL OR s.state<>'on_hold'
+                  AND (s.is_historical IS NULL OR NOT s.is_historical)
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             """
@@ -2114,6 +2256,7 @@ class Database:
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
                 WHERE s.state IS NULL OR s.state<>'on_hold'
+                  AND (s.is_historical IS NULL OR NOT s.is_historical)
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             WHERE p.id = ANY(%s)
@@ -2141,6 +2284,7 @@ class Database:
                     FROM sales_items si
                     JOIN sales s ON s.id=si.sales_id
                     WHERE s.state IS NULL OR s.state<>'on_hold'
+                      AND (s.is_historical IS NULL OR NOT s.is_historical)
                     GROUP BY si.product_id
                 ) sold ON sold.product_id=p.id
                 WHERE p.name IS NOT NULL AND p.name<>''
@@ -2196,6 +2340,7 @@ class Database:
               SELECT si.product_id, SUM(si.quantity) quantity
               FROM sales_items si JOIN sales s ON s.id=si.sales_id
               WHERE s.state IS NULL OR s.state<>'on_hold'
+                AND (s.is_historical IS NULL OR NOT s.is_historical)
               GROUP BY si.product_id
             ), stock AS (
               SELECT p.name, p.username,
@@ -2302,7 +2447,7 @@ class Database:
     def get_reports(
         self, owner_id=None, date_from=None, date_to=None, report_type=None,
         search_text=None, search_columns=None, order_by=None, order_dir='asc',
-        limit=None, offset=None,
+        limit=None, offset=None, after_id=None, after_sort=None,
     ):
         return self.get_items_for_user(
             "Reports",
@@ -2317,6 +2462,8 @@ class Database:
             order_dir=order_dir,
             limit=limit,
             offset=offset,
+            after_id=after_id,
+            after_sort=after_sort,
         )
 
     def save_report(self, report_id, data):

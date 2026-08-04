@@ -15,6 +15,25 @@ class ReportsTab(BaseTab):
     def __init__(self, database=None, parent=None):
         super().__init__(ReportsClass, ReportsEditDialog, database, parent)
 
+    def _cache_key(self):
+        """Reports add user/date-range/type filters to the cache key so a
+        cached result is never served across different report filters."""
+        owner_id = self.user_filter.currentData() if self.user_filter else None
+        use_dates = self.date_filter_enabled.isChecked()
+        date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
+        date_to = self.date_to.date().toString("yyyy-MM-dd") if use_dates else None
+        report_type = self.type_filter.currentText()
+        if report_type == "All types":
+            report_type = None
+        return (
+            self.search_bar.text().strip(),
+            self.order_combo.currentText(),
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+        )
+
     def add_additional_toolbar_buttons(self, layout):
         self.user_filter = None
         if getattr(self.database, "is_superadmin", True):
@@ -60,7 +79,8 @@ class ReportsTab(BaseTab):
         self.date_to.setEnabled(enabled)
         self.refresh_table()
 
-    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None):
+    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None,
+                    after_id=None, after_sort=None):
         owner_id = self.user_filter.currentData() if self.user_filter else None
         use_dates = self.date_filter_enabled.isChecked()
         date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
@@ -79,10 +99,12 @@ class ReportsTab(BaseTab):
             order_dir=self._order_direction(order_option),
             limit=limit,
             offset=offset,
+            after_id=after_id,
+            after_sort=after_sort,
         )
 
-    def background_fetcher(self):
-        """Capture filter widgets on the GUI thread before network loading."""
+    def background_fetcher(self, refresh_id=None, database=None):
+        """Capture filter widgets and the keyset cursor on the GUI thread."""
         owner_id = self.user_filter.currentData() if self.user_filter else None
         use_dates = self.date_filter_enabled.isChecked()
         date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
@@ -92,21 +114,31 @@ class ReportsTab(BaseTab):
             report_type = None
         search_text = self.search_bar.text().strip()
         order_option = self.order_combo.currentText()
+        order_by = self._order_by_field(order_option)
+        order_dir = self._order_direction(order_option)
         limit = self.page_size + 1
-        offset = self.current_page * self.page_size
+        after_id = self._after_id
+        after_sort = self._after_sort
         database = self.database
-        return lambda: database.get_reports(
-            owner_id,
-            date_from,
-            date_to,
-            report_type,
-            search_text=search_text,
-            search_columns=self.get_searchable_fields(),
-            order_by=self._order_by_field(order_option),
-            order_dir=self._order_direction(order_option),
-            limit=limit,
-            offset=offset,
-        )
+
+        def fetch():
+            items = database.get_reports(
+                owner_id,
+                date_from,
+                date_to,
+                report_type,
+                search_text=search_text,
+                search_columns=self.get_searchable_fields(),
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+            metrics = self._keyset_metrics(order_by, items, limit)
+            return items, None, metrics, refresh_id
+
+        return fetch
 
     def details_callback(self, obj_id):
         """Show full report text in a read-only popup"""

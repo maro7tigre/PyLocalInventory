@@ -92,6 +92,15 @@ class ImportsTab(BaseTab):
             "Total ↑",
             "Total ↓"
         ])
+
+    def _order_by_field(self, order_option):
+        """Map display labels to allowlisted sort columns."""
+        field = super()._order_by_field(order_option)
+        if field == 'recent':
+            return 'date'
+        if field == 'total':
+            return 'total_price'
+        return field
     
     def get_searchable_fields(self):
         """Get fields that can be searched for imports"""
@@ -152,7 +161,7 @@ class ImportsTab(BaseTab):
         try:
             dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
             if dialog.exec():
-                self.refresh_table()
+                self.refresh_table(force=True)
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"Failed to open import details: {e}")

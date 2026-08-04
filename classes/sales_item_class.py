@@ -51,7 +51,7 @@ class SalesItemClass(BaseClass):
                 "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
                 "required": True,
                 "default": "product",
-                "options": ["product", "service"],
+                "options": ["product", "service", "manual"],
                 "type": "string"
             },
             "product_name": {
@@ -367,6 +367,11 @@ class SalesItemClass(BaseClass):
                 self.parameters["service_id"]["value"] = None
             elif normalized == "service":
                 self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
+            elif normalized == "manual":
+                # Snapshot-only line: keep the typed name, no catalog link.
+                self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
             return
         # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:

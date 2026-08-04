@@ -15,6 +15,8 @@ from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingT
 from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
 from core.database import Database
+from core.memory_utils import process_memory_mb
+from core.session_cache import SessionCache
 from datetime import datetime
 from decimal import Decimal
 import re
@@ -204,6 +206,15 @@ class BaseTab(QWidget):
         self.page_size = 100
         self.current_page = 0
         self._has_more_rows = False
+        self._after_id = None
+        self._after_sort = None
+        self._appending = False
+
+        # Session RAM cache of raw record dicts keyed by (search, order).
+        # Serves tab switches instantly and refreshes stale views in the
+        # background, so identical database/network requests are not repeated.
+        self._cache = SessionCache()
+        self._cache_hits = 0
 
         self.setup_ui()
         app = QApplication.instance()
@@ -281,27 +292,12 @@ class BaseTab(QWidget):
         self.refresh_btn.clicked.connect(self.refresh_table)
         controls_layout.addWidget(self.refresh_btn)
 
-        self.prev_page_btn = BlueButton("< Prev")
-        self.prev_page_btn.setMinimumHeight(20)
-        self.prev_page_btn.clicked.connect(self.go_to_previous_page)
-        controls_layout.addWidget(self.prev_page_btn)
-
-        self.page_label = QLabel("Page 1")
-        self.page_label.setStyleSheet("font-size: 14px; padding: 0 8px;")
-        self.page_label.setMinimumWidth(80)
-        controls_layout.addWidget(self.page_label)
-
-        self.next_page_btn = BlueButton("Next >")
-        self.next_page_btn.setMinimumHeight(20)
-        self.next_page_btn.clicked.connect(self.go_to_next_page)
-        controls_layout.addWidget(self.next_page_btn)
-
-        self.page_size_combo = QComboBox()
-        self.page_size_combo.addItems(["25", "50", "100", "200"])
-        self.page_size_combo.setCurrentText(str(self.page_size))
-        self.page_size_combo.currentTextChanged.connect(self.on_page_size_changed)
-        self.page_size_combo.setMinimumWidth(80)
-        controls_layout.addWidget(self.page_size_combo)
+        self.load_more_btn = BlueButton("Load more")
+        self.load_more_btn.setMinimumHeight(20)
+        self.load_more_btn.setToolTip("Scroll to the bottom of the table to load more rows automatically")
+        self.load_more_btn.clicked.connect(self.load_more_rows)
+        self.load_more_btn.setVisible(False)
+        controls_layout.addWidget(self.load_more_btn)
 
         self.add_additional_toolbar_buttons(controls_layout)
         
@@ -350,6 +346,12 @@ class BaseTab(QWidget):
         self.delegate = BaseTableDelegate(self)
         self.table.setItemDelegate(self.delegate)
 
+        # Infinite scroll: when the user reaches the bottom, append the next
+        # keyset batch instead of showing a "Next" button.
+        self.table.verticalScrollBar().valueChanged.connect(
+            self._maybe_load_more_on_scroll
+        )
+
         # Set specific column widths (ID fixed at 100px, image/preview 80px, others stretch)
         for i, column_key in enumerate(self.table_columns):
             if column_key == 'id':
@@ -374,17 +376,53 @@ class BaseTab(QWidget):
         """Get parameter info for column"""
         return self.parameter_definitions.get(column_key, {})
     
-    def refresh_table(self):
-        """Refresh table data from database."""
+    def _cache_key(self):
+        """Key identifying the current search+sort view; subclasses (e.g.
+        ReportsTab with extra filter widgets) may override to widen it."""
+        return (self.search_bar.text().strip(), self.order_combo.currentText())
+
+    def refresh_table(self, force=False):
+        """Load the first batch of rows (full reset of filters, sort, cursor).
+
+        When the exact current view is already in the session cache and
+        ``force`` is False, the table renders from it instantly and a
+        background refresh is only started when the cached view is stale -
+        identical requests are never repeated. Mutation sites pass
+        ``force=True`` so the source of truth is always re-fetched.
+        """
         if self._refreshing:
             return
         if not self.database:
             QMessageBox.warning(self, "Error", "No database connection")
             return
 
+        key = self._cache_key()
+        entry = None if (force or self._needs_refresh) else self._cache.get(key)
+        if entry is not None and entry.records:
+            self._render_from_cache(entry, key)
+            if entry.is_stale():
+                self._start_full_refresh(preserve_table=True)
+            return
+
+        self._start_full_refresh()
+
+    def _start_full_refresh(self, preserve_table=False):
+        """Reset paging state and fetch the first batch in the background.
+
+        ``preserve_table=True`` keeps the currently rendered rows on screen
+        while a stale cached view refreshes in place (the fetched batch
+        replaces them when it arrives) instead of flashing an empty table.
+        """
         self._refresh_id += 1
         refresh_id = self._refresh_id
-        self.table.setRowCount(0)
+        self.current_page = 0
+        self._after_id = None
+        self._after_sort = None
+        self._has_more_rows = False
+        self._appending = False
+        if not preserve_table:
+            self.table.setRowCount(0)
+            self.table.verticalScrollBar().setValue(0)
 
         if self.database.__class__.__name__ == "RemoteDatabase":
             self._start_remote_refresh(refresh_id)
@@ -392,6 +430,70 @@ class BaseTab(QWidget):
 
         self._start_local_refresh(refresh_id)
         return
+
+    def _render_from_cache(self, entry, key):
+        """Synchronously render a cached view without any database request."""
+        cache_render_start = time.perf_counter()
+        self._cache_hits += 1
+        self._refresh_id += 1
+        self.current_page = 0
+        self._appending = False
+        self._has_more_rows = entry.has_more
+        self._after_id = entry.after_id
+        self._after_sort = entry.after_sort
+
+        if entry.levels is not None:
+            self.database._product_stock_levels = entry.levels
+
+        self.all_items = self._objects_from_records(entry.records)
+        self.filtered_items = list(self.all_items)
+        self.search_bar.update_options(self.get_search_options())
+        self.table.setRowCount(0)
+        render_start = time.perf_counter()
+        self.populate_table_with_items(self.all_items)
+        render_duration = (time.perf_counter() - render_start) * 1000
+
+        self._loaded_once = True
+        self._needs_refresh = False
+        self._last_refresh_at = time.monotonic()
+        self._update_paging_controls()
+
+        logger.info(
+            "session_cache_hit section=%s key=%s rows=%d render_ms=%.2f",
+            self.section, key, len(self.all_items), render_duration,
+        )
+        print(
+            f"[PERFORMANCE] {self.section} served from session cache: "
+            f"{len(self.all_items)} rows in "
+            f"{(time.perf_counter() - cache_render_start) * 1000:.2f} ms"
+        )
+
+    def _maybe_load_more_on_scroll(self, value):
+        """Trigger a keyset append when the scrollbar nears the bottom."""
+        scrollbar = self.table.verticalScrollBar()
+        if self._appending or self._refreshing or not self._has_more_rows:
+            return
+        if value >= scrollbar.maximum() - 150:
+            self.load_more_rows()
+
+    def load_more_rows(self):
+        """Append the next keyset batch to the already-loaded rows."""
+        if self._refreshing or self._appending:
+            return
+        if not self._has_more_rows or self._after_id is None:
+            return
+        if not self.database:
+            return
+
+        self._refresh_id += 1
+        refresh_id = self._refresh_id
+        self._appending = True
+
+        if self.database.__class__.__name__ == "RemoteDatabase":
+            self._start_remote_refresh(refresh_id, appending=True)
+            return
+
+        self._start_local_refresh(refresh_id, appending=True)
 
     def _create_worker_database(self):
         """Create an independent database connection for background refreshes."""
@@ -408,14 +510,14 @@ class BaseTab(QWidget):
                 raise RuntimeError("Failed to connect worker database")
         return worker_db
 
-    def _start_remote_refresh(self, refresh_id):
+    def _start_remote_refresh(self, refresh_id, appending=False):
         """Fetch data on a worker thread; all Qt updates remain on the main thread."""
         self._refreshing = True
         self.refresh_btn.setEnabled(False)
         fetcher = self.background_fetcher(refresh_id)
         self._start_refresh(fetcher, refresh_id, mode='client')
 
-    def _start_local_refresh(self, refresh_id):
+    def _start_local_refresh(self, refresh_id, appending=False):
         """Fetch data on a worker thread using a dedicated local database connection."""
         self._refreshing = True
         self.refresh_btn.setEnabled(False)
@@ -423,6 +525,7 @@ class BaseTab(QWidget):
             worker_db = self._create_worker_database()
         except Exception as error:
             self._refreshing = False
+            self._appending = False
             self.refresh_btn.setEnabled(True)
             logger.exception("Failed to create worker database for section=%s", self.section)
             QMessageBox.critical(
@@ -452,27 +555,10 @@ class BaseTab(QWidget):
         self._refresh_mode = mode
         thread.start()
 
-    def _apply_refresh_results(self, items_data, levels, metrics, started, refresh_id):
-        if refresh_id != self._refresh_id:
-            logger.info(
-                "Discarding stale refresh result section=%s refresh_id=%s current_id=%s",
-                self.section, refresh_id, self._refresh_id,
-            )
-            return
-
-        self.all_items = []
-        if levels is not None:
-            self.database._product_stock_levels = {
-                int(key): value for key, value in levels.items()
-            }
-
-        if len(items_data) > self.page_size:
-            self._has_more_rows = True
-            items_data = items_data[:self.page_size]
-        else:
-            self._has_more_rows = False
-
-        object_prep_start = time.perf_counter()
+    def _objects_from_records(self, items_data):
+        """Build object-class instances from raw record dicts (shared by the
+        background fetch path and the session-cache render path)."""
+        new_objects = []
         for item_data in items_data:
             try:
                 obj = self.object_class(item_data.get('ID', 0), self.database)
@@ -486,20 +572,72 @@ class BaseTab(QWidget):
                                 "Invalid refresh value section=%s field=%s id=%s",
                                 self.section, param_key, item_data.get("ID"),
                             )
-                self.all_items.append(obj)
+                new_objects.append(obj)
             except Exception:
                 logger.exception(
                     "Failed processing section=%s id=%s",
                     self.section, item_data.get("ID"),
                 )
-        object_prep_duration = (time.perf_counter() - object_prep_start) * 1000
+        return new_objects
+
+    def _apply_refresh_results(self, items_data, levels, metrics, started, refresh_id):
+        if refresh_id != self._refresh_id:
+            logger.info(
+                "Discarding stale refresh result section=%s refresh_id=%s current_id=%s",
+                self.section, refresh_id, self._refresh_id,
+            )
+            return
+
+        appending = self._appending
         metrics = metrics or {}
+        has_more = len(items_data) > self.page_size
+        items_data = items_data if not has_more else items_data[:self.page_size]
+
+        if levels is not None:
+            self.database._product_stock_levels = {
+                int(key): value for key, value in levels.items()
+            }
+
+        object_prep_start = time.perf_counter()
+        new_objects = self._objects_from_records(items_data)
+        object_prep_duration = (time.perf_counter() - object_prep_start) * 1000
+
+        if appending:
+            self.all_items.extend(new_objects)
+            self.current_page += 1
+        else:
+            self.all_items = new_objects
+            self.current_page = 0
+
+        # Advance the keyset cursor to the last row that was actually shown.
+        cursor = metrics.get('after_id')
+        if cursor is not None:
+            self._after_id = cursor
+            self._after_sort = metrics.get('after_sort')
+        self._has_more_rows = has_more and len(new_objects) == self.page_size
+
+        # Keep the session cache in step with what the user has loaded.
+        cache_key = self._cache_key()
+        if appending:
+            self._cache.append_batch(
+                cache_key, list(items_data), levels, self._has_more_rows,
+                self._after_id, self._after_sort,
+            )
+        else:
+            self._cache.set_first_batch(
+                cache_key, list(items_data), levels, self._has_more_rows,
+                self._after_id, self._after_sort,
+            )
+
         metrics['object_prep_ms'] = object_prep_duration
 
         self.search_bar.update_options(self.get_search_options())
         self.filtered_items = list(self.all_items)
         render_start = time.perf_counter()
-        self.populate_table_with_items(self.filtered_items)
+        if appending and len(new_objects):
+            self.populate_table_with_items(new_objects, append=True)
+        else:
+            self.populate_table_with_items(self.all_items)
         render_duration = (time.perf_counter() - render_start) * 1000
         metrics['render_ms'] = render_duration
 
@@ -509,9 +647,16 @@ class BaseTab(QWidget):
         self._update_paging_controls()
 
         metrics['rows'] = len(self.all_items)
+        metrics['memory_mb'] = process_memory_mb()
         logger.info(
             "refresh_metrics section=%s refresh_id=%s rows=%d metrics=%s",
             self.section, refresh_id, len(self.all_items), metrics,
+        )
+        logger.info(
+            "tab_batch section=%s refresh_id=%s batch=%d appending=%s "
+            "more=%s memory_mb=%s",
+            self.section, refresh_id, self.current_page + 1, appending,
+            self._has_more_rows, metrics['memory_mb'],
         )
 
     @Slot(object, object, object, float, int)
@@ -537,7 +682,9 @@ class BaseTab(QWidget):
 
     def _finish_refresh(self, started, mode='client'):
         self._refreshing = False
+        self._appending = False
         self.refresh_btn.setEnabled(True)
+        self._update_paging_controls()
         elapsed = time.perf_counter() - started
         rows = len(self.all_items)
         logger.log(
@@ -546,12 +693,13 @@ class BaseTab(QWidget):
             self.section.lower(), elapsed, rows, mode,
         )
         print(
-            f"[PERFORMANCE] load_{self.section.lower()} page={self.current_page + 1} "
+            f"[PERFORMANCE] load_{self.section.lower()} batch={self.current_page + 1} "
             f"completed in {elapsed:.3f} seconds mode={mode} rows={rows}"
         )
 
     def _wait_for_refresh_thread(self):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
+        self._cache.clear()
         thread = getattr(self, "_refresh_thread", None)
         if thread and thread.isRunning():
             thread.requestInterruption()
@@ -562,24 +710,29 @@ class BaseTab(QWidget):
                 )
 
     def background_fetcher(self, refresh_id=None, database=None):
-        """Capture filter and paging state before the worker thread starts."""
+        """Capture filter and keyset cursor state before the worker thread starts."""
         database = database or self.database
         section = self.section
         search_text = self.search_bar.text().strip()
         order_option = self.order_combo.currentText()
+        order_by = self._order_by_field(order_option)
+        order_dir = self._order_direction(order_option)
+        search_columns = self.get_searchable_fields()
         limit = self.page_size + 1
-        offset = self.current_page * self.page_size
+        after_id = self._after_id
+        after_sort = self._after_sort
 
         def fetch():
             if hasattr(database, 'get_operation_summary_items') and section in ('Sales', 'Imports'):
                 items = database.get_operation_summary_items(
                     section,
                     search_text=search_text,
-                    search_columns=self.get_searchable_fields(),
-                    order_by=self._order_by_field(order_option),
-                    order_dir=self._order_direction(order_option),
+                    search_columns=search_columns,
+                    order_by=order_by,
+                    order_dir=order_dir,
                     limit=limit,
-                    offset=offset,
+                    after_id=after_id,
+                    after_sort=after_sort,
                 )
                 # If the optimized summary path unexpectedly returns no rows,
                 # fall back to the generic get_items call so the UI still shows
@@ -590,11 +743,12 @@ class BaseTab(QWidget):
                         items = database.get_items(
                             section,
                             search_text=search_text,
-                            search_columns=self.get_searchable_fields(),
-                            order_by=self._order_by_field(order_option),
-                            order_dir=self._order_direction(order_option),
+                            search_columns=search_columns,
+                            order_by=order_by,
+                            order_dir=order_dir,
                             limit=limit,
-                            offset=offset,
+                            after_id=after_id,
+                            after_sort=after_sort,
                         )
                     except Exception:
                         # Keep original empty result if fallback fails
@@ -605,11 +759,12 @@ class BaseTab(QWidget):
                 items = database.get_items(
                     section,
                     search_text=search_text,
-                    search_columns=self.get_searchable_fields(),
-                    order_by=self._order_by_field(order_option),
-                    order_dir=self._order_direction(order_option),
+                    search_columns=search_columns,
+                    order_by=order_by,
+                    order_dir=order_dir,
                     limit=limit,
-                    offset=offset,
+                    after_id=after_id,
+                    after_sort=after_sort,
                 )
 
             levels = None
@@ -623,22 +778,48 @@ class BaseTab(QWidget):
                 else:
                     levels = database.get_product_stock_levels()
 
-            return items, levels, {}, refresh_id
+            metrics = self._keyset_metrics(order_by, items, limit)
+            return items, levels, metrics, refresh_id
 
         return fetch
 
-    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None):
+    def _keyset_metrics(self, order_by, items, limit):
+        """Return the keyset cursor pointing after the rows that will be shown.
+
+        The fetch pulls ``limit = page_size + 1`` rows so the UI can tell that
+        more data exists; the cursor must reference the last *displayed* row
+        (``page_size`` rows), not the extra probe row.
+        """
+        if not items:
+            return {}
+        page_size = limit - 1
+        shown = items if len(items) <= page_size else items[:page_size]
+        last = shown[-1]
+        last_id = last.get('ID')
+        if last_id is None:
+            return {}
+        sort_value = last.get(order_by) if order_by else None
+        if sort_value is not None:
+            sort_value = Database._keyset_sort_value(order_by, sort_value)
+        return {'after_id': last_id, 'after_sort': sort_value}
+
+    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None,
+                    after_id=None, after_sort=None):
         """Fetch rows for the tab; ownership-aware tabs may override."""
+        order_by = self._order_by_field(order_option)
+        order_dir = self._order_direction(order_option)
         if hasattr(self.database, 'get_operation_summary_items') and self.section in ('Sales', 'Imports'):
             try:
                 items = self.database.get_operation_summary_items(
                     self.section,
                     search_text=search_text,
                     search_columns=self.get_searchable_fields(),
-                    order_by=self._order_by_field(order_option),
-                    order_dir=self._order_direction(order_option),
+                    order_by=order_by,
+                    order_dir=order_dir,
                     limit=limit,
                     offset=offset,
+                    after_id=after_id,
+                    after_sort=after_sort,
                 )
                 if not items:
                     try:
@@ -647,10 +828,12 @@ class BaseTab(QWidget):
                             self.section,
                             search_text=search_text,
                             search_columns=self.get_searchable_fields(),
-                            order_by=self._order_by_field(order_option),
-                            order_dir=self._order_direction(order_option),
+                            order_by=order_by,
+                            order_dir=order_dir,
                             limit=limit,
                             offset=offset,
+                            after_id=after_id,
+                            after_sort=after_sort,
                         )
                     except Exception:
                         return items
@@ -662,10 +845,12 @@ class BaseTab(QWidget):
                     self.section,
                     search_text=search_text,
                     search_columns=self.get_searchable_fields(),
-                    order_by=self._order_by_field(order_option),
-                    order_dir=self._order_direction(order_option),
+                    order_by=order_by,
+                    order_dir=order_dir,
                     limit=limit,
                     offset=offset,
+                    after_id=after_id,
+                    after_sort=after_sort,
                 )
             except TypeError:
                 return self.database.get_items(self.section)
@@ -685,31 +870,19 @@ class BaseTab(QWidget):
     def mark_dirty(self):
         """Request one refresh the next time this tab becomes visible."""
         self._needs_refresh = True
-
-    def on_page_size_changed(self, value):
-        try:
-            self.page_size = int(value)
-        except (ValueError, TypeError):
-            self.page_size = 100
-        self.current_page = 0
-        self.refresh_table()
+        self._cache.clear()
 
     def go_to_previous_page(self):
-        if self.current_page <= 0:
-            return
-        self.current_page -= 1
-        self.refresh_table()
+        """Backwards-compatible no-op: pagination is now append-only via keyset."""
 
     def go_to_next_page(self):
-        if not self._has_more_rows:
-            return
-        self.current_page += 1
-        self.refresh_table()
+        """Backwards-compatible alias for load_more_rows()."""
+        self.load_more_rows()
 
     def _update_paging_controls(self):
-        self.page_label.setText(f"Page {self.current_page + 1}")
-        self.prev_page_btn.setEnabled(self.current_page > 0)
-        self.next_page_btn.setEnabled(self._has_more_rows)
+        loaded = len(self.all_items)
+        self.load_more_btn.setVisible(self._has_more_rows and loaded > 0)
+        self.load_more_btn.setEnabled(not self._appending)
 
     def _order_by_field(self, order_option):
         if not order_option or order_option == "Default":
@@ -1048,15 +1221,18 @@ class BaseTab(QWidget):
         self.filtered_items = filtered
         self.populate_table_with_items(filtered)
     
-    def populate_table_with_items(self, items):
-        """Populate table with given items"""
+    def populate_table_with_items(self, items, append=False):
+        """Populate table with given items; append renders new rows after the
+        existing ones (infinite scroll) instead of replacing the table."""
         sorting_enabled = self.table.isSortingEnabled()
         signals_blocked = self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         self.table.setSortingEnabled(False)
         try:
-            self.table.setRowCount(len(items))
-            for row, obj in enumerate(items):
+            start_row = self.table.rowCount() if append else 0
+            self.table.setRowCount(start_row + len(items))
+            for offset, obj in enumerate(items):
+                row = start_row + offset
                 try:
                     for col, column_key in enumerate(self.table_columns):
                         self.set_table_cell(row, col, column_key, obj)
@@ -1079,7 +1255,7 @@ class BaseTab(QWidget):
                             self.table.setItem(row, col, QTableWidgetItem("Error"))
             # Content measurement is disproportionately expensive on very
             # large tables; those use the configured 70px default row height.
-            if len(items) <= 300:
+            if start_row + len(items) <= 300:
                 self.table.resizeRowsToContents()
         finally:
             self.table.setSortingEnabled(sorting_enabled)
@@ -1105,6 +1281,7 @@ class BaseTab(QWidget):
             data = {column_key: new_value}
             if self.database.update_item(obj_id, data, self.section):
                 print(f"Updated {column_key} to '{new_value}' for {self.section} {obj_id}")
+                self._cache.clear()
                 # Refresh only the specific row to show calculated field updates
                 self.refresh_table()
             else:
@@ -1174,6 +1351,7 @@ class BaseTab(QWidget):
         try:
             dialog = self.dialog_class(None, self.database, self.parent_widget)
             if dialog.exec():
+                self._cache.clear()
                 self.refresh_table()
         
         except ImportError as e:
@@ -1205,6 +1383,7 @@ class BaseTab(QWidget):
         try:
             dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
             if dialog.exec():
+                self._cache.clear()
                 self.refresh_table()
         
         except ImportError as e:
@@ -1256,6 +1435,7 @@ class BaseTab(QWidget):
             try:
                 if self.database.delete_item(obj_id, self.section):
                     # Force refresh table to show updated data
+                    self._cache.clear()
                     self.refresh_table()
                     print(f"✓ Deleted {self.section[:-1].lower()} '{item_name}' and refreshed table")
                 else:

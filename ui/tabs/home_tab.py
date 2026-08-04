@@ -1026,7 +1026,7 @@ class HomeTab(QWidget):
                 SELECT COUNT(*) FROM (
                     SELECT p.ID,
                         (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID),0) -
-                         COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')),0)) as qty,
+                         COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold') AND (s.is_historical IS NULL OR NOT s.is_historical)),0)) as qty,
                         COALESCE(p.stock_alert,0) as alert
                     FROM Products p
                 ) t
@@ -1054,7 +1054,7 @@ class HomeTab(QWidget):
                     SELECT p.name AS name, p.username AS username,
                         (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
                          - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID 
-                                     WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) AS stock_level,
+                                     WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold') AND (s.is_historical IS NULL OR NOT s.is_historical)), 0)) AS stock_level,
                         COALESCE(p.stock_alert,0) AS alert
                     FROM Products p
                 ) t

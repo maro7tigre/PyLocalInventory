@@ -50,6 +50,15 @@ class ProductsTab(BaseTab):
             "Quantity ↑",
             "Quantity ↓"
         ])
+
+    def _order_by_field(self, order_option):
+        """Map display labels to allowlisted sort columns."""
+        field = super()._order_by_field(order_option)
+        if field == 'product_name':
+            return 'name'
+        if field == 'price':
+            return 'sale_price'
+        return field
     
     def get_searchable_fields(self):
         """Get fields that can be searched for products"""

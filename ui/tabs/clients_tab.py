@@ -22,7 +22,7 @@ class ClientsTab(BaseTab):
         invisible until the cache happens to expire."""
         try:
             if self.database and hasattr(self.database, 'conn') and self.database.conn:
-                self.refresh_table()
+                self.refresh_table(force=True)
         except Exception as e:
             print(f"Error refreshing {self.section} tab on switch: {e}")
 

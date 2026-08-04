@@ -164,6 +164,15 @@ class SalesTab(BaseTab):
             "Total ↑",
             "Total ↓"
         ])
+
+    def _order_by_field(self, order_option):
+        """Map display labels to allowlisted sort columns."""
+        field = super()._order_by_field(order_option)
+        if field == 'recent':
+            return 'date'
+        if field == 'total':
+            return 'total_price'
+        return field
     
     def get_searchable_fields(self):
         """Get fields that can be searched for sales"""
@@ -281,31 +290,39 @@ class SalesTab(BaseTab):
                 cp_col = self.table_columns.index('check_progress')
                 self.table.setColumnWidth(cp_col, 50)
                 self.table.horizontalHeader().setSectionResizeMode(cp_col, QHeaderView.Fixed)
+            if 'is_historical' in self.table_columns:
+                hist_col = self.table_columns.index('is_historical')
+                self.table.setColumnWidth(hist_col, 100)
+                self.table.horizontalHeader().setSectionResizeMode(hist_col, QHeaderView.Fixed)
         except Exception as e:
             print(f"Error ensuring sales columns order: {e}")
 
-    def populate_table_with_items(self, items):
+    def populate_table_with_items(self, items, append=False):
         """Populate table with custom state/progress rendering."""
         sorting_enabled = self.table.isSortingEnabled()
         signals_blocked = self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
         self.table.setSortingEnabled(False)
         try:
-            self.table.setRowCount(len(items))
+            start_row = self.table.rowCount() if append else 0
+            self.table.setRowCount(start_row + len(items))
             for row, obj in enumerate(items):
+                row = start_row + row
                 try:
                     for col, column_key in enumerate(self.table_columns):
                         if column_key == 'check_progress':
                             self._set_check_progress_cell(row, col, obj)
                         elif column_key == 'state':
                             self._set_state_cell(row, col, obj)
+                        elif column_key == 'is_historical':
+                            self._set_historical_cell(row, col, obj)
                         elif column_key == 'progress':
                             self._set_progress_cell(row, col, obj)
                         else:
                             self.set_table_cell(row, col, column_key, obj)
                 except Exception as e:
                     print(f"Error processing Sales row {row}: {e}")
-            if len(items) <= 300:
+            if start_row + len(items) <= 300:
                 self.table.resizeRowsToContents()
         finally:
             self.table.setSortingEnabled(sorting_enabled)
@@ -334,12 +351,34 @@ class SalesTab(BaseTab):
         try:
             dialog = OrderProgressDialog(obj, self.database, self)
             dialog.exec()
-            self.refresh_table()
+            self.refresh_table(force=True)
         except Exception as e:
             from PySide6.QtWidgets import QMessageBox
             QMessageBox.critical(self, "Error", f"Failed to open progress dialog:\n{e}")
             import traceback
             traceback.print_exc()
+
+    def _set_historical_cell(self, row, col, obj):
+        from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
+        is_historical = bool(obj.get_value('is_historical'))
+        label = "Historical" if is_historical else ""
+        btn = QPushButton(label) if label else QPushButton(" ")
+        btn.setEnabled(False)
+        if label:
+            btn.setStyleSheet(
+                "QPushButton { background:#6A1B9A; color:#fff; border:none; "
+                "border-radius:6px; padding:4px 10px; font-weight:bold; }"
+            )
+        btn.setCursor(Qt.PointingHandCursor)
+        btn.clicked.connect(
+            lambda _=None, r=row, c=col: self.table.setCurrentCell(r, c)
+        )
+
+        container = QWidget()
+        lay = QHBoxLayout(container)
+        lay.setContentsMargins(0, 0, 0, 0)
+        lay.addWidget(btn)
+        self.table.setCellWidget(row, col, container)
 
     def _set_state_cell(self, row, col, obj):
         from PySide6.QtWidgets import QWidget, QHBoxLayout, QPushButton
@@ -479,7 +518,7 @@ class SalesTab(BaseTab):
             if not self.database.delete_item(obj.id, 'Sales'):
                 QMessageBox.critical(self, "Error", "The sale could not be cancelled.")
                 return
-            self.refresh_table()
+            self.refresh_table(force=True)
         except Exception as exc:
             QMessageBox.critical(self, "Error", f"The sale could not be cancelled:\n{exc}")
 
@@ -498,7 +537,7 @@ class SalesTab(BaseTab):
             payload = {'state': new_state}
             self.database.update_item(obj.id, payload, 'Sales')
             # Refresh to reflect button style
-            self.refresh_table()
+            self.refresh_table(force=True)
         except Exception as e:
             print(f"Error updating sale state: {e}")
     
@@ -579,6 +618,6 @@ class SalesTab(BaseTab):
 
             dialog = PaymentDialog(selected_sale, self.database, self, config=config)
             if dialog.exec():
-                self.refresh_table()
+                self.refresh_table(force=True)
         except Exception as error:
             QMessageBox.critical(self, "Payment Error", f"Could not open the payment window:\n{error}")

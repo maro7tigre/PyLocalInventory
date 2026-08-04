@@ -31,6 +31,25 @@ class SalesClass(BaseClass):
                 "type": "string",
                 "options": ["on_hold", "pending", "confirmed", "finished"]  # internal values
             },
+            # Historical sales are recorded for the books/records but never
+            # touch product stock (no deduction, no validation, no movements).
+            "is_historical": {
+                "value": False,
+                "display_name": {
+                    "en": "Historical Sale", "fr": "Vente historique",
+                    "es": "Venta histórica"
+                },
+                "required": False,
+                "default": False,
+                "type": "bool",
+                "true_value": True,
+                "false_value": False,
+                "hint": {
+                    "en": "Record this sale without affecting current stock",
+                    "fr": "Enregistrer cette vente sans affecter le stock actuel",
+                    "es": "Registrar esta venta sin afectar el stock actual"
+                }
+            },
             "client_username": {
                 "value": "",
                 "display_name": {"en": "Client", "fr": "Client", "es": "Cliente"},
@@ -149,6 +168,7 @@ class SalesClass(BaseClass):
             "table": {
                 "id": "r",
                 "state": "r",
+                # "is_historical": "r",
                 "client_name": "r",
                 "notes": "r",
                 "date": "r",
@@ -160,6 +180,7 @@ class SalesClass(BaseClass):
                 "date": "rw",
                 "tva": "rw",
                 "notes": "rw",
+                "is_historical": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {
@@ -174,11 +195,15 @@ class SalesClass(BaseClass):
                 "created_by_username": "r",
                 "created_at": "r",
                 "operation_token": "r"
-                # Note: items are stored separately in Sales_Items table
+                # Note: items are stored separately in Sales_Items table.
+                # is_historical is intentionally NOT listed here: it is a real
+                # BOOLEAN column managed by Database._ensure_additional_columns
+                # and injected into the header by save_sale_with_items directly.
             },
             "report": {
                 "id": "r",
                 "state": "r",
+                "is_historical": "r",
                 "client_id": "r",
                 "date": "r",
                 "tva": "r",

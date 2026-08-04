@@ -35,7 +35,7 @@ class AttachmentSafetyTests(unittest.TestCase):
             def execute(self, *_args):
                 pass
             def fetchone(self):
-                return (24,)
+                return (24, 'linked-client')
         class Database:
             cursor = Cursor()
             conn = SimpleNamespace(rollback=lambda: None)

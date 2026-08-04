@@ -179,6 +179,7 @@ class ProductClass(BaseClass):
                 FROM Sales_Items si
                 JOIN Sales s ON si.sales_id = s.ID
                 WHERE si.product_id = %s AND (s.state IS NULL OR s.state != 'on_hold')
+                  AND (s.is_historical IS NULL OR NOT s.is_historical)
             """, (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0

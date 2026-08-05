@@ -9,7 +9,7 @@ database/network requests. This module keeps the *display data* of each tab
 bounded, thread-safe, in-memory cache for the lifetime of the app session.
 
 Rules (never violated)
-----------------------
+---------------------
 * Only plain dicts (raw model records), stock-level dicts and scalar cursor
   values are stored. Never QTableWidgetItems, QWidgets, connections, worker
   threads or full-size pixmaps.
@@ -19,6 +19,10 @@ Rules (never violated)
   re-fetching earlier pages.
 * Every cache entry is bounded and the whole cache is LRU-evicted, so memory
   stays flat no matter how many searches the user runs.
+* This RAM layer is the hot per-tab view cache; the durable row mirror lives
+  in the disk layer (core/cache_manager.py). The bounds for both layers are
+  defined together in core/cache_policies.py and are strictly nested (RAM
+  per-view cap < disk per-section cap).
 """
 
 import logging
@@ -28,10 +32,14 @@ from collections import OrderedDict
 from dataclasses import dataclass, field
 from typing import Any, Dict, List, Optional
 
-logger = logging.getLogger(__name__)
+from core.cache_policies import (
+    DEFAULT_STALE_SECONDS,
+    RAM_MAX_RECORDS_PER_VIEW,
+    RAM_MAX_TOTAL_RECORDS_PER_TAB,
+    RAM_MAX_VIEWS_PER_TAB,
+)
 
-#: Entries evicted by age before re-render (seconds); mirrors BaseTab staleness.
-DEFAULT_STALE_SECONDS = 30.0
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -69,9 +77,9 @@ class SessionCache:
 
     def __init__(
         self,
-        max_entries: int = 32,
-        max_records_per_entry: int = 2000,
-        max_total_records: int = 20000,
+        max_entries: int = RAM_MAX_VIEWS_PER_TAB,
+        max_records_per_entry: int = RAM_MAX_RECORDS_PER_VIEW,
+        max_total_records: int = RAM_MAX_TOTAL_RECORDS_PER_TAB,
     ):
         self._max_entries = max_entries
         self._max_records_per_entry = max_records_per_entry

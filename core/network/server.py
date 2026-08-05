@@ -52,6 +52,7 @@ _SECTION_METHODS = {
     'get_items': ('read', 0),                   # get_items(section)
     'get_items_by_operation_id': ('read', 1),   # get_items_by_operation_id(operation_id, section)
     'get_operation_summary_items': ('read', 0),  # get operation summaries for Sales/Imports
+    'get_changes': ('read', 0),                 # get_changes(section, since_seq, limit)
 }
 _ATTACHMENT_METHODS = {
     'list_attachments': ('read', 0),
@@ -189,6 +190,15 @@ def _check_permission(user, method, args, kwargs):
     if method in _SECTION_METHODS:
         kind, idx = _SECTION_METHODS[method]
         section = args[idx] if len(args) > idx else kwargs.get('section')
+        # Attachment metadata sync mirrors the attachment permission model:
+        # read access to Clients OR Sales grants the change-log stream.
+        if method == "get_changes" and section == "attachments":
+            if not any(
+                user['permissions'].get(sec, {}).get('read')
+                for sec in ('Clients', 'Sales')
+            ):
+                return False, "You don't have read access to Clients or Sales"
+            return True, None
         mapped = SECTION_GROUP.get(section, section)
         needed = _ACTION_FOR_KIND[kind]
         if method == "get_items" and mapped == "Reports":

@@ -16,7 +16,7 @@ from ui.widgets.parameters_widgets import ButtonWidget
 from core.network.protocol import PermissionDeniedError
 from core.database import Database
 from core.memory_utils import process_memory_mb
-from core.session_cache import SessionCache
+from core.session_cache import SessionCache, DEFAULT_STALE_SECONDS
 from datetime import datetime
 from decimal import Decimal
 import re
@@ -302,6 +302,20 @@ class BaseTab(QWidget):
         self.add_additional_toolbar_buttons(controls_layout)
         
         layout.addLayout(controls_layout)
+
+        # Offline/stale banner: shown (non-blocking) when the host cannot be
+        # reached so the user knows the rows on screen are cached display data.
+        self._offline_banner = QLabel(
+            "Offline - showing cached data. The host could not be reached; "
+            "changes made elsewhere may not be visible yet."
+        )
+        self._offline_banner.setStyleSheet(
+            "QLabel { background-color: #b22222; color: white; "
+            "padding: 6px; border-radius: 4px; font-weight: bold; }"
+        )
+        self._offline_banner.setWordWrap(True)
+        self._offline_banner.setVisible(False)
+        layout.addWidget(self._offline_banner)
         
         # Table setup
         self.table = QTableWidget()
@@ -384,11 +398,17 @@ class BaseTab(QWidget):
     def refresh_table(self, force=False):
         """Load the first batch of rows (full reset of filters, sort, cursor).
 
-        When the exact current view is already in the session cache and
-        ``force`` is False, the table renders from it instantly and a
-        background refresh is only started when the cached view is stale -
-        identical requests are never repeated. Mutation sites pass
-        ``force=True`` so the source of truth is always re-fetched.
+        Rendering order, cheapest first, without ever blocking the UI:
+        1. the in-memory session cache (instant), then
+        2. the on-disk SQLite cache (remote clients render their last-fetched
+           rows immediately on launch instead of waiting on the network), then
+        3. a background fetch from the source (host PG or local PG).
+
+        When the exact current view is already cached and ``force`` is False,
+        the table renders from it and a background refresh is only started
+        when the cached view is stale - identical requests are never repeated.
+        Mutation sites pass ``force=True`` so the source of truth is always
+        re-fetched.
         """
         if self._refreshing:
             return
@@ -397,11 +417,23 @@ class BaseTab(QWidget):
             return
 
         key = self._cache_key()
-        entry = None if (force or self._needs_refresh) else self._cache.get(key)
+        use_cache = not (force or self._needs_refresh)
+        offline = bool(getattr(self.database, 'offline', False))
+        entry = self._cache.get(key) if use_cache else None
         if entry is not None and entry.records:
             self._render_from_cache(entry, key)
-            if entry.is_stale():
+            if entry.is_stale() and not offline:
                 self._start_full_refresh(preserve_table=True)
+            return
+
+        if use_cache and self._try_render_from_disk(key):
+            return
+
+        if offline:
+            # Host is known unreachable: never fire a refresh that will hang on
+            # the network - keep whatever the cache holds and flag the rows as
+            # possibly stale instead.
+            self._set_offline_banner(True)
             return
 
         self._start_full_refresh()
@@ -464,6 +496,133 @@ class BaseTab(QWidget):
         )
         print(
             f"[PERFORMANCE] {self.section} served from session cache: "
+            f"{len(self.all_items)} rows in "
+            f"{(time.perf_counter() - cache_render_start) * 1000:.2f} ms"
+        )
+
+    def _disk_cache(self):
+        """Return this tab's on-disk SQLite cache, or None when not a network
+        client (or the cache failed to open)."""
+        database = self.database
+        if database is None or database.__class__.__name__ != 'RemoteDatabase':
+            return None
+        cache = getattr(database, 'cache', None)
+        if cache is None or not getattr(cache, 'opened', False):
+            return None
+        return cache
+
+    def _invalidate_disk_views(self):
+        """Drop this section's cached on-disk views after a local mutation so a
+        stale snapshot is never rendered; the next refresh repopulates the
+        cache from the host's authoritative data."""
+        disk = self._disk_cache()
+        if disk is None:
+            return
+        try:
+            disk.invalidate_views(self.section)
+        except Exception:
+            logger.exception("Disk cache invalidation failed section=%s", self.section)
+
+
+    def _disk_view_key(self):
+        """Serialize the whole cache key (2-element BaseTab key or the wider
+        subclass keys like ReportsTab's) into a single string for the disk
+        views table. repr() is deterministic and unique per key tuple."""
+        return repr(self._cache_key())
+
+    def _try_render_from_disk(self, key):
+        """Render the current view from the on-disk SQLite cache.
+
+        Used on the first visit to a view (RAM cache miss) so a network client
+        shows its last-fetched rows immediately instead of waiting on a full
+        HTTP fetch. When the cached view is older than the staleness window a
+        background refresh is started (preserving the rendered table) so the
+        host's authoritative rows replace it in place. Returns True when a
+        disk view was rendered, False when there was nothing to show.
+        """
+        disk = self._disk_cache()
+        if disk is None:
+            return False
+        try:
+            view = disk.get_view(self.section, self._disk_view_key(), '')
+        except Exception:
+            logger.exception("Disk cache view lookup failed section=%s", self.section)
+            return False
+        if view is None:
+            return False
+        record_ids, has_more, after_id, after_sort, stored_at = view
+        if not record_ids:
+            return False
+        try:
+            records_by_id = disk.get_records(self.section, record_ids)
+        except Exception:
+            logger.exception("Disk cache records read failed section=%s", self.section)
+            return False
+        records = [
+            records_by_id.get(row_id)
+            for row_id in record_ids
+            if records_by_id.get(row_id) is not None
+        ]
+        if not records:
+            return False
+
+        self._render_from_disk(key, records, has_more, after_id, after_sort, disk)
+        offline = bool(getattr(self.database, 'offline', False))
+        age = time.time() - stored_at
+        if offline:
+            # Keep showing the cached snapshot (even if stale) and tell the
+            # user it may be out of date - no point hanging on the host.
+            self._set_offline_banner(True)
+        elif age >= DEFAULT_STALE_SECONDS:
+            self._start_full_refresh(preserve_table=True)
+        return True
+
+    def _render_from_disk(self, key, records, has_more, after_id, after_sort, disk):
+        """Synchronously render a disk-cached view without any network request,
+        rehydrating the RAM session cache so repeated switches stay RAM-fast."""
+        cache_render_start = time.perf_counter()
+        self._cache_hits += 1
+        self._refresh_id += 1
+        self.current_page = 0
+        self._appending = False
+        self._has_more_rows = has_more
+        self._after_id = after_id
+        self._after_sort = after_sort
+
+        if self.section == 'Products':
+            levels = disk.get_stock()
+            if levels:
+                self.database._product_stock_levels = {
+                    int(k): value for k, value in levels.items()
+                }
+        else:
+            levels = None
+
+        self.all_items = self._objects_from_records(records)
+        self.filtered_items = list(self.all_items)
+        self.search_bar.update_options(self.get_search_options())
+        self.table.setRowCount(0)
+        render_start = time.perf_counter()
+        self.populate_table_with_items(self.all_items)
+        render_duration = (time.perf_counter() - render_start) * 1000
+
+        # Rehydrate the RAM layer so the view stays instant after this first
+        # disk read; the background refresh will refresh both layers in step.
+        self._cache.set_first_batch(
+            key, list(records), levels, has_more, after_id, after_sort,
+        )
+
+        self._loaded_once = True
+        self._needs_refresh = False
+        self._last_refresh_at = time.monotonic()
+        self._update_paging_controls()
+
+        logger.info(
+            "session_cache_disk_hit section=%s key=%s rows=%d render_ms=%.2f",
+            self.section, key, len(self.all_items), render_duration,
+        )
+        print(
+            f"[PERFORMANCE] {self.section} served from disk cache: "
             f"{len(self.all_items)} rows in "
             f"{(time.perf_counter() - cache_render_start) * 1000:.2f} ms"
         )
@@ -602,12 +761,30 @@ class BaseTab(QWidget):
         new_objects = self._objects_from_records(items_data)
         object_prep_duration = (time.perf_counter() - object_prep_start) * 1000
 
+        # Reconcile by record ID: when the freshly fetched set has the same
+        # rows in the same order as what is already on screen (the common
+        # background refresh case), update the changed cells in place so the
+        # table is never cleared and selection/scroll survive untouched.
+        # Otherwise fall back to a full re-render with selection and scroll
+        # position restored afterwards.
+        previous_selection = self.get_selected_id()
+        previous_scroll = self.table.verticalScrollBar().value()
+
+        render_duration = 0.0
         if appending:
             self.all_items.extend(new_objects)
             self.current_page += 1
         else:
+            previous_all = self.all_items
             self.all_items = new_objects
             self.current_page = 0
+            render_start = time.perf_counter()
+            if previous_all and self._reconcile_in_place(previous_all, new_objects):
+                pass
+            else:
+                self.populate_table_with_items(self.all_items)
+                self._restore_selection_and_scroll(previous_selection, previous_scroll)
+            render_duration = (time.perf_counter() - render_start) * 1000
 
         # Advance the keyset cursor to the last row that was actually shown.
         cursor = metrics.get('after_id')
@@ -629,22 +806,26 @@ class BaseTab(QWidget):
                 self._after_id, self._after_sort,
             )
 
+        # Mirror the successful fetch into the on-disk SQLite cache so the
+        # next launch (or tab open after the RAM entry is evicted) renders
+        # from disk instead of the network.
+        self._store_batch_to_disk(items_data, levels)
+
         metrics['object_prep_ms'] = object_prep_duration
 
         self.search_bar.update_options(self.get_search_options())
         self.filtered_items = list(self.all_items)
-        render_start = time.perf_counter()
         if appending and len(new_objects):
+            render_start = time.perf_counter()
             self.populate_table_with_items(new_objects, append=True)
-        else:
-            self.populate_table_with_items(self.all_items)
-        render_duration = (time.perf_counter() - render_start) * 1000
+            render_duration = (time.perf_counter() - render_start) * 1000
         metrics['render_ms'] = render_duration
 
         self._loaded_once = True
         self._needs_refresh = False
         self._last_refresh_at = time.monotonic()
         self._update_paging_controls()
+        self._set_offline_banner(False)
 
         metrics['rows'] = len(self.all_items)
         metrics['memory_mb'] = process_memory_mb()
@@ -658,6 +839,88 @@ class BaseTab(QWidget):
             self.section, refresh_id, self.current_page + 1, appending,
             self._has_more_rows, metrics['memory_mb'],
         )
+
+    def _store_batch_to_disk(self, items_data, levels):
+        """Mirror the just-fetched batch into the on-disk SQLite cache: the raw
+        wire records (payloads exactly as the host returned them, including
+        Decimal-to-string totals), the view's ordered id list with its keyset
+        cursor, and product stock levels. Runs on the UI thread but only
+        touches a handful of local rows, so it stays non-blocking."""
+        disk = self._disk_cache()
+        if disk is None:
+            return
+        try:
+            disk.store_records(self.section, items_data)
+        except Exception:
+            logger.exception("Disk cache records write failed section=%s", self.section)
+        try:
+            record_ids = []
+            for obj in self.all_items:
+                obj_id = getattr(obj, 'id', None)
+                if obj_id:
+                    record_ids.append(int(obj_id))
+            if record_ids:
+                disk.store_view(
+                    self.section, self._disk_view_key(), '', record_ids,
+                    has_more=self._has_more_rows,
+                    after_id=self._after_id,
+                    after_sort=self._after_sort,
+                )
+        except Exception:
+            logger.exception("Disk cache view write failed section=%s", self.section)
+        if levels is not None:
+            try:
+                disk.store_stock(levels)
+            except Exception:
+                logger.exception("Disk cache stock write failed section=%s", self.section)
+
+    def _reconcile_in_place(self, previous_objects, new_objects):
+        """Rewrite the on-screen rows in place when the freshly fetched set
+        matches the previously displayed set in the same order (a refresh
+        where no record was inserted or deleted). Returns True when rows were
+        patched in place, False when the caller must do a full re-render."""
+        current_ids = [getattr(obj, 'id', None) for obj in previous_objects]
+        new_ids = [getattr(obj, 'id', None) for obj in new_objects]
+        if current_ids != new_ids:
+            return False
+        self.all_items = list(new_objects)
+        for row, obj in enumerate(new_objects):
+            self._rewrite_row(row, obj)
+        return True
+
+    def _rewrite_row(self, row, obj):
+        """Replace every cell of ``row`` from ``obj`` without touching the row
+        count, so the row index, selection and scroll position survive."""
+        for col in range(self.table.columnCount()):
+            self.table.setCellWidget(row, col, None)
+        for col, column_key in enumerate(self.table_columns):
+            try:
+                self.set_table_cell(row, col, column_key, obj)
+            except Exception:
+                logger.exception(
+                    "Failed in-place cell section=%s row=%d column=%s",
+                    self.section, row, column_key,
+                )
+                self.table.setItem(row, col, QTableWidgetItem("Error"))
+        self.table.resizeRowToContents(row)
+
+    def _restore_selection_and_scroll(self, selected_id, scroll_value):
+        """Re-apply the scroll offset and re-select the row whose record id
+        matches the previously selected one after a full re-render."""
+        if scroll_value is not None:
+            scrollbar = self.table.verticalScrollBar()
+            scrollbar.setValue(min(int(scroll_value), scrollbar.maximum()))
+        if selected_id:
+            for row in range(self.table.rowCount()):
+                if self.get_object_id_from_row(row) == selected_id:
+                    self.table.selectRow(row)
+                    self.table.setCurrentCell(row, 0)
+                    break
+
+    def _set_offline_banner(self, visible):
+        """Show/hide the non-blocking "offline - showing cached data" banner."""
+        if hasattr(self, '_offline_banner'):
+            self._offline_banner.setVisible(visible)
 
     @Slot(object, object, object, float, int)
     def _remote_refresh_finished(self, items_data, levels, metrics, started, refresh_id):
@@ -674,10 +937,10 @@ class BaseTab(QWidget):
     @Slot(str, float)
     def _remote_refresh_failed(self, error, started):
         logger.error("Remote refresh failed section=%s error=%s", self.section, error)
-        QMessageBox.critical(
-            self, "Connection Error",
-            f"Failed to load {self.section} from the host:\n{error}",
-        )
+        # Keep whatever is already rendered (session/disk cache or the last
+        # successful fetch) visible and mark the tab as showing stale data;
+        # a modal box here would block the user for every failing tab.
+        self._set_offline_banner(True)
         self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
 
     def _finish_refresh(self, started, mode='client'):
@@ -1282,6 +1545,7 @@ class BaseTab(QWidget):
             if self.database.update_item(obj_id, data, self.section):
                 print(f"Updated {column_key} to '{new_value}' for {self.section} {obj_id}")
                 self._cache.clear()
+                self._invalidate_disk_views()
                 # Refresh only the specific row to show calculated field updates
                 self.refresh_table()
             else:
@@ -1352,6 +1616,7 @@ class BaseTab(QWidget):
             dialog = self.dialog_class(None, self.database, self.parent_widget)
             if dialog.exec():
                 self._cache.clear()
+                self._invalidate_disk_views()
                 self.refresh_table()
         
         except ImportError as e:
@@ -1384,6 +1649,7 @@ class BaseTab(QWidget):
             dialog = self.dialog_class(obj_id, self.database, self.parent_widget)
             if dialog.exec():
                 self._cache.clear()
+                self._invalidate_disk_views()
                 self.refresh_table()
         
         except ImportError as e:
@@ -1436,6 +1702,7 @@ class BaseTab(QWidget):
                 if self.database.delete_item(obj_id, self.section):
                     # Force refresh table to show updated data
                     self._cache.clear()
+                    self._invalidate_disk_views()
                     self.refresh_table()
                     print(f"✓ Deleted {self.section[:-1].lower()} '{item_name}' and refreshed table")
                 else:

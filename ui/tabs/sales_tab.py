@@ -171,7 +171,7 @@ class SalesTab(BaseTab):
         if field == 'recent':
             return 'date'
         if field == 'total':
-            return 'total_price'
+            return 'total_ttc'
         return field
     
     def get_searchable_fields(self):
@@ -252,9 +252,9 @@ class SalesTab(BaseTab):
             elif order_option == "Recent ↓":
                 items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('date')), reverse=True)
             elif order_option == "Total ↑":
-                items.sort(key=lambda x: float(x.get_value('total_price') or 0))
+                items.sort(key=lambda x: float(x.get_value('total_ttc') or 0))
             elif order_option == "Total ↓":
-                items.sort(key=lambda x: float(x.get_value('total_price') or 0), reverse=True)
+                items.sort(key=lambda x: float(x.get_value('total_ttc') or 0), reverse=True)
         except Exception as e:
             print(f"Error sorting sales: {e}")
         

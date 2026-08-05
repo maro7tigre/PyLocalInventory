@@ -3,10 +3,12 @@ Main window - Updated with unified tabs approach
 All tabs now use consistent BaseTab experience
 """
 import os
+import time
+from datetime import datetime
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
-from PySide6.QtCore import Qt, QSettings
+from PySide6.QtCore import Qt, QSettings, QTimer
 from PySide6.QtGui import QAction, QActionGroup
 
 from ui.widgets.themed_widgets import ThemedMainWindow
@@ -45,6 +47,7 @@ from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
+from core.sync import SyncCoordinator
 from core.user_settings import (
     load_settings,
     remember_profile_enabled,
@@ -84,6 +87,17 @@ class MainWindow(ThemedMainWindow):
         self.network_server = None
         self.network_port = DEFAULT_PORT
         self.last_network_host = ''
+        self._sync_coordinator = None
+
+        # Bottom status bar: only meaningful for network clients, where it
+        # shows when the local cache last pulled incremental changes from the
+        # host. Hidden for standalone profiles so the window looks unchanged.
+        status_bar = self.statusBar()
+        self._sync_status_label = QLabel("")
+        self._sync_status_label.setStyleSheet("color: #bbbbbb; padding: 2px 8px;")
+        status_bar.addWidget(self._sync_status_label, 1)
+        status_bar.setSizeGripEnabled(False)
+        status_bar.setVisible(False)
 
         # Always show the welcome/entry screen on launch, even if a profile was
         # remembered from last time - only auto-skip to it on later refreshes
@@ -228,6 +242,7 @@ class MainWindow(ThemedMainWindow):
     def closeEvent(self, event):
         """Handle application close event"""
         self.save_app_config()
+        self._stop_sync_coordinator()
         if self.network_server and self.network_server.is_running:
             self.network_server.stop()
         if self.database:
@@ -640,16 +655,27 @@ class MainWindow(ThemedMainWindow):
         tab_widget.currentChanged.connect(self.on_tab_changed)
 
         # Startup preload: warm the session cache of every readable entity tab
-        # (first ~page_size records each). Every refresh runs on its own
-        # background thread, so the window stays responsive and the first visit
-        # to any tab renders from the cache instead of waiting on a fetch.
+        # (first ~page_size records each). Firing every tab's worker thread /
+        # HTTP fetch at once would create a thundering herd of 6-8 concurrent
+        # network or database requests right after login. Instead the first
+        # entity tab refreshes immediately and the rest are warmed one at a
+        # time on a staggered QTimer, so the window stays snappy and each
+        # refresh gets the full host/DB attention instead of competing.
+        self._preload_tabs = {}
         for i in range(1, tab_widget.count()):
             widget = tab_widget.widget(i)
             if hasattr(widget, 'refresh_table'):
-                try:
-                    widget.refresh_table()
-                except Exception as error:
-                    print(f"✗ Preload failed for {tab_widget.tabText(i)}: {error}")
+                self._preload_tabs[i] = widget
+        self._preload_timer = QTimer(self)
+        self._preload_timer.setInterval(600)
+        self._preload_timer.timeout.connect(self._step_preload)
+        self._step_preload()
+
+        # Network clients additionally run a background incremental sync that
+        # keeps the on-disk cache warm by pulling only the host's change log
+        # deltas (instead of whole tables on every visit). The status bar
+        # shows when the cache last heard from the host.
+        self._start_sync_coordinator()
         
         # Debug info
         print(f"\n📊 Database Status:")
@@ -660,6 +686,109 @@ class MainWindow(ThemedMainWindow):
         print("   • Startup row-count scan: skipped (tabs load their own data)")
 
     # ──────────────────────────── View menu helpers ────────────────────────────
+
+    def _step_preload(self):
+        """Refresh the next not-yet-warmed entity tab in the background.
+
+        Runs once immediately at startup and then on a staggered QTimer until
+        every readable tab has had its first refresh. Tabs the user visits
+        early are dropped from the queue by ``on_tab_changed`` because their
+        own ``refresh_on_tab_switch`` already warms them.
+        """
+        if not self._preload_tabs:
+            self._preload_timer.stop()
+            return
+        index = next(iter(self._preload_tabs))
+        widget = self._preload_tabs.pop(index)
+        try:
+            widget.refresh_table()
+        except Exception as error:
+            print(f"✗ Preload failed for {self.tab_widget.tabText(index)}: {error}")
+        if self._preload_tabs:
+            self._preload_timer.start()
+
+    def _start_sync_coordinator(self):
+        """Start background incremental sync for a network client, or clear
+        the status bar for a standalone host session."""
+        self._stop_sync_coordinator()
+        database = self.database
+        if not (self._client_connected and database is not None
+                and database.__class__.__name__ == "RemoteDatabase"):
+            self.statusBar().setVisible(False)
+            return
+
+        entity_sections = [
+            'Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports',
+        ]
+        sections = [
+            section for section in entity_sections
+            if database.has_permission(section, 'read')
+        ]
+        # Attachment metadata streams under the same permission model as the
+        # entity files themselves: read on either Clients or Sales.
+        if database.has_permission('Clients', 'read') or database.has_permission('Sales', 'read'):
+            sections.append('attachments')
+        coordinator = SyncCoordinator(database, sections, parent=self)
+        coordinator.status.connect(self._on_sync_status)
+        self._sync_coordinator = coordinator
+        self._sync_status_label.setText("")
+        self.statusBar().setVisible(True)
+        coordinator.start()
+
+    def _stop_sync_coordinator(self):
+        """Stop the background sync timer if one is running."""
+        coordinator = getattr(self, '_sync_coordinator', None)
+        if coordinator is not None:
+            try:
+                coordinator.stop()
+            except Exception:
+                pass
+            self._sync_coordinator = None
+
+    def _on_sync_status(self, state, applied, last_success, error):
+        """Update the status-bar sync indicator from SyncCoordinator."""
+        label = getattr(self, '_sync_status_label', None)
+        if label is None:
+            return
+        if state == 'syncing':
+            label.setText("Syncing with host…")
+        elif state == 'ok':
+            suffix = f" · {applied} change(s) applied" if applied else ""
+            label.setText(
+                f"Last sync: {self._format_sync_age(last_success)}{suffix}"
+            )
+            coordinator = getattr(self, '_sync_coordinator', None)
+            if coordinator is not None and applied:
+                for section in coordinator.last_applied_sections:
+                    self._mark_section_tab_dirty(section)
+        else:
+            label.setText(
+                f"Sync unavailable · last successful: "
+                f"{self._format_sync_age(last_success)}"
+            )
+
+    def _format_sync_age(self, timestamp):
+        """Human-friendly relative age for the last-sync timestamp."""
+        if not timestamp:
+            return "never"
+        seconds = int(time.time() - timestamp)
+        if seconds < 5:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        if seconds < 3600:
+            return f"{seconds // 60} min ago"
+        return f"{seconds // 3600} h ago"
+
+    def _mark_section_tab_dirty(self, section):
+        """Ask the tab for ``section`` to re-fetch on its next visit, so
+        changes synced in from the host show up promptly."""
+        if not hasattr(self, 'tab_widget') or not self.tab_widget:
+            return
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if getattr(widget, 'section', None) == section and hasattr(widget, 'mark_dirty'):
+                widget.mark_dirty()
 
     def _apply_tab_visibility(self):
         """Apply self.tab_visibility to the current tab_widget."""
@@ -848,6 +977,7 @@ class MainWindow(ThemedMainWindow):
 
     def logout(self):
         """Log out current user"""
+        self._stop_sync_coordinator()
         self.database.close()
 
         if self.connection_mode == 'client':
@@ -886,6 +1016,9 @@ class MainWindow(ThemedMainWindow):
     def on_tab_changed(self, index):
         """Handle tab change to refresh data in the newly selected tab"""
         try:
+            pending = getattr(self, '_preload_tabs', None)
+            if pending is not None:
+                pending.pop(index, None)
             if hasattr(self, 'tab_widget') and self.tab_widget:
                 current_widget = self.tab_widget.widget(index)
                 

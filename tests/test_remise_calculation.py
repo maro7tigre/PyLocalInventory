@@ -247,11 +247,84 @@ class TestRemiseNotInTableColumns(unittest.TestCase):
         self.assertIn("remise", report_params)
 
     def test_table_columns_for_sales(self):
-        """Verify expected visible columns for the Sales table."""
+        """Verify expected visible columns for the Sales table.
+
+        The old "Subtotal"/"Total Price" headers are replaced by
+        "Total HT"/"Total TTC" backed by total_ht/total_ttc.
+        """
         sale = SalesClass(0, None)
         table_cols = sale.get_visible_parameters("table")
-        expected = ["id", "state", "client_name", "notes", "date", "subtotal", "total_price"]
+        expected = ["id", "state", "client_name", "notes", "date", "total_ht", "total_ttc"]
         self.assertEqual(table_cols, expected)
+
+    def test_old_financial_headers_removed_from_table(self):
+        """'subtotal' and 'total_price' must not be visible Sales table columns."""
+        sale = SalesClass(0, None)
+        table_cols = sale.get_visible_parameters("table")
+        self.assertNotIn("subtotal", table_cols)
+        self.assertNotIn("total_price", table_cols)
+
+    def test_table_headers_are_total_ht_and_total_ttc(self):
+        """Display names shown in the table header are 'Total HT' / 'Total TTC'."""
+        sale = SalesClass(0, None)
+        self.assertEqual(sale.get_display_name("total_ht"), "Total HT")
+        self.assertEqual(sale.get_display_name("total_ttc"), "Total TTC")
+
+
+# ---------------------------------------------------------------------------
+# Test 7b: Sales table values — Total HT and Total TTC as injected by the
+# summary query (authoritative saved values from the Host).
+# ---------------------------------------------------------------------------
+
+class TestSalesTableFinancialValues(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _inject(self, raw_subtotal, remise, tva):
+        """Simulate BaseTab._objects_from_records injecting a summary row."""
+        sale = SalesClass(0, None)
+        sale.set_value('remise', remise)
+        sale.set_value('tva', tva)
+        injected = {
+            'subtotal': float(raw_subtotal),
+            'total_ht': float(raw_subtotal - remise),
+            'total_ttc': float((raw_subtotal - remise) * (1 + tva / 100.0)),
+        }
+        for key, value in injected.items():
+            sale.set_raw_value(key, value)
+        return sale
+
+    def test_scenario_one(self):
+        """1 000 - 100 remise + 20% => Total HT 900.00, Total TTC 1 080.00."""
+        sale = self._inject(1000.00, 100.00, 20)
+        self.assertAlmostEqual(sale.get_value('total_ht'), 900.00, places=2)
+        self.assertAlmostEqual(sale.get_value('total_ttc'), 1080.00, places=2)
+
+    def test_scenario_two(self):
+        """132 000 - 50 000 remise + 20% => Total HT 82 000, Total TTC 98 400."""
+        sale = self._inject(132000.00, 50000.00, 20)
+        self.assertAlmostEqual(sale.get_value('total_ht'), 82000.00, places=2)
+        self.assertAlmostEqual(sale.get_value('total_ttc'), 98400.00, places=2)
+
+    def test_scenario_three(self):
+        """70 679 - 5 654.32 remise + 20% => Total HT 65 024.68, Total TTC 78 029.62."""
+        sale = self._inject(70679.00, 5654.32, 20)
+        self.assertAlmostEqual(sale.get_value('total_ht'), 65024.68, places=2)
+        self.assertAlmostEqual(sale.get_value('total_ttc'), 78029.62, places=2)
+
+    def test_calculate_methods_match_injected_values(self):
+        """Direct calculation methods agree with the injected authoritative values."""
+        totals = calculate_sale_totals(132000.00, 50000.00, 20)
+        self.assertEqual(totals["total_ht"], Decimal("82000.00"))
+        self.assertEqual(totals["total_ttc"], Decimal("98400.00"))
+        self.assertEqual(totals["vat_amount"], Decimal("16400.00"))
+
+    def test_sales_without_remise_table_values(self):
+        """No remise: Total HT = subtotal, Total TTC = subtotal * (1 + tva)."""
+        sale = self._inject(1000.00, 0.00, 20)
+        self.assertAlmostEqual(sale.get_value('total_ht'), 1000.00, places=2)
+        self.assertAlmostEqual(sale.get_value('total_ttc'), 1200.00, places=2)
 
 
 # ---------------------------------------------------------------------------

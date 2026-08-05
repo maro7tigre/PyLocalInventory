@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import base64
+import logging
 import mimetypes
 import os
 import re
@@ -11,6 +12,8 @@ from datetime import datetime
 from pathlib import Path
 
 from core.runtime_paths import safe_windows_component, user_data_root
+
+logger = logging.getLogger(__name__)
 
 ALLOWED_TYPES = {
     b"\xff\xd8\xff": ("image/jpeg", ".jpg"),
@@ -131,6 +134,7 @@ class AttachmentService:
                 (entity_type, entity_id, original, Path(original).stem, str(description or '')[:2000], str(category or '')[:100], mime, len(data), rel.as_posix()))
             attachment_id = self.database.cursor.fetchone()[0]
             self.database.conn.commit()
+            self._record_change(attachment_id, 'upsert', self._snapshot(attachment_id))
             return attachment_id
         except Exception:
             self.database.conn.rollback()
@@ -144,6 +148,33 @@ class AttachmentService:
         if not row:
             raise ValueError("Attachment not found")
         return row
+
+    def _snapshot(self, attachment_id):
+        """Full metadata row (no file bytes) used as the incremental-sync
+        payload so clients can mirror an attachment without downloading it."""
+        self._ready()
+        self.database.cursor.execute(
+            "SELECT id, entity_type, entity_id, original_filename, display_name, "
+            "description, category, mime_type, file_size, relative_path, created_at, modified_at "
+            "FROM attachments WHERE id=%s", (int(attachment_id),))
+        row = self.database.cursor.fetchone()
+        if row is None:
+            return None
+        keys = ('id', 'entity_type', 'entity_id', 'original_filename', 'display_name',
+                'description', 'category', 'mime_type', 'file_size', 'relative_path',
+                'created_at', 'modified_at')
+        return dict(zip(keys, row))
+
+    def _record_change(self, attachment_id, operation, payload=None):
+        """Append a best-effort change-log entry so remote clients learn about
+        attachment metadata changes. Never raises - sync is best-effort."""
+        try:
+            record = getattr(self.database, 'record_change', None)
+            if record is not None:
+                record('attachments', int(attachment_id), operation, payload)
+        except Exception:
+            logger.exception(
+                "record_change failed section=attachments row_id=%s", attachment_id)
 
     def download(self, attachment_id):
         _kind, _entity, rel = self._record(int(attachment_id))
@@ -185,12 +216,17 @@ class AttachmentService:
         if not fields: return False
         values.append(int(attachment_id))
         self.database.cursor.execute("UPDATE attachments SET " + ", ".join(fields) + ", modified_at=CURRENT_TIMESTAMP WHERE id=%s", values)
-        self.database.conn.commit(); return self.database.cursor.rowcount > 0
+        self.database.conn.commit()
+        changed = self.database.cursor.rowcount > 0
+        if changed:
+            self._record_change(attachment_id, 'upsert', self._snapshot(attachment_id))
+        return changed
 
     def delete(self, attachment_id):
         self._ready()
         _kind, _entity, rel = self._record(int(attachment_id))
         self.database.cursor.execute("DELETE FROM attachments WHERE id=%s", (attachment_id,)); self.database.conn.commit()
+        self._record_change(attachment_id, 'delete', None)
         try: (storage_root(self.database) / rel).unlink(missing_ok=True)
         except OSError: pass
         try:

@@ -191,6 +191,23 @@ class SalesClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_total_tva
             },
+            # Discounted Total HT (Original Subtotal - Remise) shown in the
+            # Sales table "Total HT" column. Values are authoritative from the
+            # summary query when present, otherwise recomputed centrally.
+            "total_ht": {
+                "display_name": {"en": "Total HT", "fr": "Total HT", "es": "Total HT"},
+                "required": False,
+                "type": "float",
+                "method": self.calculate_total_ht
+            },
+            # Final Total TTC (Total HT + VAT on Total HT) shown in the
+            # Sales table "Total TTC" column.
+            "total_ttc": {
+                "display_name": {"en": "Total TTC", "fr": "Total TTC", "es": "Total TTC"},
+                "required": False,
+                "type": "float",
+                "method": self.calculate_total_ttc
+            },
             "total_quantity": {
                 "value": 0,
                 "display_name": {"en": "Total Quantity", "fr": "Quantité Totale", "es": "Cantidad Total"},
@@ -222,8 +239,8 @@ class SalesClass(BaseClass):
                 "client_name": "r",
                 "notes": "r",
                 "date": "r",
-                "subtotal": "r",
-                "total_price": "r"
+                "total_ht": "r",
+                "total_ttc": "r"
             },
             "dialog": {
                 "client_username": "rw",
@@ -298,9 +315,10 @@ class SalesClass(BaseClass):
         return sum(item.get_value('subtotal') or 0 for item in items)
 
     def calculate_subtotal(self):
-        """Discounted Total HT shown in the Sales table Subtotal column.
+        """Discounted Total HT (Original Subtotal - Remise).
 
-        Subtotal (displayed) = Original Subtotal - Remise
+        Kept for internal/report compatibility. The visible Sales table column
+        is now "Total HT" via ``total_ht`` (see ``calculate_total_ht``).
         """
         totals = calculate_sale_totals(
             self._raw_subtotal(),
@@ -342,6 +360,24 @@ class SalesClass(BaseClass):
         )
         return float(totals['total_ttc'])
     
+    def calculate_total_ht(self):
+        """Discounted Total HT: Original Subtotal - Remise."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self.get_value('remise') or 0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ht'])
+
+    def calculate_total_ttc(self):
+        """Final Total TTC: Total HT + VAT computed on Total HT."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self.get_value('remise') or 0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
+
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this sales operation"""
         if not self.database:

@@ -117,6 +117,17 @@ class RemoteDatabase:
         # before build-id reporting existed - i.e. it predates this fix.
         self.host_build_id = None
 
+        # On-disk SQLite cache of fetched records, keyed by this client
+        # identity (host|port|username). Created on a successful login so it is
+        # never shared across users on a shared PC. Falls back to None if the
+        # cache cannot be opened - the cache is display-only, never critical.
+        self.cache = None
+
+        # Offline/read-only flag: set by the background sync when the host is
+        # unreachable so tabs stop firing network refreshes that hang on a
+        # dead connection and just render what the cache already holds.
+        self.offline = False
+
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
 
@@ -189,6 +200,7 @@ class RemoteDatabase:
         # Absent on a host running a build from before build-id reporting -
         # i.e. that host has not been redeployed with this fix.
         self.host_build_id = data.get('build_id')
+        self._open_cache()
         if self.host_build_id != APP_BUILD_ID:
             logger.warning(
                 "Build mismatch: this client build_id=%s host=%s port=%s reports "
@@ -203,7 +215,7 @@ class RemoteDatabase:
             )
         return True
 
-    def _call(self, method, args=None, kwargs=None):
+    def _call(self, method, args=None, kwargs=None, timeout=10):
         if not self._token:
             raise AuthError("Not connected")
 
@@ -227,7 +239,7 @@ class RemoteDatabase:
         )
         started = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 http_status = resp.status
                 data = json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
@@ -382,5 +394,95 @@ class RemoteDatabase:
             return self._call(name, list(args), kwargs)
         return _proxy
 
+    def list_attachments(self, entity_type, entity_id):
+        """Return attachment metadata for one entity.
+
+        Online: asks the host (authoritative) exactly like before. Offline:
+        renders from the synced local cache so the attachment panel still
+        works - rows carry only metadata (id, names, size, mime, relative
+        path), never file bytes or absolute paths.
+        """
+        entity_id = int(entity_id)
+        if bool(getattr(self, 'offline', False)):
+            cache = getattr(self, 'cache', None)
+            if cache is not None:
+                records = cache.get_records('attachments') or {}
+                return [
+                    record for record in records.values()
+                    if record.get('entity_type') == entity_type
+                    and int(record.get('entity_id')) == entity_id
+                ]
+        return self._call('list_attachments', [entity_type, entity_id])
+
+    def get_changes(self, section, since_seq=0, limit=500, timeout=4):
+        """Fetch incremental changes for ``section`` since sequence
+        ``since_seq``. Returns {'changes': [...], 'last_seq': N}."""
+        return self._call(
+            'get_changes', [section],
+            {'since_seq': since_seq, 'limit': limit},
+            timeout=timeout,
+        )
+
+    def sync_section(self, section, limit=500, timeout=4):
+        """Pull and apply incremental changes for one section into the local
+        SQLite cache, advancing the stored sync cursor.
+
+        Returns None when the on-disk cache is unavailable. Otherwise returns
+        {'applied': n, 'last_seq': m, 'has_more': bool} where ``has_more``
+        means the caller should loop with the returned ``last_seq`` until it
+        is False.
+        """
+        cache = self.cache
+        if cache is None:
+            return None
+        since_seq = cache.get_sync_state(section) or 0
+        data = self.get_changes(
+            section, since_seq=since_seq, limit=limit, timeout=timeout
+        )
+        changes = data.get('changes') or []
+        upserts = []
+        deletes = []
+        for change in changes:
+            row_id = change.get('row_id')
+            if row_id is None:
+                continue
+            if change.get('operation') == 'delete':
+                deletes.append(row_id)
+            elif change.get('payload'):
+                upserts.append(change['payload'])
+        if deletes:
+            cache.delete_records(section, deletes)
+        if upserts:
+            cache.store_records(section, upserts)
+        if deletes or upserts:
+            cache.invalidate_views(section)
+        last_seq = data.get('last_seq', since_seq)
+        if last_seq != since_seq:
+            cache.set_sync_state(section, last_seq)
+        return {
+            'applied': len(changes),
+            'last_seq': last_seq,
+            'has_more': len(changes) >= limit,
+        }
+
+    def _open_cache(self):
+        from core.cache_manager import CacheManager
+        try:
+            self.cache = CacheManager(
+                host=self.host, port=self.port, username=self.username
+            )
+        except Exception:
+            logger.exception(
+                "Failed to open local cache host=%s port=%s user=%s",
+                self.host, self.port, self.username,
+            )
+            self.cache = None
+
     def close(self):
+        if self.cache is not None:
+            try:
+                self.cache.close()
+            except Exception:
+                logger.exception("Failed to close local cache")
+            self.cache = None
         self._token = None

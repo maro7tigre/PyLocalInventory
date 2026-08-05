@@ -7,4 +7,4 @@ from the logs, that a given machine is running the build that contains a
 given fix rather than a stale one.
 """
 
-APP_BUILD_ID = "remise-centralized-calc-2026-08-04-v1"
+APP_BUILD_ID = "sales-table-total-ht-ttc-2026-08-05-v2"

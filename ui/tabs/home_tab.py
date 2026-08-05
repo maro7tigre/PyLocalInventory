@@ -844,6 +844,14 @@ class HomeTab(QWidget):
         if not self.database or not self.database.conn:
             return
         if self.database.__class__.__name__ == "RemoteDatabase":
+            # Offline: never start a network thread that would hang on the
+            # host - render the last persisted snapshot from disk instead.
+            if bool(getattr(self.database, 'offline', False)):
+                if not self._render_cached_dashboard():
+                    logger.warning(
+                        "Offline dashboard has no cached snapshot to render"
+                    )
+                return
             self._start_remote_dashboard_refresh()
             return
         started = time.perf_counter()
@@ -919,6 +927,44 @@ class HomeTab(QWidget):
 
     @Slot(object, float)
     def _remote_dashboard_finished(self, snapshot, started):
+        try:
+            cache = getattr(self.database, 'cache', None)
+            if cache is not None and hasattr(cache, 'store_dashboard'):
+                cache.store_dashboard(snapshot or {})
+        except Exception:
+            logger.exception("Could not persist dashboard snapshot to cache")
+        self._apply_dashboard_snapshot(snapshot, started)
+
+    @Slot(str, float)
+    def _remote_dashboard_failed(self, error, started):
+        logger.error(
+            "Remote dashboard refresh failed after %.3fs error=%s",
+            time.perf_counter() - started, error,
+        )
+        # Keep showing the last-known snapshot (from RAM or disk) instead of
+        # blanking the Home tab when the host is briefly unreachable.
+        if not self._dashboard_snapshot:
+            self._render_cached_dashboard()
+
+    def _render_cached_dashboard(self):
+        """Render the last persisted dashboard snapshot from the on-disk cache
+        (offline path). Returns True when a snapshot was rendered."""
+        cache = getattr(self.database, 'cache', None)
+        if cache is None or not hasattr(cache, 'get_dashboard'):
+            return False
+        try:
+            snapshot, _stored_at = cache.get_dashboard()
+        except Exception:
+            logger.exception("Could not read dashboard snapshot from cache")
+            return False
+        if not snapshot:
+            return False
+        self._apply_dashboard_snapshot(snapshot)
+        return True
+
+    def _apply_dashboard_snapshot(self, snapshot, started=None):
+        """Render a dashboard snapshot into the cards, lists and monthly chart.
+        Used by the online success path and the offline cache path alike."""
         self._dashboard_snapshot = dict(snapshot or {})
         values = self._dashboard_snapshot
         cards = (
@@ -945,18 +991,12 @@ class HomeTab(QWidget):
             self._monthly_profit_series.replace(
                 index, QPointF(index, sales - imports)
             )
-        elapsed = time.perf_counter() - started
-        logger.log(
-            logging.WARNING if elapsed >= 0.5 else logging.INFO,
-            "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
-        )
-
-    @Slot(str, float)
-    def _remote_dashboard_failed(self, error, started):
-        logger.error(
-            "Remote dashboard refresh failed after %.3fs error=%s",
-            time.perf_counter() - started, error,
-        )
+        if started is not None:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
+            )
 
     def _wait_for_dashboard_thread(self):
         thread = self._dashboard_thread

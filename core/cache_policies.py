@@ -25,6 +25,24 @@ Invariants (asserted by tests/test_cache_policies.py)
   cached RAM view and the tab's refresh logic agree on when data is stale.
 """
 
+# Master kill switch for the on-disk SQLite cache layer.
+#
+# The disk cache and its background incremental sync are EXPERIMENTAL. The
+# full rollout dropped app stability on remote clients (GUI-thread blocking
+# from the sync coordinator's synchronous per-section network calls and
+# GUI-thread SQLite writes), so the layer is disabled by default until the
+# regression is isolated and a controlled one-tab rollout proves it stable.
+#
+# When False:
+#   * RemoteDatabase never opens its SQLite cache (self.cache stays None).
+#   * The background SyncCoordinator is not started by MainWindow.
+#   * BaseTab never reads/writes the disk cache (RAM session cache still works).
+#   * HomeTab never persists or renders the dashboard from disk.
+#
+# All the cache code is intentionally kept in the repo behind this flag so the
+# experiment can be re-enabled without rewriting anything.
+ENABLE_SQLITE_CACHE = False
+
 # RAM session layer (per tab).
 RAM_MAX_VIEWS_PER_TAB = 32
 RAM_MAX_RECORDS_PER_VIEW = 2000

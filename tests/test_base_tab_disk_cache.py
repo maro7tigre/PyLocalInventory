@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from PySide6.QtWidgets import QApplication
 
@@ -70,6 +71,11 @@ class BaseTabDiskCacheTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        # These tests exercise the experimental on-disk cache, which is off by
+        # default - enable it just for this module.
+        self._cache_flag = mock.patch('ui.tabs.base_tab.ENABLE_SQLITE_CACHE', True)
+        self._cache_flag.start()
+        self.addCleanup(self._cache_flag.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.db_path = os.path.join(self.temp_dir.name, 'cache.db')

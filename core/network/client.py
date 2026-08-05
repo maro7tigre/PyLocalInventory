@@ -25,6 +25,7 @@ from core.network.protocol import (
 )
 from core.user_manager import SECTION_GROUP
 from core.build_info import APP_BUILD_ID
+from core.cache_policies import ENABLE_SQLITE_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -466,6 +467,9 @@ class RemoteDatabase:
         }
 
     def _open_cache(self):
+        if not ENABLE_SQLITE_CACHE:
+            self.cache = None
+            return
         from core.cache_manager import CacheManager
         try:
             self.cache = CacheManager(

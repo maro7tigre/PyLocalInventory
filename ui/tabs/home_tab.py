@@ -14,6 +14,7 @@ import time
 import logging
 
 from ui.widgets.themed_widgets import GreenButton, BlueButton, OrangeButton, RedButton
+from core.cache_policies import ENABLE_SQLITE_CACHE
 
 logger = logging.getLogger(__name__)
 
@@ -927,12 +928,13 @@ class HomeTab(QWidget):
 
     @Slot(object, float)
     def _remote_dashboard_finished(self, snapshot, started):
-        try:
-            cache = getattr(self.database, 'cache', None)
-            if cache is not None and hasattr(cache, 'store_dashboard'):
-                cache.store_dashboard(snapshot or {})
-        except Exception:
-            logger.exception("Could not persist dashboard snapshot to cache")
+        if ENABLE_SQLITE_CACHE:
+            try:
+                cache = getattr(self.database, 'cache', None)
+                if cache is not None and hasattr(cache, 'store_dashboard'):
+                    cache.store_dashboard(snapshot or {})
+            except Exception:
+                logger.exception("Could not persist dashboard snapshot to cache")
         self._apply_dashboard_snapshot(snapshot, started)
 
     @Slot(str, float)
@@ -949,6 +951,8 @@ class HomeTab(QWidget):
     def _render_cached_dashboard(self):
         """Render the last persisted dashboard snapshot from the on-disk cache
         (offline path). Returns True when a snapshot was rendered."""
+        if not ENABLE_SQLITE_CACHE:
+            return False
         cache = getattr(self.database, 'cache', None)
         if cache is None or not hasattr(cache, 'get_dashboard'):
             return False

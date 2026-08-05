@@ -17,9 +17,11 @@ from core.network.protocol import PermissionDeniedError
 from core.database import Database
 from core.memory_utils import process_memory_mb
 from core.session_cache import SessionCache, DEFAULT_STALE_SECONDS
+from core.cache_policies import ENABLE_SQLITE_CACHE
 from datetime import datetime
 from decimal import Decimal
 import re
+import threading
 import time
 import logging
 
@@ -200,6 +202,7 @@ class BaseTab(QWidget):
         self._needs_refresh = True
         self._last_refresh_at = 0.0
         self._refresh_id = 0
+        self._request_count = 0
         self._refresh_thread = None
         self._refresh_worker = None
 
@@ -395,6 +398,23 @@ class BaseTab(QWidget):
         ReportsTab with extra filter widgets) may override to widen it."""
         return (self.search_bar.text().strip(), self.order_combo.currentText())
 
+    def _log_tab_request(self, source, key, rows=0, **extra):
+        """Emit one structured line per data request a tab makes, for the
+        regression investigation. Records which source served the request
+        (ram / disk / network / offline), the thread it ran on, how many
+        refreshes preceded it, and the current process RAM footprint."""
+        self._request_count += 1
+        logger.info(
+            "tab_request section=%s request_id=%d source=%s key=%s rows=%d "
+            "thread=%s refreshing=%s refresh_calls=%d memory_mb=%.1f extra=%s",
+            self.section, self._request_count, source, key, rows,
+            threading.current_thread().name,
+            bool(self._refreshing),
+            self._refresh_id,
+            process_memory_mb(),
+            extra,
+        )
+
     def refresh_table(self, force=False):
         """Load the first batch of rows (full reset of filters, sort, cursor).
 
@@ -421,8 +441,10 @@ class BaseTab(QWidget):
         offline = bool(getattr(self.database, 'offline', False))
         entry = self._cache.get(key) if use_cache else None
         if entry is not None and entry.records:
+            self._log_tab_request('ram', key, rows=len(entry.records))
             self._render_from_cache(entry, key)
             if entry.is_stale() and not offline:
+                self._log_tab_request('ram_refresh', key, rows=len(entry.records))
                 self._start_full_refresh(preserve_table=True)
             return
 
@@ -430,12 +452,14 @@ class BaseTab(QWidget):
             return
 
         if offline:
+            self._log_tab_request('offline', key)
             # Host is known unreachable: never fire a refresh that will hang on
             # the network - keep whatever the cache holds and flag the rows as
             # possibly stale instead.
             self._set_offline_banner(True)
             return
 
+        self._log_tab_request('network', key, rows=0)
         self._start_full_refresh()
 
     def _start_full_refresh(self, preserve_table=False):
@@ -501,8 +525,11 @@ class BaseTab(QWidget):
         )
 
     def _disk_cache(self):
-        """Return this tab's on-disk SQLite cache, or None when not a network
-        client (or the cache failed to open)."""
+        """Return this tab's on-disk SQLite cache, or None when the disk cache
+        is disabled, when not a network client, or when the cache failed to
+        open."""
+        if not ENABLE_SQLITE_CACHE:
+            return None
         database = self.database
         if database is None or database.__class__.__name__ != 'RemoteDatabase':
             return None
@@ -566,6 +593,7 @@ class BaseTab(QWidget):
         if not records:
             return False
 
+        self._log_tab_request('disk', key, rows=len(records))
         self._render_from_disk(key, records, has_more, after_id, after_sort, disk)
         offline = bool(getattr(self.database, 'offline', False))
         age = time.time() - stored_at

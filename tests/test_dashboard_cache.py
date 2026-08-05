@@ -10,6 +10,7 @@ import os
 import tempfile
 import time
 import unittest
+from unittest import mock
 
 from PySide6.QtCore import QEventLoop, QTimer
 from PySide6.QtWidgets import QApplication, QLabel
@@ -92,6 +93,11 @@ class HomeTabDashboardCacheTests(unittest.TestCase):
         cls.app = QApplication.instance() or QApplication([])
 
     def setUp(self):
+        # These tests exercise the experimental on-disk cache, which is off by
+        # default - enable it just for this module.
+        self._cache_flag = mock.patch('ui.tabs.home_tab.ENABLE_SQLITE_CACHE', True)
+        self._cache_flag.start()
+        self.addCleanup(self._cache_flag.stop)
         self.temp_dir = tempfile.TemporaryDirectory()
         self.addCleanup(self.temp_dir.cleanup)
         self.cache = CacheManager(

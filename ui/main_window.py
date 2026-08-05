@@ -48,6 +48,7 @@ from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
 from core.sync import SyncCoordinator
+from core.cache_policies import ENABLE_SQLITE_CACHE
 from core.user_settings import (
     load_settings,
     remember_profile_enabled,
@@ -709,8 +710,15 @@ class MainWindow(ThemedMainWindow):
 
     def _start_sync_coordinator(self):
         """Start background incremental sync for a network client, or clear
-        the status bar for a standalone host session."""
+        the status bar for a standalone host session.
+
+        The sync only exists to keep the experimental on-disk cache warm; when
+        the disk cache is disabled the coordinator is never started, so the
+        client never polls the host from the GUI thread."""
         self._stop_sync_coordinator()
+        if not ENABLE_SQLITE_CACHE:
+            self.statusBar().setVisible(False)
+            return
         database = self.database
         if not (self._client_connected and database is not None
                 and database.__class__.__name__ == "RemoteDatabase"):

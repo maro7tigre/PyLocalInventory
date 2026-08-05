@@ -18,6 +18,7 @@ from core.database import Database
 from core.memory_utils import process_memory_mb
 from core.session_cache import SessionCache, DEFAULT_STALE_SECONDS
 from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
 from datetime import datetime
 from decimal import Decimal
 import re
@@ -40,22 +41,23 @@ class _RemoteTableFetchWorker(QObject):
     def run(self):
         started = time.perf_counter()
         try:
-            result = self.fetcher()
-            metrics = {}
-            refresh_id = None
-            if isinstance(result, tuple):
-                if len(result) == 5:
-                    items, levels, metrics, refresh_id, memory_info = result
-                elif len(result) == 4:
-                    items, levels, metrics, refresh_id = result
-                elif len(result) == 3:
-                    items, levels, metrics = result
+            with diagnostics.operation("table_fetch", section=getattr(self, '_section', '')):
+                result = self.fetcher()
+                metrics = {}
+                refresh_id = None
+                if isinstance(result, tuple):
+                    if len(result) == 5:
+                        items, levels, metrics, refresh_id, memory_info = result
+                    elif len(result) == 4:
+                        items, levels, metrics, refresh_id = result
+                    elif len(result) == 3:
+                        items, levels, metrics = result
+                    else:
+                        items, levels = result
                 else:
-                    items, levels = result
-            else:
-                items = result
-                levels = None
-            self.finished.emit(items, levels, metrics, started, refresh_id)
+                    items = result
+                    levels = None
+                self.finished.emit(items, levels, metrics, started, refresh_id)
         except Exception as error:
             logger.exception("Remote table fetch failed")
             self.failed.emit(str(error), started)
@@ -725,6 +727,7 @@ class BaseTab(QWidget):
     def _start_refresh(self, fetcher, refresh_id, worker_db=None, mode='local'):
         thread = QThread(self)
         worker = _RemoteTableFetchWorker(fetcher)
+        worker._section = self.section
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
         worker.finished.connect(self._remote_refresh_finished)
@@ -735,11 +738,15 @@ class BaseTab(QWidget):
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(lambda: setattr(self, "_refresh_thread", None))
+        thread.finished.connect(
+            lambda: diagnostics.worker_cleanup("table_fetch", self.section, refresh_id)
+        )
         if worker_db is not None:
             thread.finished.connect(lambda: worker_db.close())
         self._refresh_thread = thread
         self._refresh_worker = worker
         self._refresh_mode = mode
+        diagnostics.worker_started("table_fetch", self.section, refresh_id)
         thread.start()
 
     def _objects_from_records(self, items_data):
@@ -960,6 +967,7 @@ class BaseTab(QWidget):
                 self, "Error", f"Failed to refresh {self.section}: {error}"
             )
         finally:
+            diagnostics.worker_finished("table_fetch", self.section, refresh_id)
             self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
 
     @Slot(str, float)
@@ -969,6 +977,7 @@ class BaseTab(QWidget):
         # successful fetch) visible and mark the tab as showing stale data;
         # a modal box here would block the user for every failing tab.
         self._set_offline_banner(True)
+        diagnostics.worker_failed("table_fetch", self.section, self._refresh_id)
         self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
 
     def _finish_refresh(self, started, mode='client'):
@@ -998,6 +1007,10 @@ class BaseTab(QWidget):
             if not thread.wait(11000):
                 logger.error(
                     "Remote refresh thread did not stop section=%s", self.section
+                )
+            else:
+                logger.debug(
+                    "Remote refresh thread stopped section=%s", self.section
                 )
 
     def background_fetcher(self, refresh_id=None, database=None):

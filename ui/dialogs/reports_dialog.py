@@ -16,6 +16,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
+from core import diagnostics
 import base64
 from decimal import Decimal, InvalidOperation
 import traceback
@@ -38,7 +39,8 @@ class _PdfRenderWorker(QObject):
     def run(self):
         started = time.perf_counter()
         try:
-            self.finished.emit(self.renderer(self.html_content, self.output_path))
+            with diagnostics.operation("pdf_render", output=self.output_path):
+                self.finished.emit(self.renderer(self.html_content, self.output_path))
         except Exception as error:
             logger.exception("PDF rendering failed output=%s", self.output_path)
             self.failed.emit(str(error))
@@ -140,6 +142,7 @@ class ReportsDialog(QDialog):
             self._active_report_type = report_type
             thread = QThread(self)
             worker = _PdfRenderWorker(self._html_to_pdf, html_content, filepath)
+            worker._report_type = report_type
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             # Connect to QObject-bound slots so PySide queues every widget and
@@ -155,6 +158,7 @@ class ReportsDialog(QDialog):
             thread.finished.connect(thread.deleteLater)
             self._report_thread = thread
             self._report_worker = worker
+            diagnostics.worker_started("pdf_render", "reports", report_type)
             thread.start()
         except Exception as e:
             logger.exception("Report preparation failed type=%s", report_type)
@@ -162,12 +166,14 @@ class ReportsDialog(QDialog):
 
     @Slot(str)
     def _report_rendered_on_ui(self, pdf_path):
+        diagnostics.worker_finished("pdf_render", "reports", getattr(self, "_active_report_type", "report"))
         self._report_rendered(
             getattr(self, "_active_report_type", "report"), pdf_path
         )
 
     @Slot(str)
     def _report_failed_on_ui(self, error):
+        diagnostics.worker_failed("pdf_render", "reports", getattr(self, "_active_report_type", "report"))
         self._report_failed(
             getattr(self, "_active_report_type", "report"), error
         )

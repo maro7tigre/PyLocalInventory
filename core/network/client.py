@@ -26,6 +26,7 @@ from core.network.protocol import (
 from core.user_manager import SECTION_GROUP
 from core.build_info import APP_BUILD_ID
 from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -202,6 +203,11 @@ class RemoteDatabase:
         # i.e. that host has not been redeployed with this fix.
         self.host_build_id = data.get('build_id')
         self._open_cache()
+        diagnostics.set_mode('client')
+        logger.info(
+            "client_connected host=%s port=%s user=%s host_build_id=%s",
+            self.host, self.port, self.username, self.host_build_id,
+        )
         if self.host_build_id != APP_BUILD_ID:
             logger.warning(
                 "Build mismatch: this client build_id=%s host=%s port=%s reports "
@@ -219,6 +225,7 @@ class RemoteDatabase:
     def _call(self, method, args=None, kwargs=None, timeout=10):
         if not self._token:
             raise AuthError("Not connected")
+        diagnostics.network_call(method)
 
         url = f"http://{self.host}:{self.port}/rpc"
         safe_args = self._json_safe(args or [])
@@ -489,4 +496,5 @@ class RemoteDatabase:
             except Exception:
                 logger.exception("Failed to close local cache")
             self.cache = None
+        logger.info("client_disconnected host=%s port=%s user=%s", self.host, self.port, self.username)
         self._token = None

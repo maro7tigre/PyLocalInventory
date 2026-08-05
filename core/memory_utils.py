@@ -8,15 +8,18 @@ _PAGE_SIZE = 4096
 _CACHED_RSS_MB = None
 
 
-def process_memory_mb() -> float:
+def process_memory_mb(refresh: bool = False) -> float:
     """Current resident memory of this process in MiB.
 
     Uses the Windows GetProcessMemoryInfo API when available and psutil
     otherwise, with a graceful fallback that returns 0.0 so logging callers
     never crash on an exotic platform.
+
+    ``refresh=True`` forces a fresh sample instead of the cached value - used
+    by diagnostics so log records report live RAM rather than the first sample.
     """
     global _CACHED_RSS_MB
-    if _CACHED_RSS_MB is not None:
+    if _CACHED_RSS_MB is not None and not refresh:
         return _CACHED_RSS_MB
 
     if sys.platform == "win32":

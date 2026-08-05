@@ -16,6 +16,7 @@ import psycopg2
 from psycopg2 import OperationalError
 
 from core.pg_config import load_server_config
+from core import diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -160,7 +161,7 @@ class Database:
                     connect_timeout=5,
                     application_name="PyLocalInventory",
                 )
-                self.cursor = self.conn.cursor()
+                self.cursor = diagnostics.track_cursor(self.conn.cursor())
                 self.database_name = database_name
                 self.schema_name = None
 
@@ -176,6 +177,7 @@ class Database:
                 self._run_one_time_migrations()
 
                 print(f"✓ Connected to database: {database_name}")
+                diagnostics.db_connection_opened(kind="local")
                 return True
 
             schema_name = profile.schema_name or self._profile_schema_name(
@@ -192,7 +194,7 @@ class Database:
                 connect_timeout=5,
                 application_name="PyLocalInventory",
             )
-            self.cursor = self.conn.cursor()
+            self.cursor = diagnostics.track_cursor(self.conn.cursor())
 
             self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
             self.conn.commit()
@@ -212,6 +214,7 @@ class Database:
             self._run_one_time_migrations()
 
             print(f"✓ Connected to database schema: {schema_name}")
+            diagnostics.db_connection_opened(kind="local")
             return True
 
         except OperationalError as e:
@@ -2955,6 +2958,7 @@ class Database:
     def close(self):
         """Close database connection"""
         if self.conn:
+            diagnostics.db_connection_closed(kind="local")
             self.conn.close()
             self.conn = None
             self.cursor = None

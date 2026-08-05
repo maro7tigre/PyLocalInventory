@@ -7,7 +7,6 @@ import sys
 import threading
 import time
 from contextlib import contextmanager
-from logging.handlers import RotatingFileHandler
 
 from core.runtime_paths import app_path, user_data_root
 
@@ -33,23 +32,21 @@ def _choose_log_directory():
 
 
 def setup_logging():
-    """Configure one rotating log shared by the host and network client."""
+    """Configure the four diagnostic logs (app/crash/performance/threading),
+    faulthandler, the Qt message handler, and the exception hooks.
+
+    The heavy lifting lives in ``core.diagnostics``; everything here stays a
+    stable facade so callers keep working unchanged."""
     global _CONFIGURED, _LOG_PATH
     if _CONFIGURED:
         return _LOG_PATH
 
     directory = _choose_log_directory()
-    _LOG_PATH = os.path.join(directory, "app.log")
-    handler = RotatingFileHandler(
-        _LOG_PATH, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
-    )
-    handler.setFormatter(logging.Formatter(
-        "%(asctime)s | %(levelname)s | %(name)s | "
-        "%(funcName)s | %(threadName)s | %(message)s"
-    ))
-    root = logging.getLogger()
-    root.setLevel(logging.INFO)
-    root.addHandler(handler)
+
+    from core import diagnostics
+    diagnostics.install(directory)
+    _LOG_PATH = diagnostics.log_paths().get("app.log") or os.path.join(directory, "app.log")
+
     # Some Windows shells still expose a cp1252 stream.  Legacy diagnostic
     # prints contain Unicode symbols; make those non-fatal instead of allowing
     # a harmless status message to crash startup.

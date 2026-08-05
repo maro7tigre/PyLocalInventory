@@ -15,6 +15,7 @@ import logging
 
 from ui.widgets.themed_widgets import GreenButton, BlueButton, OrangeButton, RedButton
 from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ class _DashboardWorker(QObject):
     def run(self):
         started = time.perf_counter()
         try:
-            self.finished.emit(self.database.get_dashboard_snapshot(), started)
+            with diagnostics.operation("dashboard_snapshot", mode="client"):
+                self.finished.emit(self.database.get_dashboard_snapshot(), started)
         except Exception as error:
             logger.exception("Remote dashboard load failed")
             self.failed.emit(str(error), started)
@@ -924,10 +926,12 @@ class HomeTab(QWidget):
         thread.finished.connect(lambda: setattr(self, "_dashboard_thread", None))
         self._dashboard_thread = thread
         self._dashboard_worker = worker
+        diagnostics.worker_started("dashboard_snapshot", "home", "dashboard")
         thread.start()
 
     @Slot(object, float)
     def _remote_dashboard_finished(self, snapshot, started):
+        diagnostics.worker_finished("dashboard_snapshot", "home", "dashboard")
         if ENABLE_SQLITE_CACHE:
             try:
                 cache = getattr(self.database, 'cache', None)
@@ -939,6 +943,7 @@ class HomeTab(QWidget):
 
     @Slot(str, float)
     def _remote_dashboard_failed(self, error, started):
+        diagnostics.worker_failed("dashboard_snapshot", "home", "dashboard")
         logger.error(
             "Remote dashboard refresh failed after %.3fs error=%s",
             time.perf_counter() - started, error,

@@ -49,6 +49,7 @@ from core.network.protocol import AuthError, ConnectionFailedError, RemoteError,
 from core.build_info import APP_BUILD_ID
 from core.sync import SyncCoordinator
 from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
 from core.user_settings import (
     load_settings,
     remember_profile_enabled,
@@ -112,6 +113,8 @@ class MainWindow(ThemedMainWindow):
         self.database = Database(self.profile_manager)
         # Propagate current language to database for display name resolution
         self.database.language = getattr(self, 'language', 'en')
+        # Diagnostics context: standalone/host until a remote connect happens.
+        diagnostics.set_mode('host')
         
         # Register parameter classes manually
         self.register_parameter_classes()
@@ -242,6 +245,7 @@ class MainWindow(ThemedMainWindow):
     
     def closeEvent(self, event):
         """Handle application close event"""
+        logger.info("Application closing: stopping sync coordinator, server, and database")
         self.save_app_config()
         self._stop_sync_coordinator()
         if self.network_server and self.network_server.is_running:
@@ -544,6 +548,7 @@ class MainWindow(ThemedMainWindow):
         self.database = remote_db
         self.database.language = getattr(self, 'language', 'en')
         self.register_parameter_classes()
+        diagnostics.set_mode('client')
 
         self.last_network_host = host
         self.network_port = port_num
@@ -995,6 +1000,7 @@ class MainWindow(ThemedMainWindow):
             self.database = Database(self.profile_manager)
             self.database.language = getattr(self, 'language', 'en')
             self.register_parameter_classes()
+            diagnostics.set_mode('host')
         else:
             self.password_manager.logout()
             self.profile_manager.logout()
@@ -1024,6 +1030,8 @@ class MainWindow(ThemedMainWindow):
     def on_tab_changed(self, index):
         """Handle tab change to refresh data in the newly selected tab"""
         try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                diagnostics.set_active_tab(self.tab_widget.tabText(index))
             pending = getattr(self, '_preload_tabs', None)
             if pending is not None:
                 pending.pop(index, None)

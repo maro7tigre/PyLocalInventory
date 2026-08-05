@@ -15,6 +15,7 @@ from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
 from core import pg_backup
 from core.attachments import attachment_backup_root
+from core import diagnostics
 
 logger = logging.getLogger(__name__)
 
@@ -31,7 +32,8 @@ class _BackupCreateWorker(QObject):
     def run(self):
         started = time.perf_counter()
         try:
-            self.finished.emit(bool(self.callback()))
+            with diagnostics.operation(self.operation):
+                self.finished.emit(bool(self.callback()))
         except Exception as error:
             logger.exception("Backup worker failed operation=%s", self.operation)
             self.failed.emit(str(error))
@@ -60,7 +62,8 @@ class _BackupDownloadWorker(QObject):
     def run(self):
         started = time.perf_counter()
         try:
-            self.finished.emit(self.database.download_backup(self.destination))
+            with diagnostics.operation("network_backup_download"):
+                self.finished.emit(self.database.download_backup(self.destination))
         except Exception as error:
             logger.exception(
                 "Network backup download failed destination=%s", self.destination
@@ -242,10 +245,12 @@ class BackupsDialog(QDialog):
         thread.finished.connect(thread.deleteLater)
         self._backup_thread = thread
         self._backup_worker = worker
+        diagnostics.worker_started("backup_download", "backups", destination)
         thread.start()
 
     @Slot(str)
     def _remote_backup_finished(self, destination):
+        diagnostics.worker_finished("backup_download", "backups", destination)
         self._backup_running = False
         self.download_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
@@ -257,6 +262,7 @@ class BackupsDialog(QDialog):
 
     @Slot(str)
     def _remote_backup_failed(self, error):
+        diagnostics.worker_failed("backup_download", "backups", "network")
         self._backup_running = False
         self.download_btn.setEnabled(True)
         self.close_btn.setEnabled(True)
@@ -441,6 +447,7 @@ class BackupsDialog(QDialog):
         thread.finished.connect(thread.deleteLater)
         self._backup_thread = thread
         self._backup_worker = worker
+        diagnostics.worker_started("restore_backup", "backups", backup_path)
         thread.start()
 
     def _restore_backup_data(self, backup_path, database):
@@ -486,6 +493,7 @@ class BackupsDialog(QDialog):
         return True
 
     def _restore_completed(self, success):
+        diagnostics.worker_finished("restore_backup", "backups", "restore")
         self._backup_running = False
         self.close_btn.setEnabled(True)
         self.status_label.setText("")
@@ -502,6 +510,7 @@ class BackupsDialog(QDialog):
         self.accept()
 
     def _restore_failed(self, error):
+        diagnostics.worker_failed("restore_backup", "backups", "restore")
         self._backup_running = False
         self.close_btn.setEnabled(True)
         self.restore_btn.setEnabled(bool(self.selected_backup))
@@ -633,9 +642,11 @@ class BackupsDialog(QDialog):
             thread.finished.connect(thread.deleteLater)
             self._backup_thread = thread
             self._backup_worker = worker
+            diagnostics.worker_started("create_backup", "backups", backup_name)
             thread.start()
 
     def _backup_created(self, success):
+        diagnostics.worker_finished("create_backup", "backups", "create")
         self._backup_running = False
         self.close_btn.setEnabled(True)
         self.status_label.setText("")
@@ -645,6 +656,7 @@ class BackupsDialog(QDialog):
             QMessageBox.information(self, "Success", "Backup created successfully.")
 
     def _backup_failed(self, error):
+        diagnostics.worker_failed("create_backup", "backups", "create")
         self._backup_running = False
         self.close_btn.setEnabled(True)
         self.status_label.setText("")

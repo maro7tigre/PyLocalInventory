@@ -16,6 +16,7 @@ def main():
     """Application entry point"""
     log_file = setup_logging()
     logger = logging.getLogger(__name__)
+    from core import diagnostics
     logger.info("Application startup build_id=%s log=%s", APP_BUILD_ID, log_file)
     app = QApplication(sys.argv)
     app.setApplicationName("PyLocalInventory")
@@ -30,6 +31,9 @@ def main():
     # Create and show main window
     window = MainWindow()
     window.show()
+    # Log-only GUI-stall watchdog (created only in the real app, never in
+    # tests): reports freezes, never kills or restarts the application.
+    app._gui_watchdog = diagnostics.GuiWatchdog(parent=window)
     app.aboutToQuit.connect(lambda: logger.info("Application shutdown"))
     
     # Start event loop

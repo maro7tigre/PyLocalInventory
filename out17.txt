@@ -1,0 +1,15 @@
+....F.
+======================================================================
+FAIL: test_table_widget_stock_state_no_db (tests.test_recent_changes_full.TestOperationsTableCatalog.test_table_widget_stock_state_no_db)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\xvipe\Documents\GitHub\PyLocalInventory\tests\test_recent_changes_full.py", line 216, in test_table_widget_stock_state_no_db
+    self.assertIsNotNone(state)
+    ~~~~~~~~~~~~~~~~~~~~^^^^^^^
+AssertionError: unexpectedly None
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.105s
+
+FAILED (failures=1)
+Error updating totals: 'BaseOperationDialog' object has no attribute 'remise_spinbox'

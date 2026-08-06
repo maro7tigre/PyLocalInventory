@@ -42,6 +42,12 @@ class DummyOperation:
     def set_value(self, key, val):
         self.data[key] = val
 
+    def get_visible_parameters(self, scope=None):
+        return self.parameters
+        
+    def is_parameter_calculated(self, key):
+        return False
+
     def load_database_data(self):
         self.data['loaded'] = True
 
@@ -100,21 +106,23 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.load_data')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.apply_theme')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.validate_data', return_value=[])
+    @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QThread.start')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog._handle_missing_references', return_value=(True, False))
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog._confirm_sale_summary', return_value=True)
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QMessageBox.information')
-    def test_save_worker_success(self, mock_info, mock_confirm, mock_missing, mock_val, mock_theme, mock_load, mock_setup):
+    def test_save_worker_success(self, mock_info, mock_confirm, mock_missing, mock_thread_start, mock_val, mock_theme, mock_load, mock_setup):
         dialog = BaseOperationDialog(DummyOperation, DummyItem, operation_id=1, database=self.db)
         dialog.items_table = MagicMock()
         dialog.items_table.get_items_data.return_value = []
+        dialog.items_table.get_current_table_data.return_value = []
         dialog.parameter_widgets = {}
         dialog.save_btn = MagicMock()
         
         # Set up mock save
-        dialog._save_sale_atomically = MagicMock(return_value={"sale_id": 1, "expected": 1, "saved": 1})
+        dialog.database.save_sale_with_items = MagicMock(return_value={"sale_id": 1, "expected": 1, "saved": 1, "transaction": "committed"})
         
         # Trigger save
-        dialog._save_changes()
+        dialog.save_changes()
         
         self.assertTrue(dialog._saving)
         dialog.save_btn.setEnabled.assert_called_with(False)
@@ -145,12 +153,13 @@ class TestOperationsTableCatalog(unittest.TestCase):
             ]
         }
         
-        self.table_widget = OperationsTableWidget(DummyItem, self.db)
+        self.table_widget = OperationsTableWidget(DummyItem, database=self.db)
         # Mock items_table inside dialog
         self.dialog = MagicMock()
         self.dialog.database = self.db
         self.dialog.operation_id = 1
         from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
+        self.dialog._normalize_name = BaseOperationDialog._normalize_name
         self.validate_stock = BaseOperationDialog._validate_stock.__get__(self.dialog, BaseOperationDialog)
         self.catalog_entity_exists = BaseOperationDialog._catalog_entity_exists.__get__(self.dialog, BaseOperationDialog)
 
@@ -166,16 +175,11 @@ class TestOperationsTableCatalog(unittest.TestCase):
         self.db.cursor.execute.assert_not_called()
         
     def test_validate_stock(self):
-        # Create some mock items
-        item1 = DummyItem(1, self.db)
-        item1.set_value('product_id', 1)
-        item1.set_value('product_name', 'Apple')
-        item1.set_value('quantity', 60) # Exceeds 50
+        item1 = MagicMock()
+        item1.get_value.side_effect = lambda k: 1 if k == 'product_id' else ("Apple" if k == 'product_name' else 60)
         
-        item2 = DummyItem(2, self.db)
-        item2.set_value('product_id', 2)
-        item2.set_value('product_name', 'Banana')
-        item2.set_value('quantity', 5) # Within 10
+        item2 = MagicMock()
+        item2.get_value.side_effect = lambda k: 2 if k == 'product_id' else ("Banana" if k == 'product_name' else 5)
         
         self.db.cursor.execute = MagicMock()
         
@@ -187,24 +191,27 @@ class TestOperationsTableCatalog(unittest.TestCase):
         self.db.cursor.execute.assert_not_called()
         
     def test_table_widget_stock_state_no_db(self):
-        # OperationsTableWidget also shouldn't call SQL
+        from ui.widgets.operations_table import TableEventHandler
+        self.table_widget.event_handler.get_row_stock_state = TableEventHandler.get_row_stock_state.__get__(self.table_widget.event_handler, TableEventHandler)
+        
         self.db.cursor.execute = MagicMock()
         
-        # Insert a row and test get_row_stock_state
-        self.table_widget.table.setRowCount(1)
-        from PySide6.QtWidgets import QLineEdit, QComboBox
+        self.table_widget.data_manager.table_columns = ['product_name', 'quantity']
+        self.table_widget.table.setColumnCount(2)
+        from PySide6.QtWidgets import QLineEdit
         prod_edit = QLineEdit("Apple")
         prod_edit.setProperty("product_id", 1)
-        self.table_widget.table.setCellWidget(0, 0, prod_edit)
         
         qty_edit = QLineEdit("60")
-        self.table_widget.table.setCellWidget(0, 1, qty_edit)
         
-        # Wait, get_row_stock_state reads cell text
+        # Mock cellWidget to return these
+        self.table_widget.table.cellWidget = MagicMock(side_effect=lambda r, c: prod_edit if c == 0 else (qty_edit if c == 1 else None))
+        
+        self.table_widget.table.setRowCount(1)
         from PySide6.QtWidgets import QTableWidgetItem
         self.table_widget.table.setItem(0, 1, QTableWidgetItem("60"))
         
-        state = self.table_widget.get_row_stock_state(0)
+        state = self.table_widget.event_handler.get_row_stock_state(0)
         self.assertIsNotNone(state)
         req, stock, exceeded, name = state
         self.assertEqual(req, Decimal("60"))

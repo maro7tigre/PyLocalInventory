@@ -1,0 +1,24 @@
+...FE.
+======================================================================
+ERROR: test_table_widget_stock_state_no_db (tests.test_recent_changes_full.TestOperationsTableCatalog.test_table_widget_stock_state_no_db)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\xvipe\Documents\GitHub\PyLocalInventory\tests\test_recent_changes_full.py", line 215, in test_table_widget_stock_state_no_db
+    state = self.table_widget.get_row_stock_state(0)
+            ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AttributeError: 'OperationsTableWidget' object has no attribute 'get_row_stock_state'
+
+======================================================================
+FAIL: test_catalog_entity_exists (tests.test_recent_changes_full.TestOperationsTableCatalog.test_catalog_entity_exists)
+----------------------------------------------------------------------
+Traceback (most recent call last):
+  File "C:\Users\xvipe\Documents\GitHub\PyLocalInventory\tests\test_recent_changes_full.py", line 171, in test_catalog_entity_exists
+    self.assertFalse(self.catalog_entity_exists("product", "Orange"))
+    ~~~~~~~~~~~~~~~~^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
+AssertionError: True is not false
+
+----------------------------------------------------------------------
+Ran 6 tests in 0.048s
+
+FAILED (failures=1, errors=1)
+Error updating totals: 'BaseOperationDialog' object has no attribute 'remise_spinbox'

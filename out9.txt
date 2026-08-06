@@ -1,0 +1,6 @@
+.
+----------------------------------------------------------------------
+Ran 1 test in 0.005s
+
+OK
+Error updating totals: 'BaseOperationDialog' object has no attribute 'remise_spinbox'

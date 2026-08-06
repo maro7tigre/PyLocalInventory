@@ -26,10 +26,11 @@ class SaveWorker(QObject):
     finished = Signal(object)
     error = Signal(str)
     
-    def __init__(self, dialog, is_import):
+    def __init__(self, database, is_import, save_kwargs):
         super().__init__()
-        self.dialog = dialog
+        self.database = database
         self.is_import = is_import
+        self.save_kwargs = save_kwargs
         
     @Slot()
     def process(self):
@@ -37,9 +38,15 @@ class SaveWorker(QObject):
             if QThread.currentThread().isInterruptionRequested():
                 return
             if self.is_import:
-                res = self.dialog._save_import_atomically()
+                res = self.database.save_import_with_items(**self.save_kwargs)
+                if not isinstance(res, dict) or res.get("transaction") != "committed":
+                    raise RuntimeError(f"Host returned an invalid import-save result: {res!r}")
+                res['expected'] = len(self.save_kwargs.get('items', []))
             else:
-                res = self.dialog._save_sale_atomically()
+                res = self.database.save_sale_with_items(**self.save_kwargs)
+                if not isinstance(res, dict) or res.get('transaction') != 'committed':
+                    raise RuntimeError(f"Host returned an invalid sale-save result: {res!r}")
+                res['expected'] = len(self.save_kwargs.get('items', []))
             self.finished.emit(res)
         except Exception as e:
             self.error.emit(str(e))
@@ -48,9 +55,10 @@ class LoadWorker(QObject):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, operation_obj, fetch_catalog):
+    def __init__(self, operation_obj, database, fetch_catalog):
         super().__init__()
         self.operation_obj = operation_obj
+        self.database = database
         self.fetch_catalog = fetch_catalog
 
     @Slot()
@@ -60,8 +68,8 @@ class LoadWorker(QObject):
                 return
             if self.operation_obj:
                 self.operation_obj.load_database_data()
-            if self.fetch_catalog and getattr(self.operation_obj.database, 'get_sale_catalog', None):
-                self.operation_obj.database.sale_catalog = self.operation_obj.database.get_sale_catalog()
+            if self.fetch_catalog and getattr(self.database, 'get_sale_catalog', None):
+                self.database.sale_catalog = self.database.get_sale_catalog()
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -106,7 +114,8 @@ class BaseOperationDialog(QDialog):
 
         self.load_thread = QThread()
         self.load_worker = LoadWorker(
-            self.operation_obj if operation_id else None, 
+            self.operation_obj if operation_id else None,
+            database,
             fetch_catalog=not hasattr(database, "sale_catalog") or database.sale_catalog is None
         )
         self.load_worker.moveToThread(self.load_thread)
@@ -561,10 +570,60 @@ class BaseOperationDialog(QDialog):
                     if not self._confirm_sale_summary():
                         return
                         
+                # BUILD PAYLOAD ON GUI THREAD
+                raw_items = self.items_table.get_current_table_data()
+                prepared = []
+                if is_import:
+                    for raw in raw_items:
+                        item = dict(raw)
+                        item.pop("row_index", None)
+                        prepared.append(item)
+                else:
+                    for index, raw in enumerate(raw_items, start=1):
+                        item = dict(raw)
+                        item.pop('row_index', None)
+                        product_id = item.get('product_id')
+                        service_id = item.get('service_id')
+                        item['product_id'] = product_id
+                        item['service_id'] = service_id
+                        item['item_type'] = str(
+                            item.get('item_type')
+                            or ('product' if product_id else ('service' if service_id else ''))
+                        ).casefold()
+                        item['is_new'] = not bool(item.get('id'))
+                        prepared.append(item)
+
+                header = {
+                    key: self.operation_obj.get_value(key)
+                    for key in self.operation_obj.get_visible_parameters('database')
+                    if not self.operation_obj.is_parameter_calculated(key)
+                }
+                header["operation_token"] = (
+                    self.operation_obj.get_value("operation_token") or self.operation_token
+                )
+                
+                save_kwargs = {}
+                if is_import:
+                    save_kwargs = {
+                        'import_data': header,
+                        'items': prepared,
+                        'import_id': self.operation_id,
+                        'visible_row_count': len(raw_items)
+                    }
+                else:
+                    header["is_historical"] = bool(self.operation_obj.get_value("is_historical"))
+                    save_kwargs = {
+                        'sale_data': header,
+                        'items': prepared,
+                        'sale_id': self.operation_id,
+                        'visible_row_count': len(raw_items),
+                        'pending_entities': getattr(self, 'pending_entities', [])
+                    }
+
                 action = "updated" if self.operation_id else "created"
                 
                 self.save_thread = QThread()
-                self.save_worker = SaveWorker(self, is_import)
+                self.save_worker = SaveWorker(self.database, is_import, save_kwargs)
                 self.save_worker.moveToThread(self.save_thread)
                 self.save_thread.started.connect(self.save_worker.process)
                 self.save_worker.finished.connect(lambda res, act=action: self._on_save_finished(res, act))
@@ -775,78 +834,6 @@ class BaseOperationDialog(QDialog):
             )
         except Exception:
             return True
-
-    def _save_sale_atomically(self):
-        """Send the complete visible sale and line set in one database operation."""
-        raw_items = self.items_table.get_current_table_data()
-        extraction = getattr(self.items_table, 'last_extraction_diagnostics', {})
-        prepared = []
-        for index, raw in enumerate(raw_items, start=1):
-            item = dict(raw)
-            item.pop('row_index', None)
-            product_id = item.get('product_id')
-            service_id = item.get('service_id')
-            item['product_id'] = product_id
-            item['service_id'] = service_id
-            item['item_type'] = str(
-                item.get('item_type')
-                or ('product' if product_id else ('service' if service_id else ''))
-            ).casefold()
-            item['is_new'] = not bool(item.get('id'))
-            prepared.append(item)
-
-        header = {
-            key: self.operation_obj.get_value(key)
-            for key in self.operation_obj.get_visible_parameters('database')
-            if not self.operation_obj.is_parameter_calculated(key)
-        }
-        header["operation_token"] = (
-            self.operation_obj.get_value("operation_token") or self.operation_token
-        )
-        header["is_historical"] = bool(
-            self.operation_obj.get_value("is_historical")
-        )
-        self._write_sale_save_log(
-            f"mode={self.database.__class__.__name__} host={getattr(self.database, 'host', 'local')} "
-            f"port={getattr(self.database, 'port', 'local')} visible_rows={len(raw_items)} "
-            f"extracted_rows={len(prepared)} extraction={extraction} sale_id={self.operation_id} "
-            f"client_id={header.get('client_id')} client_identifier={header.get('client_username')} date={header.get('date')} vat={header.get('tva')} "
-            f"notes_present={bool(header.get('notes'))} items={prepared}"
-        )
-        result = self.database.save_sale_with_items(
-            header, prepared, self.operation_id, len(raw_items), self.pending_entities
-        )
-        if not isinstance(result, dict) or result.get('transaction') != 'committed':
-            raise RuntimeError(f"Host returned an invalid sale-save result: {result!r}")
-        result['expected'] = len(prepared)
-        self._write_sale_save_log(
-            f"server_result validation=ok inserted={result.get('inserted')} "
-            f"updated={result.get('updated')} deleted={result.get('deleted')} "
-            f"saved={result.get('saved')} transaction={result.get('transaction')}"
-        )
-        return result
-
-    def _save_import_atomically(self):
-        raw_items = self.items_table.get_current_table_data()
-        prepared = []
-        for raw in raw_items:
-            item = dict(raw)
-            item.pop("row_index", None)
-            prepared.append(item)
-        header = {
-            key: self.operation_obj.get_value(key)
-            for key in self.operation_obj.get_visible_parameters("database")
-            if not self.operation_obj.is_parameter_calculated(key)
-        }
-        header["operation_token"] = (
-            self.operation_obj.get_value("operation_token") or self.operation_token
-        )
-        result = self.database.save_import_with_items(
-            header, prepared, self.operation_id, len(raw_items)
-        )
-        if not isinstance(result, dict) or result.get("transaction") != "committed":
-            raise RuntimeError(f"Host returned an invalid import-save result: {result!r}")
-        return result
 
     def _refresh_related_tabs(self, *sections):
         main_window = self._get_main_window()
@@ -1076,8 +1063,17 @@ class BaseOperationDialog(QDialog):
             pass
 
     def _catalog_entity_exists(self, item_type, name):
-        table = "Products" if item_type == "product" else "Services"
         target = self._normalize_name(name)
+        catalog = getattr(self.database, 'sale_catalog', None)
+        if catalog:
+            entities = catalog.get(item_type + "s", [])
+            for e in entities:
+                if self._normalize_name(e.get("name", "")) == target:
+                    return True
+            return False
+            
+        # fallback to db
+        table = "Products" if item_type == "product" else "Services"
         self.database.cursor.execute(
             f"SELECT name FROM {table} WHERE name IS NOT NULL"
         )
@@ -1087,14 +1083,11 @@ class BaseOperationDialog(QDialog):
         )
 
     def _validate_stock(self, items_objects):
-        """Return a list of error strings for any sale item that exceeds available stock.
-
-        Excludes the current sale's own existing items from the deduction so that editing
-        a sale and changing quantities is checked correctly (not double-counted).
-        """
+        """Return a list of error strings for any sale item that exceeds available stock."""
         errors = []
         current_sale_id = self.operation_id or 0
-        cursor = self.database.cursor
+        catalog = getattr(self.database, 'sale_catalog', None)
+        
         for item in items_objects:
             try:
                 product_id = item.get_value('product_id')
@@ -1104,30 +1097,37 @@ class BaseOperationDialog(QDialog):
                 new_qty = float(item.get_value('quantity') or 0)
                 if new_qty <= 0:
                     continue
-
-                cursor.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = %s",
-                    (product_id,)
-                )
-                total_imports = cursor.fetchone()[0] or 0
-
-                # Exclude the current sale so editing doesn't double-count its own items
-                cursor.execute("""
-                    SELECT COALESCE(SUM(si.quantity), 0)
-                    FROM Sales_Items si
-                    JOIN Sales s ON si.sales_id = s.ID
-                    WHERE si.product_id = %s
-                      AND (s.state IS NULL OR s.state != 'on_hold')
-                      AND (s.is_historical IS NULL OR NOT s.is_historical)
-                      AND si.sales_id != %s
-                """, (product_id, current_sale_id))
-                sold_elsewhere = cursor.fetchone()[0] or 0
-
-                available = total_imports - sold_elsewhere
-                if new_qty > available:
-                    errors.append(
-                        f"'{product_name}': need {int(new_qty)}, only {max(0, int(available))} available"
+                
+                available = 0
+                if catalog:
+                    for p in catalog.get("products", []):
+                        if p.get("id") == product_id:
+                            available = p.get("stock", 0)
+                            break
+                else:
+                    cursor = self.database.cursor
+                    cursor.execute(
+                        "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = %s",
+                        (product_id,)
                     )
+                    total_imported = cursor.fetchone()[0]
+
+                    cursor.execute(
+                        """
+                        SELECT COALESCE(SUM(si.quantity), 0)
+                        FROM Sale_Items si
+                        JOIN Sales s ON si.sale_id = s.id
+                        WHERE si.product_id = %s
+                          AND s.state != 'on_hold'
+                          AND s.id != %s
+                        """,
+                        (product_id, current_sale_id)
+                    )
+                    total_sold = cursor.fetchone()[0]
+                    available = total_imported - total_sold
+                    
+                if new_qty > float(available):
+                    errors.append(f"{product_name} (Requested: {new_qty}, Available: {available})")
             except Exception as e:
                 print(f"Stock check error: {e}")
         return errors

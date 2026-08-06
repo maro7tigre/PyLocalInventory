@@ -23,6 +23,7 @@ logger = logging.getLogger(__name__)
 class _DashboardWorker(QObject):
     finished = Signal(object, float)
     failed = Signal(str, float)
+    cancelled = Signal(float)
 
     def __init__(self, database):
         super().__init__()
@@ -31,12 +32,33 @@ class _DashboardWorker(QObject):
     @Slot()
     def run(self):
         started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        snapshot = None
         try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
             with diagnostics.operation("dashboard_snapshot", mode="client"):
-                self.finished.emit(self.database.get_dashboard_snapshot(), started)
+                snapshot = self.database.get_dashboard_snapshot()
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                
+                is_success = True
         except Exception as error:
             logger.exception("Remote dashboard load failed")
-            self.failed.emit(str(error), started)
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(snapshot, started)
+            else:
+                self.failed.emit(error_msg, started)
 
 
 class StatCard(QFrame):
@@ -910,24 +932,35 @@ class HomeTab(QWidget):
             )
 
     def _start_remote_dashboard_refresh(self):
-        if self._dashboard_thread and self._dashboard_thread.isRunning():
-            return
-        thread = QThread(self)
+        existing_thread = getattr(self, "_dashboard_thread", None)
+        if existing_thread is not None and existing_thread.isRunning():
+            logger.warning("Duplicate dashboard refresh requested while active. Ignoring.")
+            return False
+            
+        thread = QThread()
         worker = _DashboardWorker(self.database)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        
         worker.finished.connect(self._remote_dashboard_finished)
         worker.failed.connect(self._remote_dashboard_failed)
+        
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda: setattr(self, "_dashboard_thread", None))
+        thread.finished.connect(lambda t=thread: self._on_dashboard_thread_finished(t))
+        
         self._dashboard_thread = thread
         self._dashboard_worker = worker
         diagnostics.worker_started("dashboard_snapshot", "home", "dashboard")
         thread.start()
+        return True
 
     @Slot(object, float)
     def _remote_dashboard_finished(self, snapshot, started):
@@ -1007,13 +1040,33 @@ class HomeTab(QWidget):
                 "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
             )
 
-    def _wait_for_dashboard_thread(self):
-        thread = self._dashboard_thread
-        if thread and thread.isRunning():
-            thread.requestInterruption()
-            thread.quit()
-            if not thread.wait(11000):
-                logger.error("Remote dashboard thread did not stop")
+    def _on_dashboard_thread_finished(self, thread):
+        if getattr(self, "_dashboard_thread", None) is thread:
+            self._dashboard_thread = None
+            self._dashboard_worker = None
+
+    def _wait_for_dashboard_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_dashboard_thread", None)
+        if thread is None or not thread.isRunning():
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Remote dashboard thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        # Successful wait implies thread finished executing its event loop
+        # Identity-safe reference cleanup
+        if getattr(self, "_dashboard_thread", None) is thread:
+            self._dashboard_thread = None
+            self._dashboard_worker = None
+            
+        return True
     
     def get_monthly_total(self, table_name, year, month):
         """Get total amount for a specific month"""

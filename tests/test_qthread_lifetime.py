@@ -106,5 +106,87 @@ class TestQThreadLifetime(unittest.TestCase):
         self.assertFalse(self.tab.finished_called)
         self.assertTrue(self.tab.failed_called)
 
+class TestHomeTabQThreadLifetime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from ui.tabs.home_tab import HomeTab
+        
+        class MinimalHomeTab(HomeTab):
+            def __init__(self):
+                # Init QWidget
+                super(HomeTab, self).__init__()
+                self._dashboard_thread = None
+                self._dashboard_worker = None
+                self.database = type("DB", (), {})()
+                self.finished_called = False
+                self.failed_called = False
+            def _remote_dashboard_finished(self, *args):
+                self.finished_called = True
+            def _remote_dashboard_failed(self, *args):
+                self.failed_called = True
+                
+        self.tab = MinimalHomeTab()
+        self.release_worker = threading.Event()
+        self.worker_started = threading.Event()
+        
+        def blocking_fetch():
+            self.worker_started.set()
+            self.release_worker.wait()
+            return {"total_sales": 100}
+            
+        self.tab.database.get_dashboard_snapshot = blocking_fetch
+        
+    def tearDown(self):
+        self.release_worker.set()
+        self.tab._wait_for_dashboard_thread(2000)
+        thread = getattr(self.tab, "_dashboard_thread", None)
+        if thread:
+            thread.wait(2000)
+            self.assertFalse(thread.isRunning(), "Test leaked running QThread")
+
+    def test_home_tab_wait_for_dashboard_thread_success(self):
+        self.tab._start_remote_dashboard_refresh()
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        self.assertIsNotNone(self.tab._dashboard_thread)
+        self.assertTrue(self.tab._dashboard_thread.isRunning())
+        
+        self.release_worker.set()
+        result = self.tab._wait_for_dashboard_thread(2000)
+        
+        self.assertTrue(result)
+        QApplication.processEvents()
+        
+        self.assertIsNone(self.tab._dashboard_thread)
+        self.assertIsNone(self.tab._dashboard_worker)
+
+    def test_home_tab_wait_for_dashboard_thread_timeout(self):
+        self.tab._start_remote_dashboard_refresh()
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        result = self.tab._wait_for_dashboard_thread(100)
+        
+        self.assertFalse(result)
+        self.assertIsNotNone(self.tab._dashboard_thread)
+        self.assertTrue(self.tab._dashboard_thread.isRunning())
+
+    def test_interruption_prevents_stale_data(self):
+        self.tab._start_remote_dashboard_refresh()
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        thread = self.tab._dashboard_thread
+        thread.requestInterruption()
+        self.release_worker.set()
+        
+        self.tab._wait_for_dashboard_thread(2000)
+        QApplication.processEvents()
+        
+        self.assertFalse(self.tab.finished_called)
+        self.assertFalse(self.tab.failed_called)
+
 if __name__ == "__main__":
     unittest.main()

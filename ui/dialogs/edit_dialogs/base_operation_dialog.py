@@ -144,7 +144,7 @@ class BaseOperationDialog(QDialog):
         self.load_data()
         
         if hasattr(self, 'items_table') and self.items_table:
-            self.items_table.load_data(self.operation_obj.items)
+            self.items_table.refresh_table()
 
     def _on_load_error(self, err_msg):
         if hasattr(self, 'load_worker') and self.load_worker:

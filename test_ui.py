@@ -1,6 +1,6 @@
 import sys
 import time
-from PySide6.QtWidgets import QApplication
+from PySide6.QtWidgets import QApplication, QTableView
 from PySide6.QtCore import QTimer, Qt
 from ui.main_window import MainWindow
 
@@ -11,70 +11,143 @@ def run_test():
     
     results = {}
     
-    def step1():
-        print("Step 1: Switching to Sales tab...")
-        try:
-            # Sales is usually tab index 1 (after Clients)
-            window.tabs.setCurrentIndex(1)
-        except:
-            pass
-        add_btn = None
-        sales_tab = window.tabs.currentWidget()
-        if hasattr(sales_tab, 'add_btn'):
-            add_btn = sales_tab.add_btn
-        if add_btn:
-            print("Clicking Add Sale...")
-            add_btn.click()
-            QTimer.singleShot(3000, step2)
-        else:
-            print("Could not find Add Sale button")
-            QTimer.singleShot(1000, app.quit)
+    def step_open_sales_tab():
+        print("\n--- Testing Sales ---")
+        window.tab_widget.setCurrentIndex(6) # Try switching to Sales (index 6 usually based on my previous knowledge, but let's just find it by name)
+        for i in range(window.tab_widget.count()):
+            if "Sales" in window.tab_widget.tabText(i):
+                window.tab_widget.setCurrentIndex(i)
+                break
+        QTimer.singleShot(1500, step_open_existing_sale)
 
-    def step2():
-        print("Step 2: Checking Sale dialog...")
-        top_widgets = app.topLevelWidgets()
+    def step_open_existing_sale():
+        print("B. Open EXISTING Sale")
+        sales_tab = window.tab_widget.currentWidget()
+        # Find the table view
+        table_view = sales_tab.findChild(QTableView)
+        if table_view and table_view.model() and table_view.model().rowCount() > 0:
+            print("Found existing sales. Double clicking first row...")
+            index = table_view.model().index(0, 0)
+            sales_tab.table_view.doubleClicked.emit(index)
+            QTimer.singleShot(3000, step_check_existing_sale)
+        else:
+            print("No existing sales to open.")
+            results['Existing Sale Result'] = "No existing sales found"
+            QTimer.singleShot(1000, step_open_add_sale)
+
+    def step_check_existing_sale():
         dlg = None
-        for w in top_widgets:
-            if "Sale" in w.windowTitle() or "Loading" in w.windowTitle() or "Error" in w.windowTitle():
+        for w in app.topLevelWidgets():
+            if "Sale" in w.windowTitle() and "Loading" not in w.windowTitle():
                 dlg = w
                 break
         if dlg:
-            print(f"Found dialog: {dlg.windowTitle()}")
-            results['Add Sale opened'] = True
-            if "NoneType" in dlg.windowTitle() or "Error" in dlg.windowTitle():
-                results['NoneType Error'] = True
-            
-            if hasattr(dlg, 'save_btn'):
-                print("Clicking Save...")
-                # Put some data to save
-                if hasattr(dlg, 'items_table'):
-                    pass # maybe add a row if needed, but save should work even empty or show validation
-                dlg.save_btn.click()
-                QTimer.singleShot(3000, step3)
+            results['Existing Sale Result'] = "Passed (Opened)"
+            # check rows
+            rows = dlg.items_table.table.rowCount()
+            print(f"Existing sale has {rows} item rows.")
+            if rows > 0:
+                results['Existing Sale Result'] += f", {rows} rows loaded"
             else:
-                print("No save button")
-                QTimer.singleShot(1000, app.quit)
+                results['Existing Sale Result'] += ", 0 rows loaded"
+                
+            print("F. Editing and saving existing sale...")
+            dlg.save_btn.click()
+            QTimer.singleShot(3000, step_open_add_sale)
         else:
-            print("No dialog found")
-            QTimer.singleShot(1000, app.quit)
+            results['Existing Sale Result'] = "Failed (Dialog not found or crashed)"
+            QTimer.singleShot(1000, step_open_add_sale)
+
+    def step_open_add_sale():
+        print("C. Open Add Sale")
+        sales_tab = window.tab_widget.currentWidget()
+        sales_tab.add_btn.click()
+        QTimer.singleShot(3000, step_check_add_sale)
+
+    def step_check_add_sale():
+        dlg = None
+        for w in app.topLevelWidgets():
+            if "Sale" in w.windowTitle() and "Loading" not in w.windowTitle() and w.isVisible():
+                dlg = w
+                break
+        if dlg:
+            results['New Sale Result'] = "Passed (Opened)"
+            dlg.reject() # close without saving
+            QTimer.singleShot(1000, step_open_imports_tab)
+        else:
+            results['New Sale Result'] = "Failed"
+            QTimer.singleShot(1000, step_open_imports_tab)
+
+    def step_open_imports_tab():
+        print("\n--- Testing Imports ---")
+        for i in range(window.tab_widget.count()):
+            if "Imports" in window.tab_widget.tabText(i):
+                window.tab_widget.setCurrentIndex(i)
+                break
+        QTimer.singleShot(1500, step_open_existing_import)
+
+    def step_open_existing_import():
+        print("D. Open EXISTING Import")
+        imports_tab = window.tab_widget.currentWidget()
+        table_view = imports_tab.findChild(QTableView)
+        if table_view and table_view.model() and table_view.model().rowCount() > 0:
+            print("Found existing imports. Double clicking first row...")
+            index = table_view.model().index(0, 0)
+            imports_tab.table_view.doubleClicked.emit(index)
+            QTimer.singleShot(3000, step_check_existing_import)
+        else:
+            print("No existing imports to open.")
+            results['Existing Import Result'] = "No existing imports found"
+            QTimer.singleShot(1000, step_open_add_import)
+
+    def step_check_existing_import():
+        dlg = None
+        for w in app.topLevelWidgets():
+            if "Import" in w.windowTitle() and "Loading" not in w.windowTitle() and w.isVisible():
+                dlg = w
+                break
+        if dlg:
+            results['Existing Import Result'] = "Passed (Opened)"
+            rows = dlg.items_table.table.rowCount()
+            print(f"Existing import has {rows} item rows.")
+            if rows > 0:
+                results['Existing Import Result'] += f", {rows} rows loaded"
+            else:
+                results['Existing Import Result'] += ", 0 rows loaded"
+            dlg.reject()
+            QTimer.singleShot(1000, step_open_add_import)
+        else:
+            results['Existing Import Result'] = "Failed"
+            QTimer.singleShot(1000, step_open_add_import)
+
+    def step_open_add_import():
+        print("E. Open Add Import")
+        imports_tab = window.tab_widget.currentWidget()
+        imports_tab.add_btn.click()
+        QTimer.singleShot(3000, step_check_add_import)
+
+    def step_check_add_import():
+        dlg = None
+        for w in app.topLevelWidgets():
+            if "Import" in w.windowTitle() and "Loading" not in w.windowTitle() and w.isVisible():
+                dlg = w
+                break
+        if dlg:
+            results['New Import Result'] = "Passed (Opened)"
+            dlg.reject()
+        else:
+            results['New Import Result'] = "Failed"
             
-    def step3():
-        print("Step 3: Checking if main window is still open...")
-        results['Main open'] = window.isVisible()
-        print("Main window visible:", window.isVisible())
-        
-        top_widgets = app.topLevelWidgets()
-        for w in top_widgets:
-            if "Sale" in w.windowTitle():
-                results['Dialog still open'] = w.isVisible()
-        
+        print("\nAll tests completed.")
         app.quit()
         
-    QTimer.singleShot(1000, step1)
+    QTimer.singleShot(1500, step_open_sales_tab)
+    QTimer.singleShot(30000, app.quit) # safety timeout
     
-    QTimer.singleShot(15000, app.quit) # timeout
     app.exec()
-    print("RESULTS:", results)
+    print("\nRESULTS:")
+    for k, v in results.items():
+        print(f"{k}: {v}")
 
 if __name__ == "__main__":
     run_test()

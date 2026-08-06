@@ -1112,20 +1112,25 @@ class OperationsTableWidget(QWidget):
     
     def refresh_table(self):
         """Refresh table data"""
-        self.table.setRowCount(0)
-        
-        # Load existing items
-        items = self.data_manager.load_items_from_operation(self.parent_operation)
-        for item in items:
-            row = self.table.rowCount()
-            self.table.setRowCount(row + 1)
-            self.row_factory.create_data_row(self.table, row, item)
-        
-        # Ensure empty row
-        self.empty_row_manager.ensure_single_empty_row()
-        
-        # Setup events
-        self.event_handler.setup_event_connections()
+        was_blocked = self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            
+            # Load existing items
+            items = self.data_manager.load_items_from_operation(self.parent_operation)
+            for item in items:
+                row = self.table.rowCount()
+                self.table.setRowCount(row + 1)
+                self.row_factory.create_data_row(self.table, row, item)
+            
+            # Ensure empty row
+            self.empty_row_manager.ensure_single_empty_row()
+            
+            # Setup events (will not duplicate existing connections)
+            self.event_handler.setup_event_connections()
+        finally:
+            self.table.blockSignals(was_blocked)
+            
         # Initial validation so existing rows show state immediately (only if enabled)
         if self.highlight_stock_exceed:
             self.event_handler.validate_all_rows()

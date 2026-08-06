@@ -18,7 +18,7 @@ class RemoteTableWorkerTests(unittest.TestCase):
         release_worker = threading.Event()
 
         def fetch():
-            release_worker.wait(1)
+            release_worker.wait()
             return [{"ID": 1}]
 
         thread = QThread()
@@ -29,7 +29,18 @@ class RemoteTableWorkerTests(unittest.TestCase):
         worker.finished.connect(lambda items, _levels, _started: results.extend(items))
         worker.finished.connect(thread.quit)
         worker.finished.connect(loop.quit)
+        worker.failed.connect(thread.quit)
+        worker.failed.connect(loop.quit)
         thread.started.connect(worker.run)
+
+        def cleanup_thread():
+            release_worker.set()
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait(2000)
+            self.assertFalse(thread.isRunning(), "Test leaked running QThread")
+            
+        self.addCleanup(cleanup_thread)
 
         def gui_callback():
             gui_timer_ran.append(True)
@@ -40,13 +51,17 @@ class RemoteTableWorkerTests(unittest.TestCase):
         timeout.setSingleShot(True)
         timeout.timeout.connect(loop.quit)
         timeout.start(2000)
+        
         thread.start()
+        
+        # Unblock worker quickly
+        QTimer.singleShot(200, release_worker.set)
+        
         loop.exec()
-        thread.wait(2000)
 
         self.assertTrue(gui_timer_ran)
         self.assertEqual(results, [{"ID": 1}])
-        self.assertFalse(thread.isRunning())
+
 
     def test_remote_dashboard_uses_one_background_snapshot(self):
         RemoteDatabase = type("RemoteDatabase", (), {})

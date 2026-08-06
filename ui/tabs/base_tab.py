@@ -40,11 +40,21 @@ class _RemoteTableFetchWorker(QObject):
     @Slot()
     def run(self):
         started = time.perf_counter()
+        is_success = False
+        error_msg = ""
+        items = levels = metrics = refresh_id = None
         try:
+            if QThread.currentThread().isInterruptionRequested():
+                error_msg = "Cancelled before fetch"
+                return
+                
             with diagnostics.operation("table_fetch", section=getattr(self, '_section', '')):
                 result = self.fetcher()
-                metrics = {}
-                refresh_id = None
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    error_msg = "Cancelled after fetch"
+                    return
+                
                 if isinstance(result, tuple):
                     if len(result) == 5:
                         items, levels, metrics, refresh_id, memory_info = result
@@ -57,10 +67,15 @@ class _RemoteTableFetchWorker(QObject):
                 else:
                     items = result
                     levels = None
-                self.finished.emit(items, levels, metrics, started, refresh_id)
+                is_success = True
         except Exception as error:
             logger.exception("Remote table fetch failed")
-            self.failed.emit(str(error), started)
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if is_success:
+                self.finished.emit(items, levels, metrics, started, refresh_id)
+            else:
+                self.failed.emit(error_msg, started)
 
 
 class BaseTableDelegate(QStyledItemDelegate):
@@ -752,7 +767,14 @@ class BaseTab(QWidget):
         self._start_refresh(fetcher, refresh_id, worker_db=worker_db, mode='local')
 
     def _start_refresh(self, fetcher, refresh_id, worker_db=None, mode='local'):
-        thread = QThread(self)
+        existing_thread = getattr(self, "_refresh_thread", None)
+        if existing_thread is not None and existing_thread.isRunning():
+            logger.warning("Duplicate refresh requested while thread is active. Ignoring.")
+            if worker_db is not None:
+                worker_db.close()
+            return
+            
+        thread = QThread()
         worker = _RemoteTableFetchWorker(fetcher)
         worker._section = self.section
         worker.moveToThread(thread)
@@ -764,7 +786,7 @@ class BaseTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda: setattr(self, "_refresh_thread", None))
+        thread.finished.connect(self._on_refresh_thread_finished)
         thread.finished.connect(
             lambda: diagnostics.worker_cleanup("table_fetch", self.section, refresh_id)
         )
@@ -1046,21 +1068,33 @@ class BaseTab(QWidget):
             self._refresh_pending = False
             QTimer.singleShot(0, lambda: self.refresh_table(force=True))
 
-    def _wait_for_refresh_thread(self):
+    def _on_refresh_thread_finished(self):
+        thread = getattr(self, "_refresh_thread", None)
+        if thread is not None and not thread.isRunning():
+            self._refresh_thread = None
+            self._refresh_worker = None
+
+    def _wait_for_refresh_thread(self, timeout_ms=5000):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
         self._cache.clear()
         thread = getattr(self, "_refresh_thread", None)
-        if thread and thread.isRunning():
-            thread.requestInterruption()
-            thread.quit()
-            if not thread.wait(11000):
-                logger.error(
-                    "Remote refresh thread did not stop section=%s", self.section
-                )
-            else:
-                logger.debug(
-                    "Remote refresh thread stopped section=%s", self.section
-                )
+        if thread is None or not thread.isRunning():
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error(
+                "Remote refresh thread did not stop section=%s timeout=%sms", 
+                self.section, timeout_ms
+            )
+            return False
+            
+        return True
 
     def background_fetcher(self, refresh_id=None, database=None):
         """Capture filter and keyset cursor state before the worker thread starts."""

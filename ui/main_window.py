@@ -5,6 +5,10 @@ All tabs now use consistent BaseTab experience
 import os
 import time
 from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+from datetime import datetime
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
@@ -48,7 +52,7 @@ from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
 from core.sync import SyncCoordinator
-from core.cache_policies import ENABLE_SQLITE_CACHE
+from core.cache_policies import ENABLE_SQLITE_CACHE, ENABLE_INCREMENTAL_SYNC
 from core import diagnostics
 from core.user_settings import (
     load_settings,
@@ -244,14 +248,74 @@ class MainWindow(ThemedMainWindow):
             self.settings.setValue(f"tab_visible/{key}", visible)
     
     def closeEvent(self, event):
-        """Handle application close event"""
-        logger.info("Application closing: stopping sync coordinator, server, and database")
-        self.save_app_config()
-        self._stop_sync_coordinator()
-        if self.network_server and self.network_server.is_running:
-            self.network_server.stop()
-        if self.database:
-            self.database.close()
+        """Handle application close event safely and idempotently."""
+        if getattr(self, "_shutting_down", False):
+            event.accept()
+            return
+            
+        self._shutting_down = True
+        
+        try:
+            logger.info("Application closing: initiating robust shutdown sequence")
+        except Exception:
+            pass
+            
+        try:
+            self.save_app_config()
+        except Exception as e:
+            try: logger.error(f"Error saving config during shutdown: {e}")
+            except: pass
+            
+        try:
+            self._stop_sync_coordinator()
+        except Exception as e:
+            try: logger.error(f"Error stopping sync during shutdown: {e}")
+            except: pass
+            
+        # Stop background workers in tabs
+        try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                for i in range(self.tab_widget.count()):
+                    tab = self.tab_widget.widget(i)
+                    if hasattr(tab, '_wait_for_refresh_thread'):
+                        try:
+                            tab._wait_for_refresh_thread()
+                        except Exception as e:
+                            logger.error(f"Error stopping refresh thread in tab: {e}")
+                    if hasattr(tab, '_wait_for_dashboard_thread'):
+                        try:
+                            tab._wait_for_dashboard_thread()
+                        except Exception as e:
+                            logger.error(f"Error stopping dashboard thread in tab: {e}")
+        except Exception as e:
+            try: logger.error(f"Error during tab thread cleanup: {e}")
+            except: pass
+            
+        # Stop network server
+        try:
+            if getattr(self, 'network_server', None) and self.network_server.is_running:
+                logger.info("Stopping network server...")
+                self.network_server.stop()
+        except Exception as e:
+            try: logger.error(f"Error stopping network server: {e}")
+            except: pass
+            
+        # Close database only after workers stop
+        try:
+            if getattr(self, 'database', None):
+                logger.info("Closing database connection...")
+                self.database.close()
+        except Exception as e:
+            try: logger.error(f"Error closing database: {e}")
+            except: pass
+            
+        # Flush logs
+        try:
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+        except:
+            pass
+            
         event.accept()
     
     def setup_menu(self):
@@ -721,7 +785,7 @@ class MainWindow(ThemedMainWindow):
         the disk cache is disabled the coordinator is never started, so the
         client never polls the host from the GUI thread."""
         self._stop_sync_coordinator()
-        if not ENABLE_SQLITE_CACHE:
+        if not ENABLE_SQLITE_CACHE or not ENABLE_INCREMENTAL_SYNC:
             self.statusBar().setVisible(False)
             return
         database = self.database

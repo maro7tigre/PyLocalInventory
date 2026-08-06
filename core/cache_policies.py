@@ -40,8 +40,8 @@ Invariants (asserted by tests/test_cache_policies.py)
 #   * HomeTab never persists or renders the dashboard from disk.
 #
 # All the cache code is intentionally kept in the repo behind this flag so the
-# experiment can be re-enabled without rewriting anything.
 ENABLE_SQLITE_CACHE = False
+ENABLE_INCREMENTAL_SYNC = False
 
 # RAM session layer (per tab).
 RAM_MAX_VIEWS_PER_TAB = 32

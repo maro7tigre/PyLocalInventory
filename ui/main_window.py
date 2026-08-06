@@ -255,22 +255,28 @@ class MainWindow(ThemedMainWindow):
             
         self._shutting_down = True
         
+        # Create a robust local logger helper to prevent teardown errors
+        def _safe_log(level, message, *args):
+            try:
+                # Catch NameError since the global 'logger' may be cleared during Python shutdown
+                getattr(logger, level)(message, *args)
+            except (NameError, AttributeError, RuntimeError, TypeError):
+                pass
+        
         try:
-            logger.info("Application closing: initiating robust shutdown sequence")
+            _safe_log("info", "Application closing: initiating robust shutdown sequence")
         except Exception:
             pass
             
         try:
             self.save_app_config()
         except Exception as e:
-            try: logger.error(f"Error saving config during shutdown: {e}")
-            except: pass
+            _safe_log("error", f"Error saving config during shutdown: {e}")
             
         try:
             self._stop_sync_coordinator()
         except Exception as e:
-            try: logger.error(f"Error stopping sync during shutdown: {e}")
-            except: pass
+            _safe_log("error", f"Error stopping sync during shutdown: {e}")
             
         # Stop background workers in tabs
         try:
@@ -281,39 +287,37 @@ class MainWindow(ThemedMainWindow):
                         try:
                             tab._wait_for_refresh_thread()
                         except Exception as e:
-                            logger.error(f"Error stopping refresh thread in tab: {e}")
+                            _safe_log("error", f"Error stopping refresh thread in tab: {e}")
                     if hasattr(tab, '_wait_for_dashboard_thread'):
                         try:
                             tab._wait_for_dashboard_thread()
                         except Exception as e:
-                            logger.error(f"Error stopping dashboard thread in tab: {e}")
+                            _safe_log("error", f"Error stopping dashboard thread in tab: {e}")
         except Exception as e:
-            try: logger.error(f"Error during tab thread cleanup: {e}")
-            except: pass
+            _safe_log("error", f"Error during tab thread cleanup: {e}")
             
         # Stop network server
         try:
             if getattr(self, 'network_server', None) and self.network_server.is_running:
-                logger.info("Stopping network server...")
+                _safe_log("info", "Stopping network server...")
                 self.network_server.stop()
         except Exception as e:
-            try: logger.error(f"Error stopping network server: {e}")
-            except: pass
+            _safe_log("error", f"Error stopping network server: {e}")
             
         # Close database only after workers stop
         try:
             if getattr(self, 'database', None):
-                logger.info("Closing database connection...")
+                _safe_log("info", "Closing database connection...")
                 self.database.close()
         except Exception as e:
-            try: logger.error(f"Error closing database: {e}")
-            except: pass
+            _safe_log("error", f"Error closing database: {e}")
             
         # Flush logs
         try:
+            import logging
             for handler in logging.getLogger().handlers:
                 handler.flush()
-        except:
+        except Exception:
             pass
             
         event.accept()

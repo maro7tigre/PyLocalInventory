@@ -189,5 +189,40 @@ class ImportItemSubtotalRegressionTests(unittest.TestCase):
         self.assertAlmostEqual(imp.calculate_total_price(), 87214.78, places=2)
 
 
+
+class TestDecimalParsing(unittest.TestCase):
+    def test_parse_decimal_input(self):
+        from core.calculations import parse_decimal_input, InputState
+        from decimal import Decimal
+
+        # Valid cases
+        self.assertEqual(parse_decimal_input('12'), (InputState.VALID, Decimal('12')))
+        self.assertEqual(parse_decimal_input('12.50'), (InputState.VALID, Decimal('12.50')))
+        self.assertEqual(parse_decimal_input('12,50'), (InputState.VALID, Decimal('12.50')))
+        self.assertEqual(parse_decimal_input('1 234,50'), (InputState.VALID, Decimal('1234.50')))
+        self.assertEqual(parse_decimal_input(12), (InputState.VALID, Decimal('12')))
+        self.assertEqual(parse_decimal_input(12.50), (InputState.VALID, Decimal('12.5')))
+        self.assertEqual(parse_decimal_input(Decimal('12.50')), (InputState.VALID, Decimal('12.50')))
+
+        # Empty cases
+        self.assertEqual(parse_decimal_input(''), (InputState.EMPTY, Decimal('0')))
+        self.assertEqual(parse_decimal_input('   '), (InputState.EMPTY, Decimal('0')))
+        self.assertEqual(parse_decimal_input(None), (InputState.EMPTY, Decimal('0')))
+
+        # Intermediate cases (should not crash)
+        self.assertEqual(parse_decimal_input('-'), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input('+'), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input('.'), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input(','), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input('1.'), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input('1,'), (InputState.INTERMEDIATE, Decimal('0')))
+        self.assertEqual(parse_decimal_input('-.'), (InputState.INTERMEDIATE, Decimal('0')))
+
+        # Malformed/Invalid cases
+        self.assertEqual(parse_decimal_input('abc'), (InputState.INVALID, Decimal('0')))
+        self.assertEqual(parse_decimal_input('12..5'), (InputState.INVALID, Decimal('0')))
+
 if __name__ == "__main__":
     unittest.main()
+
+

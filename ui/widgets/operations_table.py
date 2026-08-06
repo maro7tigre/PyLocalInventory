@@ -5,11 +5,16 @@ from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstrac
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
                              QStyledItemDelegate, QComboBox, QInputDialog)
 from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
-from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer
+from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer, QSignalBlocker
 from ui.widgets.preview_widget import PreviewWidget
 from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
 from decimal import Decimal, InvalidOperation
+from core.calculations import (
+    InputState,
+    parse_decimal_input,
+    calculate_line_subtotal,
+)
 
 
 class TableDataManager:
@@ -524,10 +529,8 @@ class TableEventHandler:
 
     @staticmethod
     def _parse_number(value):
-        try:
-            return float(str(value or "0").replace(" ", "").replace(",", "."))
-        except ValueError:
-            return 0.0
+        state, dec = parse_decimal_input(value)
+        return dec
 
     def _apply_subtotal_override(self, row):
         """Derive unit price when a user enters the line subtotal directly."""
@@ -541,29 +544,34 @@ class TableEventHandler:
             if subtotal_item is None:
                 return
 
-            quantity = self._parse_number(qty_item.text() if qty_item else "")
-            self._updating = True
-            if quantity <= 0:
-                quantity = 1.0
+            qty_state, quantity = parse_decimal_input(qty_item.text() if qty_item else "")
+            sub_state, subtotal = parse_decimal_input(subtotal_item.text())
+            
+            if qty_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+               sub_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID):
+                return
+            
+            blocker = QSignalBlocker(self.table)
+            
+            if quantity <= Decimal("0"):
+                quantity = Decimal("1")
                 if qty_item is None:
                     qty_item = QTableWidgetItem()
                     self.table.setItem(row, qty_col, qty_item)
                 qty_item.setText("1")
 
-            subtotal = self._parse_number(subtotal_item.text())
             unit_price = subtotal / quantity
             if price_item is None:
                 price_item = QTableWidgetItem()
                 self.table.setItem(row, price_col, price_item)
 
             price_item.setText(f"{unit_price:.6f}".rstrip('0').rstrip('.'))
-            was_updating = self._updating
-            self._updating = True
+            if price_item.text() == "":
+                price_item.setText("0")
+                
             subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
-            self._updating = was_updating
-            self._updating = False
-        except (ValueError, AttributeError, IndexError):
-            self._updating = False
+        except (ValueError, AttributeError, IndexError, InvalidOperation, TypeError):
+            pass
     
     def _on_product_name_changed(self, row, text):
         """Handle product name text changes"""
@@ -833,10 +841,16 @@ class TableEventHandler:
             qty_item = self.table.item(row, qty_col)
             price_item = self.table.item(row, price_col)
             
-            quantity = Decimal(str(qty_item.text()).replace(" ", "").replace(",", ".")) if qty_item and qty_item.text().strip() else Decimal("0")
-            unit_price = Decimal(str(price_item.text()).replace(" ", "").replace(",", ".")) if price_item and price_item.text().strip() else Decimal("0")
-            from core.calculations import calculate_line_subtotal
+            qty_state, quantity = parse_decimal_input(qty_item.text() if qty_item else "")
+            price_state, unit_price = parse_decimal_input(price_item.text() if price_item else "")
+            
+            if qty_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+               price_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID):
+                return
+            
             subtotal = calculate_line_subtotal(quantity, unit_price)
+            
+            blocker = QSignalBlocker(self.table)
             
             subtotal_item = self.table.item(row, subtotal_col)
             if not subtotal_item:
@@ -848,7 +862,7 @@ class TableEventHandler:
             # After updating subtotal, validate stock and style quantity cell if exceeded
             self._validate_stock(row)
             
-        except (ValueError, AttributeError, IndexError):
+        except (ValueError, AttributeError, IndexError, InvalidOperation, TypeError):
             pass
     
     def _reconnect_all_widgets(self):

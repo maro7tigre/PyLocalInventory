@@ -20,9 +20,16 @@ surface loudly instead of silently showing 0.00.
 
 import logging
 import traceback
-from decimal import Decimal, ROUND_HALF_UP
+from decimal import Decimal, ROUND_HALF_UP, InvalidOperation
+from enum import Enum
 
 logger = logging.getLogger(__name__)
+
+class InputState(Enum):
+    VALID = "VALID"
+    EMPTY = "EMPTY"
+    INTERMEDIATE = "INTERMEDIATE"
+    INVALID = "INVALID"
 
 _PENNY = Decimal("0.01")
 _HUNDRED = Decimal("100")
@@ -51,6 +58,53 @@ def to_decimal(value):
         )
         traceback.print_exc()
         raise
+
+
+def parse_decimal_input(value):
+    """Safely parse a raw UI string input into a Decimal and state.
+
+    Returns (InputState, Decimal).
+
+    Handles normal inputs, spaces, commas, empty, and intermediate editing
+    states (e.g. "-", ".", ","). Never raises InvalidOperation on intermediate
+    or empty inputs.
+    """
+    if value is None:
+        return InputState.EMPTY, Decimal("0")
+    if isinstance(value, Decimal):
+        return InputState.VALID, value
+
+    # Convert to string if not already
+    try:
+        text = str(value).strip()
+    except (ValueError, TypeError):
+        return InputState.INVALID, Decimal("0")
+
+    if not text:
+        return InputState.EMPTY, Decimal("0")
+
+    # Intermediate states that shouldn't crash or evaluate to 0 permanently,
+    # but the user might just be in the middle of typing.
+    intermediate_exact = {"-", "+", ".", ",", "-.", "-,", "+.", "+,"}
+    if text in intermediate_exact:
+        return InputState.INTERMEDIATE, Decimal("0")
+        
+    if text.endswith(".") or text.endswith(","):
+        prefix = text[:-1].replace(" ", "").replace(",", ".")
+        try:
+            Decimal(prefix)
+            return InputState.INTERMEDIATE, Decimal("0")
+        except (InvalidOperation, ValueError, TypeError):
+            pass
+
+    # Normalize spaces and commas
+    normalized = text.replace(" ", "").replace(",", ".")
+
+    try:
+        dec = Decimal(normalized)
+        return InputState.VALID, dec
+    except (InvalidOperation, ValueError, TypeError):
+        return InputState.INVALID, Decimal("0")
 
 
 def round_money(value):

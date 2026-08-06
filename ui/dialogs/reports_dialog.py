@@ -28,23 +28,54 @@ logger = logging.getLogger(__name__)
 class _PdfRenderWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(float)
+    status_updated = Signal(str)
 
-    def __init__(self, renderer, html_content, output_path):
+    def __init__(self, renderer, report_generator, report_type):
         super().__init__()
         self.renderer = renderer
-        self.html_content = html_content
-        self.output_path = output_path
+        self.report_generator = report_generator
+        self.report_type = report_type
 
     @Slot()
     def run(self):
         started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = None
         try:
-            with diagnostics.operation("pdf_render", output=self.output_path):
-                self.finished.emit(self.renderer(self.html_content, self.output_path))
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
+            self.status_updated.emit("Preparing report data...")
+            with diagnostics.operation("pdf_prepare", type=self.report_type):
+                html_content, output_path = self.report_generator(self.report_type)
+            
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
+            self.status_updated.emit("Rendering PDF...")
+            with diagnostics.operation("pdf_render", output=output_path):
+                result = self.renderer(html_content, output_path)
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
         except Exception as error:
-            logger.exception("PDF rendering failed output=%s", self.output_path)
-            self.failed.emit(str(error))
+            logger.exception("PDF generation failed type=%s", self.report_type)
+            error_msg = str(error) or "Unknown error"
         finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
             elapsed = time.perf_counter() - started
             logger.log(
                 logging.WARNING if elapsed >= 0.5 else logging.INFO,
@@ -128,41 +159,51 @@ class ReportsDialog(QDialog):
     
     def generate_report(self, report_type):
         """Generate report of specified type"""
-        if getattr(self, "_report_thread", None) and self._report_thread.isRunning():
-            return
+        existing_thread = getattr(self, "_report_thread", None)
+        if existing_thread is not None and existing_thread.isRunning():
+            return False
+            
         try:
             # Disable buttons during generation
             self.devis_btn.setEnabled(False)
             self.bdl_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             
-            self.status_label.setText("Preparing report...")
-            html_content, filepath = self._prepare_report(report_type)
-            self.status_label.setText("Rendering PDF...")
+            self.status_label.setText("Starting report generation...")
             self._active_report_type = report_type
-            thread = QThread(self)
-            worker = _PdfRenderWorker(self._html_to_pdf, html_content, filepath)
-            worker._report_type = report_type
+            
+            thread = QThread()
+            worker = _PdfRenderWorker(self._html_to_pdf, self._prepare_report, report_type)
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
+            
             # Connect to QObject-bound slots so PySide queues every widget and
             # QMessageBox operation onto the GUI thread. A lambda here can run
             # in the worker thread and make the success dialog unresponsive.
             worker.finished.connect(self._report_rendered_on_ui)
             worker.failed.connect(self._report_failed_on_ui)
+            worker.status_updated.connect(self.status_label.setText)
+            
             worker.finished.connect(thread.quit)
             worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
+            
             worker.finished.connect(worker.deleteLater)
             worker.failed.connect(worker.deleteLater)
-            thread.finished.connect(lambda: setattr(self, "_report_thread", None))
+            worker.cancelled.connect(worker.deleteLater)
+            
             thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda t=thread: self._on_report_thread_finished(t))
+            
             self._report_thread = thread
             self._report_worker = worker
             diagnostics.worker_started("pdf_render", "reports", report_type)
             thread.start()
+            return True
         except Exception as e:
             logger.exception("Report preparation failed type=%s", report_type)
             self._report_failed(report_type, str(e))
+            return False
 
     @Slot(str)
     def _report_rendered_on_ui(self, pdf_path):
@@ -206,6 +247,32 @@ class ReportsDialog(QDialog):
         )
         self._write_report_log(details)
         QMessageBox.critical(self, "Report Error", details)
+
+    def _on_report_thread_finished(self, thread):
+        if getattr(self, "_report_thread", None) is thread:
+            self._report_thread = None
+            self._report_worker = None
+
+    def _wait_for_report_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_report_thread", None)
+        if thread is None or not thread.isRunning():
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Report generation thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        if getattr(self, "_report_thread", None) is thread:
+            self._report_thread = None
+            self._report_worker = None
+            
+        return True
 
     def closeEvent(self, event):
         thread = getattr(self, "_report_thread", None)
@@ -344,8 +411,9 @@ class ReportsDialog(QDialog):
 
             def _decimal(value) -> Decimal:
                 try:
-                    return Decimal(str(value or 0).replace(" ", "").replace(",", "."))
-                except InvalidOperation:
+                    from core.calculations import to_decimal
+                    return to_decimal(value)
+                except Exception:
                     return Decimal("0")
 
             def _fmt_quantity(value) -> str:
@@ -471,6 +539,26 @@ class ReportsDialog(QDialog):
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
                 total_ht = 0
+                
+                # Bulk prefetch missing product names
+                missing_product_ids = set()
+                for item in self.sales_obj.items:
+                    if not item.get_value('product_name') and item.get_value('product_id'):
+                        missing_product_ids.add(int(item.get_value('product_id')))
+                
+                prefetched_product_names = {}
+                if missing_product_ids and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                    try:
+                        format_strings = ','.join(['%s'] * len(missing_product_ids))
+                        self.sales_obj.database.cursor.execute(
+                            f"SELECT id, name FROM Products WHERE id IN ({format_strings})", 
+                            tuple(missing_product_ids)
+                        )
+                        for row in self.sales_obj.database.cursor.fetchall():
+                            prefetched_product_names[row[0]] = row[1]
+                    except Exception as e:
+                        print(f"DEBUG: Error in bulk product name lookup: {e}")
+
                 for item in self.sales_obj.items:
                     product_name = item.get_value('product_name') or ""
                     item_information = item.get_value('information') or ""
@@ -481,19 +569,14 @@ class ReportsDialog(QDialog):
                         bool(service_id) and not bool(product_id)
                     )
                     
-                    # If product_name is empty, try to get it from product_id
-                    if not product_name:
-                        if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
-                            try:
-                                # Get product name from Products table
-                                self.sales_obj.database.cursor.execute(
-                                    "SELECT name FROM Products WHERE ID = %s", (product_id,)
-                                )
-                                product_data = self.sales_obj.database.cursor.fetchone()
-                                if product_data:
-                                    product_name = product_data[0]
-                            except Exception as e:
-                                print(f"DEBUG: Error getting product name: {e}")
+                    # If product_name is empty, try to get it from pre-fetched dictionary
+                    if not product_name and product_id:
+                        try:
+                            pid_int = int(product_id)
+                            if pid_int in prefetched_product_names:
+                                product_name = prefetched_product_names[pid_int]
+                        except ValueError:
+                            pass
                     
                     quantity = _decimal(item.get_value('quantity'))
                     unit_price = _decimal(item.get_value('unit_price'))

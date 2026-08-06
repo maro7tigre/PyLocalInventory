@@ -285,12 +285,20 @@ class MainWindow(ThemedMainWindow):
                     tab = self.tab_widget.widget(i)
                     if hasattr(tab, '_wait_for_refresh_thread'):
                         try:
-                            tab._wait_for_refresh_thread()
+                            if not tab._wait_for_refresh_thread():
+                                _safe_log("error", f"Refresh thread in tab {i} timed out during shutdown")
+                                self._shutting_down = False
+                                event.ignore()
+                                return
                         except Exception as e:
                             _safe_log("error", f"Error stopping refresh thread in tab: {e}")
                     if hasattr(tab, '_wait_for_dashboard_thread'):
                         try:
-                            tab._wait_for_dashboard_thread()
+                            if not tab._wait_for_dashboard_thread():
+                                _safe_log("error", f"Dashboard thread in tab {i} timed out during shutdown")
+                                self._shutting_down = False
+                                event.ignore()
+                                return
                         except Exception as e:
                             _safe_log("error", f"Error stopping dashboard thread in tab: {e}")
         except Exception as e:
@@ -1099,7 +1107,7 @@ class MainWindow(ThemedMainWindow):
         """Handle tab change to refresh data in the newly selected tab"""
         try:
             if hasattr(self, 'tab_widget') and self.tab_widget:
-                diagnostics.set_active_tab(self.tab_widget.tabText(index))
+                diagnostics.set_active_tab(self.tab_widget.tabText(index).replace('&', ''))
             pending = getattr(self, '_preload_tabs', None)
             if pending is not None:
                 pending.pop(index, None)

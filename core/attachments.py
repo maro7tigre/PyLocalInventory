@@ -207,6 +207,18 @@ class AttachmentService:
                 return None
         return base64.b64encode(thumbnail_path.read_bytes()).decode('ascii')
 
+    def thumbnails(self, attachment_ids, max_size=160):
+        """Bulk fetch thumbnails for multiple attachments."""
+        result = {}
+        for aid in attachment_ids:
+            try:
+                thumb = self.thumbnail(aid, max_size)
+                if thumb:
+                    result[aid] = thumb
+            except Exception:
+                pass
+        return result
+
     def update(self, attachment_id, display_name=None, description=None, category=None):
         self._ready()
         fields, values = [], []

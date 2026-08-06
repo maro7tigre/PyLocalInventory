@@ -3,7 +3,7 @@ Client-side drop-in stand-in for core.database.Database, backed by a network
 connection to a host running core.network.server.DatabaseServer.
 
 Exposes the same attribute surface used throughout the app - add_item,
-update_item, get_items, get_items_by_operation_id, delete_item, transactions,
+update_item, get_items, get_items_by_operation_id, get_items_by_operation_ids, delete_item, transactions,
 plus .cursor/.conn proxies for the raw-SQL call sites - so MainWindow can set
 self.database to either a real Database or a RemoteDatabase and every tab/
 dialog/domain class keeps working unmodified.
@@ -141,6 +141,15 @@ class RemoteDatabase:
             return True
         mapped = SECTION_GROUP.get(section, section)
         return bool(self.permissions.get(mapped, {}).get(action, False))
+
+    def get_items_by_operation_id(self, operation_id, section):
+        return self._call('get_items_by_operation_id', [operation_id, section])
+
+    def get_items_by_operation_ids(self, operation_ids, section):
+        return self._call('get_items_by_operation_ids', [operation_ids, section])
+
+    def get_sale_catalog(self, include_products=True, include_services=True):
+        return self._call('get_sale_catalog', [include_products, include_services])
 
     def register_class(self, cls):
         """Mirrors Database.register_class - only needs the section name
@@ -395,7 +404,7 @@ class RemoteDatabase:
 
     def __getattr__(self, name):
         # Reached only for attributes not set in __init__: add_item, update_item,
-        # get_items, get_items_by_operation_id, delete_item, begin_transaction,
+        # get_items, get_items_by_operation_id, get_items_by_operation_ids, delete_item, begin_transaction,
         # commit_transaction, rollback_transaction - forwarded generically so the
         # server-side allow-list is the single source of truth for what's exposed.
         def _proxy(*args, **kwargs):

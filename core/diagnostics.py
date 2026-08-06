@@ -460,7 +460,16 @@ class GuiWatchdog:
                 continue
             self._reporting = True
             frame = sys._current_frames().get(main_ident)
-            stack = "".join(traceback.format_stack(frame)) if frame else "(no main-thread frame)"
+            if frame:
+                frames_list = traceback.format_stack(frame)
+                if frames_list:
+                    last_frame = frames_list[-1]
+                    if ".exec(" in last_frame or ".exec_(" in last_frame:
+                        self._reporting = False
+                        continue
+                stack = "".join(frames_list)
+            else:
+                stack = "(no main-thread frame)"
             try:
                 threading_logger.warning(
                     "gui_stall seconds=%.1f tab=%s op=%s req=%s workers=%d "

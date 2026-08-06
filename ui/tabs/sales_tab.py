@@ -42,19 +42,6 @@ class SalesEditDialog(BaseOperationDialog):
         """Sales-specific validation"""
         # Keep only base validation; existence check handled in auto-create workflow
         return super().validate_data()
-    
-    def _validate_client_exists(self, username):
-        """Check if client username exists in database"""
-        if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-            return False
-        
-        try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = %s", (username,))
-            result = self.database.cursor.fetchone()
-            return result[0] > 0 if result else False
-        except Exception as e:
-            print(f"Error validating client: {e}")
-            return False
 
 
 class SalesTab(BaseTab):

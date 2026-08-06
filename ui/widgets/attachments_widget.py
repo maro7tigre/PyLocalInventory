@@ -152,6 +152,17 @@ class AttachmentPanel(QWidget):
         needle, kind = self.search.text().lower().strip(), self.filter.currentText()
         self._shown = [r for r in records if (not needle or needle in ' '.join(str(r.get(k, '')) for k in ('original_filename','display_name','mime_type')).lower()) and
                        (kind == 'All files' or (kind == 'Images' and str(r['mime_type']).startswith('image/')) or (kind == 'PDF' and r['mime_type'] == 'application/pdf'))]
+        
+        # Bulk load thumbnails
+        image_ids = [r['id'] for r in self._shown if r['mime_type'].startswith('image/')]
+        self._thumbnails_cache = {}
+        if image_ids:
+            try:
+                if hasattr(self.database, 'get_attachment_thumbnails_bulk'):
+                    self._thumbnails_cache = self.database.get_attachment_thumbnails_bulk(image_ids)
+            except Exception as e:
+                print(f"Error fetching bulk thumbnails: {e}")
+                
         self.table.setRowCount(len(self._shown))
         for row, record in enumerate(self._shown):
             preview = QTableWidgetItem('PDF' if record['mime_type'] == 'application/pdf' else '')
@@ -248,7 +259,9 @@ class AttachmentPanel(QWidget):
         if not record['mime_type'].startswith('image/'):
             return None
         try:
-            raw = self.database.get_attachment_thumbnail(record['id'])
+            raw = getattr(self, '_thumbnails_cache', {}).get(record['id'])
+            if raw is None:
+                raw = self.database.get_attachment_thumbnail(record['id'])
             image = QImage.fromData(base64.b64decode(raw)) if raw else QImage()
             return QPixmap.fromImage(image) if not image.isNull() else None
         except Exception:

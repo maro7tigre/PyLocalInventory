@@ -188,5 +188,215 @@ class TestHomeTabQThreadLifetime(unittest.TestCase):
         self.assertFalse(self.tab.finished_called)
         self.assertFalse(self.tab.failed_called)
 
+class TestReportsDialogQThreadLifetime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from ui.dialogs.reports_dialog import ReportsDialog
+        
+        class MinimalReportsDialog(ReportsDialog):
+            def __init__(self):
+                # We skip real UI init to avoid dependencies
+                super(ReportsDialog, self).__init__()
+                self._report_thread = None
+                self._report_worker = None
+                self.finished_called = False
+                self.failed_called = False
+                # Mock UI elements needed for generate_report
+                self.devis_btn = type("btn", (), {"setEnabled": lambda s, x: None})()
+                self.bdl_btn = type("btn", (), {"setEnabled": lambda s, x: None})()
+                self.cancel_btn = type("btn", (), {"setEnabled": lambda s, x: None})()
+                self.status_label = type("lbl", (), {"setText": lambda s, x: None})()
+
+            def _prepare_report(self, report_type):
+                return "<html></html>", "test.pdf"
+
+            def _html_to_pdf(self, html_content, output_path):
+                # The mocked render method
+                return self.blocking_render()
+
+            def _report_rendered_on_ui(self, pdf_path):
+                self.finished_called = True
+
+            def _report_failed_on_ui(self, error):
+                self.failed_called = True
+                
+        self.dialog = MinimalReportsDialog()
+        self.release_worker = threading.Event()
+        self.worker_started = threading.Event()
+        
+        def blocking_render():
+            self.worker_started.set()
+            self.release_worker.wait()
+            return "test.pdf"
+            
+        self.dialog.blocking_render = blocking_render
+        
+    def tearDown(self):
+        self.release_worker.set()
+        self.dialog._wait_for_report_thread(2000)
+        thread = getattr(self.dialog, "_report_thread", None)
+        if thread:
+            thread.wait(2000)
+            self.assertFalse(thread.isRunning(), "Test leaked running QThread")
+
+    def test_reports_dialog_wait_success(self):
+        self.dialog.generate_report("devis")
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        self.assertIsNotNone(self.dialog._report_thread)
+        self.assertTrue(self.dialog._report_thread.isRunning())
+        
+        self.release_worker.set()
+        result = self.dialog._wait_for_report_thread(2000)
+        
+        self.assertTrue(result)
+        QApplication.processEvents()
+        
+        self.assertIsNone(self.dialog._report_thread)
+        self.assertIsNone(self.dialog._report_worker)
+
+    def test_reports_dialog_wait_timeout(self):
+        self.dialog.generate_report("devis")
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        result = self.dialog._wait_for_report_thread(100)
+        
+        self.assertFalse(result)
+        self.assertIsNotNone(self.dialog._report_thread)
+        self.assertTrue(self.dialog._report_thread.isRunning())
+
+    def test_interruption_prevents_stale_data(self):
+        self.dialog.generate_report("devis")
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        thread = self.dialog._report_thread
+        thread.requestInterruption()
+        self.release_worker.set()
+        
+        self.dialog._wait_for_report_thread(2000)
+        QApplication.processEvents()
+        
+        self.assertFalse(self.dialog.finished_called)
+        self.assertFalse(self.dialog.failed_called)
+
+class TestBackupsDialogQThreadLifetime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        from ui.dialogs.backups_dialog import BackupsDialog
+        
+        class MinimalBackupsDialog(BackupsDialog):
+            def __init__(self):
+                super(BackupsDialog, self).__init__()
+                self._backup_thread = None
+                self._backup_worker = None
+                self._backup_running = False
+                self.finished_called = False
+                self.failed_called = False
+                self.restore_btn = type("btn", (), {"setEnabled": lambda s, x: None})()
+                self.close_btn = type("btn", (), {"setEnabled": lambda s, x: None})()
+                self.status_label = type("lbl", (), {"setText": lambda s, x: None})()
+
+            def _restore_completed(self, success):
+                self.finished_called = True
+
+            def _restore_failed(self, error):
+                self.failed_called = True
+                
+        self.dialog = MinimalBackupsDialog()
+        self.release_worker = threading.Event()
+        self.worker_started = threading.Event()
+        
+        def blocking_restore():
+            self.worker_started.set()
+            self.release_worker.wait()
+            return True
+            
+        self.dialog.blocking_restore = blocking_restore
+        
+    def tearDown(self):
+        self.release_worker.set()
+        self.dialog._wait_for_backup_thread(2000)
+        thread = getattr(self.dialog, "_backup_thread", None)
+        if thread:
+            thread.wait(2000)
+            self.assertFalse(thread.isRunning(), "Test leaked running QThread")
+
+    def _start_mock_backup(self):
+        from ui.dialogs.backups_dialog import _BackupCreateWorker
+        self.dialog._backup_running = True
+        thread = QThread()
+        worker = _BackupCreateWorker(
+            self.dialog.blocking_restore,
+            "restore_backup",
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        
+        worker.finished.connect(self.dialog._restore_completed)
+        worker.failed.connect(self.dialog._restore_failed)
+        
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda t=thread: self.dialog._on_backup_thread_finished(t))
+        
+        self.dialog._backup_thread = thread
+        self.dialog._backup_worker = worker
+        thread.start()
+
+    def test_backups_dialog_wait_success(self):
+        self._start_mock_backup()
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        self.assertIsNotNone(self.dialog._backup_thread)
+        self.assertTrue(self.dialog._backup_thread.isRunning())
+        
+        self.release_worker.set()
+        result = self.dialog._wait_for_backup_thread(2000)
+        
+        self.assertTrue(result)
+        QApplication.processEvents()
+        
+        self.assertIsNone(self.dialog._backup_thread)
+        self.assertIsNone(self.dialog._backup_worker)
+
+    def test_backups_dialog_wait_timeout(self):
+        self._start_mock_backup()
+        
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        result = self.dialog._wait_for_backup_thread(100)
+        
+        self.assertFalse(result)
+        self.assertIsNotNone(self.dialog._backup_thread)
+        self.assertTrue(self.dialog._backup_thread.isRunning())
+
+    def test_interruption_prevents_stale_data(self):
+        self._start_mock_backup()
+        self.assertTrue(self.worker_started.wait(2.0))
+        
+        thread = self.dialog._backup_thread
+        thread.requestInterruption()
+        self.release_worker.set()
+        
+        self.dialog._wait_for_backup_thread(2000)
+        QApplication.processEvents()
+        
+        self.assertFalse(self.dialog.finished_called)
+        self.assertFalse(self.dialog.failed_called)
+
 if __name__ == "__main__":
     unittest.main()

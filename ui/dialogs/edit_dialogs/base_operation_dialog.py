@@ -6,7 +6,7 @@ Replaces the complex manual layout calculations with clean auto-sizing
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                                QPushButton, QMessageBox, QScrollArea, QWidget,
                                QFormLayout, QSizePolicy)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont
 from ui.widgets.themed_widgets import GreenButton, RedButton
 from ui.widgets.operations_table import OperationsTableWidget
@@ -21,6 +21,51 @@ import logging
 from core.runtime_paths import user_data_root
 
 logger = logging.getLogger(__name__)
+
+class SaveWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+    
+    def __init__(self, dialog, is_import):
+        super().__init__()
+        self.dialog = dialog
+        self.is_import = is_import
+        
+    @Slot()
+    def process(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            if self.is_import:
+                res = self.dialog._save_import_atomically()
+            else:
+                res = self.dialog._save_sale_atomically()
+            self.finished.emit(res)
+        except Exception as e:
+            self.error.emit(str(e))
+
+class LoadWorker(QObject):
+    finished = Signal()
+    error = Signal(str)
+
+    def __init__(self, operation_obj, fetch_catalog):
+        super().__init__()
+        self.operation_obj = operation_obj
+        self.fetch_catalog = fetch_catalog
+
+    @Slot()
+    def process(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            if self.operation_obj:
+                self.operation_obj.load_database_data()
+            if self.fetch_catalog and getattr(self.operation_obj.database, 'get_sale_catalog', None):
+                self.operation_obj.database.sale_catalog = self.operation_obj.database.get_sale_catalog()
+            self.finished.emit()
+        except Exception as e:
+            self.error.emit(str(e))
+
 
 
 class BaseOperationDialog(QDialog):
@@ -44,7 +89,6 @@ class BaseOperationDialog(QDialog):
         # Create or load operation object
         if operation_id:
             self.operation_obj = operation_class(operation_id, database)
-            self.operation_obj.load_database_data()
             self.setWindowTitle(f"Edit {self.operation_obj.section[:-1]} - ID {operation_id}")
         else:
             self.operation_obj = operation_class(0, database)
@@ -55,12 +99,57 @@ class BaseOperationDialog(QDialog):
         
         # Setup UI
         self.setup_ui()
-        self.load_data()
         self.apply_theme()
+        
+        self.setEnabled(False)
+        self.setWindowTitle(self.windowTitle() + " (Loading...)")
+
+        self.load_thread = QThread()
+        self.load_worker = LoadWorker(
+            self.operation_obj if operation_id else None, 
+            fetch_catalog=not hasattr(database, "sale_catalog") or database.sale_catalog is None
+        )
+        self.load_worker.moveToThread(self.load_thread)
+        self.load_thread.started.connect(self.load_worker.process)
+        self.load_worker.finished.connect(self._on_load_finished)
+        self.load_worker.error.connect(self._on_load_error)
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.error.connect(self.load_thread.quit)
+        self.load_thread.start()
         
         # Auto-size dialog
         self.resize(900, 700)
+
         self.setMinimumSize(600, 500)
+    def _on_load_finished(self):
+        if hasattr(self, 'load_worker') and self.load_worker:
+            self.load_worker.deleteLater()
+            self.load_worker = None
+        if hasattr(self, 'load_thread') and self.load_thread:
+            self.load_thread.deleteLater()
+            self.load_thread = None
+        
+        self.setEnabled(True)
+        title = self.windowTitle().replace(" (Loading...)", "")
+        self.setWindowTitle(title)
+        self.load_data()
+        
+        if hasattr(self, 'items_table') and self.items_table:
+            self.items_table.load_data(self.operation_obj.items)
+
+    def _on_load_error(self, err_msg):
+        if hasattr(self, 'load_worker') and self.load_worker:
+            self.load_worker.deleteLater()
+            self.load_worker = None
+        if hasattr(self, 'load_thread') and self.load_thread:
+            self.load_thread.deleteLater()
+            self.load_thread = None
+        QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
+        self.setEnabled(True)
+        title = self.windowTitle().replace(" (Loading...)", "")
+        self.setWindowTitle(title)
+        self.load_data()
+
         
     def setup_ui(self):
         """Setup clean auto-sizing UI"""
@@ -401,7 +490,7 @@ class BaseOperationDialog(QDialog):
         try:
             self._save_changes_impl()
         finally:
-            if self.result() == QDialog.Rejected:
+            if self.result() == QDialog.Rejected and not (hasattr(self, 'save_thread') and self.save_thread):
                 self._saving = False
                 self.save_btn.setEnabled(True)
                 self.save_btn.setText("Save")
@@ -432,7 +521,7 @@ class BaseOperationDialog(QDialog):
                 self.operation_obj.set_value(param_key, value)
             
             # Set remise value from spinbox if it exists
-            if self.remise_spinbox is not None:
+            if getattr(self, 'remise_spinbox', None) is not None:
                 self.operation_obj.set_value('remise', float(self.remise_spinbox.value()))
             
             # For snapshots: if client_name/supplier_name empty set from username
@@ -447,63 +536,40 @@ class BaseOperationDialog(QDialog):
                 pass
             
             # Save operation to database first (ensures ID exists)
-            if self.operation_obj.section == 'Sales':
-                items_objects = self.items_table.get_items_data()
-                is_historical = bool(self.operation_obj.get_value('is_historical'))
-                sale_state = self.operation_obj.get_value('state') or 'pending'
-                if not is_historical and sale_state != 'on_hold':
-                    stock_errors = self._validate_stock(items_objects)
-                    mw = self._get_main_window()
-                    warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
-                    if stock_errors and warn_stock:
-                        reply = QMessageBox.warning(
-                            self, "Insufficient Stock",
-                            "Not enough stock for:\n\n" +
-                            "\n".join(f"  • {e}" for e in stock_errors) +
-                            "\n\nSave anyway?",
-                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                            QMessageBox.StandardButton.No
-                        )
-                        if reply != QMessageBox.StandardButton.Yes:
-                            return
-                if not self._confirm_sale_summary():
-                    return
+            if self.operation_obj.section in ('Sales', 'Imports'):
+                is_import = (self.operation_obj.section == 'Imports')
+                
+                if not is_import:
+                    items_objects = self.items_table.get_items_data()
+                    is_historical = bool(self.operation_obj.get_value('is_historical'))
+                    sale_state = self.operation_obj.get_value('state') or 'pending'
+                    if not is_historical and sale_state != 'on_hold':
+                        stock_errors = self._validate_stock(items_objects)
+                        mw = self._get_main_window()
+                        warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                        if stock_errors and warn_stock:
+                            reply = QMessageBox.warning(
+                                self, "Insufficient Stock",
+                                "Not enough stock for:\n\n" +
+                                "\n".join(f"  • {e}" for e in stock_errors) +
+                                "\n\nSave anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
+                    if not self._confirm_sale_summary():
+                        return
+                        
                 action = "updated" if self.operation_id else "created"
-                result = self._save_sale_atomically()
-                self.operation_id = result['sale_id']
-                self.operation_obj.id = result['sale_id']
-                self.operation_obj.set_value('id', result['sale_id'])
-                expected = result.get('expected', 0)
-                saved = result.get('saved', 0)
-                if saved != expected:
-                    raise RuntimeError(
-                        f"Sale was not saved: {expected} visible items were found, "
-                        f"but the server confirmed {saved} saved items."
-                    )
-                QMessageBox.information(
-                    self, "Success",
-                    f"Operation {action} successfully. {saved} items saved.\n"
-                    f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
-                    f"deleted: {result.get('deleted', 0)}."
-                )
-                self.accept()
-                self._refresh_related_tabs("Sales", "Products", "Clients")
-                return
-
-            if self.operation_obj.section == 'Imports':
-                action = "updated" if self.operation_id else "created"
-                result = self._save_import_atomically()
-                self.operation_id = result["import_id"]
-                self.operation_obj.id = result["import_id"]
-                self.operation_obj.set_value("id", result["import_id"])
-                QMessageBox.information(
-                    self,
-                    "Success",
-                    f"Import {action} successfully. {result['saved']} items saved.\n"
-                    f"Products created: {result.get('created_products', 0)}.",
-                )
-                self.accept()
-                self._refresh_related_tabs("Imports", "Products")
+                
+                self.save_thread = QThread()
+                self.save_worker = SaveWorker(self, is_import)
+                self.save_worker.moveToThread(self.save_thread)
+                self.save_thread.started.connect(self.save_worker.process)
+                self.save_worker.finished.connect(lambda res, act=action: self._on_save_finished(res, act))
+                self.save_worker.error.connect(self._on_save_error)
+                self.save_thread.start()
                 return
 
             success = self.operation_obj.save_to_database()
@@ -601,6 +667,68 @@ class BaseOperationDialog(QDialog):
                 self.operation_id,
             )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
+
+    def _on_save_finished(self, result, action):
+        if hasattr(self, 'save_worker') and self.save_worker:
+            self.save_worker.deleteLater()
+            self.save_worker = None
+        if hasattr(self, 'save_thread') and self.save_thread:
+            self.save_thread.deleteLater()
+            self.save_thread = None
+
+        self._saving = False
+        if hasattr(self, 'save_btn') and self.save_btn:
+            self.save_btn.setEnabled(True)
+            self.save_btn.setText("Save")
+
+        if getattr(self.operation_obj, 'section', '') == 'Sales':
+            self.operation_id = result['sale_id']
+            self.operation_obj.id = result['sale_id']
+            self.operation_obj.set_value('id', result['sale_id'])
+            expected = result.get('expected', 0)
+            saved = result.get('saved', 0)
+            if saved != expected:
+                QMessageBox.critical(self, "Error", 
+                    f"Sale was not saved: {expected} visible items were found, "
+                    f"but the server confirmed {saved} saved items."
+                )
+                return
+            QMessageBox.information(
+                self, "Success",
+                f"Operation {action} successfully. {saved} items saved.\n"
+                f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
+                f"deleted: {result.get('deleted', 0)}."
+            )
+            self.accept()
+            self._refresh_related_tabs("Sales", "Products", "Clients")
+            
+        elif getattr(self.operation_obj, 'section', '') == 'Imports':
+            self.operation_id = result["import_id"]
+            self.operation_obj.id = result["import_id"]
+            self.operation_obj.set_value("id", result["import_id"])
+            QMessageBox.information(
+                self,
+                "Success",
+                f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
+                f"Products created: {result.get('created_products', 0)}.",
+            )
+            self.accept()
+            self._refresh_related_tabs("Imports", "Products")
+
+    def _on_save_error(self, err_msg):
+        if hasattr(self, 'save_worker') and self.save_worker:
+            self.save_worker.deleteLater()
+            self.save_worker = None
+        if hasattr(self, 'save_thread') and self.save_thread:
+            self.save_thread.deleteLater()
+            self.save_thread = None
+
+        self._saving = False
+        if hasattr(self, 'save_btn') and self.save_btn:
+            self.save_btn.setEnabled(True)
+            self.save_btn.setText("Save")
+        
+        QMessageBox.critical(self, "Error", f"Failed to save operation: {err_msg}")
 
     def _confirm_sale_summary(self):
         """Show the required pre-save summary and ask for confirmation."""

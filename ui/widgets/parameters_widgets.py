@@ -34,7 +34,11 @@ class AdaptiveDecimalSpinBox(QDoubleSpinBox):
         return text
 
     def valueFromText(self, text):
-        return float(str(text).strip().replace(",", ".") or 0)
+        from core.calculations import to_decimal
+        try:
+            return float(to_decimal(text))
+        except Exception:
+            return 0.0
 
 
 class NumericWidget(QWidget):

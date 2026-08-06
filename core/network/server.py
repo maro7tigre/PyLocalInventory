@@ -51,16 +51,16 @@ _SECTION_METHODS = {
     'delete_item': ('delete', 1),               # delete_item(item_id, section)
     'get_items': ('read', 0),                   # get_items(section)
     'get_items_by_operation_id': ('read', 1),   # get_items_by_operation_id(operation_id, section)
+    'get_items_by_operation_ids': ('read', 1),  # get_items_by_operation_ids(operation_ids, section)
+    'get_sale_catalog': ('read', 0),            # get_sale_catalog(include_products, include_services)
     'get_operation_summary_items': ('read', 0),  # get operation summaries for Sales/Imports
     'get_changes': ('read', 0),                 # get_changes(section, since_seq, limit)
 }
 _ATTACHMENT_METHODS = {
-    'list_attachments': ('read', 0),
-    'download_attachment': ('read', None),
-    'get_attachment_thumbnail': ('read', None),
-    'upload_attachment': ('write', 0),
-    'update_attachment': ('write', None),
-    'delete_attachment': ('delete', None),
+    'get_attachment': ('read', 1),              # get_attachment(attachment_id)
+    'get_attachment_thumbnail': ('read', 1),    # get_attachment_thumbnail(attachment_id)
+    'get_attachment_thumbnails_bulk': ('read', 1),  # get_attachment_thumbnails_bulk(attachment_ids)
+    'update_attachment': ('write', 4),          # update_attachment(attachment_id, display_name, description, category),
 }
 _CLIENT_ACCOUNT_METHODS = {
     'get_client_account', 'get_client_sales', 'add_client_payment'
@@ -535,6 +535,14 @@ class DatabaseServer:
                 )
             if method == 'get_items_by_operation_id' and len(args) > 1:
                 return request_db.get_operation_items_for_user(args[0], args[1], user)
+            if method == 'get_items_by_operation_ids' and len(args) > 1:
+                return request_db.get_items_by_operation_ids(args[0], args[1])
+            if method == 'get_sale_catalog':
+                return request_db.get_sale_catalog(*args, **kwargs)
+            if method == 'get_attachment_thumbnail' and len(args) > 0:
+                return request_db.get_attachment_thumbnail(args[0])
+            if method == 'get_attachment_thumbnails_bulk' and len(args) > 0:
+                return request_db.get_attachment_thumbnails_bulk(args[0])
             if method == 'add_item' and len(args) > 1 and args[1] == 'Reports':
                 return request_db.save_report_for_user(None, args[0], user)
             if method == 'update_item' and len(args) > 2 and args[2] == 'Reports':

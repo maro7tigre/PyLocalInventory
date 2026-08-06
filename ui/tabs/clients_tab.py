@@ -16,31 +16,6 @@ class ClientsTab(BaseTab):
     def __init__(self, database=None, parent=None):
         super().__init__(ClientClass, ClientEditDialog, database, parent)
 
-    def refresh_on_tab_switch(self):
-        """Clients are shared/edited by other users concurrently, so always
-        reload from the database on switch instead of relying on BaseTab's
-        30s staleness cache — otherwise a collaborator's additions/edits stay
-        invisible until the cache happens to expire.
-
-        Two safeguards keep a switch from doubling a request that is already
-        running or just finished:
-        * while a fetch is in flight (e.g. the startup preload) the switch
-          does nothing - that request already covers the view; and
-        * a switch that lands within 2s of a completed fetch skips the extra
-          network round-trip. A manual Refresh always forces a fresh fetch.
-
-        This used to be gated on ``hasattr(self.database, 'conn')`` which is
-        only true on the host; on a remote Client PC the guard silently
-        skipped the refresh and the tab stayed empty until the user clicked
-        Refresh. Network refreshes are non-blocking, so the gate is gone."""
-        try:
-            if self.database and not self._refreshing:
-                recently_fetched = monotonic() - self._last_refresh_at < 2.0
-                if not recently_fetched:
-                    self.refresh_table(force=True)
-        except Exception as e:
-            print(f"Error refreshing {self.section} tab on switch: {e}")
-
     def add_additional_toolbar_buttons(self, layout):
         """Add the client account view command."""
         self.view_client_btn = BlueButton("View Client")

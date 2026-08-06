@@ -2418,32 +2418,58 @@ class Database:
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
 
-    def get_sale_catalog(self, include_products=True, include_services=True):
+    def get_sale_catalog(self, include_products=True, include_services=True, exclude_sale_id=None):
         """Return the sale-entry catalog and stock in a small number of queries."""
         catalog = {"products": [], "services": []}
         if include_products:
-            self.cursor.execute(
-                """
-                SELECT p.id, p.name, p.sale_price, p.preview_image,
-                       COALESCE(imported.quantity, 0)
-                       - COALESCE(sold.quantity, 0) AS stock
-                FROM products p
-                LEFT JOIN (
-                    SELECT product_id, SUM(quantity) AS quantity
-                    FROM import_items GROUP BY product_id
-                ) imported ON imported.product_id=p.id
-                LEFT JOIN (
-                    SELECT si.product_id, SUM(si.quantity) AS quantity
-                    FROM sales_items si
-                    JOIN sales s ON s.id=si.sales_id
-                    WHERE s.state IS NULL OR s.state<>'on_hold'
-                      AND (s.is_historical IS NULL OR NOT s.is_historical)
-                    GROUP BY si.product_id
-                ) sold ON sold.product_id=p.id
-                WHERE p.name IS NOT NULL AND p.name<>''
-                ORDER BY LOWER(p.name), p.id
-                """
-            )
+            if exclude_sale_id:
+                self.cursor.execute(
+                    """
+                    SELECT p.id, p.name, p.sale_price, p.preview_image,
+                           COALESCE(imported.quantity, 0)
+                           - COALESCE(sold.quantity, 0) AS stock
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT product_id, SUM(quantity) AS quantity
+                        FROM import_items GROUP BY product_id
+                    ) imported ON imported.product_id=p.id
+                    LEFT JOIN (
+                        SELECT si.product_id, SUM(si.quantity) AS quantity
+                        FROM sales_items si
+                        JOIN sales s ON s.id=si.sales_id
+                        WHERE (s.state IS NULL OR s.state<>'on_hold')
+                          AND (s.is_historical IS NULL OR NOT s.is_historical)
+                          AND s.id != %s
+                        GROUP BY si.product_id
+                    ) sold ON sold.product_id=p.id
+                    WHERE p.name IS NOT NULL AND p.name<>''
+                    ORDER BY LOWER(p.name), p.id
+                    """,
+                    (exclude_sale_id,)
+                )
+            else:
+                self.cursor.execute(
+                    """
+                    SELECT p.id, p.name, p.sale_price, p.preview_image,
+                           COALESCE(imported.quantity, 0)
+                           - COALESCE(sold.quantity, 0) AS stock
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT product_id, SUM(quantity) AS quantity
+                        FROM import_items GROUP BY product_id
+                    ) imported ON imported.product_id=p.id
+                    LEFT JOIN (
+                        SELECT si.product_id, SUM(si.quantity) AS quantity
+                        FROM sales_items si
+                        JOIN sales s ON s.id=si.sales_id
+                        WHERE s.state IS NULL OR s.state<>'on_hold'
+                          AND (s.is_historical IS NULL OR NOT s.is_historical)
+                        GROUP BY si.product_id
+                    ) sold ON sold.product_id=p.id
+                    WHERE p.name IS NOT NULL AND p.name<>''
+                    ORDER BY LOWER(p.name), p.id
+                    """
+                )
             catalog["products"] = [
                 {
                     "id": int(row[0]), "name": row[1],
@@ -2693,6 +2719,42 @@ class Database:
         self.conn.commit()
         self.record_change('Reports', int(report_id), 'delete', None)
         return True
+
+    def get_items_by_operation_ids(self, operation_ids, section):
+        """Get items for multiple operations (Sales_Items or Import_Items) in bulk"""
+        if not self.cursor or section not in self.registered_classes or not operation_ids:
+            return {}
+
+        try:
+            # Determine the foreign key column name based on section
+            if section == 'Sales_Items':
+                fk_column = 'sales_id'
+            elif section == 'Import_Items':
+                fk_column = 'import_id'
+            else:
+                print(f"Unknown item section: {section}")
+                return {}
+
+            format_strings = ','.join(['%s'] * len(operation_ids))
+            self.cursor.execute(f"SELECT * FROM {section} WHERE {fk_column} IN ({format_strings})", tuple(operation_ids))
+            rows = self.cursor.fetchall()
+
+            columns = [description[0] for description in self.cursor.description]
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+
+            result = {op_id: [] for op_id in operation_ids}
+            for row in rows:
+                item = dict(zip(columns, row))
+                op_id = item.get(fk_column)
+                if op_id in result:
+                    result[op_id].append(item)
+                    
+            return result
+
+        except Exception as e:
+            print(f"Error getting bulk items from {section}: {e}")
+            return {}
 
     def get_items_by_operation_id(self, operation_id, section):
         """Get items for a specific operation (Sales_Items or Import_Items)"""
@@ -2957,6 +3019,10 @@ class Database:
     def get_attachment_thumbnail(self, attachment_id):
         from core.attachments import AttachmentService
         return AttachmentService(self).thumbnail(int(attachment_id))
+
+    def get_attachment_thumbnails_bulk(self, attachment_ids):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).thumbnails([int(aid) for aid in attachment_ids])
 
     def update_attachment(self, attachment_id, display_name=None, description=None, category=None):
         from core.attachments import AttachmentService

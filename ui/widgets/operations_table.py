@@ -702,55 +702,18 @@ class TableEventHandler:
                         "name": record["name"], "price": record.get("price") or 0,
                     }
                     break
+
+        if product:
+            selected = product
+            chosen_type = "product"
+        elif service:
+            selected = service
+            chosen_type = "service"
         else:
-            try:
-                database.cursor.execute(
-                    "SELECT id, name, sale_price FROM products "
-                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
-                    "ORDER BY id LIMIT 2",
-                    (target,),
-                )
-                product_row = database.cursor.fetchone()
-                if product_row:
-                    product = {
-                        "type": "product", "id": int(product_row[0]),
-                        "name": product_row[1], "price": product_row[2] or 0,
-                    }
-                database.cursor.execute(
-                    "SELECT id, name, unit_price FROM services "
-                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
-                    "ORDER BY id LIMIT 2",
-                    (target,),
-                )
-                service_row = database.cursor.fetchone()
-                if service_row:
-                    service = {
-                        "type": "service", "id": int(service_row[0]),
-                        "name": service_row[1], "price": service_row[2] or 0,
-                    }
-            except Exception:
-                return None
+            return None
 
         type_col = self.data_manager.table_columns.index("item_type")
         selector = self.table.cellWidget(row, type_col)
-        chosen_type = str(selector.currentData() or "") if selector else ""
-        if product and service and not chosen_type:
-            choice, ok = QInputDialog.getItem(
-                self.table,
-                "Choose Item Type",
-                f"'{entered_name}' exists as both a Product and a Service:",
-                ["Product", "Service"],
-                editable=False,
-            )
-            if not ok:
-                return None
-            chosen_type = choice.casefold()
-        elif product and not service:
-            chosen_type = "product"
-        elif service and not product:
-            chosen_type = "service"
-
-        selected = product if chosen_type == "product" else service if chosen_type == "service" else None
         if selector and chosen_type:
             selector.blockSignals(True)
             selector.setCurrentIndex(selector.findData(chosen_type))
@@ -948,56 +911,7 @@ class TableEventHandler:
                 requested_qty, stock_available,
                 Decimal(str(requested_qty)) > stock_available, product_name,
             )
-        
-        # Product ID lookup
-        product_id = product_widget.property("product_id")
-        try:
-            if not product_id:
-                db.cursor.execute(
-                    "SELECT ID FROM Products "
-                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
-                    "ORDER BY id LIMIT 1",
-                    (self._normalized_name(product_name),),
-                )
-                res = db.cursor.fetchone()
-                if res and res[0]:
-                    product_id = res[0]
-        except Exception:
-            product_id = None
-        if not product_id:
-            return (requested_qty, None, False, product_name)
-        try:
-            cache_key = int(product_id)
-            if cache_key not in self._stock_cache:
-                product_obj = ProductClass(cache_key, db)
-                self._stock_cache[cache_key] = product_obj.calculate_quantity()
-            stock_available = self._stock_cache[cache_key]
-        except Exception:
-            stock_available = None
-        if stock_available is None:
-            return (requested_qty, None, False, product_name)
-        exceeded = requested_qty > stock_available
-        return (requested_qty, stock_available, exceeded, product_name)
-        # Product ID
-        product_id = None
-        try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = %s LIMIT 1", (product_name,))
-            res = db.cursor.fetchone()
-            if res and res[0]:
-                product_id = res[0]
-        except Exception:
-            product_id = None
-        if not product_id:
-            return (requested_qty, None, False, product_name)
-        try:
-            product_obj = ProductClass(product_id, db)
-            stock_available = product_obj.calculate_quantity()
-        except Exception:
-            stock_available = None
-        if stock_available is None:
-            return (requested_qty, None, False, product_name)
-        exceeded = requested_qty > stock_available
-        return (requested_qty, stock_available, exceeded, product_name)
+        return (requested_qty, None, False, product_name)
 
     def _validate_stock(self, row):
         state = self.get_row_stock_state(row)

@@ -500,10 +500,10 @@ class ClientDetailsDialog(QDialog):
             return
 
         purchase = self.purchases[selected_row]
-        amount_text = self.amount_input.text().strip().replace(" ", "").replace(",", ".")
-        try:
-            amount = float(amount_text)
-        except ValueError:
+        amount_text = self.amount_input.text()
+        from core.calculations import parse_decimal_input, InputState
+        state, amount_dec = parse_decimal_input(amount_text)
+        if state in (InputState.INVALID, InputState.EMPTY, InputState.INTERMEDIATE):
             QMessageBox.warning(
                 self,
                 "Invalid Amount",
@@ -511,13 +511,15 @@ class ClientDetailsDialog(QDialog):
             )
             self.amount_input.setFocus()
             return
+        
+        amount = float(amount_dec)
         outstanding = purchase["remaining"]
         if outstanding <= 0:
             QMessageBox.information(
                 self, "Purchase Paid", "This product or service is already fully paid."
             )
             return
-        amount_dec = to_decimal(amount)
+        amount_dec = amount_dec
         if amount_dec <= 0 or amount_dec > outstanding + Decimal("0.001"):
             QMessageBox.warning(
                 self,

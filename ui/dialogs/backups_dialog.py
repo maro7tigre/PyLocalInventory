@@ -22,6 +22,7 @@ logger = logging.getLogger(__name__)
 class _BackupCreateWorker(QObject):
     finished = Signal(bool)
     failed = Signal(str)
+    cancelled = Signal(float)
 
     def __init__(self, callback, operation="backup_operation"):
         super().__init__()
@@ -31,13 +32,33 @@ class _BackupCreateWorker(QObject):
     @Slot()
     def run(self):
         started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = False
         try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
             with diagnostics.operation(self.operation):
-                self.finished.emit(bool(self.callback()))
+                result = bool(self.callback())
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
         except Exception as error:
             logger.exception("Backup worker failed operation=%s", self.operation)
-            self.failed.emit(str(error))
+            error_msg = str(error) or "Unknown error"
         finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
             elapsed = time.perf_counter() - started
             logger.log(
                 logging.WARNING if elapsed >= 0.5 else logging.INFO,
@@ -52,6 +73,7 @@ class _BackupCreateWorker(QObject):
 class _BackupDownloadWorker(QObject):
     finished = Signal(str)
     failed = Signal(str)
+    cancelled = Signal(float)
 
     def __init__(self, database, destination):
         super().__init__()
@@ -61,15 +83,35 @@ class _BackupDownloadWorker(QObject):
     @Slot()
     def run(self):
         started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = None
         try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
             with diagnostics.operation("network_backup_download"):
-                self.finished.emit(self.database.download_backup(self.destination))
+                result = self.database.download_backup(self.destination)
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
         except Exception as error:
             logger.exception(
                 "Network backup download failed destination=%s", self.destination
             )
-            self.failed.emit(str(error))
+            error_msg = str(error) or "Unknown error"
         finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
             elapsed = time.perf_counter() - started
             logger.log(
                 logging.WARNING if elapsed >= 0.5 else logging.INFO,
@@ -230,19 +272,28 @@ class BackupsDialog(QDialog):
         self.download_btn.setEnabled(False)
         self.close_btn.setEnabled(False)
         self.status_label.setText("Creating backup on host and downloading…")
-        thread = QThread(self)
+        
+        thread = QThread()
         worker = _BackupDownloadWorker(
             getattr(self.parent(), "database"), destination
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        
         worker.finished.connect(self._remote_backup_finished)
         worker.failed.connect(self._remote_backup_failed)
+        
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+        
         self._backup_thread = thread
         self._backup_worker = worker
         diagnostics.worker_started("backup_download", "backups", destination)
@@ -430,21 +481,29 @@ class BackupsDialog(QDialog):
         self.restore_btn.setEnabled(False)
         self.close_btn.setEnabled(False)
         self.status_label.setText("Restoring backup…")
-        thread = QThread(self)
+        
+        thread = QThread()
         worker = _BackupCreateWorker(
             lambda: self._restore_backup_data(backup_path, database),
             "restore_backup",
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
+        
         worker.finished.connect(self._restore_completed)
         worker.failed.connect(self._restore_failed)
+        
         worker.finished.connect(thread.quit)
         worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
-        thread.finished.connect(lambda: setattr(self, "_backup_thread", None))
+        worker.cancelled.connect(worker.deleteLater)
+        
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+        
         self._backup_thread = thread
         self._backup_worker = worker
         diagnostics.worker_started("restore_backup", "backups", backup_path)
@@ -625,21 +684,29 @@ class BackupsDialog(QDialog):
             self.restore_btn.setEnabled(False)
             self.close_btn.setEnabled(False)
             self.status_label.setText("Creating backup…")
-            thread = QThread(self)
+            
+            thread = QThread()
             worker = _BackupCreateWorker(
                 lambda: self.create_backup(backup_name, show_errors=False),
                 "create_backup",
             )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
+            
             worker.finished.connect(self._backup_created)
             worker.failed.connect(self._backup_failed)
+            
             worker.finished.connect(thread.quit)
             worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
+            
             worker.finished.connect(worker.deleteLater)
             worker.failed.connect(worker.deleteLater)
-            thread.finished.connect(lambda: setattr(self, "_backup_thread", None))
+            worker.cancelled.connect(worker.deleteLater)
+            
             thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+            
             self._backup_thread = thread
             self._backup_worker = worker
             diagnostics.worker_started("create_backup", "backups", backup_name)
@@ -694,8 +761,39 @@ class BackupsDialog(QDialog):
                 self.cards_list.load_cards()  # Refresh list
                 QMessageBox.information(self, "Success", "Backup deleted successfully.")
 
+    def _on_backup_thread_finished(self, thread):
+        if getattr(self, "_backup_thread", None) is thread:
+            self._backup_thread = None
+            self._backup_worker = None
+
+    def _wait_for_backup_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_backup_thread", None)
+        if thread is None or not thread.isRunning():
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Backup thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        if getattr(self, "_backup_thread", None) is thread:
+            self._backup_thread = None
+            self._backup_worker = None
+            
+        return True
+
     def closeEvent(self, event):
-        if self._backup_running:
+        thread = getattr(self, "_backup_thread", None)
+        if thread and thread.isRunning():
+            QMessageBox.information(
+                self, "Backup in Progress",
+                "Wait for the current backup operation to finish before closing."
+            )
             event.ignore()
             return
         super().closeEvent(event)

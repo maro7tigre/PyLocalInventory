@@ -75,8 +75,8 @@ class BaseClass:
         elif param_type in ('float', 'decimal') and value is not None:
             try:
                 if param_type == 'decimal':
-                    from decimal import Decimal
-                    value = Decimal(str(value).replace(" ", "").replace(",", "."))
+                    from core.calculations import to_decimal
+                    value = to_decimal(value)
                 else:
                     value = float(value)
             except (ValueError, TypeError, ArithmeticError):

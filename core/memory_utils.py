@@ -57,10 +57,11 @@ def _windows_rss_bytes():
             ]
 
         kernel32 = ctypes.windll.kernel32
+        psapi = ctypes.windll.psapi
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
         handle = kernel32.GetCurrentProcess()
-        if kernel32.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
             return int(counters.WorkingSetSize)
     except Exception:
         return None

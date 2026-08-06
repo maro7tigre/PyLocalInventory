@@ -874,10 +874,11 @@ class Database:
 
     @staticmethod
     def _sale_decimal(value, field, minimum=None):
-        from decimal import Decimal, InvalidOperation
+        from decimal import Decimal
+        from core.calculations import to_decimal
         try:
-            number = Decimal(str(value if value not in (None, '') else 0).replace(' ', '').replace(',', '.'))
-        except (InvalidOperation, ValueError):
+            number = to_decimal(value)
+        except Exception:
             raise ValueError(f"Invalid numeric value for {field}: {value!r}")
         if minimum is not None and number < Decimal(str(minimum)):
             raise ValueError(f"{field} must be at least {minimum}")
@@ -2147,6 +2148,16 @@ class Database:
         vat_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (COALESCE(s.tva, 0) / 100.0), 0)'
         total_ttc_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (1 + COALESCE(s.tva, 0) / 100.0), 0)'
 
+        if section == 'Sales':
+            information_select = (
+                "COALESCE(STRING_AGG(COALESCE(si.information, ''), "
+                "', ' ORDER BY si.id), '')"
+            )
+            production_select = "COALESCE(SUM(si.production), 0)"
+        else:
+            information_select = "''"
+            production_select = "0"
+
         query = (
             f"SELECT s.*, "
             f"COALESCE(summary.subtotal, 0) AS subtotal, "
@@ -2162,9 +2173,9 @@ class Database:
             f"  SELECT si.{foreign_key}, "
             f"         SUM(si.quantity * si.unit_price) AS subtotal, "
             f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
-            f"         COALESCE(STRING_AGG(COALESCE(si.information, ''), ', ' ORDER BY si.id), '') AS information, "
+            f"         {information_select} AS information, "
             f"         COALESCE(SUM(si.quantity), 0) AS total_quantity, "
-            f"         COALESCE(SUM(si.production), 0) AS total_production "
+            f"         {production_select} AS total_production "
             f"  FROM {item_table} si "
             f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
             f"  GROUP BY si.{foreign_key} "

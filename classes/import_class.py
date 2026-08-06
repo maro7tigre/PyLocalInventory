@@ -3,6 +3,7 @@ Import Class - Updated to handle multiple items per import operation
 """
 from classes.base_class import BaseClass
 from classes.import_item_class import ImportItemClass
+from core.calculations import to_decimal, calculate_operation_totals
 
 
 class ImportClass(BaseClass):
@@ -189,21 +190,27 @@ class ImportClass(BaseClass):
             return []
     
     def calculate_subtotal(self):
-        """Calculate subtotal from all items"""
+        """Calculate subtotal from all items (Decimal, no float mixing)."""
         items = self.get_import_items()
-        return sum(item.get_value('subtotal') or 0 for item in items)
-    
+        return sum(to_decimal(item.get_value('subtotal')) for item in items)
+
     def calculate_total_tva(self):
-        """Calculate total VAT amount"""
-        subtotal = self.calculate_subtotal()
-        tva_percent = self.get_value('tva') or 0
-        return subtotal * (tva_percent / 100)
-    
+        """Calculate total VAT amount (centralized Decimal math)."""
+        totals = calculate_operation_totals(
+            self.calculate_subtotal(),
+            0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['vat_amount'])
+
     def calculate_total_price(self):
-        """Calculate total price including VAT"""
-        subtotal = self.calculate_subtotal()
-        tva_amount = self.calculate_total_tva()
-        return subtotal + tva_amount
+        """Calculate total price including VAT (centralized Decimal math)."""
+        totals = calculate_operation_totals(
+            self.calculate_subtotal(),
+            0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
     
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this import operation"""

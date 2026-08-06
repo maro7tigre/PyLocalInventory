@@ -14,6 +14,7 @@ from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
+from core.calculations import calculate_line_subtotal, calculate_operation_totals
 import os
 import uuid
 import logging
@@ -305,8 +306,10 @@ class BaseOperationDialog(QDialog):
             rows = self.items_table.get_current_table_data()
             subtotal = sum(
                 (
-                    Decimal(str(row.get("quantity") or 0))
-                    * Decimal(str(row.get("unit_price") or 0))
+                    calculate_line_subtotal(
+                        row.get("quantity") or 0,
+                        row.get("unit_price") or 0,
+                    )
                     for row in rows
                 ),
                 Decimal("0"),
@@ -330,16 +333,16 @@ class BaseOperationDialog(QDialog):
                 except (InvalidOperation, ValueError, TypeError):
                     remise = Decimal("0")
             
-            # Calculate totals: Total HT = Subtotal - Remise, TVA = Total HT * rate, Total TTC = Total HT + TVA
-            total_ht = subtotal - remise
-            vat_amount = total_ht * (vat_percent / Decimal("100"))
-            total_ttc = total_ht + vat_amount
+            # Centralized Decimal math:
+            # Total HT = Subtotal - Remise, TVA = Total HT * rate,
+            # Total TTC = Total HT + TVA.
+            totals = calculate_operation_totals(subtotal, remise, vat_percent)
             
             # Update displays
-            ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
-            ParameterWidgetFactory.set_widget_value(self.total_ht_widget, total_ht)
-            ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
-            ParameterWidgetFactory.set_widget_value(self.total_ttc_widget, total_ttc)
+            ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
+            ParameterWidgetFactory.set_widget_value(self.total_ht_widget, totals['total_ht'])
+            ParameterWidgetFactory.set_widget_value(self.vat_widget, totals['vat_amount'])
+            ParameterWidgetFactory.set_widget_value(self.total_ttc_widget, totals['total_ttc'])
             
         except Exception as e:
             print(f"Error updating totals: {e}")

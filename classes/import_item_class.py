@@ -171,10 +171,18 @@ class ImportItemClass(BaseClass):
             pass
     
     def calculate_subtotal(self):
-        """Calculate subtotal (quantity * unit_price)"""
-        quantity = self.get_value('quantity') or 0
-        unit_price = self.get_value('unit_price') or 0.0
-        return quantity * unit_price
+        """Calculate subtotal (quantity * unit_price) with Decimal precision.
+
+        quantity is stored as a Decimal (decimal parameter type) while
+        unit_price is a float, so multiplying them directly raised
+        ``TypeError: unsupported operand type(s) for *: 'decimal.Decimal' and
+        'float'``. Both inputs are normalized through the shared helper.
+        """
+        from core.calculations import calculate_line_subtotal
+        return calculate_line_subtotal(
+            self.get_value('quantity'),
+            self.get_value('unit_price'),
+        )
     
     def get_product_name(self):
         """Return stored snapshot product_name; try live name if product_id valid; fallback to snapshot."""

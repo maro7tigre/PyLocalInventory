@@ -1,0 +1,113 @@
+"""Authoritative monetary and quantity calculation helpers.
+
+Every quantity/price that flows into a line subtotal, Remise, Total HT, TVA,
+or Total TTC is normalized through :func:`to_decimal` first, so a value may
+arrive as a ``Decimal``, ``int``, ``float``, numeric ``str`` (including a
+comma decimal separator and thousands separators), empty string, or ``None``
+and still be combined without ever performing ``Decimal`` arithmetic with a
+raw ``float``.
+
+Float inputs are converted with ``Decimal(str(value))`` - never
+``Decimal(value)`` - so the decimal representation round-trips exactly instead
+of inheriting the binary floating point approximation. Monetary arithmetic
+stays in ``Decimal`` until the final result; floats are only produced for
+display by the callers.
+
+If a financial calculation fails the full traceback plus the input values and
+their types are logged and the exception is re-raised: a bad calculation must
+surface loudly instead of silently showing 0.00.
+"""
+
+import logging
+import traceback
+from decimal import Decimal, ROUND_HALF_UP
+
+logger = logging.getLogger(__name__)
+
+_PENNY = Decimal("0.01")
+_HUNDRED = Decimal("100")
+
+
+def to_decimal(value):
+    """Safely normalize a quantity/monetary input to ``Decimal``.
+
+    Accepts ``Decimal``, ``int``, ``float``, numeric ``str`` (with commas and
+    spaces optionally used as separators), empty string, and ``None``.
+    """
+    if value is None:
+        return Decimal("0")
+    if isinstance(value, Decimal):
+        return value
+    try:
+        if isinstance(value, str):
+            normalized = value.replace(" ", "").replace(",", ".")
+        else:
+            normalized = str(value)
+        return Decimal(normalized or "0")
+    except Exception as error:
+        logger.error(
+            "Invalid monetary/quantity input value=%r type=%s error=%s",
+            value, type(value).__name__, error,
+        )
+        traceback.print_exc()
+        raise
+
+
+def round_money(value):
+    """Round a monetary value to two decimal places (project policy)."""
+    return to_decimal(value).quantize(_PENNY, rounding=ROUND_HALF_UP)
+
+
+def calculate_line_subtotal(quantity, unit_price):
+    """Line total: ``quantity * unit_price`` at full ``Decimal`` precision."""
+    qty = to_decimal(quantity)
+    price = to_decimal(unit_price)
+    try:
+        return qty * price
+    except Exception as error:
+        logger.error(
+            "Line subtotal failed quantity=%r type=%s unit_price=%r type=%s error=%s",
+            quantity, type(quantity).__name__,
+            unit_price, type(unit_price).__name__, error,
+        )
+        traceback.print_exc()
+        raise
+
+
+def calculate_operation_totals(raw_subtotal, remise=0, tva_rate=0):
+    """Subtotal / Remise / Total HT / VAT / Total TTC for an operation.
+
+    Formulas (unchanged from the original implementation):
+
+        original_subtotal = sum(quantity * unit_price)
+        total_ht          = original_subtotal - remise
+        vat_amount        = total_ht * tva_rate / 100
+        total_ttc         = total_ht + vat_amount
+
+    Final monetary values are quantized to two decimal places with
+    ``ROUND_HALF_UP``. All values returned are ``Decimal``.
+    """
+    original = round_money(raw_subtotal)
+    discount = round_money(remise)
+    rate = to_decimal(tva_rate)
+    try:
+        total_ht = round_money(original - discount)
+        vat_amount = round_money(total_ht * rate / _HUNDRED)
+        total_ttc = round_money(total_ht + vat_amount)
+    except Exception as error:
+        logger.error(
+            "Operation totals failed raw_subtotal=%r type=%s remise=%r "
+            "type=%s tva_rate=%r type=%s error=%s",
+            raw_subtotal, type(raw_subtotal).__name__,
+            remise, type(remise).__name__,
+            tva_rate, type(tva_rate).__name__, error,
+        )
+        traceback.print_exc()
+        raise
+    return {
+        "original_subtotal": original,
+        "remise": discount,
+        "total_ht": total_ht,
+        "vat_amount": vat_amount,
+        "total_ttc": total_ttc,
+    }

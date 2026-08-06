@@ -94,13 +94,14 @@ class TableDataManager:
                 row_data['quantity'] = default_qty
             except Exception:
                 row_data['quantity'] = 1
-        # If unit_price absent, default to 0.0 (it may be filled later)
+        # If unit_price absent, default to 0 (it may be filled later)
         if 'product_name' in row_data and 'unit_price' not in row_data:
             row_data['unit_price'] = 0.0
         if 'product_name' in row_data:
-            row_data['subtotal'] = (
-                Decimal(str(row_data.get('quantity', 0))) *
-                Decimal(str(row_data.get('unit_price', 0)))
+            from core.calculations import calculate_line_subtotal
+            row_data['subtotal'] = calculate_line_subtotal(
+                row_data.get('quantity', 0),
+                row_data.get('unit_price', 0),
             )
         
         return row_data
@@ -834,7 +835,8 @@ class TableEventHandler:
             
             quantity = Decimal(str(qty_item.text()).replace(" ", "").replace(",", ".")) if qty_item and qty_item.text().strip() else Decimal("0")
             unit_price = Decimal(str(price_item.text()).replace(" ", "").replace(",", ".")) if price_item and price_item.text().strip() else Decimal("0")
-            subtotal = quantity * unit_price
+            from core.calculations import calculate_line_subtotal
+            subtotal = calculate_line_subtotal(quantity, unit_price)
             
             subtotal_item = self.table.item(row, subtotal_col)
             if not subtotal_item:

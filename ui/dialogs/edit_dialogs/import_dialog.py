@@ -340,13 +340,14 @@ class ImportEditDialog(QDialog):
     
     def update_totals(self):
         """Update total calculation fields"""
+        from core.calculations import calculate_operation_totals
         try:
             # Get current items
             items = self.import_items_table.get_items_data()
-            
-            # Calculate subtotal
+
+            # Calculate subtotal (sum of Decimal line totals)
             subtotal = sum(item.get_value('subtotal') or 0 for item in items)
-            
+
             # Get VAT percentage from the tva parameter widget
             vat_percent = 0
             if 'tva' in self.parameter_widgets:
@@ -354,22 +355,23 @@ class ImportEditDialog(QDialog):
                     vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
                 except Exception:
                     vat_percent = 0
-            
-            # Calculate VAT amount
-            vat_amount = subtotal * (vat_percent / 100)
-            
-            # Calculate total
-            total = subtotal + vat_amount
-            
+
+            # All money math runs through the shared Decimal utility so a
+            # Decimal subtotal is never multiplied by a raw float.
+            totals = calculate_operation_totals(subtotal, 0, vat_percent)
+
             # Update widgets
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             if hasattr(self, 'subtotal_widget'):
-                ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
+                ParameterWidgetFactory.set_widget_value(
+                    self.subtotal_widget, totals['original_subtotal'])
             if hasattr(self, 'vat_widget'):
-                ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
+                ParameterWidgetFactory.set_widget_value(
+                    self.vat_widget, totals['vat_amount'])
             if hasattr(self, 'total_widget'):
-                ParameterWidgetFactory.set_widget_value(self.total_widget, total)
-                
+                ParameterWidgetFactory.set_widget_value(
+                    self.total_widget, totals['total_ttc'])
+
         except Exception as e:
             print(f"Error updating totals: {e}")
     

@@ -336,11 +336,12 @@ class SalesItemClass(BaseClass):
             return None
     
     def calculate_subtotal(self):
-        """Calculate subtotal (quantity * unit_price)"""
-        from decimal import Decimal
-        quantity = Decimal(str(self.get_value('quantity') or 0))
-        unit_price = Decimal(str(self.get_value('unit_price') or 0))
-        return quantity * unit_price
+        """Calculate subtotal (quantity * unit_price) with Decimal precision."""
+        from core.calculations import calculate_line_subtotal
+        return calculate_line_subtotal(
+            self.get_value('quantity'),
+            self.get_value('unit_price'),
+        )
     
     def delete_self(self):
         """Delete this item from database - called by delete button"""

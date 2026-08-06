@@ -4,7 +4,7 @@ Example showing new parameter types: date, table
 """
 from classes.base_class import BaseClass
 from classes.sales_item_class import SalesItemClass
-from decimal import Decimal, ROUND_HALF_UP
+from core.calculations import to_decimal, calculate_operation_totals
 
 
 def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
@@ -12,11 +12,11 @@ def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
 
     Parameters
     ----------
-    raw_subtotal : Decimal|float
+    raw_subtotal : Decimal|int|float|str|None
         Sum of all Sale Item line totals (before any discount).
-    remise : Decimal|float
+    remise : Decimal|int|float|str|None
         Discount amount.
-    tva_rate : Decimal|float
+    tva_rate : Decimal|int|float|str|None
         VAT percentage, e.g. 20 for 20 %.
 
     Returns
@@ -24,29 +24,7 @@ def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
     dict with keys: original_subtotal, remise, total_ht, vat_amount, total_ttc
     All values are Decimal rounded to 2 decimal places.
     """
-    original = Decimal(str(raw_subtotal or 0)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    disc = Decimal(str(remise or 0)).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    rate = Decimal(str(tva_rate or 0))
-    total_ht = (original - disc).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    vat_amount = (total_ht * rate / Decimal("100")).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    total_ttc = (total_ht + vat_amount).quantize(
-        Decimal("0.01"), rounding=ROUND_HALF_UP
-    )
-    return {
-        "original_subtotal": original,
-        "remise": disc,
-        "total_ht": total_ht,
-        "vat_amount": vat_amount,
-        "total_ttc": total_ttc,
-    }
+    return calculate_operation_totals(raw_subtotal, remise, tva_rate)
 
 
 class SalesClass(BaseClass):
@@ -312,7 +290,7 @@ class SalesClass(BaseClass):
     def _raw_subtotal(self):
         """Internal: sum of all Sale Item line totals before any discount."""
         items = self.get_sales_items()
-        return sum(item.get_value('subtotal') or 0 for item in items)
+        return sum(to_decimal(item.get_value('subtotal')) for item in items)
 
     def calculate_subtotal(self):
         """Discounted Total HT (Original Subtotal - Remise).

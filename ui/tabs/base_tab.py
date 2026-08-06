@@ -207,6 +207,8 @@ class BaseTab(QWidget):
         self._request_count = 0
         self._refresh_thread = None
         self._refresh_worker = None
+        self._refresh_pending = False
+        self._in_flight_key = None
 
         self.page_size = 100
         self.current_page = 0
@@ -294,7 +296,10 @@ class BaseTab(QWidget):
         self.refresh_btn = GreenButton("Refresh")
         self.refresh_btn.setStyleSheet(self.refresh_btn.styleSheet() + "\nQPushButton { font-size: 14px; padding: 5px 10px; }")
         self.refresh_btn.setMinimumHeight(20)
-        self.refresh_btn.clicked.connect(self.refresh_table)
+        # A manual Refresh always re-fetches from the source (never serves the
+        # session cache), and passes an explicit True instead of letting the
+        # button's `checked` argument leak into the force flag.
+        self.refresh_btn.clicked.connect(lambda _checked=False: self.refresh_table(force=True))
         controls_layout.addWidget(self.refresh_btn)
 
         self.load_more_btn = BlueButton("Load more")
@@ -403,16 +408,18 @@ class BaseTab(QWidget):
     def _log_tab_request(self, source, key, rows=0, **extra):
         """Emit one structured line per data request a tab makes, for the
         regression investigation. Records which source served the request
-        (ram / disk / network / offline), the thread it ran on, how many
+        (ram / disk / network / offline / coalesced), the generation id,
+        whether a fetch was already in flight, the thread it ran on, how many
         refreshes preceded it, and the current process RAM footprint."""
         self._request_count += 1
         logger.info(
             "tab_request section=%s request_id=%d source=%s key=%s rows=%d "
-            "thread=%s refreshing=%s refresh_calls=%d memory_mb=%.1f extra=%s",
+            "thread=%s gen=%d in_flight=%s refresh_calls=%d memory_mb=%.1f extra=%s",
             self.section, self._request_count, source, key, rows,
             threading.current_thread().name,
-            bool(self._refreshing),
             self._refresh_id,
+            bool(self._refreshing),
+            self._request_count,
             process_memory_mb(),
             extra,
         )
@@ -432,13 +439,30 @@ class BaseTab(QWidget):
         Mutation sites pass ``force=True`` so the source of truth is always
         re-fetched.
         """
-        if self._refreshing:
-            return
         if not self.database:
             QMessageBox.warning(self, "Error", "No database connection")
             return
 
         key = self._cache_key()
+        if self._refreshing:
+            # At most one request is ever in flight per tab. When an identical
+            # non-forced view is already being fetched, the in-flight request
+            # covers this activation - drop the duplicate so one activation
+            # produces exactly one request.
+            if self._appending:
+                return
+            if key == self._in_flight_key and not force:
+                self._log_tab_request('coalesced', key, rows=0, reason='duplicate_view_in_flight')
+                return
+            # A newer/different view supersedes the in-flight fetch: bump the
+            # generation id so its result is rejected as stale when it returns,
+            # and re-issue the newest view once the current request unwinds.
+            self._refresh_id += 1
+            self._refresh_pending = True
+            self._in_flight_key = key
+            self._log_tab_request('coalesced', key, rows=0, reason='superseded_in_flight')
+            return
+
         use_cache = not (force or self._needs_refresh)
         offline = bool(getattr(self.database, 'offline', False))
         entry = self._cache.get(key) if use_cache else None
@@ -467,20 +491,23 @@ class BaseTab(QWidget):
     def _start_full_refresh(self, preserve_table=False):
         """Reset paging state and fetch the first batch in the background.
 
-        ``preserve_table=True`` keeps the currently rendered rows on screen
-        while a stale cached view refreshes in place (the fetched batch
-        replaces them when it arrives) instead of flashing an empty table.
+        The currently rendered rows are always kept on screen until the fresh
+        batch arrives: a failed fetch must never blank the table, and the new
+        rows either patch the existing ones in place (same record ids) or
+        fully replace them via re-render. The old code cleared the table
+        here, which (a) emptied it whenever the fetch failed and (b) left
+        ``_apply_refresh_results`` reconciling in place against rows that no
+        longer existed, so a manual force-refresh on a populated tab blanked
+        it. ``preserve_table`` is kept as a no-op for call-site compatibility.
         """
         self._refresh_id += 1
         refresh_id = self._refresh_id
+        self._in_flight_key = self._cache_key()
         self.current_page = 0
         self._after_id = None
         self._after_sort = None
         self._has_more_rows = False
         self._appending = False
-        if not preserve_table:
-            self.table.setRowCount(0)
-            self.table.verticalScrollBar().setValue(0)
 
         if self.database.__class__.__name__ == "RemoteDatabase":
             self._start_remote_refresh(refresh_id)
@@ -777,10 +804,19 @@ class BaseTab(QWidget):
     def _apply_refresh_results(self, items_data, levels, metrics, started, refresh_id):
         if refresh_id != self._refresh_id:
             logger.info(
-                "Discarding stale refresh result section=%s refresh_id=%s current_id=%s",
-                self.section, refresh_id, self._refresh_id,
+                "tab_result section=%s gen=%s accepted=no reason=stale_refresh_id "
+                "current_gen=%s rows=%d",
+                self.section, refresh_id, self._refresh_id, len(items_data or []),
             )
             return
+
+        network_ms = (time.perf_counter() - started) * 1000
+        logger.info(
+            "tab_result section=%s gen=%s accepted=yes reason=fresh "
+            "network_ms=%.1f rows=%d in_flight_before=%s",
+            self.section, refresh_id, network_ms, len(items_data or []),
+            bool(self._refreshing),
+        )
 
         appending = self._appending
         metrics = metrics or {}
@@ -914,6 +950,12 @@ class BaseTab(QWidget):
         matches the previously displayed set in the same order (a refresh
         where no record was inserted or deleted). Returns True when rows were
         patched in place, False when the caller must do a full re-render."""
+        if not new_objects:
+            return False
+        if self.table.rowCount() == 0:
+            # Nothing is rendered (e.g. the table was cleared elsewhere): rows
+            # cannot be patched in place, the caller must do a full re-render.
+            return False
         current_ids = [getattr(obj, 'id', None) for obj in previous_objects]
         new_ids = [getattr(obj, 'id', None) for obj in new_objects]
         if current_ids != new_ids:
@@ -983,6 +1025,7 @@ class BaseTab(QWidget):
     def _finish_refresh(self, started, mode='client'):
         self._refreshing = False
         self._appending = False
+        self._in_flight_key = None
         self.refresh_btn.setEnabled(True)
         self._update_paging_controls()
         elapsed = time.perf_counter() - started
@@ -996,6 +1039,12 @@ class BaseTab(QWidget):
             f"[PERFORMANCE] load_{self.section.lower()} batch={self.current_page + 1} "
             f"completed in {elapsed:.3f} seconds mode={mode} rows={rows}"
         )
+        if self._refresh_pending:
+            # A newer view was requested while this fetch was in flight; its
+            # result was invalidated, so re-issue it now that no request is
+            # running (single in-flight at any moment, nothing dropped).
+            self._refresh_pending = False
+            QTimer.singleShot(0, lambda: self.refresh_table(force=True))
 
     def _wait_for_refresh_thread(self):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
@@ -1161,9 +1210,15 @@ class BaseTab(QWidget):
         return []
     
     def refresh_on_tab_switch(self):
-        """Load lazily and avoid repeating blocking network refreshes."""
+        """Load lazily and avoid repeating blocking network refreshes.
+
+        Refreshes are non-blocking (worker thread), so this runs for local
+        host connections and for network clients alike. The previous
+        ``hasattr(self.database, 'conn')`` gate was only true on the host,
+        which left remote Client tabs without data until a manual Refresh.
+        """
         try:
-            if self.database and hasattr(self.database, 'conn') and self.database.conn:
+            if self.database:
                 stale = time.monotonic() - self._last_refresh_at >= 30.0
                 if not self._loaded_once or self._needs_refresh or stale:
                     self.refresh_table()

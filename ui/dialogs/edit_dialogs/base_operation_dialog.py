@@ -17,6 +17,9 @@ from decimal import Decimal, InvalidOperation
 from core.calculations import calculate_line_subtotal, calculate_operation_totals
 import os
 import uuid
+import shiboken6
+
+_active_background_threads = set()
 import logging
 from core.runtime_paths import user_data_root
 
@@ -34,22 +37,36 @@ class SaveWorker(QObject):
         
     @Slot()
     def process(self):
+        worker_db = self.database
+        is_local = hasattr(self.database, 'profile_manager') and hasattr(self.database, 'conn')
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
+                
+            if is_local:
+                from core.database import Database
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect():
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+
             if self.is_import:
-                res = self.database.save_import_with_items(**self.save_kwargs)
+                res = worker_db.save_import_with_items(**self.save_kwargs)
                 if not isinstance(res, dict) or res.get("transaction") != "committed":
                     raise RuntimeError(f"Host returned an invalid import-save result: {res!r}")
                 res['expected'] = len(self.save_kwargs.get('items', []))
             else:
-                res = self.database.save_sale_with_items(**self.save_kwargs)
+                res = worker_db.save_sale_with_items(**self.save_kwargs)
                 if not isinstance(res, dict) or res.get('transaction') != 'committed':
                     raise RuntimeError(f"Host returned an invalid sale-save result: {res!r}")
                 res['expected'] = len(self.save_kwargs.get('items', []))
             self.finished.emit(res)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if is_local and worker_db and worker_db != self.database:
+                worker_db.close()
 
 class LoadWorker(QObject):
     finished = Signal()
@@ -63,16 +80,36 @@ class LoadWorker(QObject):
 
     @Slot()
     def process(self):
+        worker_db = self.database
+        is_local = hasattr(self.database, 'profile_manager') and hasattr(self.database, 'conn')
+        old_db = getattr(self.operation_obj, 'database', None) if self.operation_obj else None
+        
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
+                
+            if is_local:
+                from core.database import Database
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect():
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+
             if self.operation_obj:
+                self.operation_obj.database = worker_db
                 self.operation_obj.load_database_data()
-            if self.fetch_catalog and getattr(self.database, 'get_sale_catalog', None):
-                self.database.sale_catalog = self.database.get_sale_catalog()
+                
+            if self.fetch_catalog and getattr(worker_db, 'get_sale_catalog', None):
+                self.database.sale_catalog = worker_db.get_sale_catalog()
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if self.operation_obj:
+                self.operation_obj.database = old_db
+            if is_local and worker_db and worker_db != self.database:
+                worker_db.close()
 
 
 
@@ -120,10 +157,20 @@ class BaseOperationDialog(QDialog):
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)
+        
+        # Safe thread cleanup lifecycle
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.finished.connect(self.load_worker.deleteLater)
+        self.load_thread.finished.connect(self.load_thread.deleteLater)
+        self.load_worker.error.connect(self.load_thread.quit)
+        self.load_worker.error.connect(self.load_worker.deleteLater)
+        
+        # Business logic callbacks
         self.load_worker.finished.connect(self._on_load_finished)
         self.load_worker.error.connect(self._on_load_error)
-        self.load_worker.finished.connect(self.load_thread.quit)
-        self.load_worker.error.connect(self.load_thread.quit)
+        
+        _active_background_threads.add(self.load_thread)
+        self.load_thread.finished.connect(lambda t=self.load_thread: _active_background_threads.discard(t))
         self.load_thread.start()
         
         # Auto-size dialog
@@ -131,33 +178,33 @@ class BaseOperationDialog(QDialog):
 
         self.setMinimumSize(600, 500)
     def _on_load_finished(self):
-        if hasattr(self, 'load_worker') and self.load_worker:
-            self.load_worker.deleteLater()
-            self.load_worker = None
-        if hasattr(self, 'load_thread') and self.load_thread:
-            self.load_thread.deleteLater()
-            self.load_thread = None
+        # Thread cleanup is handled safely by QThread.finished -> deleteLater
+        self.load_worker = None
+        self.load_thread = None
         
-        self.setEnabled(True)
-        title = self.windowTitle().replace(" (Loading...)", "")
-        self.setWindowTitle(title)
-        self.load_data()
-        
-        if hasattr(self, 'items_table') and self.items_table:
-            self.items_table.refresh_table()
+        try:
+            self.setEnabled(True)
+            title = self.windowTitle().replace(" (Loading...)", "")
+            self.setWindowTitle(title)
+            self.load_data()
+            
+            if hasattr(self, 'items_table') and self.items_table:
+                self.items_table.refresh_table()
+        except RuntimeError:
+            pass
 
     def _on_load_error(self, err_msg):
-        if hasattr(self, 'load_worker') and self.load_worker:
-            self.load_worker.deleteLater()
-            self.load_worker = None
-        if hasattr(self, 'load_thread') and self.load_thread:
-            self.load_thread.deleteLater()
-            self.load_thread = None
-        QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
-        self.setEnabled(True)
-        title = self.windowTitle().replace(" (Loading...)", "")
-        self.setWindowTitle(title)
-        self.load_data()
+        self.load_worker = None
+        self.load_thread = None
+        
+        try:
+            QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
+            self.setEnabled(True)
+            title = self.windowTitle().replace(" (Loading...)", "")
+            self.setWindowTitle(title)
+            self.load_data()
+        except RuntimeError:
+            pass
 
         
     def setup_ui(self):
@@ -501,8 +548,9 @@ class BaseOperationDialog(QDialog):
         finally:
             if self.result() == QDialog.Rejected and not (hasattr(self, 'save_thread') and self.save_thread):
                 self._saving = False
-                self.save_btn.setEnabled(True)
-                self.save_btn.setText("Save")
+                if getattr(self, 'save_btn', None):
+                    self.save_btn.setEnabled(True)
+                    self.save_btn.setText("Save")
 
     def _save_changes_impl(self):
         """Save operation and items to database (simple, reliable)"""
@@ -626,8 +674,20 @@ class BaseOperationDialog(QDialog):
                 self.save_worker = SaveWorker(self.database, is_import, save_kwargs)
                 self.save_worker.moveToThread(self.save_thread)
                 self.save_thread.started.connect(self.save_worker.process)
+                
+                # Safe thread cleanup lifecycle
+                self.save_worker.finished.connect(self.save_thread.quit)
+                self.save_worker.finished.connect(self.save_worker.deleteLater)
+                self.save_thread.finished.connect(self.save_thread.deleteLater)
+                self.save_worker.error.connect(self.save_thread.quit)
+                self.save_worker.error.connect(self.save_worker.deleteLater)
+                
+                # Business logic callbacks
                 self.save_worker.finished.connect(lambda res, act=action: self._on_save_finished(res, act))
                 self.save_worker.error.connect(self._on_save_error)
+                
+                _active_background_threads.add(self.save_thread)
+                self.save_thread.finished.connect(lambda t=self.save_thread: _active_background_threads.discard(t))
                 self.save_thread.start()
                 return
 
@@ -660,30 +720,6 @@ class BaseOperationDialog(QDialog):
                     self.update_totals()
                 except Exception:
                     pass
-
-                # Attempt final resolution for any missing product_ids
-                unresolved_names = []
-                for itm in items_objects:
-                    try:
-                        if hasattr(itm, 'get_value') and not itm.get_value('product_id'):
-                            pname = itm.get_value('product_name') or "(unknown)"
-                            # Try resolve again from DB (in case created just now)
-                            if self.database and hasattr(self.database, 'cursor') and self.database.cursor:
-                                try:
-                                    self.database.cursor.execute("SELECT ID FROM Products WHERE name = %s", (pname,))
-                                    res = self.database.cursor.fetchone()
-                                    if res and res[0]:
-                                        itm.set_value('product_id', res[0])
-                                except Exception:
-                                    pass
-                            if not itm.get_value('product_id'):
-                                unresolved_names.append(pname)
-                    except Exception:
-                        pass
-
-                if unresolved_names and not allow_unresolved:
-                    QMessageBox.critical(self, "Error", "Could not resolve product IDs for: " + ", ".join(unresolved_names) + "\nAborting save.")
-                    return
 
                 # Stock validation for sales (skip on_hold — those don't deduct stock)
                 if self.operation_obj.section == 'Sales':
@@ -728,66 +764,65 @@ class BaseOperationDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
 
     def _on_save_finished(self, result, action):
-        if hasattr(self, 'save_worker') and self.save_worker:
-            self.save_worker.deleteLater()
-            self.save_worker = None
-        if hasattr(self, 'save_thread') and self.save_thread:
-            self.save_thread.deleteLater()
-            self.save_thread = None
+        # Thread cleanup is handled safely by QThread.finished -> deleteLater
+        self.save_worker = None
+        self.save_thread = None
 
-        self._saving = False
-        if hasattr(self, 'save_btn') and self.save_btn:
-            self.save_btn.setEnabled(True)
-            self.save_btn.setText("Save")
+        try:
+            self._saving = False
+            if hasattr(self, 'save_btn') and self.save_btn:
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
 
-        if getattr(self.operation_obj, 'section', '') == 'Sales':
-            self.operation_id = result['sale_id']
-            self.operation_obj.id = result['sale_id']
-            self.operation_obj.set_value('id', result['sale_id'])
-            expected = result.get('expected', 0)
-            saved = result.get('saved', 0)
-            if saved != expected:
-                QMessageBox.critical(self, "Error", 
-                    f"Sale was not saved: {expected} visible items were found, "
-                    f"but the server confirmed {saved} saved items."
+            if getattr(self.operation_obj, 'section', '') == 'Sales':
+                self.operation_id = result['sale_id']
+                self.operation_obj.id = result['sale_id']
+                self.operation_obj.set_value('id', result['sale_id'])
+                expected = result.get('expected', 0)
+                saved = result.get('saved', 0)
+                if saved != expected:
+                    QMessageBox.critical(self, "Error", 
+                        f"Sale was not saved: {expected} visible items were found, "
+                        f"but the server confirmed {saved} saved items."
+                    )
+                    return
+                QMessageBox.information(
+                    self, "Success",
+                    f"Operation {action} successfully. {saved} items saved.\n"
+                    f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
+                    f"deleted: {result.get('deleted', 0)}."
                 )
-                return
-            QMessageBox.information(
-                self, "Success",
-                f"Operation {action} successfully. {saved} items saved.\n"
-                f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
-                f"deleted: {result.get('deleted', 0)}."
-            )
-            self.accept()
-            self._refresh_related_tabs("Sales", "Products", "Clients")
+                self.accept()
+                self._refresh_related_tabs("Sales", "Products", "Clients")
             
-        elif getattr(self.operation_obj, 'section', '') == 'Imports':
-            self.operation_id = result["import_id"]
-            self.operation_obj.id = result["import_id"]
-            self.operation_obj.set_value("id", result["import_id"])
-            QMessageBox.information(
-                self,
-                "Success",
-                f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
-                f"Products created: {result.get('created_products', 0)}.",
-            )
-            self.accept()
-            self._refresh_related_tabs("Imports", "Products")
+            elif getattr(self.operation_obj, 'section', '') == 'Imports':
+                self.operation_id = result["import_id"]
+                self.operation_obj.id = result["import_id"]
+                self.operation_obj.set_value("id", result["import_id"])
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
+                    f"Products created: {result.get('created_products', 0)}.",
+                )
+                self.accept()
+                self._refresh_related_tabs("Imports", "Products")
+        except RuntimeError:
+            pass
 
     def _on_save_error(self, err_msg):
-        if hasattr(self, 'save_worker') and self.save_worker:
-            self.save_worker.deleteLater()
-            self.save_worker = None
-        if hasattr(self, 'save_thread') and self.save_thread:
-            self.save_thread.deleteLater()
-            self.save_thread = None
+        self.save_worker = None
+        self.save_thread = None
 
-        self._saving = False
-        if hasattr(self, 'save_btn') and self.save_btn:
-            self.save_btn.setEnabled(True)
-            self.save_btn.setText("Save")
+        try:
+            self._saving = False
+            if hasattr(self, 'save_btn') and self.save_btn:
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
         
-        QMessageBox.critical(self, "Error", f"Failed to save operation: {err_msg}")
+            QMessageBox.critical(self, "Error", f"Failed to save operation: {err_msg}")
+        except RuntimeError:
+            pass
 
     def _confirm_sale_summary(self):
         """Show the required pre-save summary and ask for confirmation."""
@@ -1105,26 +1140,9 @@ class BaseOperationDialog(QDialog):
                             available = p.get("stock", 0)
                             break
                 else:
-                    cursor = self.database.cursor
-                    cursor.execute(
-                        "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = %s",
-                        (product_id,)
-                    )
-                    total_imported = cursor.fetchone()[0]
-
-                    cursor.execute(
-                        """
-                        SELECT COALESCE(SUM(si.quantity), 0)
-                        FROM Sale_Items si
-                        JOIN Sales s ON si.sale_id = s.id
-                        WHERE si.product_id = %s
-                          AND s.state != 'on_hold'
-                          AND s.id != %s
-                        """,
-                        (product_id, current_sale_id)
-                    )
-                    total_sold = cursor.fetchone()[0]
-                    available = total_imported - total_sold
+                    # GUI thread must NOT block to query database over RPC.
+                    # Skip early warning; let SaveWorker and backend validate stock.
+                    continue
                     
                 if new_qty > float(available):
                     errors.append(f"{product_name} (Requested: {new_qty}, Available: {available})")
@@ -1141,15 +1159,22 @@ class BaseOperationDialog(QDialog):
 
     def _entity_exists(self, table, username):
         try:
-            normalized = self._normalize_name(username)
-            self.database.cursor.execute(
-                f"SELECT username, name FROM {table} "
-                "WHERE username IS NOT NULL OR name IS NOT NULL"
-            )
-            return any(
-                normalized in (self._normalize_name(row[0]), self._normalize_name(row[1]))
-                for row in self.database.cursor.fetchall()
-            )
+            target = self._normalize_name(username)
+            # Try to check local cache if we already loaded it for this session to avoid multiple RPC queries
+            if not hasattr(self, '_entity_cache'):
+                self._entity_cache = {}
+                
+            if table not in self._entity_cache:
+                self.database.cursor.execute(
+                    f"SELECT username, name FROM {table} "
+                    "WHERE username IS NOT NULL OR name IS NOT NULL"
+                )
+                self._entity_cache[table] = [
+                    (self._normalize_name(row[0]), self._normalize_name(row[1]))
+                    for row in self.database.cursor.fetchall()
+                ]
+                
+            return any(target in row_tuple for row_tuple in self._entity_cache[table])
         except Exception as e:
             print(f"Error checking existence in {table}: {e}")
             return True  # Avoid blocking
@@ -1157,6 +1182,18 @@ class BaseOperationDialog(QDialog):
     def _product_exists(self, name):
         try:
             target = self._normalize_name(name)
+            
+            # Use local catalog if available (removes O(N) blocking RPC queries)
+            catalog = getattr(self.database, 'sale_catalog', None)
+            if catalog:
+                if any(self._normalize_name(p['name']) == target for p in catalog.get('products', [])):
+                    return True
+                for s in catalog.get('services', []):
+                    candidates = [s['name'], *self._split_keywords(s.get('keywords') or "")]
+                    if any(target == self._normalize_name(c) for c in candidates if c):
+                        return True
+                return False
+
             self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL")
             if any(self._normalize_name(row[0]) == target for row in self.database.cursor.fetchall()):
                 return True

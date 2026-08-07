@@ -1,6 +1,7 @@
 """
 Home tab - Beautiful dashboard with charts, statistics, and quick actions
 """
+import shiboken6
 from PySide6.QtWidgets import (
     QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QApplication,
     QPushButton, QFrame, QScrollArea, QSizePolicy, QSpacerItem
@@ -933,7 +934,15 @@ class HomeTab(QWidget):
 
     def _start_remote_dashboard_refresh(self):
         existing_thread = getattr(self, "_dashboard_thread", None)
-        if existing_thread is not None and existing_thread.isRunning():
+        is_running = False
+        if existing_thread is not None:
+            try:
+                if shiboken6.isValid(existing_thread) and existing_thread.isRunning():
+                    is_running = True
+            except RuntimeError:
+                pass
+        
+        if is_running:
             logger.warning("Duplicate dashboard refresh requested while active. Ignoring.")
             return False
             
@@ -1047,7 +1056,19 @@ class HomeTab(QWidget):
 
     def _wait_for_dashboard_thread(self, timeout_ms=5000):
         thread = getattr(self, "_dashboard_thread", None)
-        if thread is None or not thread.isRunning():
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+
+                return True
+
+        except RuntimeError:
+
+            return True
             return True
             
         if thread == QThread.currentThread():

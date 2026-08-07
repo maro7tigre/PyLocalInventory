@@ -2,6 +2,7 @@
 Base Tab Class - Enhanced to better support operations
 Unified table experience for all entities (Products, Clients, Suppliers, Sales, Imports)
 """
+import shiboken6
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QLabel, 
                                QTableWidget, QTableWidgetItem, QHeaderView, 
                                QMessageBox, QPushButton, QAbstractItemView,
@@ -733,12 +734,12 @@ class BaseTab(QWidget):
         if self.database.__class__.__name__ == 'RemoteDatabase':
             return self.database
 
+        from core.database import Database
         worker_db = Database(self.database.profile_manager)
         worker_db.language = getattr(self.database, 'language', 'en')
         worker_db.registered_classes = self.database.registered_classes
-        if getattr(self.database, 'profile_manager', None):
-            if not worker_db.connect():
-                raise RuntimeError("Failed to connect worker database")
+        # DO NOT connect synchronously on the GUI thread.
+        # Connection will be established inside the worker's fetch() closure.
         return worker_db
 
     def _start_remote_refresh(self, refresh_id, appending=False):
@@ -768,7 +769,15 @@ class BaseTab(QWidget):
 
     def _start_refresh(self, fetcher, refresh_id, worker_db=None, mode='local'):
         existing_thread = getattr(self, "_refresh_thread", None)
-        if existing_thread is not None and existing_thread.isRunning():
+        is_running = False
+        if existing_thread is not None:
+            try:
+                if shiboken6.isValid(existing_thread) and existing_thread.isRunning():
+                    is_running = True
+            except RuntimeError:
+                pass
+                
+        if is_running:
             logger.warning("Duplicate refresh requested while thread is active. Ignoring.")
             if worker_db is not None:
                 worker_db.close()
@@ -786,7 +795,9 @@ class BaseTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_refresh_thread_finished)
+        thread.finished.connect(
+            lambda t=thread, w=worker: self._on_refresh_thread_finished(t, w)
+        )
         thread.finished.connect(
             lambda: diagnostics.worker_cleanup("table_fetch", self.section, refresh_id)
         )
@@ -1068,33 +1079,48 @@ class BaseTab(QWidget):
             self._refresh_pending = False
             QTimer.singleShot(0, lambda: self.refresh_table(force=True))
 
-    def _on_refresh_thread_finished(self):
-        thread = getattr(self, "_refresh_thread", None)
-        if thread is not None and not thread.isRunning():
+    def _on_refresh_thread_finished(self, expected_thread=None, expected_worker=None):
+        if getattr(self, "_refresh_thread", None) is expected_thread:
             self._refresh_thread = None
+        if getattr(self, "_refresh_worker", None) is expected_worker:
             self._refresh_worker = None
 
     def _wait_for_refresh_thread(self, timeout_ms=5000):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
         self._cache.clear()
         thread = getattr(self, "_refresh_thread", None)
-        if thread is None or not thread.isRunning():
+        
+        if thread is None:
             return True
             
-        if thread == QThread.currentThread():
-            return False
+        try:
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+                self._refresh_thread = None
+                self._refresh_worker = None
+                return True
+                
+            if thread == QThread.currentThread():
+                return False
+                
+            thread.requestInterruption()
+            thread.quit()
             
-        thread.requestInterruption()
-        thread.quit()
-        
-        if not thread.wait(timeout_ms):
-            logger.error(
-                "Remote refresh thread did not stop section=%s timeout=%sms", 
-                self.section, timeout_ms
-            )
-            return False
+            if not thread.wait(timeout_ms):
+                logger.error(
+                    "Remote refresh thread did not stop section=%s timeout=%sms", 
+                    self.section, timeout_ms
+                )
+                return False
+                
+            self._refresh_thread = None
+            self._refresh_worker = None
+            return True
             
-        return True
+        except RuntimeError:
+            # If it's deleted during the checks, it's already finished.
+            self._refresh_thread = None
+            self._refresh_worker = None
+            return True
 
     def background_fetcher(self, refresh_id=None, database=None):
         """Capture filter and keyset cursor state before the worker thread starts."""
@@ -1110,6 +1136,11 @@ class BaseTab(QWidget):
         after_sort = self._after_sort
 
         def fetch():
+            # Establish connection inside the worker thread if not connected
+            if getattr(database, 'profile_manager', None) and not getattr(database, 'conn', None):
+                if not database.connect():
+                    raise RuntimeError("Failed to connect worker database on background thread")
+            
             if hasattr(database, 'get_operation_summary_items') and section in ('Sales', 'Imports'):
                 items = database.get_operation_summary_items(
                     section,

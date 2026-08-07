@@ -1,6 +1,7 @@
 """
 Backup management dialog - create and restore database backups
 """
+import shiboken6
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QHBoxLayout, 
                                QMessageBox, QInputDialog, QLineEdit, QFileDialog)
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
@@ -768,7 +769,19 @@ class BackupsDialog(QDialog):
 
     def _wait_for_backup_thread(self, timeout_ms=5000):
         thread = getattr(self, "_backup_thread", None)
-        if thread is None or not thread.isRunning():
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+
+                return True
+
+        except RuntimeError:
+
+            return True
             return True
             
         if thread == QThread.currentThread():

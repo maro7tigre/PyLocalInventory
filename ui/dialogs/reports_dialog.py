@@ -11,6 +11,7 @@ import shutil
 import html
 from pathlib import Path
 from datetime import datetime, timedelta
+import shiboken6
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
 from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
@@ -160,7 +161,21 @@ class ReportsDialog(QDialog):
     def generate_report(self, report_type):
         """Generate report of specified type"""
         existing_thread = getattr(self, "_report_thread", None)
-        if existing_thread is not None and existing_thread.isRunning():
+        is_running = False
+
+        if existing_thread is not None:
+
+            try:
+
+                if shiboken6.isValid(existing_thread) and existing_thread.isRunning():
+
+                    is_running = True
+
+            except RuntimeError:
+
+                pass
+
+        if is_running:
             return False
             
         try:
@@ -255,7 +270,19 @@ class ReportsDialog(QDialog):
 
     def _wait_for_report_thread(self, timeout_ms=5000):
         thread = getattr(self, "_report_thread", None)
-        if thread is None or not thread.isRunning():
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+
+                return True
+
+        except RuntimeError:
+
+            return True
             return True
             
         if thread == QThread.currentThread():

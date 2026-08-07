@@ -44,7 +44,11 @@ class OrderProgressDialog(QDialog):
         self.setWindowTitle(f"Order Progress — Sale #{sale_obj.id}")
         self.setMinimumWidth(700)
         self.setMinimumHeight(520)
-        _ensure_payments_table(database)
+        # Schema changes belong to the trusted host connection, never to a
+        # read-only LAN session (Database.connect() also ensures this table
+        # on the host, so a remote client never needs to run DDL itself).
+        if database.__class__.__name__ != "RemoteDatabase":
+            _ensure_payments_table(database)
         self._setup_ui()
 
     def _setup_ui(self):

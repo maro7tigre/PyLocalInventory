@@ -17,6 +17,11 @@ def main():
     log_file = setup_logging()
     logger = logging.getLogger(__name__)
     from core import diagnostics
+    # TEMPORARY - Sale Save freeze investigation. Enables faulthandler and a
+    # 5-second all-threads stack dump; see core/sale_save_diagnostics.py.
+    from core import sale_save_diagnostics
+    hang_log = sale_save_diagnostics.start()
+    logger.info("Sale Save hang diagnostic active log=%s", hang_log)
     logger.info("Application startup build_id=%s log=%s", APP_BUILD_ID, log_file)
     app = QApplication(sys.argv)
     app.setApplicationName("PyLocalInventory")

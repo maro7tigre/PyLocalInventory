@@ -3,7 +3,7 @@
 import logging
 from decimal import Decimal
 
-from PySide6.QtCore import QDate, Qt
+from PySide6.QtCore import QDate, Qt, QObject, QThread, Signal, Slot
 from PySide6.QtGui import QColor
 from PySide6.QtWidgets import (
     QAbstractItemView,
@@ -27,10 +27,38 @@ from core.calculations import calculate_operation_totals, to_decimal
 from ui.widgets.preview_widget import PreviewWidget
 
 logger = logging.getLogger(__name__)
+_active_account_threads = set()
 
 
 def _format_money(value):
     return f"{float(value or 0):,.2f}".replace(",", " ")
+
+
+class _ClientAccountWorker(QObject):
+    """Fetches a client's purchases/payments off the GUI thread.
+
+    get_client_account() is a multi-row query (joined purchases + payments) -
+    for a RemoteDatabase it's a synchronous RPC round-trip, and even locally
+    it can block under lock contention. Opening "View Client" must never
+    freeze the window while this runs.
+    """
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, database, client_id):
+        super().__init__()
+        self.database = database
+        self.client_id = client_id
+
+    @Slot()
+    def run(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            data = self.database.get_client_account(self.client_id)
+            self.finished.emit(data)
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 class ClientDetailsDialog(QDialog):
@@ -54,6 +82,8 @@ class ClientDetailsDialog(QDialog):
         if database.__class__.__name__ != "RemoteDatabase":
             self._ensure_payments_table()
         self._setup_ui()
+        self._account_thread = None
+        self._account_worker = None
         self.refresh_data()
 
     def _ensure_payments_table(self):
@@ -285,9 +315,8 @@ class ClientDetailsDialog(QDialog):
             table.horizontalHeader().setSectionResizeMode(2, QHeaderView.Stretch)
         return table
 
-    def _load_purchases(self):
-        self.account_data = self.database.get_client_account(self.client_obj.id)
-        rows = self.account_data.get("purchases", [])
+    def _compute_purchases(self, account_data):
+        rows = account_data.get("purchases", [])
 
         # First pass: collect raw subtotals per sale to distribute remise
         sale_raw_totals = {}
@@ -335,7 +364,7 @@ class ClientDetailsDialog(QDialog):
 
         targeted = {}
         legacy_by_sale = {}
-        for _payment_id, sale_id, item_id, _date, amount in self.account_data.get(
+        for _payment_id, sale_id, item_id, _date, amount in account_data.get(
             "payments", []
         ):
             if item_id is None:
@@ -363,22 +392,45 @@ class ClientDetailsDialog(QDialog):
         return purchases
 
     def refresh_data(self):
-        mode = 'remote' if self.database.__class__.__name__ == 'RemoteDatabase' else 'local'
-        try:
-            self.purchases = self._load_purchases()
-        except Exception as exc:
-            logger.exception(
-                "View Client refresh failed: client_id=%s mode=%s",
-                self.client_obj.id, mode,
-            )
-            QMessageBox.warning(
-                self,
-                "Client Account",
-                f"Could not refresh this client's account from the host:\n{exc}\n\n"
-                "Showing the most recently loaded data.",
-            )
-            # Keep whatever self.purchases already held - a failed refresh
-            # must not blank out data that was already on screen.
+        """Kick off an async reload of this client's purchases/payments.
+
+        get_client_account() is a multi-row query - a synchronous RPC
+        round-trip for a RemoteDatabase, and a real multi-join query even
+        locally. Opening/refreshing this dialog must never block the GUI
+        thread on it (that used to freeze the window under lock contention).
+        """
+        if self._account_thread is not None:
+            return  # a refresh is already in flight
+
+        thread = QThread()
+        worker = _ClientAccountWorker(self.database, self.client_obj.id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        # Safe thread cleanup lifecycle (mirrors BaseOperationDialog.LoadWorker)
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(thread.quit)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_account_thread_finished)
+
+        worker.finished.connect(self._on_account_loaded)
+        worker.error.connect(self._on_account_load_error)
+
+        self._account_thread = thread
+        self._account_worker = worker
+        _active_account_threads.add(thread)
+        thread.finished.connect(lambda t=thread: _active_account_threads.discard(t))
+        thread.start()
+
+    def _on_account_thread_finished(self):
+        self._account_thread = None
+        self._account_worker = None
+
+    def _apply_account_data(self, account_data):
+        self.account_data = account_data or {"purchases": [], "payments": []}
+        self.purchases = self._compute_purchases(self.account_data)
         self._populate_purchases()
         self._populate_payments()
 
@@ -396,6 +448,33 @@ class ClientDetailsDialog(QDialog):
         self.amount_input.clear()
         self.amount_input.setEnabled(False)
         self.add_payment_button.setEnabled(False)
+
+    @Slot(object)
+    def _on_account_loaded(self, account_data):
+        try:
+            self._apply_account_data(account_data)
+        except RuntimeError:
+            pass  # dialog was closed/destroyed while the fetch was in flight
+
+    @Slot(str)
+    def _on_account_load_error(self, err_msg):
+        mode = 'remote' if self.database.__class__.__name__ == 'RemoteDatabase' else 'local'
+        try:
+            logger.error(
+                "View Client refresh failed: client_id=%s mode=%s error=%s",
+                self.client_obj.id, mode, err_msg,
+            )
+            QMessageBox.warning(
+                self,
+                "Client Account",
+                f"Could not refresh this client's account from the host:\n{err_msg}\n\n"
+                "Showing the most recently loaded data.",
+            )
+            # Keep whatever self.account_data/self.purchases already held - a
+            # failed refresh must not blank out data that was already shown.
+            self._apply_account_data(self.account_data)
+        except RuntimeError:
+            pass
 
     def _populate_purchases(self):
         self.purchases_table.setRowCount(len(self.purchases))

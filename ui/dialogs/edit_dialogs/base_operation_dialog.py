@@ -18,12 +18,35 @@ from core.calculations import calculate_line_subtotal, calculate_operation_total
 import os
 import uuid
 import shiboken6
+import time
+import threading
 
 _active_background_threads = set()
 import logging
 from core.runtime_paths import user_data_root
 
 logger = logging.getLogger(__name__)
+_save_timeline_logger = logging.getLogger("save_timeline")
+# Root logger defaults to WARNING app-wide (no setLevel anywhere in this
+# codebase), which would silently drop these diagnostic events - opt this
+# specific logger into INFO regardless, so app.log actually captures them.
+_save_timeline_logger.setLevel(logging.INFO)
+
+
+def _log_save_event(event, **fields):
+    """TEMPORARY Sale Save freeze diagnostic. Writes to both app.log (via the
+    standard logger, for context) and the dedicated
+    logs/sale_save_hang_diagnostic.log (via core.sale_save_diagnostics),
+    which is the file to read when reproducing a hang. Delete once the
+    freeze investigation is closed out."""
+    t = threading.current_thread()
+    extra = " ".join(f"{k}={v!r}" for k, v in fields.items())
+    _save_timeline_logger.info(
+        "%s t=%.6f thread=%s(id=%s) %s",
+        event, time.perf_counter(), t.name, t.ident, extra,
+    )
+    from core import sale_save_diagnostics
+    sale_save_diagnostics.event(event, **fields)
 
 class SaveWorker(QObject):
     finished = Signal(object)
@@ -38,11 +61,13 @@ class SaveWorker(QObject):
     @Slot()
     def process(self):
         worker_db = self.database
-        is_local = hasattr(self.database, 'profile_manager') and hasattr(self.database, 'conn')
+        is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
+        token = (self.save_kwargs.get('sale_data') or self.save_kwargs.get('import_data') or {}).get('operation_token')
+        _log_save_event("SAVE_WORKER_ENTER", token=token, is_local=is_local)
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-                
+
             if is_local:
                 from core.database import Database
                 worker_db = Database(self.database.profile_manager)
@@ -51,6 +76,7 @@ class SaveWorker(QObject):
                 if not worker_db.connect():
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
 
+            _log_save_event("RPC_REQUEST_START", token=token, is_import=self.is_import, is_local=is_local)
             if self.is_import:
                 res = worker_db.save_import_with_items(**self.save_kwargs)
                 if not isinstance(res, dict) or res.get("transaction") != "committed":
@@ -61,9 +87,13 @@ class SaveWorker(QObject):
                 if not isinstance(res, dict) or res.get('transaction') != 'committed':
                     raise RuntimeError(f"Host returned an invalid sale-save result: {res!r}")
                 res['expected'] = len(self.save_kwargs.get('items', []))
+            _log_save_event("RPC_REQUEST_END", token=token, result="committed")
             self.finished.emit(res)
+            _log_save_event("SAVE_SUCCESS_EMIT", token=token)
         except Exception as e:
+            _log_save_event("RPC_REQUEST_END", token=token, result="error", error=str(e))
             self.error.emit(str(e))
+            _log_save_event("SAVE_ERROR_EMIT", token=token, error=str(e))
         finally:
             if is_local and worker_db and worker_db != self.database:
                 worker_db.close()
@@ -81,13 +111,13 @@ class LoadWorker(QObject):
     @Slot()
     def process(self):
         worker_db = self.database
-        is_local = hasattr(self.database, 'profile_manager') and hasattr(self.database, 'conn')
+        is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
         old_db = getattr(self.operation_obj, 'database', None) if self.operation_obj else None
-        
+
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-                
+
             if is_local:
                 from core.database import Database
                 worker_db = Database(self.database.profile_manager)
@@ -99,9 +129,12 @@ class LoadWorker(QObject):
             if self.operation_obj:
                 self.operation_obj.database = worker_db
                 self.operation_obj.load_database_data()
-                
+
             if self.fetch_catalog and getattr(worker_db, 'get_sale_catalog', None):
-                self.database.sale_catalog = worker_db.get_sale_catalog()
+                self.database.sale_catalog = worker_db.get_sale_catalog(
+                    include_clients=worker_db.has_permission('Clients', 'read'),
+                    include_suppliers=worker_db.has_permission('Suppliers', 'read'),
+                )
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -150,10 +183,11 @@ class BaseOperationDialog(QDialog):
         self.setWindowTitle(self.windowTitle() + " (Loading...)")
 
         self.load_thread = QThread()
+        _catalog = getattr(database, "sale_catalog", None)
         self.load_worker = LoadWorker(
             self.operation_obj if operation_id else None,
             database,
-            fetch_catalog=not hasattr(database, "sale_catalog") or database.sale_catalog is None
+            fetch_catalog=not _catalog or "clients" not in _catalog
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)
@@ -538,6 +572,7 @@ class BaseOperationDialog(QDialog):
     
     def save_changes(self):
         """Prevent double-clicks from starting the same transaction twice."""
+        _log_save_event("SAVE_CLICK", token=self.operation_token, operation_id=self.operation_id)
         if self._saving:
             return
         self._saving = True
@@ -555,13 +590,19 @@ class BaseOperationDialog(QDialog):
     def _save_changes_impl(self):
         """Save operation and items to database (simple, reliable)"""
         # Validate first
+        _log_save_event("GUI_VALIDATION_START", token=self.operation_token)
         errors = self.validate_data()
         if errors:
+            _log_save_event("GUI_VALIDATION_END", token=self.operation_token, result="errors")
             QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
 
         # Check for missing related entities (client/supplier, products) and offer creation
         proceed, allow_unresolved = self._handle_missing_references()
+        _log_save_event(
+            "GUI_VALIDATION_END", token=self.operation_token,
+            result="ok" if proceed else "cancelled",
+        )
         if not proceed:
             return  # User cancelled
 
@@ -619,6 +660,7 @@ class BaseOperationDialog(QDialog):
                         return
                         
                 # BUILD PAYLOAD ON GUI THREAD
+                _log_save_event("PAYLOAD_BUILD_START", token=self.operation_token)
                 raw_items = self.items_table.get_current_table_data()
                 prepared = []
                 if is_import:
@@ -669,26 +711,59 @@ class BaseOperationDialog(QDialog):
                     }
 
                 action = "updated" if self.operation_id else "created"
-                
+                _log_save_event(
+                    "PAYLOAD_BUILD_END", token=self.operation_token,
+                    item_count=len(prepared),
+                )
+
                 self.save_thread = QThread()
                 self.save_worker = SaveWorker(self.database, is_import, save_kwargs)
                 self.save_worker.moveToThread(self.save_thread)
                 self.save_thread.started.connect(self.save_worker.process)
-                
+                _log_save_event("SAVE_THREAD_CREATE", token=self.operation_token)
+
                 # Safe thread cleanup lifecycle
                 self.save_worker.finished.connect(self.save_thread.quit)
                 self.save_worker.finished.connect(self.save_worker.deleteLater)
                 self.save_thread.finished.connect(self.save_thread.deleteLater)
                 self.save_worker.error.connect(self.save_thread.quit)
                 self.save_worker.error.connect(self.save_worker.deleteLater)
-                
-                # Business logic callbacks
-                self.save_worker.finished.connect(lambda res, act=action: self._on_save_finished(res, act))
+                self.save_thread.finished.connect(
+                    lambda tok=self.operation_token: _log_save_event("SAVE_THREAD_FINISHED", token=tok)
+                )
+
+                # Business logic callbacks.
+                #
+                # PROVEN ROOT CAUSE (2026-08-07 hang investigation): Qt/PySide6's
+                # AutoConnection picks Direct vs Queued by inspecting the
+                # *receiver*'s thread affinity - and that inspection only works
+                # when the slot is a genuine bound method of a QObject. A lambda
+                # has no thread affinity of its own, so PySide6 cannot resolve it
+                # and falls back to invoking the lambda directly, synchronously,
+                # ON THE EMITTING THREAD - confirmed empirically in this exact
+                # PySide6 build (and confirmed live in
+                # logs/sale_save_hang_diagnostic.log: SAVE_GUI_CALLBACK and
+                # DIALOG_ACCEPT both logged thread=Dummy-1, the SaveWorker
+                # thread, not MainThread). Passing an explicit
+                # Qt.QueuedConnection to a lambda-wrapped connect() does NOT
+                # fix this (also verified empirically) - only connecting
+                # directly to a real bound method does. That means
+                # self.accept() and _refresh_related_tabs() (QWidget/QDialog
+                # calls) were running off the GUI thread, which is illegal in
+                # Qt and is what wedges the window into a permanent
+                # "Not Responding" state.
+                #
+                # Fix: connect directly to a real bound method (no lambda) and
+                # stash the extra `action` context on self instead of
+                # capturing it in a closure.
+                self._pending_save_action = action
+                self.save_worker.finished.connect(self._on_save_worker_finished)
                 self.save_worker.error.connect(self._on_save_error)
                 
                 _active_background_threads.add(self.save_thread)
                 self.save_thread.finished.connect(lambda t=self.save_thread: _active_background_threads.discard(t))
                 self.save_thread.start()
+                _log_save_event("SAVE_THREAD_START", token=self.operation_token)
                 return
 
             success = self.operation_obj.save_to_database()
@@ -763,7 +838,14 @@ class BaseOperationDialog(QDialog):
             )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
 
+    def _on_save_worker_finished(self, result):
+        """Real bound-method slot for SaveWorker.finished (see the comment at
+        the connect() call site) - MUST stay a genuine method, never a
+        lambda, or Qt loses the ability to dispatch it onto the GUI thread."""
+        self._on_save_finished(result, self._pending_save_action)
+
     def _on_save_finished(self, result, action):
+        _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action=action)
         # Thread cleanup is handled safely by QThread.finished -> deleteLater
         self.save_worker = None
         self.save_thread = None
@@ -792,9 +874,12 @@ class BaseOperationDialog(QDialog):
                     f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
                     f"deleted: {result.get('deleted', 0)}."
                 )
+                _log_save_event("DIALOG_ACCEPT", token=self.operation_token)
                 self.accept()
+                _log_save_event("POST_SAVE_REFRESH_START", token=self.operation_token)
                 self._refresh_related_tabs("Sales", "Products", "Clients")
-            
+                _log_save_event("POST_SAVE_REFRESH_END", token=self.operation_token)
+
             elif getattr(self.operation_obj, 'section', '') == 'Imports':
                 self.operation_id = result["import_id"]
                 self.operation_obj.id = result["import_id"]
@@ -805,12 +890,16 @@ class BaseOperationDialog(QDialog):
                     f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
                     f"Products created: {result.get('created_products', 0)}.",
                 )
+                _log_save_event("DIALOG_ACCEPT", token=self.operation_token)
                 self.accept()
+                _log_save_event("POST_SAVE_REFRESH_START", token=self.operation_token)
                 self._refresh_related_tabs("Imports", "Products")
+                _log_save_event("POST_SAVE_REFRESH_END", token=self.operation_token)
         except RuntimeError:
             pass
 
     def _on_save_error(self, err_msg):
+        _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action="error")
         self.save_worker = None
         self.save_thread = None
 
@@ -896,6 +985,14 @@ class BaseOperationDialog(QDialog):
         except OSError:
             logger.exception("Could not write sale diagnostic log")
     
+    def closeEvent(self, event):
+        # TEMPORARY Sale Save freeze diagnostic marker - see _log_save_event.
+        _log_save_event(
+            "DIALOG_CLOSE", token=getattr(self, "operation_token", None),
+            saving=getattr(self, "_saving", None),
+        )
+        super().closeEvent(event)
+
     def apply_theme(self):
         """Apply dark theme"""
         self.setStyleSheet("""
@@ -1106,16 +1203,11 @@ class BaseOperationDialog(QDialog):
                 if self._normalize_name(e.get("name", "")) == target:
                     return True
             return False
-            
-        # fallback to db
-        table = "Products" if item_type == "product" else "Services"
-        self.database.cursor.execute(
-            f"SELECT name FROM {table} WHERE name IS NOT NULL"
-        )
-        return any(
-            self._normalize_name(row[0]) == target
-            for row in self.database.cursor.fetchall()
-        )
+
+        # GUI thread must NOT block to query the database over RPC.
+        # Catalog wasn't prefetched - assume it exists; the backend
+        # re-validates at save time (matches _entity_exists/_validate_stock).
+        return True
 
     def _validate_stock(self, items_objects):
         """Return a list of error strings for any sale item that exceeds available stock."""
@@ -1160,21 +1252,19 @@ class BaseOperationDialog(QDialog):
     def _entity_exists(self, table, username):
         try:
             target = self._normalize_name(username)
-            # Try to check local cache if we already loaded it for this session to avoid multiple RPC queries
-            if not hasattr(self, '_entity_cache'):
-                self._entity_cache = {}
-                
-            if table not in self._entity_cache:
-                self.database.cursor.execute(
-                    f"SELECT username, name FROM {table} "
-                    "WHERE username IS NOT NULL OR name IS NOT NULL"
+            catalog = getattr(self.database, 'sale_catalog', None)
+            catalog_key = table.lower()  # "clients" / "suppliers"
+            if catalog and catalog_key in catalog:
+                return any(
+                    target in (self._normalize_name(e.get('username')), self._normalize_name(e.get('name')))
+                    for e in catalog.get(catalog_key, [])
                 )
-                self._entity_cache[table] = [
-                    (self._normalize_name(row[0]), self._normalize_name(row[1]))
-                    for row in self.database.cursor.fetchall()
-                ]
-                
-            return any(target in row_tuple for row_tuple in self._entity_cache[table])
+            # GUI thread must NOT block to query the database over RPC.
+            # The catalog wasn't prefetched (or doesn't cover this table) -
+            # assume it exists; the backend re-validates at save time and
+            # _handle_missing_references' own pending-entity flow still
+            # covers genuinely-new names.
+            return True
         except Exception as e:
             print(f"Error checking existence in {table}: {e}")
             return True  # Avoid blocking

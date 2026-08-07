@@ -11,11 +11,83 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
     QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView)
+
+_active_attachment_threads = set()
+
+
+class _AttachmentFetchWorker(QObject):
+    """Fetches + filters attachment records and their thumbnails off the GUI
+    thread. list_attachments()/get_attachment_thumbnails_bulk() are a
+    synchronous RPC round-trip for a RemoteDatabase (LAN client) - running
+    them directly on the GUI thread freezes the window while attachments
+    load, and this panel used to do that on every open and on every
+    keystroke in the search box."""
+    finished = Signal(list, dict)
+    error = Signal(str)
+
+    def __init__(self, database, entity_type, entity_id, needle, kind):
+        super().__init__()
+        self.database = database
+        self.entity_type = entity_type
+        self.entity_id = entity_id
+        self.needle = needle
+        self.kind = kind
+
+    @Slot()
+    def run(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            records = self.database.list_attachments(self.entity_type, self.entity_id)
+            needle, kind = self.needle, self.kind
+            shown = [
+                r for r in records
+                if (not needle or needle in ' '.join(
+                    str(r.get(k, '')) for k in ('original_filename', 'display_name', 'mime_type')
+                ).lower())
+                and (
+                    kind == 'All files'
+                    or (kind == 'Images' and str(r['mime_type']).startswith('image/'))
+                    or (kind == 'PDF' and r['mime_type'] == 'application/pdf')
+                )
+            ]
+            image_ids = [r['id'] for r in shown if r['mime_type'].startswith('image/')]
+            thumbnails = {}
+            if image_ids and hasattr(self.database, 'get_attachment_thumbnails_bulk'):
+                try:
+                    thumbnails = self.database.get_attachment_thumbnails_bulk(image_ids)
+                except Exception as e:
+                    print(f"Error fetching bulk thumbnails: {e}")
+            self.finished.emit(shown, thumbnails)
+        except Exception as e:
+            self.error.emit(str(e))
+
+
+class _ClientSalesFetchWorker(QObject):
+    """Fetches a client's sales list off the GUI thread (see
+    _AttachmentFetchWorker - same RPC-blocking concern)."""
+    finished = Signal(list)
+    error = Signal(str)
+
+    def __init__(self, database, client_id):
+        super().__init__()
+        self.database = database
+        self.client_id = client_id
+
+    @Slot()
+    def run(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            sales = self.database.get_client_sales(self.client_id)
+            self.finished.emit(list(sales))
+        except Exception as e:
+            self.error.emit(str(e))
 
 
 def _scan_with_windows_wia(output_path):
@@ -66,6 +138,10 @@ class AttachmentPanel(QWidget):
         super().__init__(parent)
         self.database, self.entity_type, self.entity_id = database, entity_type, int(entity_id)
         self._records = []
+        self._fetch_thread = None
+        self._fetch_worker = None
+        self._sales_thread = None
+        self._sales_worker = None
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
         # The client window now focuses solely on that client's sales. Client
@@ -144,25 +220,62 @@ class AttachmentPanel(QWidget):
         return [self._shown[row] for row in sorted(ids)] if hasattr(self, '_shown') else []
 
     def refresh(self):
+        """Kick off an async reload of this entity's attachments.
+
+        list_attachments()/get_attachment_thumbnails_bulk() are a
+        synchronous RPC round-trip for a RemoteDatabase - never run them on
+        the GUI thread (that used to freeze this panel on open and on every
+        keystroke in the search box).
+        """
         if self.entity_type == 'client':
             self.refresh_sales()
             return
-        try: records = self.database.list_attachments(self.entity_type, self.entity_id)
-        except Exception as exc: QMessageBox.warning(self, 'Attachments', str(exc)); return
+        if self._fetch_thread is not None:
+            return  # a fetch is already in flight; it will render current results
+
         needle, kind = self.search.text().lower().strip(), self.filter.currentText()
-        self._shown = [r for r in records if (not needle or needle in ' '.join(str(r.get(k, '')) for k in ('original_filename','display_name','mime_type')).lower()) and
-                       (kind == 'All files' or (kind == 'Images' and str(r['mime_type']).startswith('image/')) or (kind == 'PDF' and r['mime_type'] == 'application/pdf'))]
-        
-        # Bulk load thumbnails
-        image_ids = [r['id'] for r in self._shown if r['mime_type'].startswith('image/')]
-        self._thumbnails_cache = {}
-        if image_ids:
-            try:
-                if hasattr(self.database, 'get_attachment_thumbnails_bulk'):
-                    self._thumbnails_cache = self.database.get_attachment_thumbnails_bulk(image_ids)
-            except Exception as e:
-                print(f"Error fetching bulk thumbnails: {e}")
-                
+        thread = QThread()
+        worker = _AttachmentFetchWorker(self.database, self.entity_type, self.entity_id, needle, kind)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(thread.quit)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_fetch_thread_finished)
+
+        worker.finished.connect(self._on_attachments_fetched)
+        worker.error.connect(self._on_attachments_fetch_error)
+
+        self._fetch_thread = thread
+        self._fetch_worker = worker
+        _active_attachment_threads.add(thread)
+        thread.finished.connect(lambda t=thread: _active_attachment_threads.discard(t))
+        thread.start()
+
+    def _on_fetch_thread_finished(self):
+        self._fetch_thread = None
+        self._fetch_worker = None
+
+    @Slot(str)
+    def _on_attachments_fetch_error(self, err_msg):
+        try:
+            QMessageBox.warning(self, 'Attachments', err_msg)
+        except RuntimeError:
+            pass  # panel was closed/destroyed while the fetch was in flight
+
+    @Slot(list, dict)
+    def _on_attachments_fetched(self, shown, thumbnails):
+        try:
+            self._render_attachments(shown, thumbnails)
+        except RuntimeError:
+            pass  # panel was closed/destroyed while the fetch was in flight
+
+    def _render_attachments(self, shown, thumbnails):
+        self._shown = shown
+        self._thumbnails_cache = thumbnails
         self.table.setRowCount(len(self._shown))
         for row, record in enumerate(self._shown):
             preview = QTableWidgetItem('PDF' if record['mime_type'] == 'application/pdf' else '')
@@ -206,19 +319,57 @@ class AttachmentPanel(QWidget):
             return text
 
     def refresh_sales(self):
-        """Load only sales whose persisted client_id matches this client."""
+        """Kick off an async load of sales whose persisted client_id matches
+        this client. get_client_sales() is a synchronous RPC round-trip for
+        a RemoteDatabase - never run it on the GUI thread."""
         if self.entity_type != 'client' or self.client_sales_table is None:
             return
+        if self._sales_thread is not None:
+            return  # a fetch is already in flight
         self.client_sales_table.setRowCount(0)
         self.client_sales_empty.setVisible(False)
+
+        thread = QThread()
+        worker = _ClientSalesFetchWorker(self.database, self.entity_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(thread.quit)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_sales_thread_finished)
+
+        worker.finished.connect(self._on_client_sales_fetched)
+        worker.error.connect(self._on_client_sales_fetch_error)
+
+        self._sales_thread = thread
+        self._sales_worker = worker
+        _active_attachment_threads.add(thread)
+        thread.finished.connect(lambda t=thread: _active_attachment_threads.discard(t))
+        thread.start()
+
+    def _on_sales_thread_finished(self):
+        self._sales_thread = None
+        self._sales_worker = None
+
+    @Slot(str)
+    def _on_client_sales_fetch_error(self, err_msg):
         try:
-            # get_client_sales() already matches by both client_id and by
-            # username against sales.client_username, so it returns the full
-            # set of this client's sales in one call.
-            sales = self.database.get_client_sales(self.entity_id)
-        except Exception as exc:
-            QMessageBox.warning(self, 'Client sales', f'Could not load this client\'s sales: {exc}')
-            sales = []
+            QMessageBox.warning(self, 'Client sales', f"Could not load this client's sales:\n{err_msg}")
+            self._render_client_sales([])
+        except RuntimeError:
+            pass  # panel was closed/destroyed while the fetch was in flight
+
+    @Slot(list)
+    def _on_client_sales_fetched(self, sales):
+        try:
+            self._render_client_sales(sales)
+        except RuntimeError:
+            pass  # panel was closed/destroyed while the fetch was in flight
+
+    def _render_client_sales(self, sales):
         self.client_sales_empty.setVisible(not sales)
         self.client_sales_table.setRowCount(len(sales))
         for row, (sale_id, notes, date, vat, subtotal) in enumerate(sales):

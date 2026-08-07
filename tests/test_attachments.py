@@ -1,5 +1,6 @@
 import base64
 import os
+import time
 import unittest
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -61,6 +62,16 @@ class AttachmentSafetyTests(unittest.TestCase):
         app = QApplication.instance() or QApplication([])
         database = Database()
         panel = AttachmentPanel(database, 'client', 42)
+        # get_client_sales() now runs on a background QThread (never on the
+        # GUI thread - see attachments_widget._ClientSalesFetchWorker).
+        # database.client_sales_calls is mutated directly on that thread, so
+        # polling it alone races the queued 'finished' signal that actually
+        # populates the table - wait for the thread to fully wind down
+        # instead (its cleanup chain runs strictly after the render slot).
+        deadline = time.time() + 2.0
+        while panel._sales_thread is not None and time.time() < deadline:
+            app.processEvents()
+            time.sleep(0.01)
         self.assertEqual(panel.client_sales_table.rowCount(), 1)
         self.assertEqual(database.client_sales_calls, [42])
         self.assertEqual(panel.client_sales_table.item(0, 0).text(), '17')

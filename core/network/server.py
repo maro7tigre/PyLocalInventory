@@ -52,7 +52,8 @@ _SECTION_METHODS = {
     'get_items': ('read', 0),                   # get_items(section)
     'get_items_by_operation_id': ('read', 1),   # get_items_by_operation_id(operation_id, section)
     'get_items_by_operation_ids': ('read', 1),  # get_items_by_operation_ids(operation_ids, section)
-    'get_sale_catalog': ('read', 0),            # get_sale_catalog(include_products, include_services)
+    # get_sale_catalog is handled by its own dedicated branch below (its args
+    # are booleans, not a section name - see the `if method == 'get_sale_catalog'` check).
     'get_operation_summary_items': ('read', 0),  # get operation summaries for Sales/Imports
     'get_changes': ('read', 0),                 # get_changes(section, since_seq, limit)
 }
@@ -185,6 +186,26 @@ def _check_permission(user, method, args, kwargs):
                 "normalized_section=%s needed=%s mode=remote",
                 APP_BUILD_ID, user.get('id'), method, table, section, needed,
             )
+        return True, None
+
+    if method == 'get_sale_catalog':
+        # Not a single-section method (its first two positional args are
+        # booleans, not a section name) - the generic _SECTION_METHODS path
+        # below would misread args[0]/kwargs.get('section') and always deny
+        # it. Gate each optional slice by its own section's read permission.
+        def _flag(index, key, default):
+            if len(args) > index:
+                return bool(args[index])
+            return bool(kwargs.get(key, default))
+        requested = {
+            'Products': _flag(0, 'include_products', True),
+            'Services': _flag(1, 'include_services', True),
+            'Clients': _flag(3, 'include_clients', False),
+            'Suppliers': _flag(4, 'include_suppliers', False),
+        }
+        for section, wanted in requested.items():
+            if wanted and not user['permissions'].get(section, {}).get('read'):
+                return False, f"You don't have read access to {section}"
         return True, None
 
     if method in _SECTION_METHODS:
@@ -663,6 +684,15 @@ class DatabaseServer:
                                 or sales_access
                                 or permissions.get("Services", {}).get("read")
                             ),
+                            include_clients=bool(
+                                user.get("is_superadmin")
+                                or sales_access
+                                or permissions.get("Clients", {}).get("read")
+                            ),
+                            include_suppliers=bool(
+                                user.get("is_superadmin")
+                                or permissions.get("Suppliers", {}).get("read")
+                            ),
                         )
                 finally:
                     server_obj._return_database(request_db)
@@ -709,6 +739,13 @@ class DatabaseServer:
                 method = body.get('method', '')
                 args = body.get('args', [])
                 kwargs = body.get('kwargs', {})
+                is_save_call = method in ('save_sale_with_items', 'save_import_with_items')
+                if is_save_call:
+                    # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
+                    from core import sale_save_diagnostics
+                    sale_save_diagnostics.event(
+                        "RPC_REQUEST_RECEIVED", method=method, user=user.get('username'),
+                    )
 
                 if method == 'save_sale_with_items':
                     sale_data = args[0] if args else {}
@@ -723,18 +760,34 @@ class DatabaseServer:
 
                 allowed, reason = _check_permission(user, method, args, kwargs)
                 if not allowed:
+                    if is_save_call:
+                        sale_save_diagnostics.event(
+                            "RPC_REQUEST_END", method=method, result="permission_denied", reason=reason,
+                        )
                     return self._send_json(403, {'error': reason})
 
                 try:
                     started = time.perf_counter()
+                    if is_save_call:
+                        sale_save_diagnostics.event("SERVER_DISPATCH_START", method=method)
                     result = server_obj._dispatch(method, args, kwargs, user=user)
+                    if is_save_call:
+                        sale_save_diagnostics.event("SERVER_DISPATCH_END", method=method, result="ok")
                 except ValueError as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation=failed transaction=rollback error={e}")
+                    if is_save_call:
+                        sale_save_diagnostics.event(
+                            "SERVER_DISPATCH_END", method=method, result="value_error", error=str(e),
+                        )
                     return self._send_json(400, {'error': str(e)})
                 except Exception as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation_or_transaction=rollback error={e}")
+                    if is_save_call:
+                        sale_save_diagnostics.event(
+                            "SERVER_DISPATCH_END", method=method, result="exception", error=str(e),
+                        )
                     logger.exception(
                         "LAN RPC failed method=%s user=%s",
                         method, user.get("username"),
@@ -748,6 +801,10 @@ class DatabaseServer:
                 )
                 if method == 'save_sale_with_items':
                     server_obj._write_sales_log(f"validation=ok transaction=commit result={result}")
+                if is_save_call:
+                    sale_save_diagnostics.event(
+                        "RPC_REQUEST_END", method=method, result="ok", elapsed_ms=round(elapsed * 1000, 1),
+                    )
                 self._send_json(200, {'result': result})
 
         return Handler

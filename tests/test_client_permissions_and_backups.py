@@ -1,5 +1,6 @@
 import os
 import tempfile
+import time
 import unittest
 import io
 import zipfile
@@ -103,6 +104,15 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
         client.set_value("id", 7)
         client.set_value("name", "Read Only Client")
         dialog = ClientDetailsDialog(client, database)
+        # get_client_account() now runs on a background QThread (never on the
+        # GUI thread - see ClientDetailsDialog._ClientAccountWorker).
+        # database.account_calls is mutated directly on that thread, so wait
+        # for the thread to fully wind down rather than polling the list
+        # alone (that would race the queued 'finished' signal).
+        deadline = time.time() + 2.0
+        while dialog._account_thread is not None and time.time() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
         self.assertEqual(database.account_calls, [7])
         self.assertTrue(dialog.payment_form.isHidden())
         self.assertFalse(dialog.can_record_payment)

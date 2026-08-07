@@ -362,6 +362,11 @@ class Database:
             },
             'products': {
                 'created_by': 'INTEGER', 'created_by_username': 'TEXT', 'created_at': 'TEXT',
+                # Read by get_dashboard_snapshot()'s low-stock query - used to
+                # live only behind HomeTab's local-refresh code path, so a
+                # database that never ran that exact path could hit it as an
+                # undefined column.
+                'stock_alert': 'INTEGER',
             },
             'services': {
                 'unit_price': 'DOUBLE PRECISION', 'created_by': 'INTEGER',
@@ -1292,6 +1297,11 @@ class Database:
                 'item_type': requested_type,
             })
 
+        # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
+        from core import sale_save_diagnostics
+        sale_save_diagnostics.event(
+            "DB_TRANSACTION_START", sale_id=sale_id, item_count=len(validated),
+        )
         try:
             header_token = str(sale_data.get("operation_token") or "").strip()
             if not sale_id and header_token:
@@ -1303,6 +1313,9 @@ class Database:
                     self.cursor.execute(
                         "SELECT COUNT(*) FROM sales_items WHERE sales_id = %s",
                         (int(duplicate[0]),),
+                    )
+                    sale_save_diagnostics.event(
+                        "DB_TRANSACTION_END", result="duplicate_token", sale_id=int(duplicate[0]),
                     )
                     return {
                         "sale_id": int(duplicate[0]), "saved": int(self.cursor.fetchone()[0]),
@@ -1528,7 +1541,9 @@ class Database:
                             f"Insufficient stock for product ID {product_id}: "
                             f"requested {requested}, available {imported - sold_elsewhere}"
                         )
+            sale_save_diagnostics.event("DB_TRANSACTION_END", result="committing", sale_id=sale_id)
             self.conn.commit()
+            sale_save_diagnostics.event("DB_TRANSACTION_END", result="committed", sale_id=sale_id)
             return {
                 'sale_id': sale_id,
                 'saved': len(validated),
@@ -1542,8 +1557,12 @@ class Database:
                 ],
                 'transaction': 'committed',
             }
-        except Exception:
+        except Exception as e:
+            sale_save_diagnostics.event(
+                "DB_TRANSACTION_END", result="rolling_back", sale_id=sale_id, error=str(e),
+            )
             self.conn.rollback()
+            sale_save_diagnostics.event("DB_TRANSACTION_END", result="rolled_back", sale_id=sale_id)
             raise
 
     def save_import_with_items(
@@ -2418,8 +2437,16 @@ class Database:
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
 
-    def get_sale_catalog(self, include_products=True, include_services=True, exclude_sale_id=None):
-        """Return the sale-entry catalog and stock in a small number of queries."""
+    def get_sale_catalog(self, include_products=True, include_services=True, exclude_sale_id=None,
+                          include_clients=False, include_suppliers=False):
+        """Return the sale-entry catalog and stock in a small number of queries.
+
+        include_clients/include_suppliers are opt-in and deliberately cheap
+        (just username+name, no other columns) - they exist so the New/Edit
+        Sale and Import dialogs can prefetch client/supplier existence data
+        once, off the GUI thread, instead of firing a live query the moment
+        the user clicks Save (see BaseOperationDialog._entity_exists).
+        """
         catalog = {"products": [], "services": []}
         if include_products:
             if exclude_sale_id:
@@ -2488,6 +2515,22 @@ class Database:
                     "id": int(row[0]), "name": row[1],
                     "price": str(row[2] or 0), "keywords": row[3] or "",
                 }
+                for row in self.cursor.fetchall()
+            ]
+        if include_clients:
+            self.cursor.execute(
+                "SELECT username, name FROM clients WHERE username IS NOT NULL OR name IS NOT NULL"
+            )
+            catalog["clients"] = [
+                {"username": row[0] or "", "name": row[1] or ""}
+                for row in self.cursor.fetchall()
+            ]
+        if include_suppliers:
+            self.cursor.execute(
+                "SELECT username, name FROM suppliers WHERE username IS NOT NULL OR name IS NOT NULL"
+            )
+            catalog["suppliers"] = [
+                {"username": row[0] or "", "name": row[1] or ""}
                 for row in self.cursor.fetchall()
             ]
         return catalog

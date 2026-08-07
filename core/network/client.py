@@ -148,8 +148,12 @@ class RemoteDatabase:
     def get_items_by_operation_ids(self, operation_ids, section):
         return self._call('get_items_by_operation_ids', [operation_ids, section])
 
-    def get_sale_catalog(self, include_products=True, include_services=True):
-        return self._call('get_sale_catalog', [include_products, include_services])
+    def get_sale_catalog(self, include_products=True, include_services=True,
+                          include_clients=False, include_suppliers=False):
+        return self._call(
+            'get_sale_catalog', [include_products, include_services],
+            {'include_clients': include_clients, 'include_suppliers': include_suppliers},
+        )
 
     def register_class(self, cls):
         """Mirrors Database.register_class - only needs the section name
@@ -236,10 +240,17 @@ class RemoteDatabase:
             raise AuthError("Not connected")
         diagnostics.network_call(method)
 
+        is_save_call = method in ('save_sale_with_items', 'save_import_with_items')
         url = f"http://{self.host}:{self.port}/rpc"
         safe_args = self._json_safe(args or [])
         safe_kwargs = self._json_safe(kwargs or {})
         payload = json.dumps({'method': method, 'args': safe_args, 'kwargs': safe_kwargs}).encode('utf-8')
+        if is_save_call:
+            # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
+            from core import sale_save_diagnostics
+            sale_save_diagnostics.event(
+                "RPC_REQUEST_START", method=method, url=url, timeout=timeout,
+            )
         if method == 'save_sale_with_items':
             sale_data = safe_args[0] if safe_args else {}
             items = safe_args[1] if len(safe_args) > 1 else []
@@ -268,12 +279,21 @@ class RemoteDatabase:
                 self._write_network_log(
                     f"response_url={url} http_status={e.code} validation=failed error={message}"
                 )
+            if is_save_call:
+                sale_save_diagnostics.event(
+                    "RPC_REQUEST_END", method=method, result="http_error",
+                    http_status=e.code, error=message,
+                )
             if e.code == 401:
                 raise AuthError(message)
             if e.code == 403:
                 raise PermissionDeniedError(message)
             raise RemoteError(message)
-        except (AuthError, PermissionDeniedError, RemoteError):
+        except (AuthError, PermissionDeniedError, RemoteError) as e:
+            if is_save_call:
+                sale_save_diagnostics.event(
+                    "RPC_REQUEST_END", method=method, result="error", error=str(e),
+                )
             raise
         except Exception as e:
             logger.warning(
@@ -284,9 +304,18 @@ class RemoteDatabase:
                 self._write_network_log(
                     f"response_url={url} http_status=unavailable connection_error={e}"
                 )
+            if is_save_call:
+                sale_save_diagnostics.event(
+                    "RPC_REQUEST_END", method=method, result="connection_error", error=str(e),
+                )
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
         elapsed_ms = (time.perf_counter() - started) * 1000
+        if is_save_call:
+            sale_save_diagnostics.event(
+                "RPC_REQUEST_END", method=method, result="ok",
+                http_status=http_status, elapsed_ms=round(elapsed_ms, 1),
+            )
         logger.log(
             logging.WARNING if elapsed_ms >= 500 else logging.INFO,
             "LAN RPC method=%s host=%s port=%s duration_ms=%.1f build_id=%s host_build_id=%s",

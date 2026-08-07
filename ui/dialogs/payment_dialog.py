@@ -47,7 +47,11 @@ class PaymentDialog(QDialog):
         self.setMinimumWidth(440)
         self.setFixedWidth(440)
         self.setStyleSheet("background:#2a2a2a; color:#eee;")
-        _ensure_payments_table(database)
+        # Schema changes belong to the trusted host connection, never to a
+        # read-only LAN session (Database.connect() also ensures this table
+        # on the host, so a remote client never needs to run DDL itself).
+        if database.__class__.__name__ != "RemoteDatabase":
+            _ensure_payments_table(database)
         self._setup_ui()
 
     def _setup_ui(self):

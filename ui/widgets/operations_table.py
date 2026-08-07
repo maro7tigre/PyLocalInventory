@@ -1222,16 +1222,20 @@ class OperationsTableWidget(QWidget):
                     item.parameters["service_id"]["value"] = None
             except Exception:
                 pass
-            # Attempt resolution (non-fatal if fails); include regardless for later handling
+            # Attempt resolution (non-fatal if fails); include regardless for later handling.
+            # GUI thread must NOT block to query the database over RPC here - use the
+            # prefetched catalog only. If it's unavailable, leave product_id unresolved;
+            # the backend resolves by name / pending_entities at save time.
             if (hasattr(item, 'get_value') and not item.get_value('product_id')
                     and str(item_data.get("item_type") or "").casefold() != "service"):
                 try:
-                    if self.data_manager.database and hasattr(self.data_manager.database, 'cursor'):
-                        self.data_manager.database.cursor.execute(
-                            "SELECT ID FROM Products WHERE name = %s", (item.get_value('product_name'),))
-                        res = self.data_manager.database.cursor.fetchone()
-                        if res and res[0]:
-                            item.set_value('product_id', res[0])
+                    catalog = getattr(self.data_manager.database, 'sale_catalog', None)
+                    if catalog:
+                        target = self.event_handler._normalized_name(item.get_value('product_name'))
+                        for p in catalog.get('products', []):
+                            if self.event_handler._normalized_name(p.get('name')) == target:
+                                item.set_value('product_id', p.get('id'))
+                                break
                 except Exception:
                     pass
             items.append(item)

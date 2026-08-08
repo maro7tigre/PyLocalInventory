@@ -43,6 +43,20 @@ class SalesClass(BaseClass):
                 "type": "int"
             },
 
+            # Canonical per-sale Devis reference (e.g. DE-2026-525 or a manual
+            # DE-2026-525-A). Stored verbatim on sales.devis - never silently
+            # renumbered. The host allocates the preview value on save and
+            # enforces uniqueness.
+            "devis": {
+                "value": "",
+                "display_name": {"en": "Devis N°", "fr": "Devis N°", "es": "Devis N°"},
+                "required": False,
+                "default": "",
+                "options": [],
+                "type": "string",
+                "maxlength": 40
+            },
+
             # New: workflow state of the sale
             "state": {
                 "value": "pending",  # default when created
@@ -212,6 +226,7 @@ class SalesClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
+                "devis": "r",
                 "state": "r",
                 # "is_historical": "r",
                 "client_name": "r",
@@ -223,6 +238,7 @@ class SalesClass(BaseClass):
             "dialog": {
                 "client_username": "rw",
                 "date": "rw",
+                "devis": "rw",
                 "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
@@ -234,6 +250,7 @@ class SalesClass(BaseClass):
                 "client_id": "rw",
                 "client_name": "rw",  # snapshot
                 "date": "rw",
+                "devis": "rw",
                 "tva": "rw",
                 "remise": "rw",
                 "notes": "rw",
@@ -245,6 +262,8 @@ class SalesClass(BaseClass):
                 # is_historical is intentionally NOT listed here: it is a real
                 # BOOLEAN column managed by Database._ensure_additional_columns
                 # and injected into the header by save_sale_with_items directly.
+                # devis_number is managed by the host-side backfill/allocator,
+                # never sent by the client.
             },
             "report": {
                 "id": "r",

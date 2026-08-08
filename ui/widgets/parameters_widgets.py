@@ -126,7 +126,12 @@ class StringWidget(QWidget):
         
         # Set enabled state
         self.line_edit.setEnabled(editable)
-        
+
+        # Honor an optional maximum length (e.g. the Devis reference).
+        max_length = param_info.get('maxlength')
+        if max_length:
+            self.line_edit.setMaxLength(int(max_length))
+
         # Connect validation
         self.line_edit.textChanged.connect(self.validate_input)
         

@@ -1,0 +1,144 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <title>Relevé de Compte Client</title>
+  <style>
+    @page { size: A4 portrait; margin: 11mm 12mm 21mm; @bottom-center { content: "Page " counter(page) " / " counter(pages) "   •   Document généré par PyLocalInventory"; font: 8.5px Arial; color: #43555a; } }
+    * { box-sizing: border-box; }
+    html, body { margin: 0; padding: 0; background: #fff; color: #202a2d; }
+    body { font-family: Arial, Helvetica, sans-serif; font-size: 11px; line-height: 1.35; }
+    .document { width: 100%; }
+
+    /* ---------- Company / document header ---------- */
+    .top { display: table; width: 100%; table-layout: fixed; margin-bottom: 6mm; page-break-inside: avoid; }
+    .company-panel, .document-panel { display: table-cell; vertical-align: top; }
+    .company-panel { width: 56%; padding-right: 8mm; }
+    .document-panel { width: 44%; text-align: right; }
+    .report-logo { display: block; width: 112px !important; max-width: 112px !important; max-height: 67px !important; height: auto !important; object-fit: contain; margin: 0 0 2.5mm !important; }
+    .company-name { margin: 0 0 1.2mm; font-size: 13px; font-weight: 700; letter-spacing: .25px; color: #18272b; }
+    .company-lines { font-size: 9.5px; line-height: 1.45; }
+    .company-lines strong { display: inline-block; min-width: 13mm; }
+    .company-legal { margin-top: 1.2mm; font-size: 8.2px; line-height: 1.35; color: #3f5155; }
+    .document-title { margin: 1mm 0 2mm; font-size: 16px; font-weight: 700; letter-spacing: .5px; color: #183d46; text-transform: uppercase; }
+    .document-meta { display: inline-block; text-align: left; border: 1px solid #315b63; border-collapse: collapse; font-size: 10px; }
+    .document-meta td { padding: 1mm 2.5mm; }
+    .document-meta .k { color: #315b63; font-weight: 700; padding-right: 5mm; }
+
+    /* ---------- Client block ---------- */
+    .client-box { border: 1px solid #315b63; padding: 3mm 4mm; margin-bottom: 5mm; page-break-inside: avoid; }
+    .client-caption { margin: 0 0 1.5mm; padding-bottom: 1mm; border-bottom: 1px solid #b7c9cd; color: #315b63; font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+    .client-name { font-size: 12.5px; font-weight: 700; margin-bottom: 1mm; }
+    .client-lines { font-size: 10px; line-height: 1.55; }
+    .client-lines .field { display: inline-block; margin-right: 7mm; }
+    .client-lines strong { color: #315b63; }
+
+    /* ---------- Global account summary ---------- */
+    .global-summary { display: table; width: 100%; table-layout: fixed; border-collapse: collapse; margin: 0 0 6.5mm; page-break-inside: avoid; }
+    .global-summary .cell { display: table-cell; border: 1.5px solid #315b63; background: #eef4f6; text-align: center; padding: 3mm 2mm; }
+    .global-summary .cell + .cell { border-left: none; }
+    .global-summary .label { display: block; color: #315b63; font-size: 8.5px; font-weight: 700; text-transform: uppercase; letter-spacing: .6px; margin-bottom: 1.2mm; }
+    .global-summary .value { display: block; font-size: 13.5px; font-weight: 700; color: #183d46; }
+    .global-summary .cell.due { background: #fbf0e8; }
+    .global-summary .cell.due .value { color: #b3421b; }
+
+    /* ---------- Sale section ---------- */
+    .sale { margin-bottom: 7mm; page-break-inside: auto; break-inside: auto; }
+    .sale-header { border-bottom: 2px solid #147b8b; padding-bottom: 1.2mm; margin-bottom: 3mm; page-break-after: avoid; break-after: avoid; }
+    .sale-title { font-size: 12.5px; font-weight: 700; color: #183d46; letter-spacing: .3px; }
+    .devis-badge { display: inline-block; margin-left: 2mm; padding: .6mm 2.2mm; border: 1px solid #147b8b; border-radius: 2px; background: #eef4f6; color: #147b8b; font-size: 9px; font-weight: 700; letter-spacing: .3px; vertical-align: 1px; }
+    .sale-meta { font-size: 9.5px; color: #43555a; margin-top: .6mm; }
+    .sale-meta strong { color: #244c55; }
+    .sale-subtitle { margin: 0 0 1.2mm; color: #244c55; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+
+    /* ---------- Items table ---------- */
+    .items-table { width: 100%; border-collapse: collapse; }
+    .items-table thead { display: table-header-group; }
+    .items-table th { padding: 2mm 1.6mm; border: 1px solid #173f49; background: #147b8b; color: #fff; font-size: 9.5px; font-weight: 700; text-align: center; }
+    .items-table th:nth-child(1) { width: 34%; text-align: left; }
+    .items-table th:nth-child(2) { width: 27%; text-align: left; }
+    .items-table th:nth-child(3) { width: 9%; }
+    .items-table th:nth-child(4) { width: 14%; text-align: right; }
+    .items-table th:nth-child(5) { width: 16%; text-align: right; }
+    .items-table td { padding: 1.8mm 1.6mm; border: 1px solid #36565d; background: #fff; vertical-align: top; font-size: 10px; line-height: 1.3; overflow-wrap: anywhere; word-wrap: break-word; }
+    .items-table td:nth-child(1) { text-align: left; }
+    .items-table td:nth-child(2) { text-align: left; color: #43555a; }
+    .items-table td:nth-child(3) { text-align: center; white-space: nowrap; }
+    .items-table td:nth-child(4), .items-table td:nth-child(5) { text-align: right; white-space: nowrap; }
+    .items-table tr { page-break-inside: avoid; break-inside: avoid; }
+    .item-name { font-weight: 700; }
+    .item-detail { display: block; color: #43555a; font-size: 9.5px; font-weight: 400; white-space: normal; }
+
+    /* ---------- Sale totals + payment history ---------- */
+    .sale-bottom { display: table; width: 100%; table-layout: fixed; margin-top: 3mm; page-break-inside: avoid; break-inside: avoid; }
+    .totals-panel, .payments-panel { display: table-cell; vertical-align: top; }
+    .totals-panel { width: 44%; padding-right: 5mm; }
+    .payments-panel { width: 56%; }
+    .totals-table { width: 100%; border-collapse: collapse; }
+    .totals-table th, .totals-table td { border: 1px solid #31545c; padding: 1.5mm 2mm; font-size: 9.7px; }
+    .totals-table th { width: 62%; background: #e7eff1; text-align: left; font-weight: 700; color: #244c55; }
+    .totals-table td { text-align: right; white-space: nowrap; }
+    .totals-table .grand-total th { background: #147b8b; color: #fff; }
+    .totals-table .grand-total td { font-size: 10.5px; font-weight: 700; color: #153f48; }
+    .totals-table .paid td { color: #1d7a46; font-weight: 700; }
+    .totals-table .due td { color: #b3421b; font-weight: 700; }
+
+    .section-label { margin: 0 0 1.2mm; color: #244c55; font-size: 9px; font-weight: 700; text-transform: uppercase; letter-spacing: .5px; }
+    .payments-table { width: 100%; border-collapse: collapse; }
+    .payments-table th { padding: 1.5mm 2mm; border: 1px solid #173f49; background: #315b63; color: #fff; font-size: 9px; font-weight: 700; text-align: center; }
+    .payments-table th:nth-child(1) { text-align: left; width: 30%; }
+    .payments-table th:nth-child(2), .payments-table th:nth-child(3) { text-align: right; }
+    .payments-table td { padding: 1.5mm 2mm; border: 1px solid #36565d; background: #fff; font-size: 9.7px; }
+    .payments-table td:nth-child(1) { text-align: left; white-space: nowrap; }
+    .payments-table td:nth-child(2), .payments-table td:nth-child(3) { text-align: right; white-space: nowrap; }
+    .payments-table tr { page-break-inside: avoid; break-inside: avoid; }
+    .no-payments { padding: 1.8mm 2mm; border: 1px dashed #9aabad; color: #55676a; font-size: 9.7px; }
+    .payments-summary { font-size: 9.7px; margin-top: 1.5mm; }
+    .payments-summary strong { color: #244c55; }
+
+    /* ---------- Final summary + footer ---------- */
+    .final-summary { margin-top: 2mm; page-break-inside: avoid; break-inside: avoid; }
+    .final-summary .totals-table { width: 62%; margin-left: 38%; }
+    .report-footer { margin-top: 5mm; border-top: 1.5px solid #147b8b; padding-top: 2.5mm; font-size: 8.7px; line-height: 1.45; text-align: center; color: #43555a; white-space: pre-line; page-break-inside: avoid; break-inside: avoid; }
+
+    @media screen {
+      body { background: #e7ebec; padding: 12px; }
+      .document { width: 210mm; margin: 0 auto; padding: 10mm 11mm 9mm; background: #fff; box-shadow: 0 1px 8px rgba(0,0,0,.18); }
+    }
+    @media print {
+      html, body { width: 210mm; }
+      body { -webkit-print-color-adjust: exact; print-color-adjust: exact; }
+    }
+  </style>
+</head>
+<body>
+  <div class="document">
+    <header class="top">
+      <section class="company-panel">
+        {{ logo_block }}
+        <div class="company-name">LAMIDAP SARL</div>
+        <div class="company-lines">
+          <div>288, Zone Industrielle Gzenaya</div>
+          <div>90000 Tanger</div>
+          <div><strong>Tél :</strong> +212 539 39 45 60</div>
+          <div><strong>Email :</strong> lamidap@gmail.com</div>
+        </div>
+        <div class="company-legal">ICE: 000066710000023 - IF: 04909316 - RC: 31073 - Patente: 52981388 - CNSS: 7412042</div>
+      </section>
+      <section class="document-panel">
+        <div class="document-title">{{ document_title }}</div>
+        <table class="document-meta"><tr><td class="k">Date</td><td>{{ document_date }}</td></tr></table>
+      </section>
+    </header>
+
+    <section class="client-box">{{ client_block }}</section>
+    <section class="global-summary">{{ global_summary }}</section>
+    <main class="sales">{{ sales_content }}</main>
+    {{ final_summary }}
+
+    <footer class="report-footer">
+      {{ report_footer }}
+    </footer>
+  </div>
+</body>
+</html>

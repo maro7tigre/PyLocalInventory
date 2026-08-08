@@ -11,6 +11,7 @@ import re
 import json
 import logging
 from datetime import datetime
+from decimal import Decimal
 # haitam
 import psycopg2
 from psycopg2 import OperationalError
@@ -42,6 +43,92 @@ _ORDER_NUMERIC_COLUMNS = {
     'total_price', 'total_ht', 'total_ttc', 'vat_amount',
     'total_quantity', 'total_production', 'created_by',
 }
+
+# Canonical Client Account schema.
+#
+# get_client_account() joins Sales + Sales_Items and returns every field as a
+# named value. Every layer that consumes a client account - the LAN RPC server,
+# the RemoteDatabase client, the ClientDetailsDialog worker, the Purchases /
+# Payment History tables and the print workers - must use these exact names.
+# Never let a consumer unpack these rows by position; the column count has
+# grown before and the fragile positional unpacking is what crashed View
+# Client ("too many values to unpack (expected 9, got 14)").
+CLIENT_ACCOUNT_PURCHASE_FIELDS = (
+    "sale_id", "date", "state", "item_id", "product", "quantity",
+    "unit_price", "vat", "remise", "information", "production",
+    "notes", "is_historical", "created_by_username",
+)
+CLIENT_ACCOUNT_PAYMENT_FIELDS = (
+    "payment_id", "sale_id", "item_id", "date", "amount",
+)
+
+# Canonical per-Sale summary schema returned by get_client_sale_summaries().
+# One row per Sale (never one per item) so the Sales History table never needs
+# to download every Sale Item. ``devis`` is the display string DE-YEAR-N.
+CLIENT_ACCOUNT_SALE_FIELDS = (
+    "sale_id", "date", "state", "is_historical", "devis", "total", "paid",
+    "remaining",
+)
+
+# Year a Devis number is scoped to: the first 4-digit group in the sale date,
+# falling back to created_at, then 0. Kept as a single SQL expression so the
+# per-year backfill and the summaries query always agree on the same year.
+_DEVIS_YEAR_EXPR = (
+    "COALESCE("
+    "NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{4}'), ''), "
+    "NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{4}'), ''), "
+    "'0')"
+)
+
+# Maximum length of the canonical Devis reference (e.g. "DE-2026-525-A").
+# The GUI and the host-side resolver both enforce this bound.
+DEVIS_MAX_LENGTH = 40
+
+# Year a Bon de Livraison number is scoped to: the first 4-digit group in the
+# import date, falling back to created_at, then 0. Mirrors _DEVIS_YEAR_EXPR
+# (the importing alias is "s", matching the backfill/allocator call sites).
+_BL_YEAR_EXPR = (
+    "COALESCE("
+    "NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{4}'), ''), "
+    "NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{4}'), ''), "
+    "'0')"
+)
+
+# Maximum length of the persistent Bon de Livraison reference (BL-YEAR-N).
+# Enforced by the host-side resolver only - the value is never user-editable.
+BL_MAX_LENGTH = 40
+
+
+def normalize_client_sale_summaries(sale_rows, payment_rows):
+    """Convert raw summaries/payment rows to the sale-level account contract.
+
+    ``sale_rows`` follow ``CLIENT_ACCOUNT_SALE_FIELDS`` and ``payment_rows``
+    follow ``CLIENT_ACCOUNT_PAYMENT_FIELDS`` (both are already in the named
+    order used by the dialog and the report workers).
+    """
+    sales = [dict(zip(CLIENT_ACCOUNT_SALE_FIELDS, row)) for row in sale_rows]
+    payments = [
+        dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"sales": sales, "payments": payments}
+
+
+def normalize_client_account(purchase_rows, payment_rows):
+    """Convert raw Sales/Sales_Items and Payments rows to canonical dicts.
+
+    ``purchase_rows`` follow ``CLIENT_ACCOUNT_PURCHASE_FIELDS`` (the 14-column
+    Sales x Sales_Items join) and ``payment_rows`` follow
+    ``CLIENT_ACCOUNT_PAYMENT_FIELDS``. The returned structure is the single
+    Client Account data contract shared by the host GUI, the LAN RPC layer and
+    the View Client dialog / reports.
+    """
+    purchases = [
+        dict(zip(CLIENT_ACCOUNT_PURCHASE_FIELDS, row)) for row in purchase_rows
+    ]
+    payments = [
+        dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"purchases": purchases, "payments": payments}
 
 
 class Database:
@@ -353,6 +440,18 @@ class Database:
         # Ensure new snapshot columns exist (idempotent)
         self._ensure_additional_columns()
 
+        # Persist the per-year Devis reference for any sale that still lacks
+        # one (legacy data and sales created since the last startup). Runs on
+        # the trusted host only - never part of Sale Save logic.
+        self._ensure_devis_numbers()
+        # Persist the canonical TEXT reference for rows that only have a number.
+        self._ensure_devis_text()
+
+        # Persist per-year Bon de Livraison references for any import that
+        # still lacks one (legacy data and imports created since the last
+        # startup). Idempotent - allocated numbers are never renumbered.
+        self._ensure_bl_numbers()
+
     def _ensure_additional_columns(self):
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
@@ -380,11 +479,26 @@ class Database:
                 # Default FALSE so every existing sale stays a normal sale.
                 'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
                 'remise': 'DOUBLE PRECISION',
+                # Persistent per-year sequential Devis reference (DE-YEAR-N).
+                # NULL until the one-time/on-read backfill assigns it - see
+                # _ensure_devis_numbers(). Never part of Sale Save logic.
+                'devis_number': 'INTEGER',
+                # Canonical, user-editable Devis reference (e.g. DE-2026-525-A).
+                # Backfilled once from devis_number for legacy rows, then this
+                # TEXT is authoritative: manual values are stored verbatim and
+                # never silently renumbered. Enforced unique by
+                # sales_devis_uidx; the host allocates/validates on save.
+                'devis': 'TEXT',
             },
             'imports': {
                 'supplier_name': 'TEXT', 'supplier_id': 'INTEGER',
                 'created_by': 'INTEGER', 'created_by_username': 'TEXT',
                 'created_at': 'TEXT', 'operation_token': 'TEXT',
+                # Persistent per-year sequential Bon de Livraison reference
+                # (BL-YEAR-N). NULL until backfilled or allocated on first
+                # print/save. Allocated by the host only - never part of the
+                # client Import payload. Enforced unique by imports_bl_uidx.
+                'bl_number': 'TEXT',
             },
             'reports': {
                 'report_type': 'TEXT', 'created_by': 'INTEGER',
@@ -444,6 +558,12 @@ class Database:
                 "ON suppliers (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
                 "CREATE UNIQUE INDEX IF NOT EXISTS sales_operation_token_uidx "
                 "ON sales(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS sales_devis_uidx "
+                "ON sales (LOWER(BTRIM(devis))) "
+                "WHERE devis IS NOT NULL AND BTRIM(devis) <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS imports_bl_uidx "
+                "ON imports (LOWER(BTRIM(bl_number))) "
+                "WHERE bl_number IS NOT NULL AND BTRIM(bl_number) <> ''",
                 "CREATE UNIQUE INDEX IF NOT EXISTS imports_operation_token_uidx "
                 "ON imports(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
             )
@@ -564,6 +684,366 @@ class Database:
         except Exception as e:
             self.conn.rollback()
             print(f"Warning: could not create Payments table: {e}")
+
+    def _ensure_devis_numbers(self, sale_ids=None):
+        """Assign persistent per-year Devis numbers (DE-YEAR-N) to sales.
+
+        The number is stored on ``sales.devis_number`` so it is stable across
+        restarts, refreshes, other PCs and report printing. Legacy sales and
+        sales created since the last host startup are backfilled in ascending
+        ``sales.id`` order within each year, starting after the highest number
+        already assigned for that year. Already-assigned rows are never
+        touched, so the backfill is idempotent and renumbering never happens.
+
+        ``sale_ids`` optionally restricts the backfill to a subset (used by the
+        read path when a sale is about to be displayed but has no number yet).
+        When ``sale_ids`` is omitted every missing number is assigned in one
+        statement.
+
+        Returns the number of sales that were assigned a Devis number.
+        """
+        try:
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS sales_devis_number_idx ON sales(devis_number)"
+            )
+            extra = ""
+            params = []
+            if sale_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(sale_id) for sale_id in sale_ids])
+            sql = f"""
+                WITH year_map AS (
+                    SELECT s.id AS sale_id,
+                           {_DEVIS_YEAR_EXPR} AS y
+                    FROM sales s
+                    WHERE s.devis_number IS NULL {extra}
+                ),
+                grouped AS (
+                    SELECT ym.sale_id, ym.y,
+                           ROW_NUMBER() OVER (PARTITION BY ym.y ORDER BY ym.sale_id) AS rn
+                    FROM year_map ym
+                ),
+                base AS (
+                    SELECT COALESCE(NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{{4}}'), ''),
+                                    NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{{4}}'), ''),
+                                    '0') AS y,
+                           MAX(s.devis_number) AS m
+                    FROM sales s
+                    WHERE s.devis_number IS NOT NULL
+                    GROUP BY 1
+                )
+                UPDATE sales s
+                SET devis_number = g.rn + COALESCE(b.m, 0)
+                FROM grouped g
+                LEFT JOIN base b ON b.y = g.y
+                WHERE s.id = g.sale_id
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "Devis backfill assigned=%s restricted=%s",
+                    assigned, bool(sale_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("Devis backfill failed: %s", exc)
+            return 0
+
+    def _ensure_devis_text(self, sale_ids=None):
+        """Persist the canonical ``sales.devis`` TEXT reference from the
+        per-year ``devis_number`` for any sale that has a number but no text.
+
+        Legacy rows and rows created before the TEXT column existed get
+        ``DE-YEAR-N`` written once; afterwards the text is authoritative and
+        the backfill never touches a non-empty value. ``sale_ids`` optionally
+        restricts the backfill (read path). Returns rows updated.
+        """
+        try:
+            extra = ""
+            params = []
+            if sale_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(sale_id) for sale_id in sale_ids])
+            sql = f"""
+                UPDATE sales s
+                SET devis = 'DE-' || {_DEVIS_YEAR_EXPR} || '-' || s.devis_number
+                WHERE (s.devis IS NULL OR BTRIM(s.devis) = '')
+                  AND s.devis_number IS NOT NULL {extra}
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "Devis text backfill assigned=%s restricted=%s",
+                    assigned, bool(sale_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("Devis text backfill failed: %s", exc)
+            return 0
+
+    @staticmethod
+    def _devis_year_from_date(date_value):
+        """First 4-digit group of a date string, else the current year."""
+        if date_value:
+            match = re.search(r"\d{4}", str(date_value))
+            if match:
+                return match.group(0)
+        return str(datetime.now().year)
+
+    def _allocate_devis_number(self, sale_id, header):
+        """Allocate the next per-year Devis number and store it on ``header``.
+
+        Runs inside the sale-save transaction on the host - never on a GUI
+        thread - so two clients cannot race a SELECT MAX+1. The unique index
+        ``sales_devis_uidx`` remains the hard backstop.
+        """
+        year = self._devis_year_from_date(header.get("date"))
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(devis_number), 0) + 1 FROM ("
+            f"SELECT s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year "
+            "FROM sales s) sub WHERE sub.devis_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        header["devis"] = f"DE-{year}-{next_num}"
+        header["devis_number"] = next_num
+
+    def _resolve_sale_devis(self, sale_id, header):
+        """Host-side Devis resolution for creates and edits.
+
+        Mutates ``header`` with the authoritative ``devis`` (and
+        ``devis_number`` when one was allocated). Rules:
+
+        * A provided reference is stored verbatim (never silently changed)
+          and must be unique (case-insensitive) among all other sales.
+        * An empty reference on a create allocates the next per-year number.
+        * An empty reference on an edit preserves the stored reference, or
+          allocates one for legacy rows that have none yet.
+
+        Raises ValueError for over-length or duplicate references.
+        """
+        raw_devis = ""
+        if "devis" in header:
+            raw_devis = " ".join(str(header["devis"] or "").split())
+        if len(raw_devis) > DEVIS_MAX_LENGTH:
+            raise ValueError(
+                f"Devis must be at most {DEVIS_MAX_LENGTH} characters"
+            )
+        if raw_devis:
+            header["devis"] = raw_devis
+            dup_params = [self._normalize_exact(raw_devis)]
+            dup_sql = (
+                "SELECT id FROM sales WHERE LOWER(BTRIM(devis)) = %s "
+                "AND devis IS NOT NULL AND BTRIM(devis) <> ''"
+            )
+            if sale_id:
+                dup_sql += " AND id != %s"
+                dup_params.append(int(sale_id))
+            self.cursor.execute(dup_sql, dup_params)
+            if self.cursor.fetchone():
+                raise ValueError(
+                    f"Devis '{raw_devis}' is already used by another sale"
+                )
+        elif sale_id:
+            self.cursor.execute(
+                "SELECT devis FROM sales WHERE id = %s", (int(sale_id),)
+            )
+            stored_row = self.cursor.fetchone()
+            stored_devis = (stored_row[0] or "").strip() if stored_row else ""
+            if stored_devis:
+                header["devis"] = stored_devis
+            else:
+                self._allocate_devis_number(sale_id, header)
+        else:
+            self._allocate_devis_number(None, header)
+        return header
+
+    def get_next_devis_preview(self, date=None):
+        """Propose the next per-year Devis reference (DE-YEAR-N) for the UI.
+
+        Read-only and advisory: the definitive allocation/validation happens in
+        ``_resolve_sale_devis`` inside ``save_sale_with_items`` at commit time.
+        """
+        year = self._devis_year_from_date(date)
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(devis_number), 0) + 1 FROM ("
+            f"SELECT s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year "
+            "FROM sales s) sub WHERE sub.devis_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        return f"DE-{year}-{next_num}"
+
+    def _ensure_bl_numbers(self, import_ids=None):
+        """Assign persistent per-year Bon de Livraison references (BL-YEAR-N).
+
+        Backfills ``imports.bl_number`` for any import that still has none, in
+        ascending ``imports.id`` order within each year, starting after the
+        highest number already assigned for that year. Already-assigned rows
+        are never touched, so the backfill is idempotent and renumbering never
+        happens. ``import_ids`` optionally restricts the backfill (read path).
+
+        Returns the number of imports that were assigned a BL reference.
+        """
+        try:
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS imports_bl_number_idx ON imports(bl_number)"
+            )
+            extra = ""
+            params = []
+            if import_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(import_id) for import_id in import_ids])
+            sql = f"""
+                WITH year_map AS (
+                    SELECT s.id AS import_id,
+                           {_BL_YEAR_EXPR} AS y
+                    FROM imports s
+                    WHERE (s.bl_number IS NULL OR BTRIM(s.bl_number) = '') {extra}
+                ),
+                grouped AS (
+                    SELECT ym.import_id, ym.y,
+                           ROW_NUMBER() OVER (PARTITION BY ym.y ORDER BY ym.import_id) AS rn
+                    FROM year_map ym
+                ),
+                base AS (
+                    SELECT COALESCE(NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{{4}}'), ''),
+                                    NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{{4}}'), ''),
+                                    '0') AS y,
+                           MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{{4}}-(\\d+)') AS INTEGER)) AS m
+                    FROM imports s
+                    WHERE s.bl_number IS NOT NULL
+                      AND BTRIM(s.bl_number) <> ''
+                      AND s.bl_number ~ '^BL-\\d{{4}}-\\d+$'
+                    GROUP BY 1
+                )
+                UPDATE imports s
+                SET bl_number = 'BL-' || g.y || '-' || (g.rn + COALESCE(b.m, 0))
+                FROM grouped g
+                LEFT JOIN base b ON b.y = g.y
+                WHERE s.id = g.import_id
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "BL backfill assigned=%s restricted=%s",
+                    assigned, bool(import_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("BL backfill failed: %s", exc)
+            return 0
+
+    def _allocate_bl_number(self, import_id, header):
+        """Allocate the next per-year Bon de Livraison number and store it on
+        ``header``.
+
+        Runs inside the import-save transaction on the host - never on a GUI
+        thread - so two clients cannot race a SELECT MAX+1. The unique index
+        ``imports_bl_uidx`` remains the hard backstop.
+        """
+        year = self._devis_year_from_date(header.get("date"))
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{4}-(\\d+)') "
+            "AS INTEGER)), 0) + 1 FROM ("
+            f"SELECT s.bl_number, {_BL_YEAR_EXPR} AS bl_year "
+            "FROM imports s) sub WHERE sub.bl_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        header["bl_number"] = f"BL-{year}-{next_num}"
+
+    def _resolve_import_bl(self, import_id, header):
+        """Host-side Bon de Livraison reference resolution for creates/edits.
+
+        Mutates ``header`` with the authoritative ``bl_number``. Rules:
+
+        * A provided reference is stored verbatim (never silently changed)
+          and must be unique (case-insensitive) among all other imports.
+        * An empty reference on a create allocates the next per-year number.
+        * An empty reference on an edit preserves the stored reference, or
+          allocates one for legacy rows that have none yet.
+
+        Raises ValueError for over-length or duplicate references.
+        """
+        raw_bl = ""
+        if "bl_number" in header:
+            raw_bl = " ".join(str(header["bl_number"] or "").split())
+        if len(raw_bl) > BL_MAX_LENGTH:
+            raise ValueError(
+                f"Bon de livraison must be at most {BL_MAX_LENGTH} characters"
+            )
+        if raw_bl:
+            header["bl_number"] = raw_bl
+            dup_params = [self._normalize_exact(raw_bl)]
+            dup_sql = (
+                "SELECT id FROM imports WHERE LOWER(BTRIM(bl_number)) = %s "
+                "AND bl_number IS NOT NULL AND BTRIM(bl_number) <> ''"
+            )
+            if import_id:
+                dup_sql += " AND id != %s"
+                dup_params.append(int(import_id))
+            self.cursor.execute(dup_sql, dup_params)
+            if self.cursor.fetchone():
+                raise ValueError(
+                    f"Bon de livraison '{raw_bl}' is already used by another import"
+                )
+        elif import_id:
+            self.cursor.execute(
+                "SELECT bl_number FROM imports WHERE id = %s", (int(import_id),)
+            )
+            stored_row = self.cursor.fetchone()
+            stored_bl = (stored_row[0] or "").strip() if stored_row else ""
+            if stored_bl:
+                header["bl_number"] = stored_bl
+            else:
+                self._allocate_bl_number(import_id, header)
+        else:
+            self._allocate_bl_number(None, header)
+        return header
+
+    def get_import_bl_number(self, import_id):
+        """Return the persistent Bon de Livraison reference for an import.
+
+        Allocates and persists ``BL-YEAR-N`` on first access for legacy rows,
+        so reprinting the same import always keeps the same number. Host-side
+        only (never runs in the GUI thread); the unique index
+        ``imports_bl_uidx`` remains the concurrency backstop.
+        """
+        import_id = int(import_id)
+        self.cursor.execute(
+            "SELECT bl_number FROM imports WHERE id = %s", (import_id,)
+        )
+        row = self.cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Import {import_id} does not exist")
+        stored = (row[0] or "").strip()
+        if stored:
+            return stored
+        self.cursor.execute(
+            "SELECT date FROM imports WHERE id = %s", (import_id,)
+        )
+        date_row = self.cursor.fetchone()
+        header = {"date": date_row[0] if date_row else None}
+        self._allocate_bl_number(import_id, header)
+        self.cursor.execute(
+            "UPDATE imports SET bl_number = %s WHERE id = %s",
+            (header["bl_number"], import_id),
+        )
+        self.conn.commit()
+        return header["bl_number"]
 
     # ---------------- Migration & Meta Helpers -----------------
     def _ensure_meta_table(self):
@@ -1396,6 +1876,10 @@ class Database:
                 ):
                     header.pop(protected, None)
 
+            # Host-side Devis resolution (create & edit): validates or allocates
+            # the canonical per-sale reference before anything is written.
+            self._resolve_sale_devis(sale_id, header)
+
             # Resolve the relational client ID server-side for every create and
             # edit. The name remains a historical snapshot, but all client-sale
             # views filter exclusively on this immutable database ID.
@@ -1728,6 +2212,10 @@ class Database:
             header["supplier_id"] = int(supplier[0])
             header["supplier_name"] = supplier[1] or supplier_username
             header["supplier_username"] = supplier[2] or supplier_username
+
+            # Allocate/preserve the persistent Bon de Livraison reference on
+            # the host inside this transaction (never in the GUI thread).
+            self._resolve_import_bl(import_id, header)
 
             if import_id:
                 import_id = int(import_id)
@@ -2186,8 +2674,19 @@ class Database:
             f"{vat_expr} AS vat_amount, "
             f"COALESCE(summary.information, '') AS information, "
             f"COALESCE(summary.total_quantity, 0) AS total_quantity, "
-            f"COALESCE(summary.total_production, 0) AS total_production "
-            f"FROM {base_table} s "
+            f"COALESCE(summary.total_production, 0) AS total_production"
+        )
+        if section == 'Sales':
+            # The persisted devis reference wins; legacy rows (or rows saved
+            # before the TEXT column backfill) fall back to a computed
+            # DE-YEAR-N so the Sales table always shows a stable reference.
+            # The later duplicate "devis" key overrides s.* in the row dict.
+            query += (
+                f", COALESCE(NULLIF(BTRIM(s.devis), ''), "
+                f"'DE-' || {_DEVIS_YEAR_EXPR} || '-' || COALESCE(s.devis_number::text, '')) AS devis"
+            )
+        query += (
+            f" FROM {base_table} s "
             f"LEFT JOIN ("
             f"  SELECT si.{foreign_key}, "
             f"         SUM(si.quantity * si.unit_price) AS subtotal, "
@@ -2877,7 +3376,10 @@ class Database:
             "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
             "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
             "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
-            "COALESCE(s.remise, 0) "
+            "COALESCE(s.remise, 0), "
+            "COALESCE(si.information, ''), COALESCE(si.production, 0), "
+            "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
+            "COALESCE(s.created_by_username, '') "
             "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
             f"WHERE {match_clause} ORDER BY s.id, si.id"
         )
@@ -2903,9 +3405,226 @@ class Database:
             mode, user_id, role_id, client_id, match_params,
             len(sale_ids), len(purchase_rows), len(payment_rows),
         )
+        # Canonical named schema - see normalize_client_account() above.
+        return normalize_client_account(purchase_rows, payment_rows)
+
+    def get_client_sale_summaries(self, client_id, user=None):
+        """Return one row per Sale (never one per item) plus payment history.
+
+        The Sales History table only needs sale-level facts - Sale #, date,
+        Devis, status and the financial block - so this method aggregates the
+        sale items instead of downloading them. Per-Sale TTC uses the same
+        central formulas as the Client Account dialog and ``paid`` is capped at
+        the sale total so an overpayment can never push it past Total.
+
+        Devis numbers are assigned and persisted before returning: a sale can
+        be created after the last host-startup backfill and must still show a
+        stable, sequential, per-year reference across refreshes and printing.
+        """
+        client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM clients WHERE id = %s", (client_id,)
+        )
+        client_row = self.cursor.fetchone()
+        if not client_row:
+            logger.warning(
+                "get_client_sale_summaries: client not found client_id=%s "
+                "mode=%s user_id=%s",
+                client_id, mode, user_id,
+            )
+            raise ValueError(f"Client {client_id} does not exist")
+        norm = self._normalize_exact(client_row[1]) if client_row[1] else None
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            match_params = [client_id, norm]
+        else:
+            match_clause = "s.client_id=%s"
+            match_params = [client_id]
+
+        sql = (
+            f"SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            f"COALESCE(s.is_historical, FALSE), "
+            f"COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number, "
+            f"{_DEVIS_YEAR_EXPR} AS devis_year, "
+            f"COALESCE(s.tva, 0), COALESCE(s.remise, 0), "
+            f"COALESCE(SUM(si.quantity * si.unit_price), 0) "
+            f"FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id "
+            f"WHERE {match_clause} "
+            f"GROUP BY s.id, s.date, s.state, s.is_historical, s.devis, "
+            f"s.devis_number, "
+            f"devis_year, s.tva, s.remise, s.created_at "
+            f"ORDER BY s.id"
+        )
+        self.cursor.execute(sql, tuple(match_params))
+        rows = self.cursor.fetchall()
+
+        # Persist missing Devis numbers/text (a sale may have been created
+        # after the last startup backfill), then re-read so every returned
+        # summary has a stable reference.
+        missing_num = [row[0] for row in rows if row[5] is None]
+        missing_text = [
+            row[0] for row in rows
+            if not (row[4] or "").strip() and row[5] is not None
+        ]
+        if missing_num:
+            self._ensure_devis_numbers(missing_num)
+        if missing_num or missing_text:
+            self._ensure_devis_text(missing_num + missing_text)
+            self.cursor.execute(sql, tuple(match_params))
+            rows = self.cursor.fetchall()
+
+        from core.calculations import calculate_operation_totals, to_decimal
+        sale_rows = []
+        for row in rows:
+            sale_id, date, state, is_hist, devis_text, devis_number, year, vat, remise, raw = row
+            total = calculate_operation_totals(
+                to_decimal(raw), to_decimal(remise), to_decimal(vat)
+            )["total_ttc"]
+            if devis_text:
+                devis = devis_text
+            elif devis_number is not None:
+                devis = f"DE-{year}-{devis_number}"
+            else:
+                devis = f"DE-{year}-"
+            sale_rows.append([
+                sale_id, date, state, is_hist, devis, total,
+                Decimal("0"), Decimal("0"),
+            ])
+
+        payment_rows = []
+        if sale_rows:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                ([sale[0] for sale in sale_rows],),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        paid_by_sale = {}
+        for row in payment_rows:
+            paid_by_sale[row[1]] = paid_by_sale.get(row[1], Decimal("0")) + to_decimal(
+                row[4]
+            )
+        for sale in sale_rows:
+            total = sale[5]
+            paid = min(paid_by_sale.get(sale[0], Decimal("0")), total)
+            sale[6] = paid
+            sale[7] = max(total - paid, Decimal("0"))
+
+        logger.info(
+            "get_client_sale_summaries: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sale_count=%s payment_count=%s",
+            mode, user_id, role_id, client_id, len(sale_rows), len(payment_rows),
+        )
+        return normalize_client_sale_summaries(sale_rows, payment_rows)
+
+    def get_client_sale_items(self, sale_id, user=None):
+        """Return one Sale's item rows + its payments (for single-sale PDFs).
+
+        The Sales History table never calls this - only the "Print Selected
+        Sale" report path needs the item-level detail. Returns the canonical
+        purchase rows (same named fields as ``get_client_account``) plus the
+        sale's payments and a tiny sale block carrying the Devis reference.
+        """
+        sale_id = int(sale_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+
+        sql = (
+            "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
+            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
+            "COALESCE(s.remise, 0), "
+            "COALESCE(si.information, ''), COALESCE(si.production, 0), "
+            "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
+            "COALESCE(s.created_by_username, '') "
+            "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
+            "WHERE s.id = %s ORDER BY si.id"
+        )
+        self.cursor.execute(sql, (sale_id,))
+        purchase_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+            FROM payments p
+            WHERE p.sale_id = %s
+            ORDER BY p.id DESC
+            """,
+            (sale_id,),
+        )
+        payment_rows = self.cursor.fetchall()
+
+        # Sale-level block (Devis reference) used by the print worker.
+        self.cursor.execute(
+            f"""
+            SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'),
+                   COALESCE(s.is_historical, FALSE),
+                   COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number,
+                   {_DEVIS_YEAR_EXPR} AS devis_year
+            FROM sales s
+            WHERE s.id = %s
+            """,
+            (sale_id,),
+        )
+        sale_row = self.cursor.fetchone()
+        sale_block = []
+        if sale_row:
+            if sale_row[5] is None or not (sale_row[4] or "").strip():
+                self._ensure_devis_numbers([sale_row[0]])
+                self._ensure_devis_text([sale_row[0]])
+                self.cursor.execute(
+                    f"""
+                    SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'),
+                           COALESCE(s.is_historical, FALSE),
+                           COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number,
+                           {_DEVIS_YEAR_EXPR} AS devis_year
+                    FROM sales s
+                    WHERE s.id = %s
+                    """,
+                    (sale_id,),
+                )
+                sale_row = self.cursor.fetchone()
+            if sale_row:
+                devis_text, devis_number, year = sale_row[4], sale_row[5], sale_row[6]
+                if devis_text:
+                    devis = devis_text
+                elif devis_number is not None:
+                    devis = f"DE-{year}-{devis_number}"
+                else:
+                    devis = f"DE-{year}-"
+                sale_block = [{
+                    "sale_id": sale_row[0],
+                    "date": sale_row[1],
+                    "state": sale_row[2],
+                    "is_historical": sale_row[3],
+                    "devis": devis,
+                }]
+
+        logger.info(
+            "get_client_sale_items: mode=%s user_id=%s role_id=%s sale_id=%s "
+            "item_rows=%s payment_count=%s",
+            mode, user_id, role_id, sale_id, len(purchase_rows), len(payment_rows),
+        )
         return {
-            "purchases": [list(row) for row in purchase_rows],
-            "payments": [list(row) for row in payment_rows],
+            "purchases": [
+                dict(zip(CLIENT_ACCOUNT_PURCHASE_FIELDS, row)) for row in purchase_rows
+            ],
+            "payments": [
+                dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+            ],
+            "sales": sale_block,
         }
 
     def get_client_sales(self, client_id, user=None):
@@ -2975,31 +3694,64 @@ class Database:
     def add_client_payment(
         self, client_id, sale_id, sales_item_id, amount, date, user=None
     ):
-        """Record a payment after verifying it belongs to the requested client."""
+        """Record a payment after verifying it belongs to the requested client.
+
+        ``sales_item_id`` may be ``None`` for a sale-level payment: the Sales
+        History table is one row per Sale, so payments no longer need to target
+        a single item. When an item id is given it must belong to the sale.
+        """
         client_id = int(client_id)
         sale_id = int(sale_id)
-        sales_item_id = int(sales_item_id)
+        sales_item_id = int(sales_item_id) if sales_item_id else None
         amount = float(amount)
         if amount <= 0:
             raise ValueError("Payment amount must be greater than zero")
 
         try:
+            self.cursor.execute(
+                "SELECT username FROM clients WHERE id=%s", (client_id,)
+            )
+            cres = self.cursor.fetchone()
+            norm = None
+            if cres:
+                username = str(cres[0] or '').strip()
+                norm = self._normalize_exact(username) if username else None
+
             owner_clause = ""
             owner_params = []
             if user and not user.get("is_superadmin"):
                 owner_clause = " AND s.created_by = %s"
                 owner_params.append(int(user.get("id") or 0))
-            self.cursor.execute(
-                f"""
-                SELECT 1
-                FROM sales s
-                JOIN sales_items si ON si.sales_id = s.id
-                WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
-                """,
-                (sale_id, sales_item_id, client_id, *owner_params),
-            )
-            if not self.cursor.fetchone():
-                raise ValueError("The selected purchase does not belong to this client")
+
+            if sales_item_id:
+                self.cursor.execute(
+                    f"""
+                    SELECT 1
+                    FROM sales s
+                    JOIN sales_items si ON si.sales_id = s.id
+                    WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
+                    """,
+                    (sale_id, sales_item_id, client_id, *owner_params),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected purchase does not belong to this client")
+            else:
+                if norm:
+                    match_clause = (
+                        "(s.client_id=%s OR "
+                        "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+                    )
+                    match_params = [client_id, norm]
+                else:
+                    match_clause = "s.client_id=%s"
+                    match_params = [client_id]
+                self.cursor.execute(
+                    f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}{owner_clause}",
+                    (sale_id, *match_params, *owner_params),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected sale does not belong to this client")
+
             self.cursor.execute(
                 """
                 INSERT INTO payments (sale_id, sales_item_id, amount, date)
@@ -3011,6 +3763,40 @@ class Database:
             payment_id = self.cursor.fetchone()[0]
             self.conn.commit()
             return int(payment_id)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_client_payment(self, payment_id, amount, user=None):
+        """Edit ONLY the amount of a single payment.
+
+        No other field and no other row is touched - the sale, its items,
+        stock and totals are never modified by this call. This backs the
+        Client Account "Edit Payment Amount" feature. The no-overpayment rule
+        is enforced by the dialog before this is called.
+        """
+        payment_id = int(payment_id)
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "UPDATE payments SET amount = %s WHERE id = %s RETURNING id",
+                (amount, payment_id),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "update_client_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s amount=%s",
+                mode, user_id, role_id, payment_id, amount,
+            )
+            return int(row[0])
         except Exception:
             self.conn.rollback()
             raise

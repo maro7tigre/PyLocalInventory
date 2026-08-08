@@ -54,6 +54,65 @@ class ImportsTab(BaseTab):
     def get_preview_category(self):
         """Override to specify preview category for import operations"""
         return "company"  # Since imports are typically associated with suppliers
+
+    def add_additional_toolbar_buttons(self, layout):
+        """Add the Bon de Livraison button beside the other import actions."""
+        from ui.widgets.themed_widgets import OrangeButton
+
+        self.bdl_btn = OrangeButton("📦 Bon de livraison")
+        self.bdl_btn.setStyleSheet(
+            self.bdl_btn.styleSheet()
+            + "\nQPushButton { font-size: 14px; padding: 5px 10px; }"
+        )
+        self.bdl_btn.setMinimumHeight(20)
+        self.bdl_btn.clicked.connect(self.show_bon_de_livraison)
+        layout.addWidget(self.bdl_btn)
+
+    def show_bon_de_livraison(self):
+        """Generate a Bon de Livraison PDF for the selected import."""
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            current_row = self.table.currentRow()
+            if current_row < 0:
+                QMessageBox.information(
+                    self, "No Selection",
+                    "Please select an import to generate a Bon de Livraison.",
+                )
+                return
+            if current_row >= len(self.filtered_items):
+                QMessageBox.warning(
+                    self, "Error",
+                    "The selected row is no longer valid. Please refresh and try again.",
+                )
+                return
+
+            import_obj = self.filtered_items[current_row]
+
+            profile_manager = None
+            if hasattr(self.parent_widget, 'profile_manager'):
+                profile_manager = self.parent_widget.profile_manager
+            elif hasattr(self.parent_widget, 'parent') and hasattr(
+                self.parent_widget.parent, 'profile_manager'
+            ):
+                profile_manager = self.parent_widget.parent.profile_manager
+
+            if not profile_manager:
+                QMessageBox.warning(
+                    self, "Error", "Could not access profile manager."
+                )
+                return
+
+            from ui.dialogs.import_bdl_dialog import ImportBdlDialog
+            dialog = ImportBdlDialog(import_obj, profile_manager, self)
+            dialog.exec()
+
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to generate Bon de Livraison:\n{str(e)}"
+            )
+            print(f"Error in show_bon_de_livraison: {e}")
+            import traceback
+            traceback.print_exc()
     
     def get_search_options(self):
         """Get autocomplete options for imports search"""

@@ -45,9 +45,9 @@ class RemoteDatabase:
             or (section == "Sales" and action == "write" and self.can_record_payment)
         )
 
-    def get_client_account(self, client_id):
+    def get_client_sale_summaries(self, client_id):
         self.account_calls.append(client_id)
-        return {"purchases": [], "payments": []}
+        return {"sales": [], "payments": []}
 
 
 class ClientPermissionAndBackupTests(unittest.TestCase):
@@ -75,6 +75,27 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
             {},
         )
         self.assertTrue(allowed)
+
+    def test_payment_write_methods_require_sales_write(self):
+        for method, args in [
+            ("add_client_payment", [7, 8, None, 10, "2026-07-27"]),
+            ("update_client_payment", [3, 45.00]),
+        ]:
+            denied, _ = _check_permission(
+                _user(client_read=True), method, args, {}
+            )
+            self.assertFalse(denied)
+            allowed, _ = _check_permission(
+                _user(client_read=True, sales_write=True), method, args, {}
+            )
+            self.assertTrue(allowed)
+
+    def test_sale_level_rpc_methods_gate_under_clients_read(self):
+        for method in ("get_client_sale_summaries", "get_client_sale_items"):
+            allowed, _ = _check_permission(_user(client_read=True), method, [7], {})
+            self.assertTrue(allowed)
+            denied, _ = _check_permission(_user(), method, [7], {})
+            self.assertFalse(denied)
 
     def test_regular_user_cannot_bypass_report_ownership_with_raw_sql(self):
         allowed, reason = _check_permission(

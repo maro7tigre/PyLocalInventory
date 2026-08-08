@@ -6,7 +6,7 @@ from ui.tabs.base_tab import BaseTab
 from PySide6.QtCore import Qt, QPoint, QDate
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QSpinBox, QLineEdit,
-    QWidget, QProgressBar, QSizePolicy, QFrame, QPushButton, QMessageBox)
+    QWidget, QFrame, QPushButton, QMessageBox)
 from PySide6.QtGui import QPixmap, QColor
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
@@ -248,35 +248,30 @@ class SalesTab(BaseTab):
         return items
 
     # ------------- New columns injection and custom cell rendering -------------
-    _VIRTUAL_COLUMN_HEADERS = {'check_progress': '', 'progress': 'Progress'}
 
     def _ensure_new_columns_order(self):
-        """Ensure state appears after ID, check_progress button is second, and progress column exists."""
+        """Final Sales table columns (exactly):
+        ID | Devis | State | Client Name | Notes | Date | Total HT | Total TTC."""
         try:
+            if 'devis' not in self.table_columns:
+                self.table_columns.insert(1, 'devis')
             if 'state' not in self.table_columns:
-                self.table_columns.insert(1, 'state')
-            if 'check_progress' not in self.table_columns:
-                # Insert right after id (index 0), before state
-                self.table_columns.insert(1, 'check_progress')
-            if 'progress' not in self.table_columns:
-                self.table_columns.append('progress')
+                self.table_columns.insert(2, 'state')
 
             temp_obj = self.object_class(0, self.database)
             headers = []
             for key in self.table_columns:
-                if key in self._VIRTUAL_COLUMN_HEADERS:
-                    headers.append(self._VIRTUAL_COLUMN_HEADERS[key])
-                elif key in temp_obj.parameters:
+                if key in temp_obj.parameters:
                     headers.append(temp_obj.get_display_name(key))
                 else:
                     headers.append(key.capitalize())
             self.table.setColumnCount(len(self.table_columns))
             self.table.setHorizontalHeaderLabels(headers)
-            # Fix the check_progress column to a narrow width
-            if 'check_progress' in self.table_columns:
-                cp_col = self.table_columns.index('check_progress')
-                self.table.setColumnWidth(cp_col, 50)
-                self.table.horizontalHeader().setSectionResizeMode(cp_col, QHeaderView.Fixed)
+            # Keep the Devis reference column at a readable fixed width.
+            if 'devis' in self.table_columns:
+                devis_col = self.table_columns.index('devis')
+                self.table.setColumnWidth(devis_col, 120)
+                self.table.horizontalHeader().setSectionResizeMode(devis_col, QHeaderView.Fixed)
             if 'is_historical' in self.table_columns:
                 hist_col = self.table_columns.index('is_historical')
                 self.table.setColumnWidth(hist_col, 100)
@@ -285,7 +280,7 @@ class SalesTab(BaseTab):
             print(f"Error ensuring sales columns order: {e}")
 
     def populate_table_with_items(self, items, append=False):
-        """Populate table with custom state/progress rendering."""
+        """Populate table with custom state rendering."""
         sorting_enabled = self.table.isSortingEnabled()
         signals_blocked = self.table.blockSignals(True)
         self.table.setUpdatesEnabled(False)
@@ -297,14 +292,10 @@ class SalesTab(BaseTab):
                 row = start_row + row
                 try:
                     for col, column_key in enumerate(self.table_columns):
-                        if column_key == 'check_progress':
-                            self._set_check_progress_cell(row, col, obj)
-                        elif column_key == 'state':
+                        if column_key == 'state':
                             self._set_state_cell(row, col, obj)
                         elif column_key == 'is_historical':
                             self._set_historical_cell(row, col, obj)
-                        elif column_key == 'progress':
-                            self._set_progress_cell(row, col, obj)
                         else:
                             self.set_table_cell(row, col, column_key, obj)
                 except Exception as e:
@@ -316,23 +307,6 @@ class SalesTab(BaseTab):
             self.table.blockSignals(signals_blocked)
             self.table.setUpdatesEnabled(True)
             self.table.viewport().update()
-
-    def _set_check_progress_cell(self, row, col, obj):
-        from PySide6.QtWidgets import QPushButton
-        btn = QPushButton("📦")
-        btn.setToolTip("Check Progress")
-        btn.setCursor(Qt.PointingHandCursor)
-        btn.setStyleSheet(
-            "QPushButton { background:#1565C0; color:#fff; border:none; border-radius:4px; padding:3px 8px; font-size:15px; }"
-            "QPushButton:hover { background:#1976D2; }"
-        )
-        btn.clicked.connect(lambda _=None, o=obj, r=row, c=col: (self.table.setCurrentCell(r, c), self._open_progress_for_sale(o)))
-
-        container = QWidget()
-        lay = QHBoxLayout(container)
-        lay.setContentsMargins(4, 2, 4, 2)
-        lay.addWidget(btn)
-        self.table.setCellWidget(row, col, container)
 
     def _open_progress_for_sale(self, obj):
         try:
@@ -386,47 +360,6 @@ class SalesTab(BaseTab):
         lay = QHBoxLayout(container)
         lay.setContentsMargins(0,0,0,0)
         lay.addWidget(btn)
-        self.table.setCellWidget(row, col, container)
-
-    def _set_progress_cell(self, row, col, obj):
-        total_target = float(obj.get_value('total_quantity') or 0)
-        total_prod = float(obj.get_value('total_production') or 0)
-        if total_target <= 0:
-            # Fallback for legacy rows or if summary fields were not loaded
-            try:
-                items = obj.get_sales_items()
-                total_target = sum(float(item.get_value('quantity') or 0) for item in items)
-                total_prod = sum(float(item.get_value('production') or 0) for item in items)
-            except Exception:
-                total_target = 0
-                total_prod = 0
-
-        pct = min(int(total_prod / total_target * 100), 100) if total_target > 0 else 0
-
-        if pct >= 100:
-            chunk_color = '#4CAF50'
-        elif pct > 0:
-            chunk_color = '#FF9800'
-        else:
-            chunk_color = '#555'
-
-        bar = QProgressBar()
-        bar.setRange(0, 100)
-        bar.setValue(pct)
-        bar.setFormat(f"{pct}%")
-        bar.setTextVisible(True)
-        bar.setStyleSheet(
-            f"QProgressBar {{ border:1px solid #444; border-radius:4px; background:#2a2a2a; text-align:center; color:#fff; }}"
-            f"QProgressBar::chunk {{ background:{chunk_color}; border-radius:3px; }}"
-        )
-
-        container = QWidget()
-        lay = QHBoxLayout(container)
-        lay.setContentsMargins(6, 3, 6, 3)
-        lay.addWidget(bar)
-        # Pass mouse events through so clicking the bar selects the table row
-        bar.setAttribute(Qt.WA_TransparentForMouseEvents, True)
-        container.setAttribute(Qt.WA_TransparentForMouseEvents, True)
         self.table.setCellWidget(row, col, container)
 
     def _open_state_popup(self, obj, anchor):

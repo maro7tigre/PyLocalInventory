@@ -95,10 +95,11 @@
         <div class="document-number">{{ document_ref }}</div>
         <div class="document-date"><strong>Date :</strong> {{ date }}</div>
         <div class="customer-box">
-          <div class="customer-caption">Client</div>
-          <div class="customer-name">{{ client_name }}</div>
-          <div class="customer-line">{{ client_address }}</div>
-          <div class="customer-line"><strong>ICE :</strong> {{ client_ice }}</div>
+          <div class="customer-caption">Fournisseur</div>
+          <div class="customer-name">{{ supplier_name }}</div>
+          <div class="customer-line">{{ supplier_address }}</div>
+          <div class="customer-line"><strong>Tél :</strong> {{ supplier_phone }}</div>
+          <div class="customer-line"><strong>Email :</strong> {{ supplier_email }}</div>
         </div>
       </section>
     </header>
@@ -125,7 +126,7 @@
           <div class="section-value">{{ sale_notes }}</div>
         </section>
         <section class="signature-panel">
-          <div class="section-label">Réception client</div>
+          <div class="section-label">Réception des marchandises</div>
           <div class="signature-box">Nom, cachet et signature</div>
         </section>
       </div>

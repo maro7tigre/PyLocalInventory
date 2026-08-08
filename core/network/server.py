@@ -64,8 +64,10 @@ _ATTACHMENT_METHODS = {
     'update_attachment': ('write', 4),          # update_attachment(attachment_id, display_name, description, category),
 }
 _CLIENT_ACCOUNT_METHODS = {
-    'get_client_account', 'get_client_sales', 'add_client_payment'
+    'get_client_account', 'get_client_sales', 'get_client_sale_summaries',
+    'get_client_sale_items', 'add_client_payment', 'update_client_payment',
 }
+_CLIENT_PAYMENT_WRITE_METHODS = {'add_client_payment', 'update_client_payment'}
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
 _ALWAYS_ALLOWED = {
@@ -150,6 +152,21 @@ def _check_permission(user, method, args, kwargs):
     if method in _PRODUCT_READ_METHODS:
         if not user['permissions'].get('Products', {}).get('read'):
             return False, "You don't have read access to Products"
+        return True, None
+
+    if method == 'get_next_devis_preview':
+        # Read-only advisory Devis proposal; gated by Sales read/write access.
+        if not (user['permissions'].get('Sales', {}).get('read')
+                or user['permissions'].get('Sales', {}).get('write')):
+            return False, "You don't have read access to Sales"
+        return True, None
+
+    if method == 'get_import_bl_number':
+        # Read the persistent Bon de Livraison reference (allocating it on
+        # first print for legacy imports). Gated by Imports read/write access.
+        if not (user['permissions'].get('Imports', {}).get('read')
+                or user['permissions'].get('Imports', {}).get('write')):
+            return False, "You don't have read access to Imports"
         return True, None
 
     if method == 'cursor.execute':
@@ -237,7 +254,7 @@ def _check_permission(user, method, args, kwargs):
                 APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
             )
             return False, "You don't have read access to Clients"
-        if (method == 'add_client_payment'
+        if (method in _CLIENT_PAYMENT_WRITE_METHODS
                 and not user['permissions'].get('Sales', {}).get('write')):
             logger.warning(
                 "Permission denied (client account): build_id=%s user_id=%s role_id=%s "
@@ -488,6 +505,12 @@ class DatabaseServer:
 
             if method == 'save_sale_with_items':
                 return request_db.save_sale_with_items(*args, **kwargs, user=user)
+
+            if method == 'get_next_devis_preview':
+                return request_db.get_next_devis_preview(*args, **kwargs)
+
+            if method == 'get_import_bl_number':
+                return request_db.get_import_bl_number(*args, **kwargs)
 
             if method == 'save_import_with_items':
                 return request_db.save_import_with_items(*args, **kwargs, user=user)

@@ -250,11 +250,12 @@ class TestRemiseNotInTableColumns(unittest.TestCase):
         """Verify expected visible columns for the Sales table.
 
         The old "Subtotal"/"Total Price" headers are replaced by
-        "Total HT"/"Total TTC" backed by total_ht/total_ttc.
+        "Total HT"/"Total TTC" backed by total_ht/total_ttc, and the
+        canonical Devis reference is the second column.
         """
         sale = SalesClass(0, None)
         table_cols = sale.get_visible_parameters("table")
-        expected = ["id", "state", "client_name", "notes", "date", "total_ht", "total_ttc"]
+        expected = ["id", "devis", "state", "client_name", "notes", "date", "total_ht", "total_ttc"]
         self.assertEqual(table_cols, expected)
 
     def test_old_financial_headers_removed_from_table(self):

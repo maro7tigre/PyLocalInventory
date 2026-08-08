@@ -102,11 +102,13 @@ class LoadWorker(QObject):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, operation_obj, database, fetch_catalog):
+    def __init__(self, operation_obj, database, fetch_catalog, fetch_devis_preview=False):
         super().__init__()
         self.operation_obj = operation_obj
         self.database = database
         self.fetch_catalog = fetch_catalog
+        self.fetch_devis_preview = fetch_devis_preview
+        self.devis_preview = None
 
     @Slot()
     def process(self):
@@ -135,6 +137,14 @@ class LoadWorker(QObject):
                     include_clients=worker_db.has_permission('Clients', 'read'),
                     include_suppliers=worker_db.has_permission('Suppliers', 'read'),
                 )
+
+            # Advisory Devis preview for a NEW sale. Off-thread so the dialog
+            # never blocks on the network; the host re-validates on save.
+            if self.fetch_devis_preview and getattr(worker_db, 'get_next_devis_preview', None):
+                try:
+                    self.devis_preview = worker_db.get_next_devis_preview()
+                except Exception:
+                    self.devis_preview = None
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -187,7 +197,8 @@ class BaseOperationDialog(QDialog):
         self.load_worker = LoadWorker(
             self.operation_obj if operation_id else None,
             database,
-            fetch_catalog=not _catalog or "clients" not in _catalog
+            fetch_catalog=not _catalog or "clients" not in _catalog,
+            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters)
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)
@@ -213,6 +224,7 @@ class BaseOperationDialog(QDialog):
         self.setMinimumSize(600, 500)
     def _on_load_finished(self):
         # Thread cleanup is handled safely by QThread.finished -> deleteLater
+        _preview = self.load_worker.devis_preview if self.load_worker else None
         self.load_worker = None
         self.load_thread = None
         
@@ -221,10 +233,24 @@ class BaseOperationDialog(QDialog):
             title = self.windowTitle().replace(" (Loading...)", "")
             self.setWindowTitle(title)
             self.load_data()
+            if _preview is not None:
+                self._apply_devis_preview(_preview)
             
             if hasattr(self, 'items_table') and self.items_table:
                 self.items_table.refresh_table()
         except RuntimeError:
+            pass
+
+    def _apply_devis_preview(self, preview):
+        """Fill the Devis field with the host advisory preview (new Sales only)."""
+        if not self.operation_obj or 'devis' not in self.operation_obj.parameters:
+            return
+        widget = self.parameter_widgets.get('devis')
+        if widget is None:
+            return
+        try:
+            ParameterWidgetFactory.set_widget_value(widget, preview)
+        except Exception:
             pass
 
     def _on_load_error(self, err_msg):
@@ -567,6 +593,17 @@ class BaseOperationDialog(QDialog):
                 errors.append(
                     f"Remise ({remise:,.2f}) cannot exceed the subtotal ({float(raw_subtotal):,.2f})"
                 )
+
+        # Validate the Devis reference for Sales operations
+        if (getattr(self.operation_obj, 'section', '') == 'Sales'
+                and 'devis' in self.operation_obj.parameters):
+            devis_widget = self.parameter_widgets.get('devis')
+            raw_devis = ParameterWidgetFactory.get_widget_value(devis_widget) if devis_widget else None
+            if raw_devis is not None:
+                devis_value = str(raw_devis).strip()
+                if devis_value:
+                    if len(devis_value) > 40:
+                        errors.append("Devis N° must be at most 40 characters")
         
         return errors
     
@@ -937,6 +974,7 @@ class BaseOperationDialog(QDialog):
             lines = [
                 "Please review this sale before saving:",
                 "",
+                f"  \u2022 Devis N°: {self.operation_obj.get_value('devis') or '(allocated on save)'}",
                 f"  \u2022 Historical Sale: {'Yes' if is_historical else 'No'}",
                 (
                     "  \u2022 Stock impact: None (no deduction, no validation)"

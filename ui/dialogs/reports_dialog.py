@@ -498,15 +498,19 @@ class ReportsDialog(QDialog):
                     print(f"DEBUG: Error getting client contact details: {e}")
 
             sale_notes = self.sales_obj.get_value('notes') or ""
-            department = (
-                self.sales_obj.get_value('created_by_username')
-                or getattr(self.sales_obj.database, 'username', None)
-                or "Legacy / Unassigned"
-            )
 
-            # Generate document reference
+            # Generate document reference. For Devis, use the canonical,
+            # user-editable devis reference when one exists; fall back to a
+            # deterministic DOC-<id> placeholder for legacy rows.
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
-            doc_ref = f"DOC-{sales_id:06d}"
+            try:
+                doc_devis = str(self.sales_obj.get_value('devis') or '').strip()
+            except Exception:
+                doc_devis = ''
+            if report_type == 'devis' and doc_devis:
+                doc_ref = html.escape(doc_devis)
+            else:
+                doc_ref = f"DOC-{sales_id:06d}"
             
             # Get sales items - ensure they are loaded from database
             items_html = ""
@@ -738,7 +742,6 @@ class ReportsDialog(QDialog):
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
                 'date': date,
-                'department': html.escape(str(department)),
                 'document_ref': doc_ref,
                 'client_name': client_name,
                 'client_address': client_address,

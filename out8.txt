@@ -1,6 +1,0 @@
-Operation save failed section=Sales operation_id=1
-Traceback (most recent call last):
-  File "C:\Users\xvipe\Documents\GitHub\PyLocalInventory\ui\dialogs\edit_dialogs\base_operation_dialog.py", line 598, in _save_changes_impl
-    for key in self.operation_obj.get_visible_parameters('database')
-               ^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^^
-AttributeError: 'DummyOperation' object has no attribute 'get_visible_parameters'

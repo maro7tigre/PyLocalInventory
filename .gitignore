@@ -3,25 +3,26 @@ __pycache__/
 *.py[cod]
 *$py.class
 .venv/
-.playwright-browsers/
 venv/
 env/
 ENV/
 .env
-
-# Test, type-checker, and coverage output
+.playwright-browsers/
 .pytest_cache/
 .cache/
+.mypy_cache/
+.ruff_cache/
+
+# Test, type-checker, and coverage output
 .coverage
 .coverage.*
 htmlcov/
-.mypy_cache/
-.ruff_cache/
 
 # Packaging output (the official spec is intentionally tracked)
 build/
 dist/
 output/
+generated/
 tmp/
 *.spec
 !PyLocalInventory.spec
@@ -29,20 +30,53 @@ tmp/
 *.zip
 *.7z
 *.rar
-*.pdf
 *.egg-info/
 
 # Runtime-generated/private application data
-profiles/*
+profiles/
 logs/
 *.log
+crash.log
 *.tmp
 *.temp
+attachments/
+backups/
 local_settings.py
 db.sqlite3
 db.sqlite3-journal
 *.db-shm
 *.db-wal
+
+# Temporary/debug output
+out*.txt
+output*.txt
+temp*.txt
+*.pdf
+
+# Repomix/generated context
+repomix-output.xml
+
+# One-off debug / patch / migration helper scripts (kept locally, not published)
+add_report_worker.py
+append_methods.py
+regex_patch.py
+inject_diagnostics.py
+remove_diagnostics.py
+run_one.py
+run_sale_save.py
+run_test.py
+run_test2.py
+fix*.py
+patch*.py
+test_automation.py
+test_print.py
+test_print_crash.py
+test_recent_changes.py
+test_ui.py
+test_winauto.py
+test_worker.py
+docs/ANTIGRAVITY_STABILITY_FIX_PROMPT.md
+docs/PYLOCALINVENTORY_ANTIGRAVITY_CONTEXT.md
 
 # Editor and OS metadata
 .vscode/

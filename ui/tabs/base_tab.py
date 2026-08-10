@@ -795,9 +795,7 @@ class BaseTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(
-            lambda t=thread, w=worker: self._on_refresh_thread_finished(t, w)
-        )
+        thread.finished.connect(self._on_refresh_thread_finished)
         thread.finished.connect(
             lambda: diagnostics.worker_cleanup("table_fetch", self.section, refresh_id)
         )
@@ -1079,11 +1077,10 @@ class BaseTab(QWidget):
             self._refresh_pending = False
             QTimer.singleShot(0, lambda: self.refresh_table(force=True))
 
-    def _on_refresh_thread_finished(self, expected_thread=None, expected_worker=None):
-        if getattr(self, "_refresh_thread", None) is expected_thread:
-            self._refresh_thread = None
-        if getattr(self, "_refresh_worker", None) is expected_worker:
-            self._refresh_worker = None
+    @Slot()
+    def _on_refresh_thread_finished(self):
+        self._refresh_thread = None
+        self._refresh_worker = None
 
     def _wait_for_refresh_thread(self, timeout_ms=5000):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
@@ -1281,13 +1278,21 @@ class BaseTab(QWidget):
         host connections and for network clients alike. The previous
         ``hasattr(self.database, 'conn')`` gate was only true on the host,
         which left remote Client tabs without data until a manual Refresh.
+
+        One request per tab activation: a switch never fires a second request
+        while a fetch is already in flight, and never duplicates a fetch that
+        just completed (2s grace window). Any other activation forces a fresh
+        load so the visible rows reflect the latest source data.
         """
         try:
             if self.database:
-                stale = time.monotonic() - self._last_refresh_at >= 30.0
-                if not self._loaded_once or self._needs_refresh or stale:
-                    self.refresh_table()
-                    print(f"✓ Refreshed {self.section} tab data")
+                if self._refreshing:
+                    return
+                if time.monotonic() - self._last_refresh_at < 2.0:
+                    return
+                if not self._loaded_once or self._needs_refresh:
+                    self.refresh_table(force=True)
+                    print(f"[OK] Refreshed {self.section} tab data")
         except Exception as e:
             print(f"Error refreshing {self.section} tab on switch: {e}")
 

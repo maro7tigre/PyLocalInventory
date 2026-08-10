@@ -215,7 +215,7 @@ class BaseOperationDialog(QDialog):
         self.load_worker.error.connect(self._on_load_error)
         
         _active_background_threads.add(self.load_thread)
-        self.load_thread.finished.connect(lambda t=self.load_thread: _active_background_threads.discard(t))
+        self.load_thread.finished.connect(self._on_load_thread_finished)
         self.load_thread.start()
         
         # Auto-size dialog
@@ -223,10 +223,10 @@ class BaseOperationDialog(QDialog):
 
         self.setMinimumSize(600, 500)
     def _on_load_finished(self):
-        # Thread cleanup is handled safely by QThread.finished -> deleteLater
+        # NOTE: self.load_thread / self.load_worker are intentionally NOT
+        # cleared here - see _on_save_finished. Refs are cleared in
+        # _on_load_thread_finished, queued to fire only after load_thread.finished.
         _preview = self.load_worker.devis_preview if self.load_worker else None
-        self.load_worker = None
-        self.load_thread = None
         
         try:
             self.setEnabled(True)
@@ -254,9 +254,8 @@ class BaseOperationDialog(QDialog):
             pass
 
     def _on_load_error(self, err_msg):
-        self.load_worker = None
-        self.load_thread = None
-        
+        # Refs are cleared in _on_load_thread_finished (see _on_save_finished).
+
         try:
             QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
             self.setEnabled(True)
@@ -265,6 +264,18 @@ class BaseOperationDialog(QDialog):
             self.load_data()
         except RuntimeError:
             pass
+
+    def _on_load_thread_finished(self):
+        """Queued (bound-method) handler for load_thread.finished. Fires only
+        after the load worker's OS thread has fully stopped, so it is now safe
+        to drop the last references to the thread/worker without a QThread
+        being destroyed while its native thread is still running."""
+        try:
+            _active_background_threads.discard(self.load_thread)
+        except RuntimeError:
+            pass
+        self.load_worker = None
+        self.load_thread = None
 
         
     def setup_ui(self):
@@ -798,7 +809,7 @@ class BaseOperationDialog(QDialog):
                 self.save_worker.error.connect(self._on_save_error)
                 
                 _active_background_threads.add(self.save_thread)
-                self.save_thread.finished.connect(lambda t=self.save_thread: _active_background_threads.discard(t))
+                self.save_thread.finished.connect(self._on_save_thread_finished)
                 self.save_thread.start()
                 _log_save_event("SAVE_THREAD_START", token=self.operation_token)
                 return
@@ -883,9 +894,13 @@ class BaseOperationDialog(QDialog):
 
     def _on_save_finished(self, result, action):
         _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action=action)
-        # Thread cleanup is handled safely by QThread.finished -> deleteLater
-        self.save_worker = None
-        self.save_thread = None
+        # NOTE: self.save_thread / self.save_worker are intentionally NOT
+        # cleared here. The worker's OS thread may still be winding down when
+        # this queued callback runs; dropping the last references here lets the
+        # QThread be garbage-collected while its native thread is still
+        # running, which crashes with a native access violation under load.
+        # Refs are cleared in _on_save_thread_finished, queued to fire only
+        # after save_thread.finished (i.e. the thread has fully stopped).
 
         try:
             self._saving = False
@@ -937,8 +952,7 @@ class BaseOperationDialog(QDialog):
 
     def _on_save_error(self, err_msg):
         _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action="error")
-        self.save_worker = None
-        self.save_thread = None
+        # Refs are cleared in _on_save_thread_finished (see _on_save_finished).
 
         try:
             self._saving = False
@@ -949,6 +963,18 @@ class BaseOperationDialog(QDialog):
             QMessageBox.critical(self, "Error", f"Failed to save operation: {err_msg}")
         except RuntimeError:
             pass
+
+    def _on_save_thread_finished(self):
+        """Queued (bound-method) handler for save_thread.finished. Fires only
+        after the save worker's OS thread has fully stopped, so it is now safe
+        to drop the last references to the thread/worker without a QThread
+        being destroyed while its native thread is still running."""
+        try:
+            _active_background_threads.discard(self.save_thread)
+        except RuntimeError:
+            pass
+        self.save_worker = None
+        self.save_thread = None
 
     def _confirm_sale_summary(self):
         """Show the required pre-save summary and ask for confirmation."""

@@ -293,7 +293,7 @@ class BackupsDialog(QDialog):
         worker.cancelled.connect(worker.deleteLater)
         
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+        thread.finished.connect(self._on_backup_thread_finished)
         
         self._backup_thread = thread
         self._backup_worker = worker
@@ -503,7 +503,7 @@ class BackupsDialog(QDialog):
         worker.cancelled.connect(worker.deleteLater)
         
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+        thread.finished.connect(self._on_backup_thread_finished)
         
         self._backup_thread = thread
         self._backup_worker = worker
@@ -706,7 +706,7 @@ class BackupsDialog(QDialog):
             worker.cancelled.connect(worker.deleteLater)
             
             thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(lambda t=thread: self._on_backup_thread_finished(t))
+            thread.finished.connect(self._on_backup_thread_finished)
             
             self._backup_thread = thread
             self._backup_worker = worker
@@ -762,10 +762,10 @@ class BackupsDialog(QDialog):
                 self.cards_list.load_cards()  # Refresh list
                 QMessageBox.information(self, "Success", "Backup deleted successfully.")
 
-    def _on_backup_thread_finished(self, thread):
-        if getattr(self, "_backup_thread", None) is thread:
-            self._backup_thread = None
-            self._backup_worker = None
+    @Slot()
+    def _on_backup_thread_finished(self):
+        self._backup_thread = None
+        self._backup_worker = None
 
     def _wait_for_backup_thread(self, timeout_ms=5000):
         thread = getattr(self, "_backup_thread", None)
@@ -776,12 +776,14 @@ class BackupsDialog(QDialog):
         try:
 
             if not shiboken6.isValid(thread) or not thread.isRunning():
-
+                self._backup_thread = None
+                self._backup_worker = None
                 return True
 
         except RuntimeError:
-
-            return True
+            # If it's deleted during the checks, it's already finished.
+            self._backup_thread = None
+            self._backup_worker = None
             return True
             
         if thread == QThread.currentThread():

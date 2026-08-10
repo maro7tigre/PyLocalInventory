@@ -1,7 +1,7 @@
 import unittest
 from unittest.mock import MagicMock, patch
 import time
-from PySide6.QtWidgets import QApplication, QDialog
+from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
 from PySide6.QtCore import QTimer
 
 # Ensure QApplication exists
@@ -41,8 +41,22 @@ class TestSaveStability(unittest.TestCase):
         # Patch Database so worker local connections return our mock
         self.patcher = patch('core.database.Database', return_value=self.db)
         self.mock_db_class = self.patcher.start()
-        
+        # The save worker's success path opens a MODAL QMessageBox.information
+        # that would block forever in a headless test (no user to click OK).
+        # Auto-dismiss every modal box so the thread-lifecycle logic - not the
+        # dialog UX - is what this stress test exercises.
+        self.qmsg_patchers = [
+            patch.object(QMessageBox, 'information', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'critical', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'warning', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes),
+        ]
+        for patcher in self.qmsg_patchers:
+            patcher.start()
+
     def tearDown(self):
+        for patcher in self.qmsg_patchers:
+            patcher.stop()
         self.patcher.stop()
 
     def test_duplicate_save_protection(self):

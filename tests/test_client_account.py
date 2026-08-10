@@ -1,5 +1,6 @@
 import unittest
 import json
+import time
 from decimal import Decimal
 from unittest.mock import MagicMock, patch
 
@@ -514,6 +515,19 @@ class ClientAccountDialogTests(unittest.TestCase):
                 dialog.add_payment()
         # Sale-level payment: item_id is None.
         add.assert_called_once_with(1, 1, None, 50.0, "01-08-2026")
+        # add_payment() called the REAL refresh_data() here (the construction
+        # patch scope already ended), which kicks off a genuine async
+        # account-fetch QThread. Pump the event loop until it finishes so the
+        # queued QThread.finished cleanup (_on_account_thread_finished) runs
+        # before the test exits - otherwise a dangling thread wrapper on the
+        # closed dialog triggers a PySide6 native fail-fast at shutdown.
+        thread = getattr(dialog, "_account_thread", None)
+        deadline = time.time() + 3.0
+        while thread and thread.isRunning() and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.005)
+        for _ in range(10):
+            QApplication.processEvents()
 
     def test_add_payment_blocks_overpayment(self):
         account = {

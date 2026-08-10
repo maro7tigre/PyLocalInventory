@@ -702,8 +702,42 @@ class TableEventHandler:
                         "name": record["name"], "price": record.get("price") or 0,
                     }
                     break
+        else:
+            try:
+                database.cursor.execute(
+                    "SELECT id, name, sale_price FROM products "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                product_row = database.cursor.fetchone()
+                if product_row:
+                    product = {
+                        "type": "product", "id": int(product_row[0]),
+                        "name": product_row[1], "price": product_row[2] or 0,
+                    }
+                database.cursor.execute(
+                    "SELECT id, name, unit_price FROM services "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                service_row = database.cursor.fetchone()
+                if service_row:
+                    service = {
+                        "type": "service", "id": int(service_row[0]),
+                        "name": service_row[1], "price": service_row[2] or 0,
+                    }
+            except Exception:
+                return None
 
-        if product:
+        type_col = self.data_manager.table_columns.index("item_type")
+        selector = self.table.cellWidget(row, type_col)
+        chosen_type = str(selector.currentData() or "") if selector else ""
+
+        if service and chosen_type == "service":
+            selected = service
+        elif product:
             selected = product
             chosen_type = "product"
         elif service:
@@ -712,8 +746,6 @@ class TableEventHandler:
         else:
             return None
 
-        type_col = self.data_manager.table_columns.index("item_type")
-        selector = self.table.cellWidget(row, type_col)
         if selector and chosen_type:
             selector.blockSignals(True)
             selector.setCurrentIndex(selector.findData(chosen_type))

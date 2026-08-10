@@ -323,10 +323,93 @@ class _NameFilter(logging.Filter):
         return record.name in self.names
 
 
+class _MultiProcessRotatingFileHandler(RotatingFileHandler):
+    """RotatingFileHandler that never drops records when rotation is
+    temporarily blocked by another process holding the log open.
+
+    On Windows, ``os.rename`` in the stock ``doRollover`` fails with
+    PermissionError whenever any other process has the log file open
+    without FILE_SHARE_DELETE.  That exception used to be swallowed by
+    ``handleError``, silently discarding the record being logged.  This
+    handler instead falls back to appending the record and retries the
+    rotation on the next emit.  It also opens its streams with
+    FILE_SHARE_DELETE so rotation can succeed once all instances run the
+    new code."""
+
+    def _open(self):
+        if os.name == "nt":
+            try:
+                return _open_log_stream_share_delete(
+                    self.baseFilename, self.encoding
+                )
+            except OSError:
+                pass
+        return super()._open()
+
+    def emit(self, record):
+        try:
+            if self.shouldRollover(record):
+                try:
+                    self.doRollover()
+                except OSError:
+                    # Rotation is not possible right now (another process is
+                    # holding the log open).  doRollover already closed our
+                    # stream, so reopen it and append the record instead of
+                    # dropping it; rotation is retried on the next emit.
+                    if self.stream is None:
+                        self.stream = self._open()
+            logging.FileHandler.emit(self, record)
+        except Exception:
+            self.handleError(record)
+
+
+def _open_log_stream_share_delete(path, encoding):
+    """Open ``path`` in append mode with FILE_SHARE_DELETE so other
+    processes may rename/rotate it while this stream stays open."""
+    import ctypes
+    import msvcrt
+
+    GENERIC_WRITE = 0x40000000
+    FILE_SHARE_READ = 0x00000001
+    FILE_SHARE_WRITE = 0x00000002
+    FILE_SHARE_DELETE = 0x00000004
+    OPEN_ALWAYS = 4
+    FILE_ATTRIBUTE_ARCHIVE = 0x20
+
+    create_file = ctypes.windll.kernel32.CreateFileW
+    create_file.restype = ctypes.c_void_p
+    create_file.argtypes = [
+        ctypes.c_wchar_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+        ctypes.c_uint32,
+        ctypes.c_uint32,
+        ctypes.c_void_p,
+    ]
+
+    handle = create_file(
+        os.fspath(path),
+        GENERIC_WRITE,
+        FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+        None,
+        OPEN_ALWAYS,
+        FILE_ATTRIBUTE_ARCHIVE,
+        None,
+    )
+    if not handle or handle == ctypes.c_void_p(-1).value:
+        raise ctypes.WinError()
+
+    fd = msvcrt.open_osfhandle(handle, os.O_WRONLY | os.O_APPEND)
+    if fd < 0:
+        raise OSError("msvcrt.open_osfhandle failed")
+    return os.fdopen(fd, "a", encoding=encoding)
+
+
 def _add_rotating_handler(log_dir, filename, filter_rule):
     path = os.path.join(log_dir, filename)
     _LOG_PATHS[filename] = path
-    handler = RotatingFileHandler(
+    handler = _MultiProcessRotatingFileHandler(
         path, maxBytes=5 * 1024 * 1024, backupCount=3, encoding="utf-8"
     )
     handler.setFormatter(logging.Formatter(_STANDARD_FORMAT))

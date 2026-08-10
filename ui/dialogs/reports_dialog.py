@@ -32,11 +32,12 @@ class _PdfRenderWorker(QObject):
     cancelled = Signal(float)
     status_updated = Signal(str)
 
-    def __init__(self, renderer, report_generator, report_type):
+    def __init__(self, renderer, report_generator, report_type, sales_db=None):
         super().__init__()
         self.renderer = renderer
         self.report_generator = report_generator
         self.report_type = report_type
+        self.sales_db = sales_db
 
     @Slot()
     def run(self):
@@ -45,14 +46,35 @@ class _PdfRenderWorker(QObject):
         is_cancelled = False
         error_msg = ""
         result = None
+        worker_db = None
         try:
             if QThread.currentThread().isInterruptionRequested():
                 is_cancelled = True
                 return
-                
+
+            # A psycopg2 connection is not thread-safe: the shared
+            # sales_obj.database is owned by the GUI thread and must never be
+            # used from this worker. For local/host databases we open a
+            # dedicated connection on this thread so report queries never
+            # interleave with GUI-thread queries on the same socket.
+            sales_db = self.sales_db
+            if sales_db is not None and sales_db.__class__.__name__ != 'RemoteDatabase':
+                try:
+                    from core.database import Database
+                    worker_db = Database(sales_db.profile_manager)
+                    worker_db.language = getattr(sales_db, 'language', 'en')
+                    worker_db.registered_classes = sales_db.registered_classes
+                    if not worker_db.connect():
+                        worker_db = None
+                except Exception:
+                    worker_db = None
+
             self.status_updated.emit("Preparing report data...")
             with diagnostics.operation("pdf_prepare", type=self.report_type):
-                html_content, output_path = self.report_generator(self.report_type)
+                if worker_db is not None:
+                    html_content, output_path = self.report_generator(self.report_type, worker_db)
+                else:
+                    html_content, output_path = self.report_generator(self.report_type)
             
             if QThread.currentThread().isInterruptionRequested():
                 is_cancelled = True
@@ -71,6 +93,11 @@ class _PdfRenderWorker(QObject):
             logger.exception("PDF generation failed type=%s", self.report_type)
             error_msg = str(error) or "Unknown error"
         finally:
+            if worker_db is not None:
+                try:
+                    worker_db.close()
+                except Exception:
+                    pass
             if is_cancelled:
                 self.cancelled.emit(started)
             elif is_success:
@@ -188,7 +215,12 @@ class ReportsDialog(QDialog):
             self._active_report_type = report_type
             
             thread = QThread()
-            worker = _PdfRenderWorker(self._html_to_pdf, self._prepare_report, report_type)
+            worker = _PdfRenderWorker(
+                self._html_to_pdf,
+                self._prepare_report,
+                report_type,
+                sales_db=getattr(getattr(self, 'sales_obj', None), 'database', None),
+            )
             worker.moveToThread(thread)
             thread.started.connect(worker.run)
             
@@ -208,7 +240,7 @@ class ReportsDialog(QDialog):
             worker.cancelled.connect(worker.deleteLater)
             
             thread.finished.connect(thread.deleteLater)
-            thread.finished.connect(lambda t=thread: self._on_report_thread_finished(t))
+            thread.finished.connect(self._on_report_thread_finished)
             
             self._report_thread = thread
             self._report_worker = worker
@@ -263,10 +295,10 @@ class ReportsDialog(QDialog):
         self._write_report_log(details)
         QMessageBox.critical(self, "Report Error", details)
 
-    def _on_report_thread_finished(self, thread):
-        if getattr(self, "_report_thread", None) is thread:
-            self._report_thread = None
-            self._report_worker = None
+    @Slot()
+    def _on_report_thread_finished(self):
+        self._report_thread = None
+        self._report_worker = None
 
     def _wait_for_report_thread(self, timeout_ms=5000):
         thread = getattr(self, "_report_thread", None)
@@ -277,12 +309,14 @@ class ReportsDialog(QDialog):
         try:
 
             if not shiboken6.isValid(thread) or not thread.isRunning():
-
+                self._report_thread = None
+                self._report_worker = None
                 return True
 
         except RuntimeError:
-
-            return True
+            # If it's deleted during the checks, it's already finished.
+            self._report_thread = None
+            self._report_worker = None
             return True
             
         if thread == QThread.currentThread():
@@ -318,10 +352,14 @@ class ReportsDialog(QDialog):
         self._write_report_log(self._report_context(report_type, actual_output_path, None))
         return actual_output_path
 
-    def _prepare_report(self, report_type):
-        """Collect database/UI data on the GUI thread before worker rendering."""
+    def _prepare_report(self, report_type, database=None):
+        """Collect database/UI data on the GUI thread before worker rendering.
+        ``database`` is the worker-owned connection when running on the worker
+        thread (local/host mode); ``None`` means the shared sales connection
+        (RemoteDatabase RPC or test doubles)."""
         # Get current profile path
-        database = getattr(self.sales_obj, 'database', None)
+        if database is None:
+            database = getattr(self.sales_obj, 'database', None)
         profile = getattr(self.profile_manager, "selected_profile", None)
         if not profile:
             profile = getattr(database, "remote_profile", None)
@@ -354,7 +392,7 @@ class ReportsDialog(QDialog):
         self._last_output_path = filepath
         
         # Generate HTML content
-        html_content = self._generate_html_content(report_type)
+        html_content = self._generate_html_content(report_type, database)
         
         return html_content, filepath
 
@@ -392,7 +430,7 @@ class ReportsDialog(QDialog):
                 except Exception as e:
                     print(f"Error deleting old report {report_file}: {e}")
     
-    def _generate_html_content(self, report_type):
+    def _generate_html_content(self, report_type, database=None):
         """Generate HTML content based on report type"""
         # Get template path - all templates have _templet suffix
         template_path = resource_path("report", f"{report_type}_templet.html")
@@ -405,7 +443,7 @@ class ReportsDialog(QDialog):
             template_content = f.read()
         
         # Get sales data
-        sales_data = self._extract_sales_data(report_type)
+        sales_data = self._extract_sales_data(report_type, database)
         
         # Replace placeholders
         html_content = self._replace_placeholders(template_content, sales_data)
@@ -425,9 +463,13 @@ class ReportsDialog(QDialog):
             f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
         )
 
-    def _extract_sales_data(self, report_type: str):
+    def _extract_sales_data(self, report_type: str, database=None):
         """Extract data from sales object"""
         try:
+            # Worker-owned connection when generating on the worker thread
+            # (local/host mode); falls back to the shared sales connection.
+            db = database or getattr(self.sales_obj, 'database', None)
+
             def _fmt_fr(value: float) -> str:
                 try:
                     s = f"{float(value):,.2f}"
@@ -478,17 +520,17 @@ class ReportsDialog(QDialog):
             client_email = ""
             client_ice = ""
             client_id = self.sales_obj.get_value('client_id')
-            if hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+            if db is not None:
                 try:
                     if client_id:
-                        self.sales_obj.database.cursor.execute(
+                        db.cursor.execute(
                             "SELECT address, phone, email, ice FROM Clients WHERE ID = %s", (client_id,)
                         )
                     else:
-                        self.sales_obj.database.cursor.execute(
+                        db.cursor.execute(
                             "SELECT address, phone, email, ice FROM Clients WHERE username = %s", (client_username,)
                         )
-                    client_row = self.sales_obj.database.cursor.fetchone()
+                    client_row = db.cursor.fetchone()
                     if client_row:
                         client_address = client_row[0] or ""
                         client_phone = client_row[1] or ""
@@ -519,13 +561,13 @@ class ReportsDialog(QDialog):
 
             # BDL uses the service catalog to exclude product-only rows.
             report_services = []
-            if report_type == 'bdl' and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+            if report_type == 'bdl' and db is not None:
                 try:
-                    self.sales_obj.database.cursor.execute(
+                    db.cursor.execute(
                         "SELECT id, name, description, keywords FROM Services "
                         "WHERE name IS NOT NULL AND name != '' ORDER BY id"
                     )
-                    for service_id, service_name, description, keywords in self.sales_obj.database.cursor.fetchall():
+                    for service_id, service_name, description, keywords in db.cursor.fetchall():
                         aliases = [service_name]
                         aliases.extend(
                             part.strip()
@@ -545,17 +587,17 @@ class ReportsDialog(QDialog):
             if not hasattr(self.sales_obj, 'items') or not self.sales_obj.items:
                 print("DEBUG: Loading sales items from database...")
                 sales_id_value = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID')
-                if sales_id_value and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                if sales_id_value and db is not None:
                     try:
                         # Load items from database
-                        items_data = self.sales_obj.database.get_items_by_operation_id(sales_id_value, 'Sales_Items')
+                        items_data = db.get_items_by_operation_id(sales_id_value, 'Sales_Items')
                         print(f"DEBUG: Found {len(items_data)} sales items in database")
                         
                         # Create item objects
                         from classes.sales_item_class import SalesItemClass
                         self.sales_obj.items = []
                         for item_data in items_data:
-                            item_obj = SalesItemClass(0, self.sales_obj.database)
+                            item_obj = SalesItemClass(0, db)
                             # Load item data
                             for key, value in item_data.items():
                                 if key in item_obj.parameters:
@@ -578,14 +620,14 @@ class ReportsDialog(QDialog):
                         missing_product_ids.add(int(item.get_value('product_id')))
                 
                 prefetched_product_names = {}
-                if missing_product_ids and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                if missing_product_ids and db is not None:
                     try:
                         format_strings = ','.join(['%s'] * len(missing_product_ids))
-                        self.sales_obj.database.cursor.execute(
+                        db.cursor.execute(
                             f"SELECT id, name FROM Products WHERE id IN ({format_strings})", 
                             tuple(missing_product_ids)
                         )
-                        for row in self.sales_obj.database.cursor.fetchall():
+                        for row in db.cursor.fetchall():
                             prefetched_product_names[row[0]] = row[1]
                     except Exception as e:
                         print(f"DEBUG: Error in bulk product name lookup: {e}")

@@ -351,7 +351,7 @@ class TestBackupsDialogQThreadLifetime(unittest.TestCase):
         worker.cancelled.connect(worker.deleteLater)
         
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self.dialog._on_backup_thread_finished(t))
+        thread.finished.connect(self.dialog._on_backup_thread_finished)
         
         self.dialog._backup_thread = thread
         self.dialog._backup_worker = worker

@@ -914,7 +914,7 @@ class HomeTab(QWidget):
         worker.cancelled.connect(worker.deleteLater)
         
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._on_dashboard_thread_finished(t))
+        thread.finished.connect(self._on_dashboard_thread_finished)
         
         self._dashboard_thread = thread
         self._dashboard_worker = worker
@@ -1000,10 +1000,10 @@ class HomeTab(QWidget):
                 "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
             )
 
-    def _on_dashboard_thread_finished(self, thread):
-        if getattr(self, "_dashboard_thread", None) is thread:
-            self._dashboard_thread = None
-            self._dashboard_worker = None
+    @Slot()
+    def _on_dashboard_thread_finished(self):
+        self._dashboard_thread = None
+        self._dashboard_worker = None
 
     def _wait_for_dashboard_thread(self, timeout_ms=5000):
         thread = getattr(self, "_dashboard_thread", None)
@@ -1014,12 +1014,14 @@ class HomeTab(QWidget):
         try:
 
             if not shiboken6.isValid(thread) or not thread.isRunning():
-
+                self._dashboard_thread = None
+                self._dashboard_worker = None
                 return True
 
         except RuntimeError:
-
-            return True
+            # If it's deleted during the checks, it's already finished.
+            self._dashboard_thread = None
+            self._dashboard_worker = None
             return True
             
         if thread == QThread.currentThread():

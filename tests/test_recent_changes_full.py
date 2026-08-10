@@ -58,15 +58,37 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
             "products": [{"id": 1, "name": "Prod A", "stock": 10}],
             "services": []
         }
+        # Save/load error paths open MODAL QMessageBox dialogs that would
+        # block forever in a headless test (no user to click). Auto-dismiss
+        # every modal box so the async lifecycle - not the dialog UX - is
+        # what these tests exercise.
+        self.qmsg_patchers = [
+            patch.object(QMessageBox, 'information', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'critical', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'warning', return_value=QMessageBox.Ok),
+            patch.object(QMessageBox, 'question', return_value=QMessageBox.Yes),
+        ]
+        for patcher in self.qmsg_patchers:
+            patcher.start()
+
+    def tearDown(self):
+        for patcher in self.qmsg_patchers:
+            patcher.stop()
         self.db.get_sale_catalog.return_value = self.db.sale_catalog
 
+    @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QThread.start')
+    @patch('core.database.Database')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.setup_ui')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.load_data')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.apply_theme')
-    def test_load_worker_success(self, mock_theme, mock_load, mock_setup):
+    def test_load_worker_success(self, mock_theme, mock_load, mock_setup, mock_db_class, mock_thread_start):
+        mock_db_class.return_value.connect.return_value = True
+        mock_db_class.return_value.get_sale_catalog.return_value = self.db.sale_catalog
         dialog = BaseOperationDialog(DummyOperation, DummyItem, operation_id=1, database=self.db)
         
-        # Test worker
+        # Test worker (QThread.start is mocked so the worker only runs via the
+        # explicit process() call below; the real thread would otherwise delete
+        # the worker before we get here, racing this test).
         self.assertTrue(dialog.load_thread.isRunning() or not dialog.load_thread.isFinished())
         
         if dialog.load_worker:
@@ -81,11 +103,14 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
         self.assertTrue(dialog.operation_obj.data.get('loaded'))
         self.assertEqual(dialog.database.sale_catalog["products"][0]["name"], "Prod A")
 
+    @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QThread.start')
+    @patch('core.database.Database')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.setup_ui')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.load_data')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.apply_theme')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QMessageBox.warning')
-    def test_load_worker_failure(self, mock_warn, mock_theme, mock_load, mock_setup):
+    def test_load_worker_failure(self, mock_warn, mock_theme, mock_load, mock_setup, mock_db_class, mock_thread_start):
+        mock_db_class.return_value.connect.return_value = True
         dialog = BaseOperationDialog(DummyOperation, DummyItem, operation_id=1, database=self.db)
         
         # Mock load_database_data to raise exception
@@ -138,6 +163,9 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
         
         self.assertFalse(dialog._saving)
         dialog.save_btn.setEnabled.assert_called_with(True)
+        # Refs are cleared by _on_save_thread_finished (queued after the thread
+        # stops), so simulate that delivery before asserting the cleanup.
+        dialog._on_save_thread_finished()
         self.assertIsNone(dialog.save_worker)
 
 class TestOperationsTableCatalog(unittest.TestCase):

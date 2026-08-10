@@ -213,6 +213,10 @@ class SalesReportRegressionTests(unittest.TestCase):
 
     def test_sale_form_updates_subtotal_vat_and_total(self):
         dialog = SalesEditDialog(None, None)
+        lt = dialog.load_thread
+        if lt is not None:
+            lt.wait(5000)
+        self.app.processEvents()
         table = dialog.items_table.table
         columns = dialog.items_table.data_manager.table_columns
         name = table.cellWidget(0, columns.index("product_name"))
@@ -277,7 +281,7 @@ class SalesReportRegressionTests(unittest.TestCase):
         profile = _Values({"company name": "Network Company"})
         manager = type("Manager", (), {"selected_profile": profile})()
         dialog = ReportsDialog(sale, manager)
-        dialog._generate_html_content = lambda _kind: "<html><body>client report</body></html>"
+        dialog._generate_html_content = lambda _kind, database=None: "<html><body>client report</body></html>"
 
         def write_pdf(_html, output):
             with open(output, "wb") as stream:
@@ -302,7 +306,7 @@ class SalesReportRegressionTests(unittest.TestCase):
         sale.database = remote
         manager = type("Manager", (), {"selected_profile": None})()
         dialog = ReportsDialog(sale, manager)
-        dialog._generate_html_content = lambda _kind: "<html>host profile</html>"
+        dialog._generate_html_content = lambda _kind, database=None: "<html>host profile</html>"
         dialog._html_to_pdf = lambda _html, output: output
 
         with tempfile.TemporaryDirectory() as local_dir, patch(

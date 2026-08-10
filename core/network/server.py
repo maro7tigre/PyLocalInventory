@@ -62,6 +62,10 @@ _ATTACHMENT_METHODS = {
     'get_attachment_thumbnail': ('read', 1),    # get_attachment_thumbnail(attachment_id)
     'get_attachment_thumbnails_bulk': ('read', 1),  # get_attachment_thumbnails_bulk(attachment_ids)
     'update_attachment': ('write', 4),          # update_attachment(attachment_id, display_name, description, category),
+    'list_attachments': ('read', 0),            # list_attachments(entity_type, entity_id)
+    'upload_attachment': ('write', 0),          # upload_attachment(entity_type, entity_id, ...)
+    'download_attachment': ('read', None),      # download_attachment(attachment_id) - no owner arg
+    'delete_attachment': ('delete', None),      # delete_attachment(attachment_id) - no owner arg
 }
 _CLIENT_ACCOUNT_METHODS = {
     'get_client_account', 'get_client_sales', 'get_client_sale_summaries',

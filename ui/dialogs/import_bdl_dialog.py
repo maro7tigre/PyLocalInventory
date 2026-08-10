@@ -337,7 +337,7 @@ class ImportBdlDialog(QDialog):
         worker.failed.connect(worker.deleteLater)
 
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(lambda t=thread: self._on_thread_finished(t))
+        thread.finished.connect(self._on_thread_finished)
 
         self._report_thread = thread
         self._report_worker = worker
@@ -371,10 +371,10 @@ class ImportBdlDialog(QDialog):
         )
         self.accept()
 
-    def _on_thread_finished(self, thread):
-        if getattr(self, "_report_thread", None) is thread:
-            self._report_thread = None
-            self._report_worker = None
+    @Slot()
+    def _on_thread_finished(self):
+        self._report_thread = None
+        self._report_worker = None
 
     def open_pdf(self, pdf_path):
         """Open the PDF with the default system application."""

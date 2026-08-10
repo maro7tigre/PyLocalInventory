@@ -14,9 +14,8 @@
     .company-panel, .document-panel { display: table-cell; vertical-align: top; }
     .company-panel { width: 54%; padding-right: 10mm; }
     .document-panel { width: 46%; }
-    .report-logo { display: block; width: 112px !important; max-width: 112px !important; max-height: 67px !important; height: auto !important; object-fit: contain; margin: 0 0 3mm !important; }
-    .logo-placeholder { width: 112px; height: 44px; border: 1px solid #315b63; color: #315b63; text-align: center; line-height: 44px; margin-bottom: 3mm; }
-    .company-name { margin: 0 0 1.5mm; font-size: 13px; font-weight: 700; letter-spacing: .25px; color: #18272b; }
+    .report-logo { display: block; width: 128px !important; max-width: 128px !important; max-height: 128px !important; height: auto !important; object-fit: contain; margin: 0 0 3mm !important; }
+    .logo-placeholder { width: 128px; height: 44px; border: 1px solid #315b63; color: #315b63; text-align: center; line-height: 44px; margin-bottom: 3mm; }
     .company-lines { font-size: 9.5px; line-height: 1.45; }
     .company-lines strong { display: inline-block; min-width: 13mm; }
     .company-legal { margin-top: 1.5mm; font-size: 8.3px; line-height: 1.35; color: #3f5155; }
@@ -81,14 +80,11 @@
     <header class="top">
       <section class="company-panel">
         {{ logo_block }}
-        <div class="company-name">LAMIDAP SARL</div>
         <div class="company-lines">
-          <div>288, Zone Industrielle Gzenaya</div>
-          <div>90000 Tanger</div>
-          <div><strong>Tél :</strong> +212 539 39 45 60</div>
-          <div><strong>Email :</strong> lamidap@gmail.com</div>
+          <div>{{ company_address }}</div>
+          <div><strong>Tél :</strong> {{ company_phone }}</div>
+          <div><strong>Email :</strong> {{ company_email }}</div>
         </div>
-        <div class="company-legal">ICE: 000066710000023 - IF: 04909316 - RC: 31073<br>Patente: 52981388 - CNSS: 7412042</div>
       </section>
       <section class="document-panel">
         <div class="document-title">BON DE LIVRAISON N°</div>
@@ -106,9 +102,8 @@
 
     <footer class="footer print-footer">
       <div class="footer-rule"></div>
-      <div class="footer-company">LAMIDAP SARL - Menuiserie Industrielle de Bois et Decorations</div>
-      <div class="footer-line">ICE: 000066710000023 - PATENTE: 52981388 - I.F: 04909316 - R.C: 31073 - CNSS: 7412042</div>
-      <div class="footer-line">ATTIJARI WAFA BANQUE, CENTRE D'AFFAIRE - RIB: 007 640 00 1370100000023 15</div>
+      <div class="footer-line">{{ company_address }}</div>
+      <div class="footer-line">Tél : {{ company_phone }} | Email : {{ company_email }}</div>
     </footer>
 
     <main class="items-area">
@@ -134,9 +129,8 @@
 
     <footer class="footer">
       <div class="footer-rule"></div>
-      <div class="footer-company">LAMIDAP SARL - Menuiserie Industrielle de Bois et Décorations</div>
-      <div class="footer-line">ICE: 000066710000023 - PATENTE: 52981388 - I.F: 04909316 - R.C: 31073 - CNSS: 7412042</div>
-      <div class="footer-line">ATTIJARI WAFA BANQUE, CENTRE D’AFFAIRE COMPTE N° RIB: 007 640 00 1370100000023 15</div>
+      <div class="footer-line">{{ company_address }}</div>
+      <div class="footer-line">Tél : {{ company_phone }} | Email : {{ company_email }}</div>
     </footer>
   </div>
 </body>

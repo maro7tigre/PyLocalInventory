@@ -32,10 +32,10 @@ def generate_verification_report():
     sale.database = None
 
     profile = _Values({
-        'company name': 'LAMIDAP SARL',
-        'phone': '+212 539 39 45 60',
-        'address': '288, Zone Industrielle Gzenaya, 90000 Tanger',
-        'email': 'lamidap@gmail.com',
+        'company name': '',
+        'phone': '0661135570',
+        'address': 'Hararin Sidi driss 35, Tanger 90000',
+        'email': 'Lamibois1@gmail.com',
         'report footer': '',
     })
     manager = type('VerificationProfileManager', (), {'selected_profile': profile})()

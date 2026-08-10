@@ -144,6 +144,18 @@ try {
         }
     }
 
+    # The canonical LAMIBOIS logo must be bundled byte-for-byte identical.
+    $SourceLogoPath = Join-Path $RepositoryRoot "assets\lamibois.png"
+    $PackagedLogoPath = Join-Path $InternalPath "assets\lamibois.png"
+    if (-not (Test-Path -LiteralPath $PackagedLogoPath -PathType Leaf)) {
+        throw "The new LAMIBOIS logo is missing from the build: $PackagedLogoPath"
+    }
+    $SourceLogoHash = (Get-FileHash -LiteralPath $SourceLogoPath -Algorithm SHA256).Hash
+    $PackagedLogoHash = (Get-FileHash -LiteralPath $PackagedLogoPath -Algorithm SHA256).Hash
+    if ($SourceLogoHash -ne $PackagedLogoHash) {
+        throw "The packaged logo does not match the canonical assets\lamibois.png"
+    }
+
     $PackagedBrowser = Get-ChildItem -LiteralPath (Join-Path $InternalPath "playwright-browsers") `
         -Filter "chrome-headless-shell.exe" -File -Recurse -ErrorAction SilentlyContinue | Select-Object -First 1
     if ($null -eq $PackagedBrowser) {

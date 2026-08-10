@@ -18,7 +18,15 @@ from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 from core import diagnostics
-import base64
+from core.company_branding import (
+    COMPANY_ADDRESS,
+    COMPANY_EMAIL,
+    COMPANY_LOGO_PATH,
+    COMPANY_PHONE,
+    build_report_footer,
+    get_company_logo_block,
+    resolve_company_name,
+)
 from decimal import Decimal, InvalidOperation
 import traceback
 import time
@@ -450,18 +458,9 @@ class ReportsDialog(QDialog):
         
         return html_content
     
-    def _get_lamidap_logo_block(self):
-        """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
-        logo_path = resource_path('report', 'lamidap_logo.png')
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, 'rb') as img_f:
-            b64 = base64.b64encode(img_f.read()).decode('ascii')
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
+    def _get_company_logo_block(self):
+        """Return the report logo <img> block (central company_branding source)."""
+        return get_company_logo_block()
 
     def _extract_sales_data(self, report_type: str, database=None):
         """Extract data from sales object"""
@@ -500,13 +499,13 @@ class ReportsDialog(QDialog):
             )
             if not profile:
                 raise RuntimeError("Report profile details are unavailable")
-            company_name = profile.get_value("company name") or "Your Company"
-            company_phone = profile.get_value("phone") or ""
-            company_address = profile.get_value("address") or ""
-            company_email = profile.get_value("email") or ""
-            report_footer = profile.get_value("report footer") or ""
+            company_name = resolve_company_name(profile)
+            company_phone = COMPANY_PHONE
+            company_address = COMPANY_ADDRESS
+            company_email = COMPANY_EMAIL
+            report_footer = build_report_footer()
 
-            logo_block = self._get_lamidap_logo_block()
+            logo_block = get_company_logo_block()
 
             # Extract sales data
             client_username = self.sales_obj.get_value('client_username') or ""
@@ -858,7 +857,7 @@ class ReportsDialog(QDialog):
 
     def _log_report_resources(self, report_type, template_path):
         report_dir = resource_path('report')
-        logo_path = resource_path('report', 'lamidap_logo.png')
+        logo_path = COMPANY_LOGO_PATH
         browser_path = self._find_installed_chromium()
         self._write_report_log("\n".join([
             f"Frozen runtime: {bool(getattr(sys, 'frozen', False))}",

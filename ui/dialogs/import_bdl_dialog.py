@@ -9,7 +9,6 @@ the same import always yields the same Bon de Livraison number.
 Rendering runs in a QThread worker (RPC/DB data collection + Chromium PDF
 render), mirroring the Sales ReportsDialog lifecycle.
 """
-import base64
 import logging
 import os
 import subprocess
@@ -25,6 +24,13 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox,
                                QVBoxLayout)
 
 from core.calculations import to_decimal
+from core.company_branding import (
+    COMPANY_ADDRESS,
+    COMPANY_EMAIL,
+    COMPANY_PHONE,
+    get_company_logo_block,
+    resolve_company_name,
+)
 from core.runtime_paths import resource_path, local_reports_dir
 from ui.widgets.themed_widgets import RedButton
 
@@ -111,18 +117,8 @@ class _ImportBdlWorker(QObject):
         except Exception:
             return str(value)
 
-    def _get_lamidap_logo_block(self):
-        logo_path = resource_path("report", "lamidap_logo.png")
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, "rb") as img_f:
-            b64 = base64.b64encode(img_f.read()).decode("ascii")
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; '
-            f'object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
+    def _get_company_logo_block(self):
+        return get_company_logo_block()
 
     def _generate_html(self, import_id, bl_number):
         """Render the import Bon de Livraison from the selected import only."""
@@ -188,8 +184,16 @@ class _ImportBdlWorker(QObject):
         if not rows_html.strip():
             rows_html = '<tr class="empty-row"><td colspan="3">Aucun article</td></tr>'
 
+        profile = None
+        if getattr(self, "profile_manager", None) is not None:
+            profile = getattr(self.profile_manager, "selected_profile", None)
+
         data = {
-            'logo_block': self._get_lamidap_logo_block(),
+            'logo_block': self._get_company_logo_block(),
+            'company_name': html_lib.escape(str(resolve_company_name(profile))),
+            'company_address': html_lib.escape(COMPANY_ADDRESS),
+            'company_phone': html_lib.escape(COMPANY_PHONE),
+            'company_email': html_lib.escape(COMPANY_EMAIL),
             'document_ref': html_lib.escape(str(bl_number)),
             'date': html_lib.escape(str(date_value)),
             'supplier_name': html_lib.escape(str(supplier_name)),

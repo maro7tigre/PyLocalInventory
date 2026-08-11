@@ -47,7 +47,7 @@ class _Cursor:
             self.fetchone_value = (22, 'Known Service') if str(params[0]).lower() == 'known service' else None
         elif normalized.startswith('select id, name, username from clients'):
             self.fetchone_value = (33, 'Client', 'client')
-        elif normalized.startswith('select coalesce(sum(quantity), 0) from import_items'):
+        elif normalized.startswith('select coalesce(sum(ii.quantity), 0) from import_items'):
             self.fetchone_value = (100,)
         elif normalized.startswith('select coalesce(sum(si.quantity), 0)'):
             self.fetchone_value = (0,)

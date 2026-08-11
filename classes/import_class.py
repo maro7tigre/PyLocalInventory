@@ -51,6 +51,32 @@ class ImportClass(BaseClass):
                 "options": [],
                 "type": "date"
             },
+            "bl_number": {
+                "value": "",
+                "display_name": {"en": "Bon de Livraison N°", "fr": "Bon de Livraison N°", "es": "Bon de Livraison N°"},
+                "required": False,
+                "default": "",
+                "options": [],
+                "type": "string",
+                "editable": True,
+                "readonly": False
+            },
+            "is_historical": {
+                "value": False,
+                "display_name": {"en": "Historical Import — Do not affect current stock", "fr": "Importation Historique — N'affecte pas le stock actuel", "es": "Importación Histórica — No afecta el stock actual"},
+                "required": False,
+                "default": False,
+                "options": [],
+                "type": "bool",
+                # Canonical boolean mapping: the value stays Python True/False
+                # end-to-end (checkbox -> payload -> RPC -> PostgreSQL BOOLEAN).
+                # Without this the BaseClass bool conversion falls back to the
+                # integer true_value=1/false_value=0 and the INSERT sends an
+                # integer into the BOOLEAN imports.is_historical column.
+                "true_value": True,
+                "false_value": False,
+                "readonly": False
+            },
             # TVA now a checkbox: unchecked=0%, checked=20%
             "tva": {
                 "value": 20.0,
@@ -133,22 +159,27 @@ class ImportClass(BaseClass):
                 "supplier_username": "r",
                 "supplier_name": "r",
                 "date": "r",
+                "bl_number": "r",
                 "total_price": "r",
                 "details": "r"
             },
             "dialog": {
                 "supplier_username": "rw",
                 "date": "rw",
+                "bl_number": "rw",
                 "tva": "rw",
                 "notes": "rw",
+                "is_historical": "rw",
                 "items": "rw"
             },
             "database": {
                 "supplier_username": "rw",
                 "supplier_name": "rw",
                 "date": "rw",
+                "bl_number": "rw",
                 "tva": "rw",
                 "notes": "rw",
+                "is_historical": "rw",
                 "created_by": "r",
                 "created_by_username": "r",
                 "created_at": "r",

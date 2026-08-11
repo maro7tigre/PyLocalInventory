@@ -38,7 +38,7 @@ class _Cursor:
             self._row = None
         elif normalized.startswith("select id from products") and normalized.endswith("for update"):
             self._row = (int(params[0]),)
-        elif normalized.startswith("select coalesce(sum(quantity), 0) from import_items"):
+        elif normalized.startswith("select coalesce(sum(ii.quantity), 0)"):
             self._row = (self.imported,)
         elif normalized.startswith("select coalesce(sum(si.quantity), 0)"):
             self._row = (self.sold,)

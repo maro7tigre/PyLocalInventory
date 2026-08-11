@@ -3801,6 +3801,37 @@ class Database:
             self.conn.rollback()
             raise
 
+    def delete_client_payment(self, payment_id, user=None):
+        """Delete ONLY a single payment record by its persisted payment ID.
+
+        No other row is touched - the sale, its items, stock, the client and
+        the Devis reference are never modified by this call. Backs the Client
+        Account "Delete Payment" feature; the user confirms before this is
+        called. Raises ValueError if the payment does not exist.
+        """
+        payment_id = int(payment_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id = %s RETURNING id",
+                (payment_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "delete_client_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s",
+                mode, user_id, role_id, payment_id,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def delete_item(self, item_id, section):
         """Delete item from section"""
         if not self.cursor or section not in self.registered_classes:

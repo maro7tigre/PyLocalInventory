@@ -111,6 +111,9 @@ class _StubDatabase:
     def update_client_payment(self, payment_id, amount):
         return None
 
+    def delete_client_payment(self, payment_id):
+        return None
+
 
 class ClientAccountSchemaTests(unittest.TestCase):
     def test_purchase_fields_are_exactly_the_14_column_join(self):
@@ -224,6 +227,20 @@ class _FakeConn:
         pass
 
 
+class _DeleteCursor:
+    """Scripted cursor for Database.delete_client_payment()."""
+
+    def __init__(self, found=True):
+        self.found = found
+        self.executed = []
+
+    def execute(self, sql, params=None):
+        self.executed.append((sql, params))
+
+    def fetchone(self):
+        return (12,) if self.found else None
+
+
 class ClientAccountBackendTests(unittest.TestCase):
     """Exercise the real Database.get_client_sale_summaries() code path."""
 
@@ -242,6 +259,33 @@ class ClientAccountBackendTests(unittest.TestCase):
         self.assertEqual(sale2["paid"], Decimal("10000.00"))
         self.assertEqual(sale2["remaining"], Decimal("28360.40"))
         self.assertEqual(result["payments"][0]["amount"], Decimal("10000.00"))
+
+    def test_delete_client_payment_deletes_only_by_payment_id(self):
+        from core.database import Database
+
+        db = Database.__new__(Database)
+        cursor = _DeleteCursor(found=True)
+        db.cursor = cursor
+        db.conn = _FakeConn()
+        result = db.delete_client_payment(12)
+        self.assertEqual(result, 12)
+        sql, params = cursor.executed[0]
+        self.assertIn("DELETE FROM payments", sql)
+        self.assertIn("WHERE id = %s", sql)
+        self.assertEqual(params, (12,))
+
+    def test_delete_client_payment_missing_payment_rolls_back_and_raises(self):
+        from core.database import Database
+
+        db = Database.__new__(Database)
+        cursor = _DeleteCursor(found=False)
+        db.cursor = cursor
+        conn = _FakeConn()
+        db.conn = conn
+        with patch.object(conn, "rollback") as rollback:
+            with self.assertRaises(ValueError):
+                db.delete_client_payment(99)
+        rollback.assert_called_once()
 
 
 class ClientAccountDialogTests(unittest.TestCase):
@@ -584,6 +628,132 @@ class ClientAccountDialogTests(unittest.TestCase):
         args, _kwargs = start.call_args
         self.assertEqual(args[0], 3)
         self.assertIsInstance(args[1], Decimal)
+
+    def test_delete_payment_button_sits_next_to_edit_button(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1")],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        dialog = self._build_dialog(account)
+        header = dialog.delete_payment_btn.parentWidget()
+        layout = header.layout()
+        edit_index = delete_index = -1
+        for i in range(layout.count()):
+            widget = layout.itemAt(i).widget()
+            if widget is dialog.edit_payment_btn:
+                edit_index = i
+            elif widget is dialog.delete_payment_btn:
+                delete_index = i
+        self.assertTrue(edit_index >= 0)
+        self.assertEqual(delete_index, edit_index + 1)
+
+    def test_delete_payment_with_no_selection_deletes_nothing(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1",
+                                      total=Decimal("200.00"), paid=Decimal("40.00"),
+                                      remaining=Decimal("160.00"))],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        with patch.object(database, "delete_client_payment") as delete, patch(
+            "ui.dialogs.client_details_dialog.QMessageBox.information"
+        ) as info:
+            dialog._delete_selected_payment()
+        delete.assert_not_called()
+        info.assert_called_once()
+        self.assertEqual(dialog.payments_table.rowCount(), 1)
+
+    def test_delete_payment_cancel_confirmation_deletes_nothing(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1",
+                                      total=Decimal("200.00"), paid=Decimal("40.00"),
+                                      remaining=Decimal("160.00"))],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        with patch.object(dialog, "_confirm_payment_delete", return_value=False) as confirm, patch.object(
+            database, "delete_client_payment"
+        ) as delete, patch.object(dialog, "_start_payment_delete") as start:
+            dialog.payments_table.setCurrentCell(0, 0)
+            dialog._delete_selected_payment()
+        confirm.assert_called_once()
+        delete.assert_not_called()
+        start.assert_not_called()
+
+    def test_delete_selected_payment_asks_confirmation_and_calls_delete(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1",
+                                      total=Decimal("200.00"), paid=Decimal("40.00"),
+                                      remaining=Decimal("160.00"))],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        with patch.object(dialog, "_confirm_payment_delete", return_value=True) as confirm, patch.object(
+            dialog, "_start_payment_delete"
+        ) as start:
+            dialog.payments_table.setCurrentCell(0, 0)
+            dialog._delete_selected_payment()
+        confirm.assert_called_once()
+        args, _kwargs = confirm.call_args
+        self.assertEqual(args[0]["payment_id"], 12)
+        self.assertEqual(args[1], "DE-2026-1")
+        start.assert_called_once_with(12)
+
+    def test_confirm_delete_builds_message_with_delete_and_cancel_buttons(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1")],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        dialog = self._build_dialog(account)
+        with patch("ui.dialogs.client_details_dialog.QMessageBox") as box_cls:
+            box = box_cls.return_value
+            box.addButton.return_value = "delete-btn"
+            box.clickedButton.return_value = "delete-btn"
+            result = dialog._confirm_payment_delete(
+                dialog.payments[0], "DE-2026-1"
+            )
+            button_texts = [call.args[0] for call in box.addButton.call_args_list]
+            self.assertIn("Delete", button_texts)
+            self.assertIn("Cancel", button_texts)
+            self.assertTrue(result)
+
+    def test_delete_payment_worker_refreshes_after_delete(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1",
+                                      total=Decimal("200.00"), paid=Decimal("40.00"),
+                                      remaining=Decimal("160.00"))],
+            "payments": [_canonical_payment(12, 1, amount=40, item_id=None)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        # The worker's finished handler calls self.refresh_data() and shows a
+        # modal QMessageBox; keep both patched while we pump the event loop.
+        with patch.object(dialog, "refresh_data") as refresh, patch(
+            "ui.dialogs.client_details_dialog.QMessageBox.information"
+        ):
+            dialog._start_payment_delete(12)
+            deadline = time.time() + 3.0
+            while getattr(dialog, "_payment_delete_thread", None) is not None and time.time() < deadline:
+                QApplication.processEvents()
+                time.sleep(0.005)
+        self.assertFalse(dialog._payment_delete_inflight)
+        self.assertEqual(dialog.delete_payment_btn.text(), "Delete Payment")
+        refresh.assert_called_once()
 
 
 if __name__ == "__main__":

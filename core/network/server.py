@@ -70,8 +70,11 @@ _ATTACHMENT_METHODS = {
 _CLIENT_ACCOUNT_METHODS = {
     'get_client_account', 'get_client_sales', 'get_client_sale_summaries',
     'get_client_sale_items', 'add_client_payment', 'update_client_payment',
+    'delete_client_payment',
 }
-_CLIENT_PAYMENT_WRITE_METHODS = {'add_client_payment', 'update_client_payment'}
+_CLIENT_PAYMENT_WRITE_METHODS = {
+    'add_client_payment', 'update_client_payment', 'delete_client_payment',
+}
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
 _ALWAYS_ALLOWED = {

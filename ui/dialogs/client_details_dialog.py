@@ -132,6 +132,34 @@ class _PaymentUpdateWorker(QObject):
             self.error.emit(str(e))
 
 
+class _PaymentDeleteWorker(QObject):
+    """Deletes one payment off the GUI thread.
+
+    A single ``delete_client_payment`` DELETE on the remote host - never on
+    the GUI thread, so a slow LAN round-trip cannot freeze the window.
+    """
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, database, payment_id):
+        super().__init__()
+        self.database = database
+        self.payment_id = payment_id
+
+    @Slot()
+    def run(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            self.database.delete_client_payment(self.payment_id)
+            self.finished.emit({"payment_id": self.payment_id})
+        except Exception as e:
+            logger.exception(
+                "Payment delete failed: payment_id=%s", self.payment_id,
+            )
+            self.error.emit(str(e))
+
+
 class _ClientReportWorker(QObject):
     """Renders a Client Statement / single-sale PDF off the GUI thread.
 
@@ -713,6 +741,9 @@ class ClientDetailsDialog(QDialog):
         self._payment_edit_thread = None
         self._payment_edit_worker = None
         self._payment_edit_inflight = False
+        self._payment_delete_thread = None
+        self._payment_delete_worker = None
+        self._payment_delete_inflight = False
         self.refresh_data()
 
     def _ensure_payments_table(self):
@@ -919,6 +950,15 @@ class ClientDetailsDialog(QDialog):
         self.edit_payment_btn.setEnabled(False)
         self.edit_payment_btn.clicked.connect(self._edit_selected_payment)
         payments_header_layout.addWidget(self.edit_payment_btn)
+        self.delete_payment_btn = QPushButton("Delete Payment")
+        self.delete_payment_btn.setObjectName("dangerBtn")
+        self.delete_payment_btn.setToolTip(
+            "Delete the selected payment record (only that payment - never "
+            "the sale, items, stock or Devis)"
+        )
+        self.delete_payment_btn.setEnabled(False)
+        self.delete_payment_btn.clicked.connect(self._delete_selected_payment)
+        payments_header_layout.addWidget(self.delete_payment_btn)
         payments_header_layout.addWidget(self.payments_count_label)
         payments_layout.addWidget(payments_header)
 
@@ -1062,6 +1102,8 @@ class ClientDetailsDialog(QDialog):
                 border-radius:5px; padding:8px 14px;
             }
             QPushButton:hover { background:#1976D2; }
+            #dangerBtn { background:#c62828; }
+            #dangerBtn:hover { background:#e53935; }
             """
         )
 
@@ -1237,6 +1279,7 @@ class ClientDetailsDialog(QDialog):
         self.amount_input.setEnabled(False)
         self.add_payment_button.setEnabled(False)
         self.edit_payment_btn.setEnabled(False)
+        self.delete_payment_btn.setEnabled(False)
         self.print_statement_btn.setEnabled(True)
         self._update_print_selected_enabled()
 
@@ -1362,6 +1405,7 @@ class ClientDetailsDialog(QDialog):
             self.payments_count_label.setText("0 records")
             self.payments_stack.setCurrentIndex(1)
             self.edit_payment_btn.setEnabled(False)
+            self.delete_payment_btn.setEnabled(False)
             return
 
         self.payments_table.setRowCount(len(rows))
@@ -1400,10 +1444,11 @@ class ClientDetailsDialog(QDialog):
     def _payment_selected(self, current_row, _current_col, _previous_row, _previous_col):
         if not getattr(self, "can_record_payment", False):
             self.edit_payment_btn.setEnabled(False)
+            self.delete_payment_btn.setEnabled(False)
             return
-        self.edit_payment_btn.setEnabled(
-            current_row >= 0 and current_row < len(self.payments)
-        )
+        enabled = current_row >= 0 and current_row < len(self.payments)
+        self.edit_payment_btn.setEnabled(enabled)
+        self.delete_payment_btn.setEnabled(enabled)
 
     def _purchase_selected(self, current_row, _current_col, _previous_row, _previous_col):
         self._update_print_selected_enabled()
@@ -1648,6 +1693,8 @@ class ClientDetailsDialog(QDialog):
             return
         if self._payment_edit_inflight:
             return  # an edit is already being saved
+        if self._payment_delete_inflight:
+            return  # a delete is already being saved
         payment = self._selected_payment()
         if not payment:
             QMessageBox.information(
@@ -1696,6 +1743,7 @@ class ClientDetailsDialog(QDialog):
         self._payment_edit_inflight = True
         self.edit_payment_btn.setEnabled(False)
         self.edit_payment_btn.setText("Saving...")
+        self.delete_payment_btn.setEnabled(False)
         self.add_payment_button.setEnabled(False)
 
         thread = QThread()
@@ -1740,6 +1788,108 @@ class ClientDetailsDialog(QDialog):
         try:
             QMessageBox.critical(
                 self, "Payment Error", f"Could not update the payment:\n{error}"
+            )
+            self.refresh_data()
+        except RuntimeError:
+            pass
+
+    def _delete_selected_payment(self):
+        if not self.can_record_payment:
+            QMessageBox.information(
+                self, "Read-Only Access", "You don't have permission to delete payments."
+            )
+            return
+        if self._payment_delete_inflight:
+            return  # a delete is already being saved
+        if self._payment_edit_inflight:
+            return  # an edit is already being saved
+        payment = self._selected_payment()
+        if not payment:
+            QMessageBox.information(
+                self, "Delete Payment", "Please select a payment to delete."
+            )
+            return
+
+        sale = next(
+            (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
+        )
+        if sale is None:
+            QMessageBox.warning(
+                self, "Delete Payment", "The sale of this payment could not be resolved."
+            )
+            return
+
+        devis = sale.get("devis") or "-"
+        if not self._confirm_payment_delete(payment, devis):
+            return
+        self._start_payment_delete(payment["payment_id"])
+
+    def _confirm_payment_delete(self, payment, devis):
+        """Modal confirmation before a payment is permanently deleted."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete Payment")
+        box.setText(
+            f"Are you sure you want to delete Payment #{payment['payment_id']}\n"
+            f"Amount: {_format_money(payment['amount'])} {self.currency}\n"
+            f"Sale: #{payment['sale_id']}\n"
+            f"Devis: {devis}\n\n"
+            "This action will remove this payment permanently."
+        )
+        delete_btn = box.addButton("Delete", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        return box.clickedButton() is delete_btn
+
+    def _start_payment_delete(self, payment_id):
+        self._payment_delete_inflight = True
+        self.edit_payment_btn.setEnabled(False)
+        self.delete_payment_btn.setEnabled(False)
+        self.delete_payment_btn.setText("Deleting...")
+        self.add_payment_button.setEnabled(False)
+
+        thread = QThread()
+        worker = _PaymentDeleteWorker(self.database, payment_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(thread.quit)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_payment_delete_thread_finished)
+
+        worker.finished.connect(self._on_payment_delete_finished)
+        worker.error.connect(self._on_payment_delete_failed)
+
+        self._payment_delete_thread = thread
+        self._payment_delete_worker = worker
+        thread.start()
+
+    def _on_payment_delete_thread_finished(self):
+        self._payment_delete_thread = None
+        self._payment_delete_worker = None
+
+    @Slot(object)
+    def _on_payment_delete_finished(self, _payload):
+        self._payment_delete_inflight = False
+        self.delete_payment_btn.setText("Delete Payment")
+        try:
+            QMessageBox.information(
+                self, "Payment Deleted", "The payment was deleted."
+            )
+            self.refresh_data()
+        except RuntimeError:
+            pass
+
+    @Slot(str)
+    def _on_payment_delete_failed(self, error):
+        self._payment_delete_inflight = False
+        self.delete_payment_btn.setText("Delete Payment")
+        try:
+            QMessageBox.critical(
+                self, "Delete Payment", f"Could not delete the payment:\n{error}"
             )
             self.refresh_data()
         except RuntimeError:

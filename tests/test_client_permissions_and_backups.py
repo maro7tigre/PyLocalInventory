@@ -80,6 +80,7 @@ class ClientPermissionAndBackupTests(unittest.TestCase):
         for method, args in [
             ("add_client_payment", [7, 8, None, 10, "2026-07-27"]),
             ("update_client_payment", [3, 45.00]),
+            ("delete_client_payment", [12]),
         ]:
             denied, _ = _check_permission(
                 _user(client_read=True), method, args, {}

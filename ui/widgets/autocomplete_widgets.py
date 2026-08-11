@@ -16,8 +16,7 @@ class AutoCompleteLineEdit(QLineEdit):
         self.multi_value = multi_value
         self.completer = None
         self.suggestions_frozen = False
-        self._options_cache = None
-        
+
         # Set default background for table editing
         self.setStyleSheet("QLineEdit { background-color: #2D2D2D; color: white; }")
         
@@ -36,18 +35,23 @@ class AutoCompleteLineEdit(QLineEdit):
         super().keyPressEvent(event)
     
     def _get_options_list(self):
-        """Get the actual options list, calling method if necessary"""
+        """Get the actual options list, calling method if necessary.
+
+        Always re-invokes callables instead of caching the result on the
+        widget: product/service options can change (e.g. a product is
+        added or renamed) while this widget stays alive, and a stale
+        per-widget cache would hide those updates until the widget was
+        recreated. Callers that need caching (e.g. DB-backed option
+        providers) implement their own TTL cache.
+        """
         if callable(self.options):
-            if self._options_cache is not None:
-                return self._options_cache
             try:
-                self._options_cache = self.options() or []
-                return self._options_cache
+                return self.options() or []
             except Exception as e:
                 print(f"Error calling options method: {e}")
                 return []
         return self.options or []
-    
+
     def _setup_completer(self):
         """Initialize completer if options are available"""
         options_list = self._get_options_list()
@@ -155,13 +159,11 @@ class AutoCompleteLineEdit(QLineEdit):
     def update_options(self, new_options):
         """Update options and refresh completer"""
         self.options = new_options
-        self._options_cache = None
         self._setup_completer()
-    
+
     def refresh_options(self):
         """Refresh options if they are callable (for dynamic database updates)"""
         if callable(self.options):
-            self._options_cache = None
             self._setup_completer()
     
     def _update_autocomplete(self, text):
@@ -211,7 +213,6 @@ class AutoExpandingTextEdit(QTextEdit):
         self.options = options or []
         self.multi_value = multi_value
         self.allow_free_text = allow_free_text
-        self._options_cache = None
         self.minimum_editor_height = minimum_height
         self.maximum_editor_height = maximum_height
         self.setAcceptRichText(False)
@@ -237,12 +238,10 @@ class AutoExpandingTextEdit(QTextEdit):
         self.setPlainText(str(text or ""))
 
     def _get_options_list(self):
+        """Always re-invoke callables; see AutoCompleteLineEdit._get_options_list."""
         if callable(self.options):
-            if self._options_cache is not None:
-                return self._options_cache
             try:
-                self._options_cache = self.options() or []
-                return self._options_cache
+                return self.options() or []
             except Exception as exc:
                 print(f"Error calling options method: {exc}")
                 return []

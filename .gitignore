@@ -77,7 +77,7 @@ test_winauto.py
 test_worker.py
 docs/ANTIGRAVITY_STABILITY_FIX_PROMPT.md
 docs/PYLOCALINVENTORY_ANTIGRAVITY_CONTEXT.md
-
+tests/
 # Editor and OS metadata
 .vscode/
 .idea/

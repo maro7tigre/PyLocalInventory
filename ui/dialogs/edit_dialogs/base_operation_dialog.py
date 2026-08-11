@@ -206,13 +206,15 @@ class BaseOperationDialog(QDialog):
         self.setWindowTitle(self.windowTitle() + " (Loading...)")
 
         self.load_thread = QThread()
-        _catalog = getattr(database, "sale_catalog", None)
+        # Always re-fetch (off-thread, so it never blocks the UI): the
+        # catalog holds product/service prices and stock, which can change
+        # between dialog opens. Reusing a session-long snapshot here used to
+        # show stale prices until the app was restarted.
         self.load_worker = LoadWorker(
             self.operation_obj if operation_id else None,
             database,
-            fetch_catalog=not _catalog or "clients" not in _catalog,
-            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters),
-            fetch_bl_preview=(not operation_id and 'bl_number' in self.operation_obj.parameters)
+            fetch_catalog=True,
+            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters)
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)

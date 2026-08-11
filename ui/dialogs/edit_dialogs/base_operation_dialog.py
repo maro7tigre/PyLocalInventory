@@ -102,13 +102,16 @@ class LoadWorker(QObject):
     finished = Signal()
     error = Signal(str)
 
-    def __init__(self, operation_obj, database, fetch_catalog, fetch_devis_preview=False):
+    def __init__(self, operation_obj, database, fetch_catalog, fetch_devis_preview=False,
+                 fetch_bl_preview=False):
         super().__init__()
         self.operation_obj = operation_obj
         self.database = database
         self.fetch_catalog = fetch_catalog
         self.fetch_devis_preview = fetch_devis_preview
+        self.fetch_bl_preview = fetch_bl_preview
         self.devis_preview = None
+        self.bl_preview = None
 
     @Slot()
     def process(self):
@@ -145,6 +148,16 @@ class LoadWorker(QObject):
                     self.devis_preview = worker_db.get_next_devis_preview()
                 except Exception:
                     self.devis_preview = None
+
+            # Advisory Bon de Livraison preview for a NEW import. Off-thread so
+            # the dialog never blocks on the network; the host re-allocates and
+            # validates uniqueness transactionally on save (same pattern as the
+            # Devis preview).
+            if self.fetch_bl_preview and getattr(worker_db, 'get_next_bl_preview', None):
+                try:
+                    self.bl_preview = worker_db.get_next_bl_preview()
+                except Exception:
+                    self.bl_preview = None
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -200,8 +213,9 @@ class BaseOperationDialog(QDialog):
         self.load_worker = LoadWorker(
             self.operation_obj if operation_id else None,
             database,
-            fetch_catalog=True,
-            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters)
+            fetch_catalog=not _catalog or "clients" not in _catalog,
+            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters),
+            fetch_bl_preview=(not operation_id and 'bl_number' in self.operation_obj.parameters)
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)
@@ -230,6 +244,7 @@ class BaseOperationDialog(QDialog):
         # cleared here - see _on_save_finished. Refs are cleared in
         # _on_load_thread_finished, queued to fire only after load_thread.finished.
         _preview = self.load_worker.devis_preview if self.load_worker else None
+        _preview_bl = self.load_worker.bl_preview if self.load_worker else None
         
         try:
             self.setEnabled(True)
@@ -238,6 +253,8 @@ class BaseOperationDialog(QDialog):
             self.load_data()
             if _preview is not None:
                 self._apply_devis_preview(_preview)
+            if _preview_bl is not None:
+                self._apply_bl_preview(_preview_bl)
             
             if hasattr(self, 'items_table') and self.items_table:
                 self.items_table.refresh_table()
@@ -249,6 +266,20 @@ class BaseOperationDialog(QDialog):
         if not self.operation_obj or 'devis' not in self.operation_obj.parameters:
             return
         widget = self.parameter_widgets.get('devis')
+        if widget is None:
+            return
+        try:
+            ParameterWidgetFactory.set_widget_value(widget, preview)
+        except Exception:
+            pass
+
+    def _apply_bl_preview(self, preview):
+        """Fill the Bon de Livraison field with the host advisory preview
+        (new Imports only). Editable, so the user can override it; the host
+        re-validates uniqueness and re-allocates on save."""
+        if not self.operation_obj or 'bl_number' not in self.operation_obj.parameters:
+            return
+        widget = self.parameter_widgets.get('bl_number')
         if widget is None:
             return
         try:
@@ -339,12 +370,20 @@ class BaseOperationDialog(QDialog):
             
             self.parameter_widgets[param_key] = widget
             
-            # Historical-sale flag: one labelled checkbox, no extra form label.
-            # Label text is part of the product requirement.
+            # Historical-operation flag: one labelled checkbox, no extra form
+            # label. Label text is part of the product requirement.
             if param_key == 'is_historical':
                 checkbox = getattr(widget, 'checkbox', None)
                 if checkbox is not None:
-                    checkbox.setText("Historical Sale \u2014 Do not affect current stock")
+                    section = getattr(self.operation_obj, 'section', 'Sales')
+                    if section == 'Imports':
+                        checkbox.setText(
+                            "Historical Import \u2014 Do not affect current stock"
+                        )
+                    else:
+                        checkbox.setText(
+                            "Historical Sale \u2014 Do not affect current stock"
+                        )
                 form_layout.addRow(widget)
                 continue
 

@@ -16,6 +16,7 @@ os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from core.database import BL_MAX_LENGTH, Database
 from core.network.server import _check_permission
+from classes.import_class import ImportClass
 
 
 class _FakeConn:
@@ -60,6 +61,12 @@ class _BlFakeCursor:
             return (self.stored_bl,)
         if self._sql.strip().startswith("SELECT date FROM imports"):
             return (self.import_date,)
+        if "SELECT id, name FROM products" in self._sql:
+            return (1, "Bois de chêne")
+        if "FROM suppliers" in self._sql:
+            return (7, "Bois Plus SARL", "boisplus")
+        if "RETURNING id" in self._sql:
+            return (100,)
         return None
 
     def fetchall(self):
@@ -125,6 +132,68 @@ class BlResolverTests(unittest.TestCase):
         self.assertIn("bl_year = %s", sql)
         self.assertEqual(params, ("2026",))
         self.assertEqual(header["bl_number"], "BL-2026-12")
+
+    def test_preview_proposes_next_number_for_year(self):
+        self.cursor.max_number = 27
+        self.assertEqual(self.db.get_next_bl_preview("2026-07-01"), "BL-2026-28")
+
+    def test_preview_is_advisory_only_no_write(self):
+        self.cursor.max_number = 27
+        before = len(self.cursor.queries)
+        self.db.get_next_bl_preview("2026-07-01")
+        sql, _ = self.cursor.queries[-1]
+        self.assertNotIn("UPDATE", sql)
+        self.assertNotIn("INSERT", sql)
+        self.assertEqual(self.db.conn.commits, 0)
+
+
+class BlHistoricalFlagTests(unittest.TestCase):
+    def setUp(self):
+        self.cursor = _BlFakeCursor()
+        self.db = Database.__new__(Database)
+        self.db.cursor = self.cursor
+        self.db.conn = _FakeConn()
+        self.db.registered_classes = {"Imports": ImportClass}
+
+    def test_bool_flag_parser_maps_int_and_bool_to_python_bool(self):
+        self.assertIs(self.db._parse_bool_flag(True), True)
+        self.assertIs(self.db._parse_bool_flag(False), False)
+        self.assertIs(self.db._parse_bool_flag(1), True)
+        self.assertIs(self.db._parse_bool_flag(0), False)
+        self.assertIs(self.db._parse_bool_flag("1"), True)
+        self.assertIs(self.db._parse_bool_flag("false"), False)
+        self.assertIs(self.db._parse_bool_flag(None), False)
+
+    def test_import_class_keeps_is_historical_as_python_bool(self):
+        from classes.import_class import ImportClass as ImportCls
+        obj = ImportCls(0, None)
+        for source, expected in [(True, True), (False, False), (1, True), (0, False),
+                                 ("true", True), ("", False)]:
+            obj.set_value('is_historical', source)
+            value = obj.get_value('is_historical')
+            self.assertIs(value, expected, f"source={source!r} -> {value!r}")
+
+    def test_save_import_normalizes_integer_is_historical_to_bool(self):
+        self.cursor.max_number = 27
+        payload = {
+            "supplier_username": "boisplus", "supplier_name": "boisplus",
+            "date": "2026-07-01", "bl_number": "", "tva": 20.0,
+            "is_historical": 1, "operation_token": "tok-hist-1",
+        }
+        item = [{"product_name": "Bois de chêne", "quantity": "5", "unit_price": "10"}]
+        self.db.save_import_with_items(payload, item, import_id=None,
+                                       visible_row_count=1)
+        insert_sql = insert_params = None
+        for sql, params in self.cursor.queries:
+            s = str(sql)
+            if s.startswith("INSERT INTO imports") and "is_historical" in s:
+                insert_sql, insert_params = s, params
+                break
+        self.assertIsNotNone(insert_params)
+        columns = insert_sql.split("(", 1)[1].split(")", 1)[0].split(",")
+        idx = [c.strip().strip('"') for c in columns].index("is_historical")
+        self.assertIs(type(insert_params[idx]), bool)
+        self.assertIs(insert_params[idx], True)
 
 
 class BlBackfillTests(unittest.TestCase):
@@ -212,6 +281,31 @@ class ImportBlServerPermissionTests(unittest.TestCase):
         allowed, _ = _check_permission(
             {"is_superadmin": True, "permissions": {}},
             "get_import_bl_number", [12], {},
+        )
+        self.assertTrue(allowed)
+
+    def test_bl_preview_denied_without_imports_access(self):
+        allowed, _ = _check_permission(
+            self._user(), "get_next_bl_preview", [], {}
+        )
+        self.assertFalse(allowed)
+
+    def test_bl_preview_allowed_with_imports_read(self):
+        allowed, _ = _check_permission(
+            self._user(imports_read=True), "get_next_bl_preview", [], {}
+        )
+        self.assertTrue(allowed)
+
+    def test_bl_preview_allowed_with_imports_write(self):
+        allowed, _ = _check_permission(
+            self._user(imports_write=True), "get_next_bl_preview", [], {}
+        )
+        self.assertTrue(allowed)
+
+    def test_bl_preview_allowed_for_superadmin(self):
+        allowed, _ = _check_permission(
+            {"is_superadmin": True, "permissions": {}},
+            "get_next_bl_preview", [], {},
         )
         self.assertTrue(allowed)
 

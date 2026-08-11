@@ -62,6 +62,25 @@ CLIENT_ACCOUNT_PAYMENT_FIELDS = (
     "payment_id", "sale_id", "item_id", "date", "amount",
 )
 
+# Canonical Supplier Account schemas - the single data contract shared by the
+# host GUI, the LAN RPC layer and the View Supplier dialog / statement report.
+# Mirrors the Client Account fields so the same widget pipeline can render
+# either side. One row per Import x Import_Items join in the "imports" view
+# and one row per payment in the "payments" view.
+SUPPLIER_ACCOUNT_IMPORT_FIELDS = (
+    "import_id", "date", "item_id", "product", "quantity",
+    "unit_price", "vat", "notes", "is_historical", "created_by_username",
+)
+SUPPLIER_ACCOUNT_PAYMENT_FIELDS = (
+    "payment_id", "import_id", "item_id", "date", "amount",
+)
+# Canonical per-Import summary schema returned by
+# get_supplier_import_summaries(). One row per Import (never one per item).
+SUPPLIER_ACCOUNT_IMPORT_SUMMARY_FIELDS = (
+    "import_id", "date", "bl_number", "is_historical", "total", "paid",
+    "remaining",
+)
+
 # Canonical per-Sale summary schema returned by get_client_sale_summaries().
 # One row per Sale (never one per item) so the Sales History table never needs
 # to download every Sale Item. ``devis`` is the display string DE-YEAR-N.
@@ -129,6 +148,23 @@ def normalize_client_account(purchase_rows, payment_rows):
         dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
     ]
     return {"purchases": purchases, "payments": payments}
+
+
+def normalize_supplier_account(import_rows, payment_rows):
+    """Convert raw Imports/Import_Items and Payments rows to canonical dicts.
+
+    ``import_rows`` follow ``SUPPLIER_ACCOUNT_IMPORT_FIELDS`` and
+    ``payment_rows`` follow ``SUPPLIER_ACCOUNT_PAYMENT_FIELDS``. The returned
+    structure is the single Supplier Account data contract shared by the host
+    GUI, the LAN RPC layer and the View Supplier dialog / reports.
+    """
+    imports = [
+        dict(zip(SUPPLIER_ACCOUNT_IMPORT_FIELDS, row)) for row in import_rows
+    ]
+    payments = [
+        dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"imports": imports, "payments": payments}
 
 
 class Database:
@@ -499,6 +535,12 @@ class Database:
                 # print/save. Allocated by the host only - never part of the
                 # client Import payload. Enforced unique by imports_bl_uidx.
                 'bl_number': 'TEXT',
+                # Historical imports are books-only: they never touch stock.
+                # Mirrors sales.is_historical above. Also the canonical creation
+                # path when the column is absent - the class-driven migration
+                # loop would otherwise add it as DOUBLE PRECISION (see the
+                # type-normalization block below).
+                'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
             },
             'reports': {
                 'report_type': 'TEXT', 'created_by': 'INTEGER',
@@ -529,6 +571,40 @@ class Database:
             except Exception as e_tab:
                 self.conn.rollback()
                 print(f"Warning: snapshot column check failed for {table}: {e_tab}")
+
+        # imports.is_historical must be BOOLEAN, not DOUBLE PRECISION. Databases
+        # that added the column through the class-driven migration loop before
+        # this fix got it as DOUBLE PRECISION because _sql_type_for maps the
+        # 'bool' type to DOUBLE PRECISION (deliberate for the numeric tva
+        # toggle). sales.is_historical is never affected - it is intentionally
+        # absent from SalesClass's "database" section, so it is only ever
+        # created here as BOOLEAN. Normalize the type so every consumer works:
+        # COALESCE(i.is_historical, FALSE) and NOT i.is_historical both require
+        # a boolean. Existing values are preserved - NULL stays NULL, 0 becomes
+        # FALSE, any other number becomes TRUE. Idempotent: skipped once the
+        # column is already BOOLEAN.
+        for col_table in ("imports", "sales"):
+            try:
+                self.cursor.execute(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s "
+                    "AND column_name = 'is_historical'",
+                    (col_table,),
+                )
+                type_row = self.cursor.fetchone()
+                if type_row and type_row[0] != "boolean":
+                    self.cursor.execute(
+                        f"ALTER TABLE {col_table} ALTER COLUMN is_historical "
+                        "TYPE BOOLEAN USING (is_historical <> 0)"
+                    )
+                    self.conn.commit()
+                    print(f"✓ Normalized {col_table}.is_historical to BOOLEAN")
+            except Exception as e_type:
+                self.conn.rollback()
+                print(
+                    f"Warning: could not normalize {col_table}.is_historical "
+                    f"to BOOLEAN: {e_type}"
+                )
 
         try:
             index_statements = (
@@ -662,7 +738,7 @@ class Database:
             print(f"Warning: could not create attachment tables: {e}")
 
     def _ensure_payments_table(self):
-        """Create the client-account payment table during trusted host startup."""
+        """Create the client/supplier-account payment table during trusted host startup."""
         try:
             self.cursor.execute(
                 """
@@ -670,15 +746,31 @@ class Database:
                     id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                     sale_id INTEGER,
                     sales_item_id INTEGER,
+                    import_id INTEGER,
+                    import_item_id INTEGER,
                     amount DOUBLE PRECISION,
                     date TEXT,
                     FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
-                    FOREIGN KEY (sales_item_id) REFERENCES sales_items(id) ON DELETE CASCADE
+                    FOREIGN KEY (sales_item_id) REFERENCES sales_items(id) ON DELETE CASCADE,
+                    FOREIGN KEY (import_id) REFERENCES imports(id) ON DELETE CASCADE,
+                    FOREIGN KEY (import_item_id) REFERENCES import_items(id) ON DELETE CASCADE
                 )
                 """
             )
             self.cursor.execute(
                 "ALTER TABLE payments ADD COLUMN IF NOT EXISTS sales_item_id INTEGER"
+            )
+            # Supplier side of the same table: an Import-level payment recorded
+            # against a supplier account. Idempotent for legacy databases.
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS import_id INTEGER"
+            )
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS import_item_id INTEGER"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS payments_import_id_idx "
+                "ON payments(import_id) WHERE import_id IS NOT NULL"
             )
             self.conn.commit()
         except Exception as e:
@@ -958,7 +1050,7 @@ class Database:
             "SELECT COALESCE(MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{4}-(\\d+)') "
             "AS INTEGER)), 0) + 1 FROM ("
             f"SELECT s.bl_number, {_BL_YEAR_EXPR} AS bl_year "
-            "FROM imports s) sub WHERE sub.bl_year = %s",
+            "FROM imports s) s WHERE s.bl_year = %s",
             (year,),
         )
         row = self.cursor.fetchone()
@@ -1013,6 +1105,24 @@ class Database:
         else:
             self._allocate_bl_number(None, header)
         return header
+
+    def get_next_bl_preview(self, date=None):
+        """Propose the next per-year Bon de Livraison reference (BL-YEAR-N).
+
+        Read-only and advisory: the definitive allocation/validation happens in
+        ``_resolve_import_bl`` inside ``save_import_with_items`` at commit time.
+        """
+        year = self._devis_year_from_date(date)
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{4}-(\\d+)') "
+            "AS INTEGER)), 0) + 1 FROM ("
+            f"SELECT s.bl_number, {_BL_YEAR_EXPR} AS bl_year "
+            "FROM imports s) s WHERE s.bl_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        return f"BL-{year}-{next_num}"
 
     def get_import_bl_number(self, import_id):
         """Return the persistent Bon de Livraison reference for an import.
@@ -1670,8 +1780,11 @@ class Database:
                 raise ValueError(f"Product {product_id} does not exist")
 
             self.cursor.execute(
-                "SELECT COALESCE(SUM(quantity), 0) "
-                "FROM import_items WHERE product_id=%s",
+                "SELECT COALESCE(SUM(ii.quantity), 0) "
+                "FROM import_items ii "
+                "JOIN imports i ON i.id = ii.import_id "
+                "WHERE ii.product_id=%s "
+                "  AND (i.is_historical IS NULL OR NOT i.is_historical)",
                 (product_id,),
             )
             imported = self.cursor.fetchone()[0] or 0
@@ -2005,7 +2118,11 @@ class Database:
                     if not self.cursor.fetchone():
                         raise ValueError(f"Product {product_id} does not exist")
                     self.cursor.execute(
-                        "SELECT COALESCE(SUM(quantity), 0) FROM import_items WHERE product_id=%s",
+                        "SELECT COALESCE(SUM(ii.quantity), 0) "
+                        "FROM import_items ii "
+                        "JOIN imports i ON i.id = ii.import_id "
+                        "WHERE ii.product_id=%s "
+                        "  AND (i.is_historical IS NULL OR NOT i.is_historical)",
                         (product_id,),
                     )
                     imported = self.cursor.fetchone()[0] or 0
@@ -2191,6 +2308,12 @@ class Database:
                 for key in import_obj.get_visible_parameters("database")
                 if key in import_data and not import_obj.is_parameter_calculated(key)
             }
+            # is_historical lives on a real BOOLEAN column. Normalize here so the
+            # INSERT/UPDATE always sends Python True/False regardless of whether
+            # the payload arrives as bool, 0/1 or a string (mirrors the Sale
+            # save path). Never persists 1/0 into the boolean column.
+            if "is_historical" in header:
+                header["is_historical"] = self._parse_bool_flag(header["is_historical"])
             supplier_username = " ".join(
                 str(header.get("supplier_username") or "").split()
             )
@@ -2895,8 +3018,11 @@ class Database:
                    COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
             FROM products p
             LEFT JOIN (
-                SELECT product_id, SUM(quantity) AS quantity
-                FROM import_items GROUP BY product_id
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii
+                JOIN imports i ON i.id = ii.import_id
+                WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                GROUP BY ii.product_id
             ) imported ON imported.product_id=p.id
             LEFT JOIN (
                 SELECT si.product_id, SUM(si.quantity) AS quantity
@@ -2919,8 +3045,11 @@ class Database:
                    COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
             FROM products p
             LEFT JOIN (
-                SELECT product_id, SUM(quantity) AS quantity
-                FROM import_items GROUP BY product_id
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii
+                JOIN imports i ON i.id = ii.import_id
+                WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                GROUP BY ii.product_id
             ) imported ON imported.product_id=p.id
             LEFT JOIN (
                 SELECT si.product_id, SUM(si.quantity) AS quantity
@@ -2956,8 +3085,11 @@ class Database:
                            - COALESCE(sold.quantity, 0) AS stock
                     FROM products p
                     LEFT JOIN (
-                        SELECT product_id, SUM(quantity) AS quantity
-                        FROM import_items GROUP BY product_id
+                        SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                        FROM import_items ii
+                        JOIN imports i ON i.id = ii.import_id
+                        WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                        GROUP BY ii.product_id
                     ) imported ON imported.product_id=p.id
                     LEFT JOIN (
                         SELECT si.product_id, SUM(si.quantity) AS quantity
@@ -2981,8 +3113,11 @@ class Database:
                            - COALESCE(sold.quantity, 0) AS stock
                     FROM products p
                     LEFT JOIN (
-                        SELECT product_id, SUM(quantity) AS quantity
-                        FROM import_items GROUP BY product_id
+                        SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                        FROM import_items ii
+                        JOIN imports i ON i.id = ii.import_id
+                        WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                        GROUP BY ii.product_id
                     ) imported ON imported.product_id=p.id
                     LEFT JOIN (
                         SELECT si.product_id, SUM(si.quantity) AS quantity
@@ -3055,8 +3190,11 @@ class Database:
         self.cursor.execute(
             """
             WITH imported AS (
-              SELECT product_id, SUM(quantity) quantity
-              FROM import_items GROUP BY product_id
+              SELECT ii.product_id, SUM(ii.quantity) quantity
+              FROM import_items ii
+              JOIN imports i ON i.id = ii.import_id
+              WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+              GROUP BY ii.product_id
             ), sold AS (
               SELECT si.product_id, SUM(si.quantity) quantity
               FROM sales_items si JOIN sales s ON s.id=si.sales_id
@@ -3795,6 +3933,407 @@ class Database:
                 "update_client_payment: mode=%s user_id=%s role_id=%s "
                 "payment_id=%s amount=%s",
                 mode, user_id, role_id, payment_id, amount,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_client_payment(self, payment_id, user=None):
+        """Delete ONLY a single payment record by its persisted payment ID.
+
+        No other row is touched - the sale, its items, stock, the client and
+        the Devis reference are never modified by this call. Backs the Client
+        Account "Delete Payment" feature; the user confirms before this is
+        called. Raises ValueError if the payment does not exist.
+        """
+        payment_id = int(payment_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id = %s RETURNING id",
+                (payment_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "delete_client_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s",
+                mode, user_id, role_id, payment_id,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Supplier Account (mirror of the Client Account API above)
+    # ------------------------------------------------------------------
+    def _supplier_match_clause(self, supplier_row):
+        """Build the imports lookup clause for one supplier.
+
+        Matches by supplier_id as well as by the supplier's username against
+        imports.supplier_username, exactly like the client account lookup.
+        Returns ``(clause, params)`` with ``clause`` carrying ``%s`` holes.
+        """
+        norm = self._normalize_exact(supplier_row[1]) if supplier_row[1] else None
+        if norm:
+            clause = (
+                "(i.supplier_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(i.supplier_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            return clause, [int(supplier_row[0]), norm]
+        return "i.supplier_id=%s", [int(supplier_row[0])]
+
+    def _supplier_import_sql(self, alias_owner=True):
+        """Shared 10-column Import x Import_Items SELECT (named-field order)."""
+        return (
+            "SELECT i.id, COALESCE(i.date, ''), "
+            "ii.id, COALESCE(ii.product_name, ''), COALESCE(ii.quantity, 0), "
+            "COALESCE(ii.unit_price, 0), COALESCE(i.tva, 0), "
+            "COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE), "
+            "COALESCE(i.created_by_username, '') "
+            "FROM imports i JOIN import_items ii ON ii.import_id = i.id "
+        )
+
+    def get_supplier_account(self, supplier_id, user=None):
+        """Return supplier account rows through one permission-gated backend API.
+
+        The LAN server exposes this method under Suppliers/read, mirroring
+        ``get_client_account`` under Clients/read. Imports are company-wide
+        data, not per-creator data: access is controlled solely by the
+        Suppliers:read permission check the LAN server already enforces before
+        calling this method (no created_by ownership filter is applied).
+        """
+        supplier_id = int(supplier_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM suppliers WHERE id = %s", (supplier_id,)
+        )
+        supplier_row = self.cursor.fetchone()
+        if not supplier_row:
+            logger.warning(
+                "get_supplier_account: supplier not found supplier_id=%s "
+                "mode=%s user_id=%s",
+                supplier_id, mode, user_id,
+            )
+            raise ValueError(f"Supplier {supplier_id} does not exist")
+
+        match_clause, match_params = self._supplier_match_clause(supplier_row)
+        sql = self._supplier_import_sql() + f"WHERE {match_clause} ORDER BY i.id, ii.id"
+        self.cursor.execute(sql, tuple(match_params))
+        import_rows = self.cursor.fetchall()
+        import_ids = sorted({row[0] for row in import_rows})
+        payment_rows = []
+        if import_ids:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.import_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                (import_ids,),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        logger.info(
+            "get_supplier_account: mode=%s user_id=%s role_id=%s supplier_id=%s "
+            "import_count=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, supplier_id,
+            len(import_ids), len(import_rows), len(payment_rows),
+        )
+        return normalize_supplier_account(import_rows, payment_rows)
+
+    def get_supplier_import_summaries(self, supplier_id, user=None):
+        """Return one row per Import (never one per item) plus payment history.
+
+        The Import History table only needs import-level facts - Import #,
+        date, BL reference, status and the financial block - so this method
+        aggregates the import items instead of downloading them. Per-Import
+        TTC uses the same central formula as the account dialog and ``paid``
+        is capped at the import total.
+        """
+        supplier_id = int(supplier_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM suppliers WHERE id = %s", (supplier_id,)
+        )
+        supplier_row = self.cursor.fetchone()
+        if not supplier_row:
+            logger.warning(
+                "get_supplier_import_summaries: supplier not found "
+                "supplier_id=%s mode=%s user_id=%s",
+                supplier_id, mode, user_id,
+            )
+            raise ValueError(f"Supplier {supplier_id} does not exist")
+
+        match_clause, match_params = self._supplier_match_clause(supplier_row)
+        sql = (
+            "SELECT i.id, COALESCE(i.date, ''), "
+            "COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''), "
+            "COALESCE(i.is_historical, FALSE), "
+            "COALESCE(i.tva, 0), "
+            "COALESCE(SUM(ii.quantity * ii.unit_price), 0) "
+            "FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id "
+            f"WHERE {match_clause} "
+            "GROUP BY i.id, i.date, i.bl_number, i.is_historical, i.tva, "
+            "i.created_at ORDER BY i.id"
+        )
+        self.cursor.execute(sql, tuple(match_params))
+        rows = self.cursor.fetchall()
+
+        from core.calculations import calculate_operation_totals, to_decimal
+        import_rows = []
+        for row in rows:
+            import_id, date, bl_number, is_hist, vat, raw = row
+            total = calculate_operation_totals(
+                to_decimal(raw), to_decimal(0), to_decimal(vat)
+            )["total_ttc"]
+            import_rows.append([
+                import_id, date, bl_number, is_hist, total,
+                Decimal("0"), Decimal("0"),
+            ])
+
+        payment_rows = []
+        if import_rows:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.import_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                ([row[0] for row in import_rows],),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        paid_by_import = {}
+        for row in payment_rows:
+            paid_by_import[row[1]] = paid_by_import.get(row[1], Decimal("0")) + to_decimal(
+                row[4]
+            )
+        for imp in import_rows:
+            total = imp[4]
+            paid = min(paid_by_import.get(imp[0], Decimal("0")), total)
+            imp[5] = paid
+            imp[6] = max(total - paid, Decimal("0"))
+
+        summaries = [
+            dict(zip(SUPPLIER_ACCOUNT_IMPORT_SUMMARY_FIELDS, row))
+            for row in import_rows
+        ]
+        payments = [
+            dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row))
+            for row in payment_rows
+        ]
+        logger.info(
+            "get_supplier_import_summaries: mode=%s user_id=%s role_id=%s "
+            "supplier_id=%s import_count=%s payment_count=%s",
+            mode, user_id, role_id, supplier_id, len(import_rows), len(payment_rows),
+        )
+        return {"imports": summaries, "payments": payments}
+
+    def get_supplier_import_items(self, import_id, user=None):
+        """Return one Import's item rows + its payments (for single-import PDFs)."""
+        import_id = int(import_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+
+        sql = self._supplier_import_sql() + "WHERE i.id = %s ORDER BY ii.id"
+        self.cursor.execute(sql, (import_id,))
+        import_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+            FROM payments p
+            WHERE p.import_id = %s
+            ORDER BY p.id DESC
+            """,
+            (import_id,),
+        )
+        payment_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT i.id, COALESCE(i.date, ''), COALESCE(i.tva, 0),
+                   COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE),
+                   COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''),
+                   COALESCE(i.supplier_username, ''), COALESCE(i.supplier_name, '')
+            FROM imports i WHERE i.id = %s
+            """,
+            (import_id,),
+        )
+        block_row = self.cursor.fetchone() or (
+            import_id, '', 0, '', False, '', '', ''
+        )
+
+        logger.info(
+            "get_supplier_import_items: mode=%s user_id=%s role_id=%s "
+            "import_id=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, import_id, len(import_rows), len(payment_rows),
+        )
+        return {
+            "imports": [
+                dict(zip(SUPPLIER_ACCOUNT_IMPORT_FIELDS, row))
+                for row in import_rows
+            ],
+            "payments": [
+                dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row))
+                for row in payment_rows
+            ],
+            "import": {
+                "import_id": int(block_row[0]),
+                "date": block_row[1],
+                "vat": block_row[2],
+                "notes": block_row[3],
+                "is_historical": block_row[4],
+                "bl_number": block_row[5],
+                "supplier_username": block_row[6],
+                "supplier_name": block_row[7],
+            },
+        }
+
+    def add_supplier_payment(
+        self, supplier_id, import_id, import_item_id, amount, date, user=None
+    ):
+        """Record a payment after verifying it belongs to the requested supplier.
+
+        ``import_item_id`` may be ``None`` for an import-level payment: the
+        Import History table is one row per Import, so payments no longer need
+        to target a single item. When an item id is given it must belong to
+        the import.
+        """
+        supplier_id = int(supplier_id)
+        import_id = int(import_id)
+        import_item_id = int(import_item_id) if import_item_id else None
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+
+        try:
+            self.cursor.execute(
+                "SELECT username FROM suppliers WHERE id=%s", (supplier_id,)
+            )
+            sres = self.cursor.fetchone()
+            norm = None
+            if sres:
+                username = str(sres[0] or '').strip()
+                norm = self._normalize_exact(username) if username else None
+
+            if import_item_id:
+                self.cursor.execute(
+                    """
+                    SELECT 1
+                    FROM imports i
+                    JOIN import_items ii ON ii.import_id = i.id
+                    WHERE i.id = %s AND ii.id = %s AND i.supplier_id = %s
+                    """,
+                    (import_id, import_item_id, supplier_id),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected import item does not belong to this supplier")
+            else:
+                if norm:
+                    match_clause = (
+                        "(i.supplier_id=%s OR "
+                        "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(i.supplier_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+                    )
+                    match_params = [supplier_id, norm]
+                else:
+                    match_clause = "i.supplier_id=%s"
+                    match_params = [supplier_id]
+                self.cursor.execute(
+                    f"SELECT 1 FROM imports i WHERE i.id = %s AND {match_clause}",
+                    (import_id, *match_params),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected import does not belong to this supplier")
+
+            self.cursor.execute(
+                """
+                INSERT INTO payments (import_id, import_item_id, amount, date)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (import_id, import_item_id, amount, str(date)),
+            )
+            payment_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return int(payment_id)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_supplier_payment(self, payment_id, amount, user=None):
+        """Edit ONLY the amount of a single supplier payment.
+
+        No other field and no other row is touched - the import, its items,
+        stock and totals are never modified by this call. The no-overpayment
+        rule is enforced by the dialog before this is called.
+        """
+        payment_id = int(payment_id)
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "UPDATE payments SET amount = %s "
+                "WHERE id = %s AND import_id IS NOT NULL RETURNING id",
+                (amount, payment_id),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "update_supplier_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s amount=%s",
+                mode, user_id, role_id, payment_id, amount,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_supplier_payment(self, payment_id, user=None):
+        """Delete ONLY a single supplier payment record by its persisted ID.
+
+        No other row is touched - the import, its items, stock, the supplier
+        and the BL reference are never modified by this call. Raises
+        ValueError if the payment does not exist.
+        """
+        payment_id = int(payment_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id = %s AND import_id IS NOT NULL "
+                "RETURNING id",
+                (payment_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "delete_supplier_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s",
+                mode, user_id, role_id, payment_id,
             )
             return int(row[0])
         except Exception:

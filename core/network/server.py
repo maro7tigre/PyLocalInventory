@@ -71,7 +71,17 @@ _CLIENT_ACCOUNT_METHODS = {
     'get_client_account', 'get_client_sales', 'get_client_sale_summaries',
     'get_client_sale_items', 'add_client_payment', 'update_client_payment',
 }
-_CLIENT_PAYMENT_WRITE_METHODS = {'add_client_payment', 'update_client_payment'}
+_CLIENT_PAYMENT_WRITE_METHODS = {
+    'add_client_payment', 'update_client_payment', 'delete_client_payment',
+}
+_SUPPLIER_ACCOUNT_METHODS = {
+    'get_supplier_account', 'get_supplier_import_summaries',
+    'get_supplier_import_items', 'add_supplier_payment',
+    'update_supplier_payment', 'delete_supplier_payment',
+}
+_SUPPLIER_PAYMENT_WRITE_METHODS = {
+    'add_supplier_payment', 'update_supplier_payment', 'delete_supplier_payment',
+}
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
 _ALWAYS_ALLOWED = {
@@ -168,6 +178,14 @@ def _check_permission(user, method, args, kwargs):
     if method == 'get_import_bl_number':
         # Read the persistent Bon de Livraison reference (allocating it on
         # first print for legacy imports). Gated by Imports read/write access.
+        if not (user['permissions'].get('Imports', {}).get('read')
+                or user['permissions'].get('Imports', {}).get('write')):
+            return False, "You don't have read access to Imports"
+        return True, None
+
+    if method == 'get_next_bl_preview':
+        # Read-only advisory Bon de Livraison proposal for the New Import
+        # dialog. Gated by Imports read/write access like get_next_devis_preview.
         if not (user['permissions'].get('Imports', {}).get('read')
                 or user['permissions'].get('Imports', {}).get('write')):
             return False, "You don't have read access to Imports"
@@ -271,6 +289,31 @@ def _check_permission(user, method, args, kwargs):
             "method=%s client_id=%s permission_filter=Clients:read-only "
             "(no created_by ownership filter applied) mode=remote",
             APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+        )
+        return True, None
+
+    if method in _SUPPLIER_ACCOUNT_METHODS:
+        supplier_id = args[0] if args else None
+        if not user['permissions'].get('Suppliers', {}).get('read'):
+            logger.warning(
+                "Permission denied (supplier account): build_id=%s user_id=%s role_id=%s "
+                "method=%s supplier_id=%s needed=Suppliers:read mode=remote",
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
+            )
+            return False, "You don't have read access to Suppliers"
+        if (method in _SUPPLIER_PAYMENT_WRITE_METHODS
+                and not user['permissions'].get('Imports', {}).get('write')):
+            logger.warning(
+                "Permission denied (supplier account): build_id=%s user_id=%s role_id=%s "
+                "method=%s supplier_id=%s needed=Imports:write mode=remote",
+                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
+            )
+            return False, "You don't have write access to Imports"
+        logger.info(
+            "Permission granted (supplier account): build_id=%s user_id=%s role_id=%s "
+            "method=%s supplier_id=%s permission_filter=Suppliers:read-only "
+            "(no created_by ownership filter applied) mode=remote",
+            APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
         )
         return True, None
 
@@ -516,6 +559,9 @@ class DatabaseServer:
             if method == 'get_import_bl_number':
                 return request_db.get_import_bl_number(*args, **kwargs)
 
+            if method == 'get_next_bl_preview':
+                return request_db.get_next_bl_preview(*args, **kwargs)
+
             if method == 'save_import_with_items':
                 return request_db.save_import_with_items(*args, **kwargs, user=user)
 
@@ -572,6 +618,8 @@ class DatabaseServer:
                 return snapshot
             if method in _CLIENT_ACCOUNT_METHODS:
                 return getattr(request_db, method)(*args, **kwargs, user=user)
+            if method in _SUPPLIER_ACCOUNT_METHODS:
+                return getattr(request_db, method)(*args, **kwargs, user=user)
 
             if method == 'get_items' and args and args[0] in ('Sales', 'Sales_Items', 'Reports'):
                 return request_db.get_items_for_user(
@@ -599,7 +647,9 @@ class DatabaseServer:
                 return request_db.delete_report_for_user(args[0], user)
 
             if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
-                    or method in _CLIENT_ACCOUNT_METHODS or method in _REPORT_METHODS
+                    or method in _CLIENT_ACCOUNT_METHODS
+                    or method in _SUPPLIER_ACCOUNT_METHODS
+                    or method in _REPORT_METHODS
                     or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED
                     or method in (
                         'save_product_with_opening_stock',

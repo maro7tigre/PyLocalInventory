@@ -5,7 +5,10 @@ Now consistent with Products/Clients/Suppliers experience
 from ui.tabs.base_tab import BaseTab
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
+from classes.supplier_class import SupplierClass
 from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
+from ui.dialogs.supplier_details_dialog import SupplierDetailsDialog
+from ui.widgets.themed_widgets import BlueButton
 from datetime import datetime
 import re
 
@@ -68,6 +71,71 @@ class ImportsTab(BaseTab):
         self.bdl_btn.clicked.connect(self.show_bon_de_livraison)
         layout.addWidget(self.bdl_btn)
 
+        self.view_supplier_btn = BlueButton("View Supplier")
+        self.view_supplier_btn.setToolTip(
+            "View the supplier of the selected import (imports, payments, balance)"
+        )
+        self.view_supplier_btn.setStyleSheet(
+            self.view_supplier_btn.styleSheet()
+            + "\nQPushButton { font-size: 14px; padding: 5px 10px; }"
+        )
+        self.view_supplier_btn.setMinimumHeight(20)
+        self.view_supplier_btn.clicked.connect(self.view_supplier)
+        layout.addWidget(self.view_supplier_btn)
+
+    def view_supplier(self):
+        """Open the account view of the selected import's supplier."""
+        from PySide6.QtWidgets import QMessageBox
+        try:
+            current_row = self.table.currentRow()
+            if current_row < 0:
+                QMessageBox.information(
+                    self, "No Selection",
+                    "Please select an import to view its supplier.",
+                )
+                return
+            if current_row >= len(self.filtered_items):
+                QMessageBox.warning(
+                    self, "Error",
+                    "The selected row is no longer valid. Please refresh and try again.",
+                )
+                return
+
+            import_obj = self.filtered_items[current_row]
+            supplier_id = import_obj.get_value('supplier_id') or None
+            username = import_obj.get_value('supplier_username')
+            if not supplier_id and username:
+                if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
+                    QMessageBox.warning(self, "Supplier Error", "No database connection.")
+                    return
+                self.database.cursor.execute(
+                    "SELECT ID FROM Suppliers WHERE username = %s", (username,)
+                )
+                res = self.database.cursor.fetchone()
+                if res:
+                    supplier_id = res[0]
+            if not supplier_id:
+                QMessageBox.warning(
+                    self, "Supplier Error", "This import has no associated supplier."
+                )
+                return
+
+            supplier = SupplierClass(int(supplier_id), self.database)
+            if not supplier.load_database_data():
+                QMessageBox.warning(self, "Supplier Error", "Could not load the supplier.")
+                return
+
+            dialog = SupplierDetailsDialog(supplier, self.database, self)
+            dialog.showMaximized()
+            dialog.exec()
+        except Exception as e:
+            QMessageBox.critical(
+                self, "Error", f"Failed to open the supplier:\n{str(e)}"
+            )
+            print(f"Error in view_supplier: {e}")
+            import traceback
+            traceback.print_exc()
+
     def show_bon_de_livraison(self):
         """Generate a Bon de Livraison PDF for the selected import."""
         from PySide6.QtWidgets import QMessageBox
@@ -125,6 +193,7 @@ class ImportsTab(BaseTab):
                 supplier_username = obj.get_value('supplier_username')
                 supplier_name = obj.get_value('supplier_name')
                 date = obj.get_value('date')
+                bl_number = obj.get_value('bl_number')
                 
                 if supplier_username:
                     options.add(str(supplier_username))
@@ -132,6 +201,8 @@ class ImportsTab(BaseTab):
                     options.add(str(supplier_name))
                 if date:
                     options.add(str(date))
+                if bl_number:
+                    options.add(str(bl_number))
             except:
                 pass
         
@@ -163,7 +234,7 @@ class ImportsTab(BaseTab):
     
     def get_searchable_fields(self):
         """Get fields that can be searched for imports"""
-        return ['supplier_username', 'supplier_name', 'date']
+        return ['supplier_username', 'supplier_name', 'date', 'bl_number']
     
     def matches_search(self, obj, search_text):
         """Check if import matches search criteria"""
@@ -179,9 +250,11 @@ class ImportsTab(BaseTab):
         try:
             supplier_username = obj.get_value('supplier_username') or ""
             supplier_name = obj.get_value('supplier_name') or ""
+            bl_number = obj.get_value('bl_number') or ""
             return (
                 search_lower in supplier_username.lower() or 
-                search_lower in supplier_name.lower()
+                search_lower in supplier_name.lower() or
+                search_lower in str(bl_number).lower()
             )
         except:
             return False

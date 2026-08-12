@@ -129,6 +129,51 @@ class DevisResolverTests(unittest.TestCase):
         self.assertEqual(header["devis"], "DE-2026-4")
         self.assertEqual(header["devis_number"], 4)
 
+    def test_create_with_unmodified_preview_text_recovers_devis_number(self):
+        # New Sale pre-fills the Devis field with get_next_devis_preview()'s
+        # advisory value; if the user leaves it untouched, it is submitted
+        # here exactly like a manually-typed reference. Recovering
+        # devis_number from it (since it is still in the exact "DE-YEAR-N"
+        # generator format) is the fix for the generator getting stuck: without
+        # it, devis_number stays NULL forever and MAX(devis_number) - what
+        # _allocate_devis_number() reads - never advances.
+        header = {"date": "2026-07-01", "devis": "DE-2026-32"}
+        self.db._resolve_sale_devis(None, header)
+        self.assertEqual(header["devis"], "DE-2026-32")
+        self.assertEqual(header["devis_number"], 32)
+
+    def test_edit_with_unmodified_canonical_text_recovers_devis_number(self):
+        # Same recovery on edit - self-heals a previously-affected row the
+        # next time it is opened and saved, without changing its devis text.
+        header = {"date": "2026-07-01", "devis": "DE-2026-15"}
+        self.db._resolve_sale_devis(9, header)
+        self.assertEqual(header["devis"], "DE-2026-15")
+        self.assertEqual(header["devis_number"], 15)
+
+    def test_customized_reference_with_suffix_does_not_set_devis_number(self):
+        # A genuinely hand-edited reference (not the untouched generator
+        # format) must not be misread as a sequence number.
+        header = {"date": "2026-07-01", "devis": "DE-2026-525-A"}
+        self.db._resolve_sale_devis(None, header)
+        self.assertNotIn("devis_number", header)
+
+    def test_regression_generator_no_longer_stuck_after_verbatim_save(self):
+        """End-to-end reproduction of the reported bug: DE-2026-31 kept being
+        proposed to every new Sale because devis_number was never persisted
+        for sales saved with the dialog's unmodified preview text.
+        """
+        # Sale #31 gets saved with its pre-filled preview "DE-2026-31" left
+        # untouched (sale_id=None: this is the create path).
+        header = {"date": "2026-07-01", "devis": "DE-2026-31"}
+        self.db._resolve_sale_devis(None, header)
+        self.assertEqual(header["devis_number"], 31)
+
+        # The Postgres MAX(devis_number) the next preview reads now reflects
+        # that sale (in the old broken code this stayed at whatever it was
+        # before sale #31, so the same "DE-2026-31" kept getting proposed).
+        self.cursor.max_number = 31
+        self.assertEqual(self.db.get_next_devis_preview("2026-07-02"), "DE-2026-32")
+
 
 class DevisPreviewTests(unittest.TestCase):
     def setUp(self):

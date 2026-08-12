@@ -383,5 +383,68 @@ class ImportBdlHtmlTests(unittest.TestCase):
         self.assertEqual(self.db.bl_calls, [12])
 
 
+class _ImportEditCursor:
+    """Minimal scripted cursor driving save_import_with_items' edit path,
+    to prove editing an import created by a different user is no longer
+    blocked by ownership alone (see ImportCrossUserEditTests below)."""
+
+    def __init__(self):
+        self.statements = []
+        self.rowcount = 1
+        self._normalized = ""
+
+    def execute(self, sql, params=()):
+        self._normalized = " ".join(sql.lower().split())
+        self.statements.append((self._normalized, params))
+
+    def fetchone(self):
+        sql = self._normalized
+        if sql.startswith("select id, name, username from suppliers"):
+            return (7, "Bois Plus SARL", "boisplus")
+        if sql.startswith("select bl_number from imports"):
+            return ("BL-2026-9",)
+        if sql.startswith("select id, name from products"):
+            return (1, "Bois de chêne")
+        if "returning id" in sql:
+            return (777,)
+        return None
+
+    def fetchall(self):
+        if self._normalized.startswith("select id from import_items"):
+            return []
+        return []
+
+
+class ImportCrossUserEditTests(unittest.TestCase):
+    def test_edit_by_different_user_with_imports_write_succeeds(self):
+        cursor = _ImportEditCursor()
+        db = Database.__new__(Database)
+        db.cursor = cursor
+        db.conn = _FakeConn()
+        db.registered_classes = {"Imports": ImportClass}
+
+        result = db.save_import_with_items(
+            {
+                "supplier_username": "boisplus", "date": "2026-07-01",
+                "tva": 20.0, "is_historical": False,
+            },
+            [{"product_name": "Bois de chêne", "quantity": "5", "unit_price": "10"}],
+            import_id=55,
+            visible_row_count=1,
+            # Import was created by user 1; user 999 (not a superadmin) is
+            # editing it here. Imports:write permission (checked by the RPC
+            # layer before this method is ever reached) is the only gate -
+            # ownership alone must not block the edit.
+            user={"id": 999, "is_superadmin": False},
+        )
+        self.assertEqual(result["transaction"], "committed")
+        self.assertEqual(result["import_id"], 55)
+        self.assertEqual(db.conn.commits, 1)
+        self.assertFalse(any(
+            "created_by" in sql and sql.startswith("select 1 from imports")
+            for sql, _ in cursor.statements
+        ))
+
+
 if __name__ == "__main__":
     unittest.main()

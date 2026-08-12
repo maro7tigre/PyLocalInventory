@@ -12,7 +12,7 @@ from pathlib import Path
 logger = logging.getLogger(__name__)
 
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot
-from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon
+from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
     QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView)
@@ -194,7 +194,7 @@ class AttachmentPanel(QWidget):
         self.client_sales_empty.setAlignment(Qt.AlignCenter)
         self.client_sales_empty.setStyleSheet('color: #9e9e9e; padding: 14px;')
         self.client_sales_table = QTableWidget(0, 6)
-        self.client_sales_table.setHorizontalHeaderLabels(['ID', 'Notes', 'Date', 'Subtotal', 'Total', 'Actions'])
+        self.client_sales_table.setHorizontalHeaderLabels(['ID', 'Devis N°', 'Date', 'Subtotal', 'Total', 'Actions'])
         self.client_sales_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.client_sales_table.setEditTriggers(QTableWidget.NoEditTriggers)
         header = self.client_sales_table.horizontalHeader()
@@ -212,7 +212,7 @@ class AttachmentPanel(QWidget):
         self._add_paths([url.toLocalFile() for url in event.mimeData().urls() if url.isLocalFile()]); event.acceptProposedAction()
 
     def keyPressEvent(self, event):
-        if event.matches(event.StandardKey.Paste): self.paste_image(); return
+        if event.matches(QKeySequence.StandardKey.Paste): self.paste_image(); return
         super().keyPressEvent(event)
 
     def _selected(self):
@@ -370,12 +370,14 @@ class AttachmentPanel(QWidget):
             pass  # panel was closed/destroyed while the fetch was in flight
 
     def _render_client_sales(self, sales):
+        from core.database import format_devis_display
         self.client_sales_empty.setVisible(not sales)
         self.client_sales_table.setRowCount(len(sales))
-        for row, (sale_id, notes, date, vat, subtotal) in enumerate(sales):
+        for row, (sale_id, devis, date, vat, subtotal) in enumerate(sales):
             from core.calculations import calculate_operation_totals
             total = calculate_operation_totals(subtotal, 0, vat)['total_ttc']
-            for column, value in enumerate((sale_id, notes or '', self._sale_date(date), self._money(subtotal), self._money(total))):
+            devis_display = format_devis_display(devis) or '-'
+            for column, value in enumerate((sale_id, devis_display, self._sale_date(date), self._money(subtotal), self._money(total))):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.UserRole, int(sale_id))
                 self.client_sales_table.setItem(row, column, item)

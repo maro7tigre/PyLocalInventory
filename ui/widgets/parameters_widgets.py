@@ -182,6 +182,12 @@ class DateWidget(QWidget):
         
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
+        # Without an explicit format, QDateEdit falls back to the OS locale,
+        # which reads/shows month/day/year on this system - display/edit as
+        # day/month/year instead (New/Edit Sale, New/Edit Import). The
+        # underlying value stored to the database is untouched - date()
+        # below always serializes to yyyy-MM-dd regardless of display format.
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setDate(QDate.currentDate())  # Default to today
         self.date_edit.setEnabled(editable)
         

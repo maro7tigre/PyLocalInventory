@@ -409,10 +409,43 @@ class _ClientReportWorker(QObject):
             rows = sales[sale_id]
             sale_blocks.append(self._render_sale_section(sale_id, rows, currency))
 
-        sales_content = "".join(sale_blocks)
+        # General/unallocated client payments (not tied to any Sale) - only
+        # relevant for the full statement, listed after the Sale sections and
+        # folded into the totals below so they are never silently dropped.
+        general_payments = []
+        if self.report_type == "full_statement":
+            general_payments = [
+                pay for pay in self.payments if pay.get("sale_id") is None
+            ]
+            general_payments.sort(key=self._payment_sort_key)
+        general_paid = sum(
+            (to_decimal(pay.get("amount") or 0) for pay in general_payments),
+            Decimal("0"),
+        )
+        if general_payments:
+            rows_html = "".join(
+                f"<tr><td>{html_lib.escape(self._format_french_date(pay.get('date')))}</td>"
+                f"<td>{self._fmt_money(to_decimal(pay.get('amount') or 0))} {currency}</td></tr>"
+                for pay in general_payments
+            )
+            sales_content = "".join(sale_blocks) + (
+                '<div class="sale">'
+                '<div class="sale-header">'
+                '<div class="sale-title">PAIEMENTS GÉNÉRAUX (sans vente)</div>'
+                "</div>"
+                '<table class="payments-table">'
+                "<thead><tr><th>Date</th><th>Montant payé</th></tr></thead><tbody>"
+                + rows_html
+                + "</tbody></table>"
+                '<div class="payments-summary">Total : '
+                f"<strong>{self._fmt_money(general_paid)} {currency}</strong></div>"
+                "</div>"
+            )
+        else:
+            sales_content = "".join(sale_blocks)
 
         total_sales = sum(self.sale_ttc_by_id.values(), Decimal("0"))
-        total_paid = sum(self.sale_paid_by_id.values(), Decimal("0"))
+        total_paid = sum(self.sale_paid_by_id.values(), Decimal("0")) + general_paid
         total_remaining = max(total_sales - total_paid, Decimal("0"))
 
         # ------------------------------------------------------------------
@@ -648,8 +681,9 @@ class _EditPaymentDialog(QDialog):
         layout = QVBoxLayout(self)
         layout.setSpacing(10)
 
+        sale_label = f"Sale #{sale_id}" if sale_id is not None else "General Payment (no Sale)"
         info = QLabel(
-            f"Payment #{payment_id} — Sale #{sale_id} (Devis {devis or '-'})\n"
+            f"Payment #{payment_id} — {sale_label} (Devis N° {devis or '-'})\n"
             f"Current amount: {_format_money(current)} {currency}"
         )
         info.setWordWrap(True)
@@ -662,10 +696,14 @@ class _EditPaymentDialog(QDialog):
         form.addRow("New amount:", self.amount_edit)
         layout.addLayout(form)
 
-        hint = QLabel(
-            f"Maximum allowed (so the sale is not overpaid): "
-            f"{_format_money(max_allowed)} {currency}"
-        )
+        if max_allowed is None:
+            # General/unallocated payment - no Sale total to be capped by.
+            hint = QLabel("Enter any amount greater than 0.")
+        else:
+            hint = QLabel(
+                f"Maximum allowed (so the sale is not overpaid): "
+                f"{_format_money(max_allowed)} {currency}"
+            )
         hint.setWordWrap(True)
         layout.addWidget(hint)
 
@@ -693,13 +731,18 @@ class _EditPaymentDialog(QDialog):
             )
             self.amount_edit.setFocus()
             return
-        if amount <= 0 or amount > self.max_allowed + Decimal("0.001"):
-            QMessageBox.warning(
-                self,
-                "Invalid Amount",
-                f"Enter an amount between 0.01 and "
-                f"{_format_money(self.max_allowed)} {self.currency}.",
-            )
+        over_cap = (
+            self.max_allowed is not None and amount > self.max_allowed + Decimal("0.001")
+        )
+        if amount <= 0 or over_cap:
+            if self.max_allowed is None:
+                message = "Enter an amount greater than 0."
+            else:
+                message = (
+                    f"Enter an amount between 0.01 and "
+                    f"{_format_money(self.max_allowed)} {self.currency}."
+                )
+            QMessageBox.warning(self, "Invalid Amount", message)
             self.amount_edit.setFocus()
             return
         self._amount = amount
@@ -764,6 +807,12 @@ class ClientDetailsDialog(QDialog):
         # PostgreSQL can perform this migration safely and idempotently itself.
         self.database.cursor.execute(
             "ALTER TABLE Payments ADD COLUMN IF NOT EXISTS sales_item_id INTEGER"
+        )
+        # General/unallocated client payment (client_id set, sale_id NULL) -
+        # mirrors the same additive column added by
+        # core.database.Database._ensure_payments_table().
+        self.database.cursor.execute(
+            "ALTER TABLE Payments ADD COLUMN IF NOT EXISTS client_id INTEGER"
         )
         self.database.conn.commit()
 
@@ -1010,7 +1059,7 @@ class ClientDetailsDialog(QDialog):
         bar_layout.setContentsMargins(10, 8, 10, 8)
         bar_layout.setSpacing(14)
         self.selected_sale_label = QLabel("Selected Sale #—")
-        self.selected_devis_label = QLabel("Devis: —")
+        self.selected_devis_label = QLabel("Devis N°: —")
         self.selected_remaining_label = QLabel("Remaining: —")
         self.selected_remaining_label.setObjectName("selectedRemaining")
         bar_layout.addWidget(self.selected_sale_label)
@@ -1032,7 +1081,8 @@ class ClientDetailsDialog(QDialog):
 
         self.add_payment_button = QPushButton("Add Payment")
         self.add_payment_button.setToolTip(
-            "Record this payment against the selected sale"
+            "Record this payment against the selected sale, or as a general "
+            "client payment if no sale is selected"
         )
         self.add_payment_button.clicked.connect(self.add_payment)
         self.amount_input.returnPressed.connect(self.add_payment)
@@ -1265,7 +1315,17 @@ class ClientDetailsDialog(QDialog):
         total_bought = sum(
             (sale["total"] for sale in self.sales), Decimal("0")
         )
-        total_paid = sum((sale["paid"] for sale in self.sales), Decimal("0"))
+        # Total Paid counts both Sale-linked payments (sale["paid"], already
+        # capped per-sale by the backend) and general/unallocated client
+        # payments (payments with no sale_id) - Remaining is Total Bought
+        # minus that combined figure.
+        sale_paid = sum((sale["paid"] for sale in self.sales), Decimal("0"))
+        general_paid = sum(
+            (to_decimal(pay.get("amount") or 0) for pay in self.payments
+             if pay.get("sale_id") is None),
+            Decimal("0"),
+        )
+        total_paid = sale_paid + general_paid
         remaining = max(total_bought - total_paid, 0)
 
         self.total_bought_label.setText(f"{_format_money(total_bought)} {self.currency}")
@@ -1275,9 +1335,23 @@ class ClientDetailsDialog(QDialog):
         color = "#4CAF50" if remaining <= 0 else "#FF9800"
         self.remaining_label.setStyleSheet(f"font-size:18px; font-weight:bold; color:{color};")
 
+        # No Sale row is selected right after a (re)load - default to general/
+        # unallocated payment mode (Case B) rather than a disabled form, since
+        # a Client payment no longer requires selecting a Sale first.
+        self.selected_sale_label.setText("Selected Sale: General Payment (no Sale)")
+        self.selected_devis_label.setText("Devis N°: —")
+        self.selected_remaining_label.setText("Remaining: —")
+        self._apply_selected_bar_style(Decimal("0"), has_selection=False)
         self.amount_input.clear()
-        self.amount_input.setEnabled(False)
-        self.add_payment_button.setEnabled(False)
+        if self.can_record_payment:
+            self.amount_input.setEnabled(True)
+            self.amount_input.setPlaceholderText(
+                "General payment amount, for example 1 500.00"
+            )
+            self.add_payment_button.setEnabled(True)
+        else:
+            self.amount_input.setEnabled(False)
+            self.add_payment_button.setEnabled(False)
         self.edit_payment_btn.setEnabled(False)
         self.delete_payment_btn.setEnabled(False)
         self.print_statement_btn.setEnabled(True)
@@ -1411,11 +1485,17 @@ class ClientDetailsDialog(QDialog):
         self.payments_table.setRowCount(len(rows))
         for row_index, payment in enumerate(rows):
             sale_id = payment["sale_id"]
-            devis = self.devis_by_sale.get(sale_id) or "-"
-            devis_display = f"Devis N° {devis}" if devis != "-" else "-"
+            if sale_id is None:
+                # General/unallocated client payment - not tied to any Sale.
+                sale_display = "—"
+                devis_display = "—"
+            else:
+                devis = self.devis_by_sale.get(sale_id) or "-"
+                devis_display = f"Devis N° {devis}" if devis != "-" else "-"
+                sale_display = f"#{sale_id}"
             values = [
                 f"#{payment['payment_id']}",
-                f"#{sale_id}",
+                sale_display,
                 self._format_date(payment["date"]),
                 _format_money(payment["amount"]),
                 devis_display,
@@ -1453,22 +1533,32 @@ class ClientDetailsDialog(QDialog):
     def _purchase_selected(self, current_row, _current_col, _previous_row, _previous_col):
         self._update_print_selected_enabled()
         if current_row < 0 or current_row >= len(self.sales):
-            self.selected_sale_label.setText("Selected Sale #—")
-            self.selected_devis_label.setText("Devis: —")
+            # No Sale selected: this is valid "general/unallocated client
+            # payment" mode, not an error state - a Client may pay an amount
+            # that is not being assigned to one specific Sale.
+            self.selected_sale_label.setText("Selected Sale: General Payment (no Sale)")
+            self.selected_devis_label.setText("Devis N°: —")
             self.selected_remaining_label.setText("Remaining: —")
             self._apply_selected_bar_style(Decimal("0"), has_selection=False)
             self.amount_input.clear()
-            self.amount_input.setEnabled(False)
-            self.add_payment_button.setEnabled(False)
+            if not self.can_record_payment:
+                self.amount_input.setEnabled(False)
+                self.add_payment_button.setEnabled(False)
+                return
+            self.amount_input.setEnabled(True)
+            self.amount_input.setPlaceholderText(
+                "General payment amount, for example 1 500.00"
+            )
+            self.add_payment_button.setEnabled(True)
             return
 
         sale = self.sales[current_row]
         remaining = sale["remaining"]
         devis = sale["devis"] or "-"
         self.selected_sale_label.setText(f"Selected Sale #{sale['sale_id']}")
-        self.selected_devis_label.setText(
-            f"Devis: {devis}" if devis == "-" else f"Devis: Devis N° {devis}"
-        )
+        # The label itself already reads "Devis N°:" - never repeat "Devis N°"
+        # inside the value too.
+        self.selected_devis_label.setText(f"Devis N°: {devis}")
         self.selected_remaining_label.setText(
             f"Remaining: {_format_money(remaining)} {self.currency}"
         )
@@ -1621,15 +1711,9 @@ class ClientDetailsDialog(QDialog):
             )
             return
         selected_row = self.purchases_table.currentRow()
-        if selected_row < 0 or selected_row >= len(self.sales):
-            QMessageBox.information(
-                self,
-                "Select Sale",
-                "Select the sale that this payment is for.",
-            )
-            return
+        has_sale = 0 <= selected_row < len(self.sales)
+        sale = self.sales[selected_row] if has_sale else None
 
-        sale = self.sales[selected_row]
         amount_text = self.amount_input.text()
         from core.calculations import parse_decimal_input, InputState
         state, amount_dec = parse_decimal_input(amount_text)
@@ -1643,17 +1727,25 @@ class ClientDetailsDialog(QDialog):
             return
 
         amount = float(amount_dec)
-        outstanding = sale["remaining"]
-        if outstanding <= 0:
-            QMessageBox.information(
-                self, "Sale Paid", "This sale is already fully paid."
-            )
-            return
-        if amount_dec <= 0 or amount_dec > outstanding + Decimal("0.001"):
+        if has_sale:
+            outstanding = sale["remaining"]
+            if outstanding <= 0:
+                QMessageBox.information(
+                    self, "Sale Paid", "This sale is already fully paid."
+                )
+                return
+            if amount_dec <= 0 or amount_dec > outstanding + Decimal("0.001"):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Amount",
+                    f"Enter an amount between 0.01 and {_format_money(outstanding)} {self.currency}.",
+                )
+                return
+        elif amount_dec <= 0:
             QMessageBox.warning(
                 self,
                 "Invalid Amount",
-                f"Enter an amount between 0.01 and {_format_money(outstanding)} {self.currency}.",
+                "Enter an amount greater than 0.",
             )
             return
 
@@ -1661,7 +1753,7 @@ class ClientDetailsDialog(QDialog):
         try:
             self.database.add_client_payment(
                 self.client_obj.id,
-                sale["sale_id"],
+                sale["sale_id"] if has_sale else None,
                 None,
                 amount,
                 date,
@@ -1670,12 +1762,20 @@ class ClientDetailsDialog(QDialog):
             QMessageBox.critical(self, "Payment Error", f"Could not save payment:\n{error}")
             return
 
-        QMessageBox.information(
-            self,
-            "Payment Saved",
-            f"Payment of {_format_money(amount)} {self.currency} was recorded for "
-            f"sale #{sale['sale_id']} (Devis {sale['devis'] or '-'}).",
-        )
+        if has_sale:
+            QMessageBox.information(
+                self,
+                "Payment Saved",
+                f"Payment of {_format_money(amount)} {self.currency} was recorded for "
+                f"sale #{sale['sale_id']} (Devis N° {sale['devis'] or '-'}).",
+            )
+        else:
+            QMessageBox.information(
+                self,
+                "Payment Saved",
+                f"General payment of {_format_money(amount)} {self.currency} was "
+                "recorded for this client (not linked to a specific sale).",
+            )
         self.refresh_data()
 
     def _selected_payment(self):
@@ -1702,34 +1802,41 @@ class ClientDetailsDialog(QDialog):
             )
             return
 
-        sale = next(
-            (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
-        )
-        if sale is None:
-            QMessageBox.warning(
-                self, "Edit Payment", "The sale of this payment could not be resolved."
-            )
-            return
-
         current = to_decimal(payment.get("amount") or 0)
-        # No-overpayment rule (same as Add Payment): the edited amount must
-        # keep the sale's total paid at or below its Total TTC.
-        other_paid = sum(
-            (
-                to_decimal(p["amount"] or 0)
-                for p in self.payments
-                if p["payment_id"] != payment["payment_id"]
-                and p["sale_id"] == payment["sale_id"]
-            ),
-            Decimal("0"),
-        )
-        max_allowed = sale["total"] - other_paid
+        if payment["sale_id"] is None:
+            # General/unallocated client payment - no Sale total to be
+            # capped by, just require a positive amount.
+            sale = None
+            devis = "-"
+            max_allowed = None
+        else:
+            sale = next(
+                (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
+            )
+            if sale is None:
+                QMessageBox.warning(
+                    self, "Edit Payment", "The sale of this payment could not be resolved."
+                )
+                return
+            devis = sale["devis"] or "-"
+            # No-overpayment rule (same as Add Payment): the edited amount
+            # must keep the sale's total paid at or below its Total TTC.
+            other_paid = sum(
+                (
+                    to_decimal(p["amount"] or 0)
+                    for p in self.payments
+                    if p["payment_id"] != payment["payment_id"]
+                    and p["sale_id"] == payment["sale_id"]
+                ),
+                Decimal("0"),
+            )
+            max_allowed = sale["total"] - other_paid
 
         dialog = _EditPaymentDialog(
             self,
             payment_id=payment["payment_id"],
             sale_id=payment["sale_id"],
-            devis=sale["devis"] or "-",
+            devis=devis,
             current=current,
             max_allowed=max_allowed,
             currency=self.currency,
@@ -1810,30 +1917,36 @@ class ClientDetailsDialog(QDialog):
             )
             return
 
-        sale = next(
-            (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
-        )
-        if sale is None:
-            QMessageBox.warning(
-                self, "Delete Payment", "The sale of this payment could not be resolved."
+        if payment["sale_id"] is None:
+            # General/unallocated client payment - no Sale to resolve.
+            devis = "-"
+        else:
+            sale = next(
+                (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
             )
-            return
+            if sale is None:
+                QMessageBox.warning(
+                    self, "Delete Payment", "The sale of this payment could not be resolved."
+                )
+                return
+            devis = sale.get("devis") or "-"
 
-        devis = sale.get("devis") or "-"
         if not self._confirm_payment_delete(payment, devis):
             return
         self._start_payment_delete(payment["payment_id"])
 
     def _confirm_payment_delete(self, payment, devis):
         """Modal confirmation before a payment is permanently deleted."""
+        sale_id = payment["sale_id"]
+        sale_display = f"#{sale_id}" if sale_id is not None else "— (general payment)"
         box = QMessageBox(self)
         box.setIcon(QMessageBox.Warning)
         box.setWindowTitle("Delete Payment")
         box.setText(
             f"Are you sure you want to delete Payment #{payment['payment_id']}\n"
             f"Amount: {_format_money(payment['amount'])} {self.currency}\n"
-            f"Sale: #{payment['sale_id']}\n"
-            f"Devis: {devis}\n\n"
+            f"Sale: {sale_display}\n"
+            f"Devis N°: {devis}\n\n"
             "This action will remove this payment permanently."
         )
         delete_btn = box.addButton("Delete", QMessageBox.DestructiveRole)

@@ -103,6 +103,30 @@ _DEVIS_YEAR_EXPR = (
 # The GUI and the host-side resolver both enforce this bound.
 DEVIS_MAX_LENGTH = 40
 
+# Matches an unmodified, machine-generated reference (e.g. "DE-2026-32"), as
+# opposed to a manually customized one (e.g. "DE-2026-525-A"). Used by
+# _resolve_sale_devis to recover devis_number from a verbatim value that
+# happens to still be in the exact generator format - see its docstring.
+_DEVIS_TEXT_NUMBER_RE = re.compile(r"^DE-\d{4}-(\d+)$", re.IGNORECASE)
+
+
+def format_devis_display(devis):
+    """Human-readable Devis reference with an explicit ``N°`` marker, e.g.
+    ``"DE-2026-31"`` -> ``"DE N°-2026-31"``.
+
+    Presentation only - the persisted ``sales.devis`` value is never touched.
+    Use this wherever only the bare reference would otherwise be shown with
+    no adjacent "Devis N°" label, so the user is never left wondering
+    whether ``DE-2026-31`` is a generic ID.
+    """
+    text = str(devis or "").strip()
+    if not text:
+        return ""
+    prefix, sep, rest = text.partition("-")
+    if not sep:
+        return text
+    return f"{prefix} N°-{rest}"
+
 # Year a Bon de Livraison number is scoped to: the first 4-digit group in the
 # import date, falling back to created_at, then 0. Mirrors _DEVIS_YEAR_EXPR
 # (the importing alias is "s", matching the backfill/allocator call sites).
@@ -772,6 +796,18 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS payments_import_id_idx "
                 "ON payments(import_id) WHERE import_id IS NOT NULL"
             )
+            # General/unallocated client payment: recorded directly against a
+            # client (client_id set, sale_id NULL) when the payment isn't tied
+            # to one specific Sale. Additive/idempotent for legacy databases -
+            # existing Sale-linked payments (sale_id set, client_id NULL) are
+            # untouched and keep working exactly as before.
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS client_id INTEGER"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS payments_client_id_idx "
+                "ON payments(client_id) WHERE client_id IS NOT NULL"
+            )
             self.conn.commit()
         except Exception as e:
             self.conn.rollback()
@@ -911,13 +947,29 @@ class Database:
         """Host-side Devis resolution for creates and edits.
 
         Mutates ``header`` with the authoritative ``devis`` (and
-        ``devis_number`` when one was allocated). Rules:
+        ``devis_number`` when one was allocated or recovered). Rules:
 
         * A provided reference is stored verbatim (never silently changed)
           and must be unique (case-insensitive) among all other sales.
         * An empty reference on a create allocates the next per-year number.
         * An empty reference on an edit preserves the stored reference, or
           allocates one for legacy rows that have none yet.
+
+        The New/Edit Sale dialog pre-fills the Devis field with the advisory
+        preview from ``get_next_devis_preview()`` so the user can see (and
+        optionally override) it before saving - that pre-filled text is
+        submitted here exactly like a manually-typed one, so it always hits
+        the "provided reference" branch below, never the auto-allocate one.
+        Without recovering ``devis_number`` from it too, ``devis_number``
+        would stay NULL on every normally-created sale, so
+        ``_allocate_devis_number()``'s ``MAX(devis_number)`` would never
+        advance past whatever it was before this ran - stuck proposing the
+        same (already-used) number to every subsequent new Sale. Recovering
+        the number here (only when the text is still in the exact
+        unmodified "DE-YEAR-N" generator format - a genuinely customized
+        reference like "DE-2026-525-A" is left alone) keeps the allocator in
+        sync and self-heals any sale whose number was previously lost this
+        way, without touching its stored ``devis`` text at all.
 
         Raises ValueError for over-length or duplicate references.
         """
@@ -943,6 +995,9 @@ class Database:
                 raise ValueError(
                     f"Devis '{raw_devis}' is already used by another sale"
                 )
+            match = _DEVIS_TEXT_NUMBER_RE.match(raw_devis)
+            if match:
+                header["devis_number"] = int(match.group(1))
         elif sale_id:
             self.cursor.execute(
                 "SELECT devis FROM sales WHERE id = %s", (int(sale_id),)
@@ -2028,13 +2083,10 @@ class Database:
 
             if sale_id:
                 sale_id = int(sale_id)
-                if user and not user.get("is_superadmin"):
-                    self.cursor.execute(
-                        "SELECT 1 FROM sales WHERE id=%s AND created_by=%s",
-                        (sale_id, int(user.get("id") or 0)),
-                    )
-                    if not self.cursor.fetchone():
-                        raise PermissionError("This sale belongs to another user")
+                # Editing is gated solely by the caller's Sales:write permission
+                # (enforced by the RPC layer in core/network/server.py before this
+                # method is ever called) - who originally created the sale does not
+                # additionally restrict who may edit it.
                 assignments = ', '.join(f"{key} = %s" for key in header)
                 self.cursor.execute(
                     f"UPDATE sales SET {assignments} WHERE id = %s",
@@ -2342,13 +2394,10 @@ class Database:
 
             if import_id:
                 import_id = int(import_id)
-                if user and not user.get("is_superadmin"):
-                    self.cursor.execute(
-                        "SELECT 1 FROM imports WHERE id=%s AND created_by=%s",
-                        (import_id, int(user.get("id") or 0)),
-                    )
-                    if not self.cursor.fetchone():
-                        raise PermissionError("This import belongs to another user")
+                # Editing is gated solely by the caller's Imports:write permission
+                # (enforced by the RPC layer in core/network/server.py before this
+                # method is ever called) - who originally created the import does
+                # not additionally restrict who may edit it.
                 for protected in (
                     "created_by", "created_by_username", "created_at", "operation_token"
                 ):
@@ -3536,6 +3585,19 @@ class Database:
                 (sale_ids,),
             )
             payment_rows = self.cursor.fetchall()
+        # General/unallocated client payments (not tied to any Sale) - same
+        # 5-column shape with sale_id/item_id NULL, so every existing
+        # CLIENT_ACCOUNT_PAYMENT_FIELDS consumer keeps working unchanged.
+        self.cursor.execute(
+            """
+            SELECT p.id, NULL::INTEGER, NULL::INTEGER, p.date, p.amount
+            FROM payments p
+            WHERE p.client_id = %s AND p.sale_id IS NULL
+            ORDER BY p.id DESC
+            """,
+            (client_id,),
+        )
+        payment_rows = list(payment_rows) + list(self.cursor.fetchall())
 
         logger.info(
             "get_client_account: mode=%s user_id=%s role_id=%s client_id=%s "
@@ -3658,6 +3720,20 @@ class Database:
             paid = min(paid_by_sale.get(sale[0], Decimal("0")), total)
             sale[6] = paid
             sale[7] = max(total - paid, Decimal("0"))
+
+        # General/unallocated client payments (not tied to any Sale) - added
+        # after the per-Sale paid/remaining math above so they never affect a
+        # Sale's own totals, only the client-level payment history/total.
+        self.cursor.execute(
+            """
+            SELECT p.id, NULL::INTEGER, NULL::INTEGER, p.date, p.amount
+            FROM payments p
+            WHERE p.client_id = %s AND p.sale_id IS NULL
+            ORDER BY p.id DESC
+            """,
+            (client_id,),
+        )
+        payment_rows = list(payment_rows) + list(self.cursor.fetchall())
 
         logger.info(
             "get_client_sale_summaries: mode=%s user_id=%s role_id=%s client_id=%s "
@@ -3803,14 +3879,32 @@ class Database:
             params = [client_id]
 
         sql = (
-            "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), "
-            "COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
+            "SELECT s.id, COALESCE(NULLIF(BTRIM(s.devis), ''), '') AS devis_text, "
+            f"s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year, "
+            "COALESCE(s.date, ''), COALESCE(s.tva, 0), "
+            "COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
             "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
-            f"WHERE {match_clause} GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC"
+            f"WHERE {match_clause} "
+            "GROUP BY s.id, s.devis, s.devis_number, s.date, s.tva "
+            "ORDER BY s.date DESC, s.id DESC"
         )
         try:
             self.cursor.execute(sql, params)
             rows = [list(row) for row in self.cursor.fetchall()]
+
+            # Persist missing Devis numbers/text (a sale may have been
+            # created after the last startup backfill) so every returned
+            # row has a stable reference, same as get_client_sale_summaries().
+            missing_num = [row[0] for row in rows if row[2] is None]
+            missing_text = [
+                row[0] for row in rows if not (row[1] or "").strip() and row[2] is not None
+            ]
+            if missing_num:
+                self._ensure_devis_numbers(missing_num)
+            if missing_num or missing_text:
+                self._ensure_devis_text(missing_num + missing_text)
+                self.cursor.execute(sql, params)
+                rows = [list(row) for row in self.cursor.fetchall()]
         except Exception:
             logger.exception(
                 "get_client_sales failed: mode=%s user_id=%s role_id=%s client_id=%s sql_params=%s",
@@ -3821,6 +3915,17 @@ class Database:
             except Exception:
                 logger.exception("get_client_sales: rollback after failed query also failed")
             raise
+
+        result = []
+        for sale_id, devis_text, devis_number, year, date, vat, subtotal in rows:
+            if devis_text:
+                devis = devis_text
+            elif devis_number is not None:
+                devis = f"DE-{year}-{devis_number}"
+            else:
+                devis = f"DE-{year}-"
+            result.append([sale_id, devis, date, vat, subtotal])
+        rows = result
 
         logger.info(
             "get_client_sales: mode=%s user_id=%s role_id=%s client_id=%s "
@@ -3834,42 +3939,67 @@ class Database:
     ):
         """Record a payment after verifying it belongs to the requested client.
 
-        ``sales_item_id`` may be ``None`` for a sale-level payment: the Sales
-        History table is one row per Sale, so payments no longer need to target
-        a single item. When an item id is given it must belong to the sale.
+        ``sale_id`` may be ``None`` for a general/unallocated client-level
+        payment that is not tied to any specific Sale (a client account
+        payment, e.g. money received without allocating it to one purchase).
+        ``sales_item_id`` must then also be ``None``. A general payment is
+        stored with ``client_id`` set and ``sale_id``/``sales_item_id`` NULL -
+        it never creates or touches a Sale, and never affects stock.
+
+        When ``sale_id`` is given, ``sales_item_id`` may still be ``None`` for
+        a sale-level payment: the Sales History table is one row per Sale, so
+        payments no longer need to target a single item. When an item id is
+        given it must belong to the sale.
         """
         client_id = int(client_id)
-        sale_id = int(sale_id)
+        sale_id = int(sale_id) if sale_id else None
         sales_item_id = int(sales_item_id) if sales_item_id else None
         amount = float(amount)
         if amount <= 0:
             raise ValueError("Payment amount must be greater than zero")
+        if sales_item_id and not sale_id:
+            raise ValueError("A purchase-level payment must include its sale")
 
         try:
             self.cursor.execute(
                 "SELECT username FROM clients WHERE id=%s", (client_id,)
             )
             cres = self.cursor.fetchone()
+            if not cres:
+                raise ValueError(f"Client {client_id} does not exist")
             norm = None
-            if cres:
-                username = str(cres[0] or '').strip()
-                norm = self._normalize_exact(username) if username else None
+            username = str(cres[0] or '').strip()
+            norm = self._normalize_exact(username) if username else None
 
-            owner_clause = ""
-            owner_params = []
-            if user and not user.get("is_superadmin"):
-                owner_clause = " AND s.created_by = %s"
-                owner_params.append(int(user.get("id") or 0))
+            if sale_id is None:
+                # General/unallocated client payment - no Sale to verify
+                # against, never creates one. Does not touch stock.
+                self.cursor.execute(
+                    """
+                    INSERT INTO payments (client_id, sale_id, sales_item_id, amount, date)
+                    VALUES (%s, NULL, NULL, %s, %s)
+                    RETURNING id
+                    """,
+                    (client_id, amount, str(date)),
+                )
+                payment_id = self.cursor.fetchone()[0]
+                self.conn.commit()
+                return int(payment_id)
 
+            # Adding a payment is gated solely by the caller's Sales:write
+            # permission (enforced by the RPC layer in core/network/server.py
+            # before this method is ever called) - who originally created the
+            # sale does not additionally restrict who may record a payment
+            # against it.
             if sales_item_id:
                 self.cursor.execute(
-                    f"""
+                    """
                     SELECT 1
                     FROM sales s
                     JOIN sales_items si ON si.sales_id = s.id
-                    WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
+                    WHERE s.id = %s AND si.id = %s AND s.client_id = %s
                     """,
-                    (sale_id, sales_item_id, client_id, *owner_params),
+                    (sale_id, sales_item_id, client_id),
                 )
                 if not self.cursor.fetchone():
                     raise ValueError("The selected purchase does not belong to this client")
@@ -3884,8 +4014,8 @@ class Database:
                     match_clause = "s.client_id=%s"
                     match_params = [client_id]
                 self.cursor.execute(
-                    f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}{owner_clause}",
-                    (sale_id, *match_params, *owner_params),
+                    f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}",
+                    (sale_id, *match_params),
                 )
                 if not self.cursor.fetchone():
                     raise ValueError("The selected sale does not belong to this client")

@@ -58,7 +58,7 @@ class AttachmentSafetyTests(unittest.TestCase):
             def list_attachments(self, *_args): return []
             def get_client_sales(self, client_id):
                 self.client_sales_calls.append(client_id)
-                return [[17, 'Kitchen order', '2026-07-24', 20, 1000]]
+                return [[17, 'DE-2026-3', '2026-07-24', 20, 1000]]
         app = QApplication.instance() or QApplication([])
         database = Database()
         panel = AttachmentPanel(database, 'client', 42)
@@ -75,6 +75,14 @@ class AttachmentSafetyTests(unittest.TestCase):
         self.assertEqual(panel.client_sales_table.rowCount(), 1)
         self.assertEqual(database.client_sales_calls, [42])
         self.assertEqual(panel.client_sales_table.item(0, 0).text(), '17')
+        # Column 1 is now Devis N° (replaces the old Notes column) and shows
+        # the reference with an explicit N° marker, never a bare-looking ID.
+        headers = [
+            panel.client_sales_table.horizontalHeaderItem(c).text()
+            for c in range(panel.client_sales_table.columnCount())
+        ]
+        self.assertEqual(headers[1], 'Devis N°')
+        self.assertEqual(panel.client_sales_table.item(0, 1).text(), 'DE N°-2026-3')
         panel.deleteLater()
 
     @patch('ui.widgets.attachments_widget.QMessageBox.information')

@@ -201,6 +201,29 @@ class NetworkSaleSavingTests(unittest.TestCase):
         self.assertFalse(line_sql[0].startswith('delete'))
         self.assertEqual(database.conn.commits, 1)
 
+    def test_edit_by_different_user_with_write_permission_succeeds(self):
+        # A non-superadmin user editing a sale someone else created must not
+        # be blocked by ownership alone - Sales:write permission (checked by
+        # the RPC layer before this method is ever reached) is the only gate.
+        database = _database(existing=(101, 102))
+        result = database.save_sale_with_items(
+            {'client_username': 'client', 'date': '2026-07-20', 'tva': 0, 'state': 'pending'},
+            [
+                {'id': 101, 'item_type': 'product', 'product_name': 'Known Product', 'quantity': 3, 'unit_price': 9},
+                {'item_type': 'service', 'product_name': 'Known Service', 'quantity': 1, 'unit_price': 4},
+            ],
+            sale_id=7,
+            visible_row_count=2,
+            user={'id': 999, 'is_superadmin': False},
+        )
+        self.assertEqual((result['updated'], result['inserted'], result['deleted']), (1, 1, 1))
+        self.assertEqual(database.conn.commits, 1)
+        self.assertEqual(database.conn.rollbacks, 0)
+        self.assertFalse(any(
+            'created_by' in sql and sql.startswith('select 1 from sales')
+            for sql, _ in database.cursor.statements
+        ))
+
     def test_invalid_existing_line_rolls_back_header_and_lines(self):
         database = _database(existing=(101,))
         with self.assertRaisesRegex(ValueError, 'does not belong'):

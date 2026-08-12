@@ -215,6 +215,9 @@ class _FakeCursor:
                 (2, "2026-07-05", "pending", False, "", 2, "2026", 20, 100033, 132000),
             ]
         if "FROM payments" in self._sql:
+            if "client_id" in self._sql:
+                # General/unallocated client payments query - none for this test.
+                return []
             return [(1, 2, None, "2026-07-06", Decimal("10000.00"))]
         return []
 
@@ -241,8 +244,41 @@ class _DeleteCursor:
         return (12,) if self.found else None
 
 
+class _ClientSalesFakeCursor:
+    """Scripted cursor for the real Database.get_client_sales() code path."""
+
+    def __init__(self):
+        self.queries = []
+        self._sql = ""
+
+    def execute(self, sql, params=None):
+        self.queries.append((sql, params))
+        self._sql = sql
+
+    def fetchone(self):
+        if "FROM clients" in self._sql:
+            return (1, "majid asilah")
+        return None
+
+    def fetchall(self):
+        if "FROM sales s LEFT JOIN sales_items" in self._sql:
+            # (sale_id, devis_text, devis_number, devis_year, date, tva, subtotal)
+            return [(17, "DE-2026-3", 3, "2026", "2026-07-24", 20, 1000)]
+        return []
+
+
 class ClientAccountBackendTests(unittest.TestCase):
     """Exercise the real Database.get_client_sale_summaries() code path."""
+
+    def test_get_client_sales_returns_devis_instead_of_notes(self):
+        from core.database import Database
+
+        db = Database.__new__(Database)
+        db.cursor = _ClientSalesFakeCursor()
+        db.conn = _FakeConn()
+        rows = db.get_client_sales(1)
+        # (sale_id, devis, date, vat, subtotal) - devis replaces notes.
+        self.assertEqual(rows, [[17, "DE-2026-3", "2026-07-24", 20, 1000]])
 
     def test_get_client_sale_summaries_runs_without_name_error(self):
         from core.database import Database
@@ -572,6 +608,134 @@ class ClientAccountDialogTests(unittest.TestCase):
             time.sleep(0.005)
         for _ in range(10):
             QApplication.processEvents()
+
+    def test_add_payment_without_sale_selection_records_general_payment(self):
+        # No Sale selected in the Sales History table - a Client may still
+        # give a general/unallocated payment not tied to one purchase.
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1",
+                                      total=Decimal("100.00"), paid=Decimal("0.00"),
+                                      remaining=Decimal("100.00"))],
+            "payments": [],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        dialog.date_input.setDate(QDate(2026, 8, 12))
+        self.assertEqual(dialog.purchases_table.currentRow(), -1)
+        self.assertTrue(dialog.amount_input.isEnabled())
+        self.assertTrue(dialog.add_payment_button.isEnabled())
+        with patch.object(database, "add_client_payment") as add:
+            add.side_effect = lambda *_args: None
+            dialog.amount_input.setText("5000")
+            with patch("ui.dialogs.client_details_dialog.QMessageBox.information"):
+                dialog.add_payment()
+        # sale_id is None: not linked to any Sale, no stock/sale side effects.
+        add.assert_called_once_with(1, None, None, 5000.0, "12-08-2026")
+        thread = getattr(dialog, "_account_thread", None)
+        deadline = time.time() + 3.0
+        while thread and thread.isRunning() and time.time() < deadline:
+            QApplication.processEvents()
+            time.sleep(0.005)
+        for _ in range(10):
+            QApplication.processEvents()
+
+    def test_general_payment_counts_toward_totals_and_shows_dash_columns(self):
+        account = {
+            "sales": [
+                _canonical_sale(1, devis="DE-2026-1", total=Decimal("50000.00"),
+                                paid=Decimal("10000.00"), remaining=Decimal("40000.00")),
+            ],
+            "payments": [
+                _canonical_payment(1, 1, amount=10000),
+                # General/unallocated payment: sale_id is None.
+                _canonical_payment(2, None, amount=5000, date="12-08-2026"),
+            ],
+        }
+        dialog = self._build_dialog(account)
+        self.assertEqual(dialog.total_bought_label.text(), "50 000.00 MAD")
+        self.assertEqual(dialog.total_paid_label.text(), "15 000.00 MAD")
+        self.assertEqual(dialog.remaining_label.text(), "35 000.00 MAD")
+        self.assertEqual(dialog.payments_table.rowCount(), 2)
+        general_row = next(
+            r for r in range(dialog.payments_table.rowCount())
+            if dialog.payments_table.item(r, 0).text() == "#2"
+        )
+        self.assertEqual(dialog.payments_table.item(general_row, 1).text(), "—")
+        self.assertEqual(dialog.payments_table.item(general_row, 4).text(), "—")
+
+    def test_edit_general_payment_has_no_sale_cap(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1")],
+            "payments": [_canonical_payment(9, None, amount=5000)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        with patch("ui.dialogs.client_details_dialog.QMessageBox.warning") as warning, patch.object(
+            dialog, "_start_payment_edit"
+        ) as start:
+            dialog.payments_table.setCurrentCell(0, 0)
+            with patch("ui.dialogs.client_details_dialog._EditPaymentDialog") as edit_cls:
+                edit_cls.return_value.exec.return_value = QDialog.Accepted
+                edit_cls.return_value.amount_decimal.return_value = Decimal("7000.00")
+                dialog._edit_selected_payment()
+                self.assertIsNone(edit_cls.call_args.kwargs["max_allowed"])
+        warning.assert_not_called()
+        start.assert_called_once_with(9, Decimal("7000.00"))
+
+    def test_delete_general_payment_does_not_warn_unresolved_sale(self):
+        account = {
+            "sales": [_canonical_sale(1, devis="DE-2026-1")],
+            "payments": [_canonical_payment(9, None, amount=5000)],
+        }
+        database = _StubDatabase(account)
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(account)
+        with patch.object(dialog, "_confirm_payment_delete", return_value=True) as confirm, patch.object(
+            dialog, "_start_payment_delete"
+        ) as start, patch("ui.dialogs.client_details_dialog.QMessageBox.warning") as warning:
+            dialog.payments_table.setCurrentCell(0, 0)
+            dialog._delete_selected_payment()
+        warning.assert_not_called()
+        confirm.assert_called_once()
+        start.assert_called_once_with(9)
+
+    def test_add_client_payment_backend_inserts_unallocated_payment(self):
+        from core.database import Database
+
+        class _GeneralPaymentCursor:
+            def __init__(self):
+                self.executed = []
+                self._sql = ""
+
+            def execute(self, sql, params=None):
+                self.executed.append((sql, params))
+                self._sql = sql
+
+            def fetchone(self):
+                if "FROM clients" in self._sql:
+                    return (1, "majid asilah")
+                if "RETURNING id" in self._sql:
+                    return (501,)
+                return None
+
+        db = Database.__new__(Database)
+        cursor = _GeneralPaymentCursor()
+        db.cursor = cursor
+        db.conn = _FakeConn()
+        payment_id = db.add_client_payment(1, None, None, 5000.0, "12-08-2026")
+        self.assertEqual(payment_id, 501)
+        insert_sql, insert_params = cursor.executed[-1]
+        self.assertIn("INSERT INTO payments", insert_sql)
+        self.assertIn("client_id", insert_sql)
+        self.assertEqual(insert_params, (1, 5000.0, "12-08-2026"))
 
     def test_add_payment_blocks_overpayment(self):
         account = {

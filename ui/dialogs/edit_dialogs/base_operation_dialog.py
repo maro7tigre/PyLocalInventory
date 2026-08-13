@@ -27,6 +27,13 @@ from core.runtime_paths import user_data_root
 
 logger = logging.getLogger(__name__)
 _save_timeline_logger = logging.getLogger("save_timeline")
+
+# QDoubleSpinBox clamps setValue() to its configured range.  Financial fields
+# need an explicit business-sized range instead of NumericWidget's deliberately
+# conservative generic default (999999), which is also used by quantities and
+# other unrelated numeric parameters.
+FINANCIAL_WIDGET_MAX = 999_999_999_999.99
+
 # Root logger defaults to WARNING app-wide (no setLevel anywhere in this
 # codebase), which would silently drop these diagnostic events - opt this
 # specific logger into INFO regardless, so app.log actually captures them.
@@ -303,12 +310,16 @@ class BaseOperationDialog(QDialog):
         after the load worker's OS thread has fully stopped, so it is now safe
         to drop the last references to the thread/worker without a QThread
         being destroyed while its native thread is still running."""
+        close_after_load = getattr(self, "_close_after_load", False)
         try:
             _active_background_threads.discard(self.load_thread)
         except RuntimeError:
             pass
         self.load_worker = None
         self.load_thread = None
+        if close_after_load:
+            self._close_after_load = False
+            QTimer.singleShot(0, self.reject)
 
         
     def setup_ui(self):
@@ -460,7 +471,7 @@ class BaseOperationDialog(QDialog):
         if getattr(self.operation_obj, 'section', '') == 'Sales':
             from PySide6.QtWidgets import QDoubleSpinBox
             self.remise_spinbox = QDoubleSpinBox()
-            self.remise_spinbox.setRange(0.0, 999999999.0)
+            self.remise_spinbox.setRange(0.0, FINANCIAL_WIDGET_MAX)
             self.remise_spinbox.setDecimals(2)
             self.remise_spinbox.setSuffix(" MAD")
             self.remise_spinbox.setMinimumHeight(30)
@@ -507,7 +518,13 @@ class BaseOperationDialog(QDialog):
     def create_total_widget(self, label, unit):
         """Create a read-only total display widget"""
         widget = ParameterWidgetFactory.create_widget(
-            {'type': 'float', 'unit': unit}, {}, None, editable=False
+            {
+                'type': 'float',
+                'unit': unit,
+                'min': -FINANCIAL_WIDGET_MAX,
+                'max': FINANCIAL_WIDGET_MAX,
+            },
+            {}, None, editable=False,
         )
         ParameterWidgetFactory.set_widget_value(widget, 0.0)
         return widget
@@ -1096,6 +1113,20 @@ class BaseOperationDialog(QDialog):
             "DIALOG_CLOSE", token=getattr(self, "operation_token", None),
             saving=getattr(self, "_saving", None),
         )
+        load_thread = getattr(self, "load_thread", None)
+        if load_thread is not None:
+            try:
+                if shiboken6.isValid(load_thread) and load_thread.isRunning():
+                    # Closing the dialog drops its worker/thread references. A
+                    # captured production crash proved that doing so while the
+                    # initial LoadWorker was still connecting can destroy the
+                    # running QThread and abort the process. Keep the dialog
+                    # alive until QThread.finished, then reject it normally.
+                    self._close_after_load = True
+                    event.ignore()
+                    return
+            except RuntimeError:
+                pass
         super().closeEvent(event)
 
     def apply_theme(self):

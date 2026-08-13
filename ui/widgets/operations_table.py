@@ -92,17 +92,19 @@ class TableDataManager:
         except (ValueError, AttributeError):
             pass
 
-        # If we have product_name but no quantity yet, set default 1 (so later logic can proceed)
-        if 'product_name' in row_data and 'quantity' not in row_data:
+        is_section = str(row_data.get('item_type') or '').casefold() == 'section'
+        # Financial defaults apply only to actual Sale/Import lines. A Section
+        # intentionally has no quantity, price, or subtotal.
+        if 'product_name' in row_data and 'quantity' not in row_data and not is_section:
             try:
                 default_qty = self.parameter_definitions.get('quantity', {}).get('default', 1)
                 row_data['quantity'] = default_qty
             except Exception:
                 row_data['quantity'] = 1
         # If unit_price absent, default to 0 (it may be filled later)
-        if 'product_name' in row_data and 'unit_price' not in row_data:
+        if 'product_name' in row_data and 'unit_price' not in row_data and not is_section:
             row_data['unit_price'] = 0.0
-        if 'product_name' in row_data:
+        if 'product_name' in row_data and not is_section:
             from core.calculations import calculate_line_subtotal
             row_data['subtotal'] = calculate_line_subtotal(
                 row_data.get('quantity', 0),
@@ -158,6 +160,11 @@ class TableRowFactory:
         """Create a row with existing item data"""
         for col, param_key in enumerate(self.data_manager.table_columns):
             self._create_cell(table, row, col, param_key, item)
+        is_section = bool(
+            item and hasattr(item, 'get_value')
+            and str(item.get_value('item_type') or '').casefold() == 'section'
+        )
+        self.set_section_row_state(table, row, is_section)
     
     def create_empty_row(self, table, row):
         """Create an empty row for new data entry"""
@@ -187,6 +194,7 @@ class TableRowFactory:
             "product": "Product",
             "service": "Service",
             "manual": "Keep only in Sale",
+            "section": "Section",
         }
         options = self.data_manager.parameter_definitions.get(
             "item_type", {}
@@ -204,6 +212,57 @@ class TableRowFactory:
         selector.setCurrentIndex(index if index >= 0 else 0)
         selector.setProperty("row", row)
         table.setCellWidget(row, col, selector)
+
+    def set_section_row_state(self, table, row, is_section):
+        """Make structural Section cells visibly non-financial and non-editable."""
+        try:
+            name_col = self.data_manager.table_columns.index('product_name')
+            name_widget = table.cellWidget(row, name_col)
+            if name_widget:
+                if is_section:
+                    name_widget.setProperty('item_type', 'section')
+                    name_widget.setProperty('product_id', None)
+                    name_widget.setProperty('service_id', None)
+                name_widget.setPlaceholderText('Section title' if is_section else 'Product')
+                font = name_widget.font()
+                font.setBold(is_section)
+                name_widget.setFont(font)
+        except (ValueError, AttributeError):
+            pass
+
+        try:
+            info_col = self.data_manager.table_columns.index('information')
+            info_widget = table.cellWidget(row, info_col)
+            if info_widget:
+                info_widget.setEnabled(not is_section)
+                if is_section and hasattr(info_widget, 'setText'):
+                    info_widget.setText('')
+        except (ValueError, AttributeError):
+            pass
+
+        for param_key in ('quantity', 'unit_price', 'subtotal'):
+            try:
+                col = self.data_manager.table_columns.index(param_key)
+            except ValueError:
+                continue
+            cell = table.item(row, col)
+            if cell is None:
+                cell = QTableWidgetItem()
+                table.setItem(row, col, cell)
+            if is_section:
+                cell.setText('')
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsEnabled)
+                cell.setBackground(QBrush(QColor('#333333')))
+                cell.setToolTip('Not applicable to Section rows')
+            else:
+                cell.setFlags(cell.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable)
+                cell.setBackground(QBrush())
+                cell.setToolTip('')
+                if param_key == 'quantity' and not cell.text().strip():
+                    default_qty = self.data_manager.parameter_definitions.get(
+                        'quantity', {}
+                    ).get('default', 1)
+                    cell.setText(str(default_qty))
     
     def _create_delete_button_cell(self, table, row, col):
         """Create delete button cell"""
@@ -369,6 +428,13 @@ class EmptyRowManager:
     
     def _is_row_empty(self, row):
         """Check if row is empty"""
+        try:
+            type_col = self.row_factory.data_manager.table_columns.index('item_type')
+            selector = self.table.cellWidget(row, type_col)
+            if selector and str(selector.currentData() or '').casefold() == 'section':
+                return False
+        except (ValueError, AttributeError):
+            pass
         # Check product name first (most important)
         product_name = self._get_product_name(row)
         if product_name:
@@ -414,6 +480,7 @@ class TableEventHandler:
         self.empty_row_manager = empty_row_manager
         self.items_changed_callback = items_changed_callback
         self._updating = False
+        self._empty_row_update_pending = False
         self._stock_cache = {}
         self._table_events_connected = False
     
@@ -481,14 +548,23 @@ class TableEventHandler:
 
     def _on_item_type_changed(self, row):
         try:
+            type_col = self.data_manager.table_columns.index("item_type")
+            selector = self.table.cellWidget(row, type_col)
+            selected_type = str(selector.currentData() or "").casefold() if selector else ""
             name_col = self.data_manager.table_columns.index("product_name")
             name_widget = self.table.cellWidget(row, name_col)
             if name_widget:
                 name_widget.setProperty("product_id", None)
                 name_widget.setProperty("service_id", None)
-                name_widget.setProperty("item_type", None)
-                if name_widget.text().strip():
+                name_widget.setProperty("item_type", selected_type or None)
+                self.empty_row_manager.row_factory.set_section_row_state(
+                    self.table, row, selected_type == 'section'
+                )
+                if selected_type != 'section' and name_widget.text().strip():
                     self._handle_product_selection(row, name_widget.text().strip())
+            if selected_type == 'section':
+                self.empty_row_manager.ensure_single_empty_row()
+                self._reconnect_all_widgets()
             self.items_changed_callback()
         except (ValueError, AttributeError):
             pass
@@ -518,14 +594,31 @@ class TableEventHandler:
         
         # Ensure empty row management
         if not self.empty_row_manager._is_row_empty(row):
-            self._updating = True
-            try:
-                self.empty_row_manager.ensure_single_empty_row()
-                self._reconnect_all_widgets()
-            finally:
-                self._updating = False
+            self._schedule_empty_row_update()
         
         self.items_changed_callback()
+
+    def _schedule_empty_row_update(self):
+        """Normalize rows after the current itemChanged delivery has returned."""
+        if self._empty_row_update_pending:
+            return
+        self._empty_row_update_pending = True
+        QTimer.singleShot(0, self._apply_pending_empty_row_update)
+
+    def _apply_pending_empty_row_update(self):
+        self._empty_row_update_pending = False
+        if self._updating:
+            self._schedule_empty_row_update()
+            return
+        self._updating = True
+        try:
+            self.empty_row_manager.ensure_single_empty_row()
+            self._reconnect_all_widgets()
+        except RuntimeError:
+            # The owning dialog/table may have closed before the queued call.
+            pass
+        finally:
+            self._updating = False
 
     @staticmethod
     def _parse_number(value):
@@ -596,16 +689,24 @@ class TableEventHandler:
         """Handle when product selection is completed"""
         product_name = self.empty_row_manager._get_product_name(row)
         if product_name:
-            self._handle_product_selection(row, product_name)
+            try:
+                type_col = self.data_manager.table_columns.index('item_type')
+                selector = self.table.cellWidget(row, type_col)
+                item_type = str(selector.currentData() or '').casefold() if selector else ''
+            except (ValueError, AttributeError):
+                item_type = ''
+            if item_type != 'section':
+                self._handle_product_selection(row, product_name)
             self.empty_row_manager.ensure_single_empty_row()
             self._reconnect_all_widgets()
             self.items_changed_callback()
             # Bridge the widget-backed product name to the item-backed
             # quantity delegate. This makes Tab and a single click reliably
             # enter quantity editing instead of merely selecting the row.
-            QTimer.singleShot(
-                0, lambda r=row: self._begin_quantity_edit(r, select_all=True)
-            )
+            if item_type != 'section':
+                QTimer.singleShot(
+                    0, lambda r=row: self._begin_quantity_edit(r, select_all=True)
+                )
 
     def _begin_quantity_edit(self, row, select_all=False):
         try:
@@ -676,7 +777,7 @@ class TableEventHandler:
             type_col = None
         if type_col is not None:
             selector = self.table.cellWidget(row, type_col)
-            if selector and str(selector.currentData() or "") == "manual":
+            if selector and str(selector.currentData() or "") in ("manual", "section"):
                 return None
         target = self._normalized_name(entered_name)
         product = service = None
@@ -888,7 +989,7 @@ class TableEventHandler:
                 item_type = str(selector.currentData() or item_type).casefold()
             except (ValueError, AttributeError):
                 pass
-        if item_type in ("service", "manual"):
+        if item_type in ("service", "manual", "section"):
             return None
         
         # Get quantity from either active editor or cell item
@@ -1227,6 +1328,13 @@ class OperationsTableWidget(QWidget):
         
         for item_data in items_data:
             item = self.data_manager.item_class(0, self.data_manager.database)
+            # Set the type before the name so Section titles never go through
+            # Product/Service catalog resolution.
+            if 'item_type' in item_data:
+                try:
+                    item.set_value('item_type', item_data['item_type'])
+                except Exception:
+                    pass
             # Set product_name first to trigger snapshot logic in item class
             if 'product_name' in item_data:
                 try:
@@ -1235,7 +1343,7 @@ class OperationsTableWidget(QWidget):
                     pass
             # Set remaining fields except product_name
             for key, value in item_data.items():
-                if key == 'product_name':
+                if key in ('product_name', 'item_type'):
                     continue
                 try:
                     if hasattr(item, 'is_parameter_calculated') and item.is_parameter_calculated(key):
@@ -1259,7 +1367,7 @@ class OperationsTableWidget(QWidget):
             # prefetched catalog only. If it's unavailable, leave product_id unresolved;
             # the backend resolves by name / pending_entities at save time.
             if (hasattr(item, 'get_value') and not item.get_value('product_id')
-                    and str(item_data.get("item_type") or "").casefold() != "service"):
+                    and str(item_data.get("item_type") or "").casefold() == "product"):
                 try:
                     catalog = getattr(self.data_manager.database, 'sale_catalog', None)
                     if catalog:
@@ -1273,6 +1381,29 @@ class OperationsTableWidget(QWidget):
             items.append(item)
         
         return items
+
+    def add_section_row(self):
+        """Append one editable structural Section before the trailing empty row."""
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            self.empty_row_manager._remove_all_empty_rows()
+            row = self.table.rowCount()
+            self.table.setRowCount(row + 1)
+            item = self.data_manager.item_class(0, self.data_manager.database)
+            item.set_value('item_type', 'section')
+            self.row_factory.create_data_row(self.table, row, item)
+            self.empty_row_manager.ensure_single_empty_row()
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+        self.event_handler._reconnect_all_widgets()
+        try:
+            name_col = self.data_manager.table_columns.index('product_name')
+            name_widget = self.table.cellWidget(row, name_col)
+            if name_widget:
+                name_widget.setFocus()
+        except (ValueError, AttributeError):
+            pass
+        self._on_items_changed()
     
     def _delete_row(self, row):
         """Delete a specific row"""

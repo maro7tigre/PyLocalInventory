@@ -1,5 +1,6 @@
 import os
 import threading
+import time
 import unittest
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
@@ -282,6 +283,46 @@ class TestReportsDialogQThreadLifetime(unittest.TestCase):
         
         self.assertFalse(self.dialog.finished_called)
         self.assertFalse(self.dialog.failed_called)
+
+
+class TestOperationDialogLoadThreadLifetime(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def test_close_waits_for_initial_load_thread(self):
+        from ui.dialogs.edit_dialogs import base_operation_dialog as dialog_module
+
+        class MinimalOperationDialog(dialog_module.BaseOperationDialog):
+            def __init__(self):
+                super(dialog_module.BaseOperationDialog, self).__init__()
+                self.load_thread = QThread()
+                self.load_worker = object()
+                dialog_module._active_background_threads.add(self.load_thread)
+                self.load_thread.finished.connect(self.load_thread.deleteLater)
+                self.load_thread.finished.connect(self._on_load_thread_finished)
+
+        dialog = MinimalOperationDialog()
+        dialog.show()
+        dialog.load_thread.start()
+        self.assertTrue(dialog.load_thread.isRunning())
+
+        self.assertFalse(dialog.close())
+        self.assertTrue(dialog.isVisible())
+        self.assertTrue(dialog._close_after_load)
+
+        thread = dialog.load_thread
+        thread.quit()
+        deadline = time.time() + 2.0
+        while dialog.load_thread is not None and time.time() < deadline:
+            self.app.processEvents()
+            time.sleep(0.005)
+        for _ in range(3):
+            self.app.processEvents()
+
+        self.assertIsNone(dialog.load_thread)
+        self.assertFalse(dialog.isVisible())
+        self.assertNotIn(thread, dialog_module._active_background_threads)
 
 class TestBackupsDialogQThreadLifetime(unittest.TestCase):
     @classmethod

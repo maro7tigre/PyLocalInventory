@@ -109,5 +109,21 @@ class TestOperationsTableDecimal(unittest.TestCase):
         self.handler._apply_subtotal_override(0)
         self.assertEqual(self.table.item(0, 1).text(), "10.00")
 
+    def test_item_changed_defers_empty_row_removal(self):
+        empty_row_manager = MagicMock()
+        empty_row_manager._is_row_empty.return_value = False
+        callback = MagicMock()
+        handler = TableEventHandler(
+            self.table, DummyDataManager(), empty_row_manager, callback
+        )
+        handler._update_row_subtotal = MagicMock()
+        handler._validate_stock = MagicMock()
+
+        handler._on_item_changed(self.table.item(0, 0))
+
+        empty_row_manager.ensure_single_empty_row.assert_not_called()
+        self.app.processEvents()
+        empty_row_manager.ensure_single_empty_row.assert_called_once_with()
+
 if __name__ == "__main__":
     unittest.main()

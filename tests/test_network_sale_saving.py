@@ -4,6 +4,7 @@ from decimal import Decimal
 from unittest.mock import patch
 
 from classes.sales_class import SalesClass
+from classes.sales_item_class import SalesItemClass
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import DatabaseServer
@@ -182,6 +183,161 @@ class NetworkSaleSavingTests(unittest.TestCase):
         self.assertEqual([item['item_type'] for item in result['items']], ['product', 'service'])
         self.assertEqual(database.conn.commits, 1)
         self.assertEqual(database.conn.rollbacks, 0)
+
+    def test_large_sale_line_reaches_database_as_exact_decimals(self):
+        database = _database()
+        result = database.save_sale_with_items(
+            {
+                'client_username': 'client', 'date': '2026-08-13',
+                'tva': 20, 'remise': Decimal('1000000.00'),
+                'state': 'pending', 'is_historical': True,
+            },
+            [{
+                'item_type': 'manual', 'product_name': 'Large Manual Sale',
+                'quantity': Decimal('20'),
+                'unit_price': Decimal('1000000.00'),
+            }],
+            visible_row_count=1,
+        )
+
+        insert_params = next(
+            params for sql, params in database.cursor.statements
+            if sql.startswith('insert into sales_items')
+        )
+        self.assertEqual(insert_params[6], Decimal('20'))
+        self.assertEqual(insert_params[7], Decimal('1000000.00'))
+        self.assertEqual(insert_params[6] * insert_params[7], Decimal('20000000.00'))
+        self.assertEqual(result['transaction'], 'committed')
+
+    def test_sections_persist_in_mixed_order_without_financial_or_stock_values(self):
+        database = _database()
+        result = database.save_sale_with_items(
+            {
+                'client_username': 'client', 'date': '2026-08-13',
+                'tva': 20, 'state': 'pending', 'is_historical': False,
+            },
+            [
+                {'item_type': 'section', 'product_name': 'IMMEUBLES', 'sort_order': 1},
+                {'item_type': 'product', 'product_name': 'Known Product',
+                 'quantity': 2, 'unit_price': 100, 'sort_order': 2},
+                {'item_type': 'section', 'product_name': 'VILLAS', 'sort_order': 3},
+                {'item_type': 'service', 'product_name': 'Known Service',
+                 'quantity': 3, 'unit_price': 50, 'sort_order': 4},
+            ],
+            visible_row_count=4,
+        )
+
+        inserts = [
+            params for sql, params in database.cursor.statements
+            if sql.startswith('insert into sales_items')
+        ]
+        self.assertEqual([params[3] for params in inserts], [
+            'section', 'product', 'section', 'service',
+        ])
+        self.assertEqual([params[4] for params in inserts], [
+            'IMMEUBLES', 'Known Product', 'VILLAS', 'Known Service',
+        ])
+        self.assertEqual([params[9] for params in inserts], [1, 2, 3, 4])
+        for params in (inserts[0], inserts[2]):
+            self.assertIsNone(params[1])
+            self.assertIsNone(params[2])
+            self.assertIsNone(params[6])
+            self.assertIsNone(params[7])
+            self.assertIsNone(params[8])
+        self.assertEqual(result['saved'], 4)
+        stock_queries = [
+            sql for sql, _params in database.cursor.statements
+            if sql.startswith('select id from products where id=')
+        ]
+        self.assertEqual(len(stock_queries), 1)
+
+    def test_rename_and_delete_section_does_not_delete_following_product(self):
+        database = _database(existing=(101, 102, 103))
+        result = database.save_sale_with_items(
+            {
+                'client_username': 'client', 'date': '2026-08-13',
+                'tva': 0, 'state': 'pending', 'is_historical': True,
+            },
+            [
+                {'id': 101, 'item_type': 'section',
+                 'product_name': 'IMMEUBLES A', 'sort_order': 1},
+                {'id': 102, 'item_type': 'product', 'product_name': 'Known Product',
+                 'quantity': 2, 'unit_price': 100, 'sort_order': 2},
+            ],
+            sale_id=75,
+            visible_row_count=2,
+        )
+
+        updates = [
+            params for sql, params in database.cursor.statements
+            if sql.startswith('update sales_items')
+        ]
+        self.assertEqual(updates[0][3], 'IMMEUBLES A')
+        self.assertEqual(updates[0][8], 1)
+        delete_params = next(
+            params for sql, params in database.cursor.statements
+            if sql.startswith('delete from sales_items')
+        )
+        self.assertEqual(delete_params[0], 75)
+        self.assertEqual(set(delete_params[1]), {103})
+        self.assertEqual((result['updated'], result['deleted']), (2, 1))
+
+    def test_remote_request_serializes_section_in_normal_sale_payload(self):
+        remote = RemoteDatabase(None, 'host-pc', 8765, 'user', 'password')
+        remote._token = 'test-token'
+        captured = {}
+
+        def open_request(request, timeout):
+            captured.update(json.loads(request.data.decode()))
+            return _Response()
+
+        with patch('urllib.request.urlopen', side_effect=open_request):
+            remote._call(
+                'save_sale_with_items',
+                [{'client_username': 'client'}, [{
+                    'item_type': 'section', 'product_name': 'IMMEUBLES',
+                    'sort_order': 1,
+                }]],
+            )
+
+        section = captured['args'][1][0]
+        self.assertEqual(section, {
+            'item_type': 'section', 'product_name': 'IMMEUBLES', 'sort_order': 1,
+        })
+
+    def test_sale_item_reload_uses_persisted_mixed_row_order(self):
+        class OrderCursor:
+            description = [
+                ('id',), ('sales_id',), ('item_type',),
+                ('product_name',), ('sort_order',),
+            ]
+
+            def __init__(self):
+                self.sql = ''
+
+            def execute(self, sql, params=()):
+                self.sql = ' '.join(sql.lower().split())
+
+            def fetchall(self):
+                return [
+                    (10, 75, 'section', 'IMMEUBLES', 1),
+                    (11, 75, 'product', 'Product A', 2),
+                    (12, 75, 'product', 'Product B', 3),
+                    (13, 75, 'section', 'VILLAS', 4),
+                    (14, 75, 'service', 'Product C', 5),
+                ]
+
+        database = Database.__new__(Database)
+        database.cursor = OrderCursor()
+        database.conn = _Connection()
+        database.registered_classes = {'Sales_Items': SalesItemClass}
+
+        rows = database.get_items_by_operation_id(75, 'Sales_Items')
+
+        self.assertIn('order by coalesce(sort_order, id), id', database.cursor.sql)
+        self.assertEqual([row['product_name'] for row in rows], [
+            'IMMEUBLES', 'Product A', 'Product B', 'VILLAS', 'Product C',
+        ])
 
     def test_edit_updates_inserts_and_deletes_without_delete_first(self):
         database = _database(existing=(101, 102))

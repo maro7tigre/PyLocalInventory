@@ -294,8 +294,12 @@ class SalesClass(BaseClass):
             items = []
             for row in self.database.get_items_by_operation_id(self.id, "Sales_Items"):
                 item = SalesItemClass(row.get("ID", 0), self.database)
+                if row.get("item_type"):
+                    item.set_value("item_type", row["item_type"])
                 for key, value in row.items():
                     parameter = "id" if key == "ID" else key
+                    if parameter == "item_type":
+                        continue
                     if parameter in item.parameters and not item.is_parameter_calculated(parameter):
                         item.set_value(parameter, value)
                 items.append(item)
@@ -309,7 +313,11 @@ class SalesClass(BaseClass):
     def _raw_subtotal(self):
         """Internal: sum of all Sale Item line totals before any discount."""
         items = self.get_sales_items()
-        return sum(to_decimal(item.get_value('subtotal')) for item in items)
+        return sum(
+            to_decimal(item.get_value('subtotal'))
+            for item in items
+            if str(item.get_value('item_type') or '').casefold() != 'section'
+        )
 
     def calculate_subtotal(self):
         """Discounted Total HT (Original Subtotal - Remise).

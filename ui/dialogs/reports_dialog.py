@@ -598,8 +598,12 @@ class ReportsDialog(QDialog):
                         self.sales_obj.items = []
                         for item_data in items_data:
                             item_obj = SalesItemClass(0, db)
+                            if item_data.get("item_type"):
+                                item_obj.set_value("item_type", item_data["item_type"])
                             # Load item data
                             for key, value in item_data.items():
+                                if key == "item_type":
+                                    continue
                                 if key in item_obj.parameters:
                                     try:
                                         item_obj.set_value(key, value)
@@ -650,6 +654,32 @@ class ReportsDialog(QDialog):
                                 product_name = prefetched_product_names[pid_int]
                         except ValueError:
                             pass
+
+                    if item_type == "section":
+                        section_title = html.escape(str(product_name).strip())
+                        title_html = (
+                            '<strong class="sale-section-title" '
+                            'style="display:block;text-align:left">'
+                            f'{section_title}</strong>'
+                        )
+                        if report_type == 'devis':
+                            row_html = (
+                                f'<tr class="sale-section-row"><td></td><td>{title_html}</td>'
+                                '<td></td><td></td><td></td></tr>'
+                            )
+                        elif report_type == 'bdl':
+                            row_html = (
+                                f'<tr class="sale-section-row"><td></td><td>{title_html}</td>'
+                                '<td></td></tr>'
+                            )
+                        else:
+                            row_html = (
+                                f'<tr class="sale-section-row"><td>{title_html}</td>'
+                                '<td></td><td></td><td></td></tr>'
+                            )
+                        items_html += row_html + "\n"
+                        rendered_rows += 1
+                        continue
                     
                     quantity = _decimal(item.get_value('quantity'))
                     unit_price = _decimal(item.get_value('unit_price'))

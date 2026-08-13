@@ -51,8 +51,15 @@ class SalesItemClass(BaseClass):
                 "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
                 "required": True,
                 "default": "product",
-                "options": ["product", "service", "manual"],
+                "options": ["product", "service", "manual", "section"],
                 "type": "string"
+            },
+            "sort_order": {
+                "value": None,
+                "display_name": {"en": "Sort Order", "fr": "Ordre", "es": "Orden"},
+                "required": False,
+                "default": None,
+                "type": "int"
             },
             "product_name": {
                 "value": "",
@@ -158,6 +165,7 @@ class SalesItemClass(BaseClass):
                 "product_id": "rw",
                 "service_id": "rw",
                 "item_type": "rw",
+                "sort_order": "rw",
                 "product_name": "rw",  # snapshot of name at time of operation
                 "information": "rw",
                 "quantity": "rw",
@@ -337,6 +345,9 @@ class SalesItemClass(BaseClass):
     
     def calculate_subtotal(self):
         """Calculate subtotal (quantity * unit_price) with Decimal precision."""
+        if str(self.get_value("item_type") or "").casefold() == "section":
+            from decimal import Decimal
+            return Decimal("0")
         from core.calculations import calculate_line_subtotal
         return calculate_line_subtotal(
             self.get_value('quantity'),
@@ -373,10 +384,22 @@ class SalesItemClass(BaseClass):
                 # Snapshot-only line: keep the typed name, no catalog link.
                 self.parameters["product_id"]["value"] = None
                 self.parameters["service_id"]["value"] = None
+            elif normalized == "section":
+                # Structural Sale/Devis heading: never link it to the catalog
+                # and keep financial fields genuinely non-applicable.
+                self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
+                self.parameters["information"]["value"] = ""
+                self.parameters["quantity"]["value"] = None
+                self.parameters["unit_price"]["value"] = None
+                self.parameters["production"]["value"] = None
             return
         # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:
             name_clean = value.strip()
+            if str(self.get_value("item_type") or "").casefold() == "section":
+                BaseClass.set_value(self, "product_name", name_clean)
+                return
             product_data = self.get_product_data_by_name(name_clean)
             if not product_data:
                 service_name = self.get_service_name_by_keyword(name_clean)

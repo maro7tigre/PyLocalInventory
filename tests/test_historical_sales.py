@@ -57,6 +57,35 @@ class HistoricalSaleSavingTests(unittest.TestCase):
             for sql, _params in database.cursor.statements
         ))
 
+    def test_historical_sale_persists_section_without_stock_participation(self):
+        database = _database()
+        result = database.save_sale_with_items(
+            {
+                'client_username': 'client', 'date': '2026-08-13',
+                'tva': 0, 'state': 'pending', 'is_historical': True,
+            },
+            [
+                {'item_type': 'section', 'product_name': 'IMMEUBLES', 'sort_order': 1},
+                {'item_type': 'product', 'product_name': 'Known Product',
+                 'quantity': 99999, 'unit_price': 10, 'sort_order': 2},
+            ],
+            visible_row_count=2,
+        )
+
+        inserts = [
+            params for sql, params in database.cursor.statements
+            if sql.startswith('insert into sales_items')
+        ]
+        self.assertEqual([params[3] for params in inserts], ['section', 'product'])
+        self.assertEqual(inserts[0][4], 'IMMEUBLES')
+        self.assertIsNone(inserts[0][6])
+        self.assertIsNone(inserts[0][7])
+        self.assertEqual(result['saved'], 2)
+        self.assertFalse(any(
+            sql.startswith('select id from products') and sql.endswith('for update')
+            for sql, _params in database.cursor.statements
+        ))
+
     def test_historical_flag_persisted_in_insert_header(self):
         database = _database()
         database.save_sale_with_items(

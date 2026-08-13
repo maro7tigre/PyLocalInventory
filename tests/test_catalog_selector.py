@@ -4,8 +4,10 @@ import unittest
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QValidator
+from PySide6.QtCore import Qt
 from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
 
+from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from ui.widgets.operations_table import OperationsTableWidget
 
@@ -80,7 +82,7 @@ class CatalogSelectorTests(unittest.TestCase):
         self.assertIsNone(widget.event_handler.get_row_stock_state(0))
         widget.close()
 
-    def test_type_selector_offers_product_service_and_keep_only(self):
+    def test_type_selector_offers_product_service_keep_only_and_section(self):
         widget = OperationsTableWidget(
             SalesItemClass,
             database=_Database(),
@@ -89,10 +91,10 @@ class CatalogSelectorTests(unittest.TestCase):
         type_col = widget.data_manager.table_columns.index("item_type")
         selector = widget.table.cellWidget(0, type_col)
 
-        self.assertEqual(selector.count(), 3)
+        self.assertEqual(selector.count(), 4)
         self.assertEqual(
             [selector.itemData(index) for index in range(selector.count())],
-            ["product", "service", "manual"],
+            ["product", "service", "manual", "section"],
         )
         widget.close()
 
@@ -136,6 +138,81 @@ class CatalogSelectorTests(unittest.TestCase):
 
         self.assertEqual(state, QValidator.Acceptable)
         delegate.destroyEditor(editor, index)
+        widget.close()
+
+    def test_add_section_has_title_only_and_blank_disabled_financial_cells(self):
+        sale = SalesClass(0, None)
+        widget = OperationsTableWidget(
+            SalesItemClass,
+            parent_operation=sale,
+            columns=[
+                "item_type", "product_name", "information", "quantity",
+                "unit_price", "subtotal", "delete_action",
+            ],
+            highlight_stock_exceed=True,
+        )
+
+        widget.add_section_row()
+        columns = widget.data_manager.table_columns
+        selector = widget.table.cellWidget(0, columns.index("item_type"))
+        name = widget.table.cellWidget(0, columns.index("product_name"))
+        name.setText("IMMEUBLES")
+        self.app.processEvents()
+
+        self.assertEqual(selector.currentText(), "Section")
+        self.assertEqual(selector.currentData(), "section")
+        for key in ("quantity", "unit_price", "subtotal"):
+            cell = widget.table.item(0, columns.index(key))
+            self.assertEqual(cell.text(), "")
+            self.assertFalse(bool(cell.flags() & Qt.ItemIsEditable))
+
+        self.assertEqual(widget.get_current_table_data(), [{
+            "item_type": "section",
+            "product_name": "IMMEUBLES",
+            "row_index": 1,
+        }])
+        section = widget.get_items_data()[0]
+        self.assertEqual(section.get_value("item_type"), "section")
+        self.assertIsNone(section.get_value("quantity"))
+        self.assertIsNone(widget.event_handler.get_row_stock_state(0))
+        widget.close()
+
+    def test_delete_section_keeps_following_products_and_order(self):
+        sale = SalesClass(1, None)
+        section = SalesItemClass(11, None, sales_id=1)
+        section.set_value("item_type", "section")
+        section.set_value("product_name", "VILLAS")
+        product_c = SalesItemClass(12, None, sales_id=1)
+        product_c.set_value("item_type", "manual")
+        product_c.set_value("product_name", "Product C")
+        product_c.set_value("quantity", 2)
+        product_c.set_value("unit_price", 50)
+        product_d = SalesItemClass(13, None, sales_id=1)
+        product_d.set_value("item_type", "manual")
+        product_d.set_value("product_name", "Product D")
+        product_d.set_value("quantity", 3)
+        product_d.set_value("unit_price", 25)
+        sale.items = [section, product_c, product_d]
+
+        widget = OperationsTableWidget(
+            SalesItemClass,
+            parent_operation=sale,
+            columns=[
+                "item_type", "product_name", "quantity", "unit_price",
+                "subtotal", "delete_action",
+            ],
+        )
+        self.assertEqual(
+            [row["product_name"] for row in widget.get_current_table_data()],
+            ["VILLAS", "Product C", "Product D"],
+        )
+
+        widget._delete_row(0)
+
+        self.assertEqual(
+            [row["product_name"] for row in widget.get_current_table_data()],
+            ["Product C", "Product D"],
+        )
         widget.close()
 
 

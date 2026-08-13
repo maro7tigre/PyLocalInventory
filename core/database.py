@@ -572,6 +572,7 @@ class Database:
             },
             'sales_items': {
                 'product_name': 'TEXT', 'service_id': 'INTEGER', 'item_type': 'TEXT',
+                'sort_order': 'INTEGER',
             },
             'import_items': {'product_name': 'TEXT'}
         }
@@ -1918,8 +1919,14 @@ class Database:
             name = str(raw.get('product_name') or raw.get('designation') or '').strip()
             if not name:
                 raise ValueError(f"Item {index}: designation is required")
-            quantity = self._sale_decimal(raw.get('quantity'), f"item {index} quantity", '0.001')
-            unit_price = self._sale_decimal(raw.get('unit_price'), f"item {index} unit price", '0')
+            requested_type = str(raw.get("item_type") or "").strip().casefold()
+            is_section = requested_type == "section"
+            quantity = None if is_section else self._sale_decimal(
+                raw.get('quantity'), f"item {index} quantity", '0.001'
+            )
+            unit_price = None if is_section else self._sale_decimal(
+                raw.get('unit_price'), f"item {index} unit price", '0'
+            )
             item_id = raw.get('id')
             product_id = raw.get('product_id')
             service_id = raw.get('service_id')
@@ -1929,20 +1936,23 @@ class Database:
                 service_id = int(service_id) if service_id not in (None, '', 0, '0') else None
             except (TypeError, ValueError):
                 raise ValueError(f"Item {index}: IDs must be integers when present")
+            if is_section:
+                product_id = None
+                service_id = None
 
-            requested_type = str(raw.get("item_type") or "").strip().casefold()
-            if requested_type not in ("product", "service", "manual"):
+            if requested_type not in ("product", "service", "manual", "section"):
                 requested_type = "product" if product_id else ("service" if service_id else "")
             validated.append({
                 'id': item_id,
                 'product_id': product_id,
                 'service_id': service_id,
                 'product_name': name,
-                'information': str(raw.get('information') or '').strip(),
+                'information': '' if is_section else str(raw.get('information') or '').strip(),
                 'quantity': quantity,
                 'unit_price': unit_price,
-                'production': int(raw.get('production') or 0),
+                'production': None if is_section else int(raw.get('production') or 0),
                 'item_type': requested_type,
+                'sort_order': int(raw.get('sort_order') or index),
             })
 
         # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
@@ -2001,10 +2011,11 @@ class Database:
                         raise ValueError(
                             f"Choose Product or Service for '{item['product_name']}'"
                         )
-                if kind == "manual":
+                if kind in ("manual", "section"):
                     # Snapshot-only line ("Keep only in this Sale"): the typed
-                    # name is stored with no Product/Service link and never
-                    # affects stock. New lines are allowed as well.
+                    # name is stored with no Product/Service link. Section rows
+                    # additionally have NULL financial fields. Neither kind
+                    # affects stock or creates catalog records.
                     continue
                 table = "products" if kind == "product" else "services"
                 selected_id = item["product_id"] if kind == "product" else item["service_id"]
@@ -2115,6 +2126,7 @@ class Database:
                     item['product_id'], item['service_id'], item['item_type'],
                     item['product_name'], item['information'],
                     item['quantity'], item['unit_price'], item['production'],
+                    item['sort_order'],
                 )
                 if item['id'] is not None:
                     if item['id'] not in existing_ids:
@@ -2122,7 +2134,7 @@ class Database:
                     self.cursor.execute(
                         "UPDATE sales_items SET product_id=%s, service_id=%s, item_type=%s, "
                         "product_name=%s, information=%s, quantity=%s, unit_price=%s, "
-                        "production=%s WHERE id=%s AND sales_id=%s",
+                        "production=%s, sort_order=%s WHERE id=%s AND sales_id=%s",
                         (*values, item['id'], sale_id),
                     )
                     retained_ids.add(item['id'])
@@ -2131,8 +2143,8 @@ class Database:
                     self.cursor.execute(
                         "INSERT INTO sales_items "
                         "(sales_id, product_id, service_id, item_type, product_name, "
-                        "information, quantity, unit_price, production) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        "information, quantity, unit_price, production, sort_order) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (sale_id, *values),
                     )
                     row = self.cursor.fetchone()
@@ -3465,7 +3477,14 @@ class Database:
                 return {}
 
             format_strings = ','.join(['%s'] * len(operation_ids))
-            self.cursor.execute(f"SELECT * FROM {section} WHERE {fk_column} IN ({format_strings})", tuple(operation_ids))
+            order_sql = (
+                " ORDER BY sales_id, COALESCE(sort_order, id), id"
+                if section == 'Sales_Items' else " ORDER BY import_id, id"
+            )
+            self.cursor.execute(
+                f"SELECT * FROM {section} WHERE {fk_column} IN ({format_strings}){order_sql}",
+                tuple(operation_ids),
+            )
             rows = self.cursor.fetchall()
 
             columns = [description[0] for description in self.cursor.description]
@@ -3500,7 +3519,14 @@ class Database:
                 print(f"Unknown item section: {section}")
                 return []
 
-            self.cursor.execute(f"SELECT * FROM {section} WHERE {fk_column} = %s", (operation_id,))
+            order_sql = (
+                " ORDER BY COALESCE(sort_order, id), id"
+                if section == 'Sales_Items' else " ORDER BY id"
+            )
+            self.cursor.execute(
+                f"SELECT * FROM {section} WHERE {fk_column} = %s{order_sql}",
+                (operation_id,),
+            )
             rows = self.cursor.fetchall()
 
             # Get column names (see get_items() for why 'ID' is restored)

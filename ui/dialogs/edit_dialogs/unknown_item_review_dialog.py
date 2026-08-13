@@ -1,7 +1,8 @@
 """
 Unknown Item Review Dialog - single review screen for sale lines that are not
 linked to a Product or Service yet. The user decides for every line whether to
-Add to Products, Add to Services, Keep only in this Sale, or Cancel and edit.
+Add to Products, Add to Services, Keep only in this Sale, keep it as a Section,
+or Cancel and edit.
 """
 
 from PySide6.QtWidgets import (
@@ -20,6 +21,7 @@ class UnknownItemReviewDialog(QDialog):
         "product": "Add to Products",
         "service": "Add to Services",
         "manual": "Keep only in this Sale",
+        "section": "Section",
         "cancel": "Cancel and edit",
     }
 
@@ -63,6 +65,7 @@ class UnknownItemReviewDialog(QDialog):
             entered_type = str(item.get("item_type") or "").casefold()
             type_label = {
                 "product": "Product", "service": "Service", "manual": "Manual",
+                "section": "Section",
             }.get(entered_type, "Not set")
             type_item = QTableWidgetItem(type_label)
             type_item.setFlags(type_item.flags() & ~Qt.ItemIsEditable)

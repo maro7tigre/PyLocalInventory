@@ -1,14 +1,18 @@
 import os
 import unittest
+from types import SimpleNamespace
+from unittest.mock import patch
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtGui import QValidator
 from PySide6.QtCore import Qt
-from PySide6.QtWidgets import QApplication, QStyleOptionViewItem
+from PySide6.QtWidgets import QApplication, QDialog, QStyleOptionViewItem
 
 from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
+from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog
+from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
 from ui.widgets.operations_table import OperationsTableWidget
 
 
@@ -46,6 +50,30 @@ class _ServiceOnlyCursor(_CatalogCursor):
             self.row = (22, "Known Service", 35)
         else:
             self.row = None
+
+
+class _ReviewResult:
+    decisions = []
+
+    def __init__(self, _items, _parent=None):
+        pass
+
+    def exec(self):
+        return QDialog.Accepted
+
+    def get_decisions(self):
+        return list(self.decisions)
+
+
+class _ReviewDatabase:
+    def __init__(self):
+        self.cursor = object()
+        self.sale_catalog = {"products": [], "services": []}
+        self.permission_checks = []
+
+    def has_permission(self, section, permission):
+        self.permission_checks.append((section, permission))
+        return True
 
 
 class CatalogSelectorTests(unittest.TestCase):
@@ -97,6 +125,105 @@ class CatalogSelectorTests(unittest.TestCase):
             ["product", "service", "manual", "section"],
         )
         widget.close()
+
+    def test_unknown_review_offers_section_per_line_and_apply_to_all(self):
+        dialog = UnknownItemReviewDialog([
+            {"name": "IMMEUBLES", "quantity": 1, "unit_price": 0},
+            {"name": "VILLAS", "quantity": 1, "unit_price": 0},
+        ])
+        expected = ["product", "service", "manual", "section", "cancel"]
+        row_selector = dialog.table.cellWidget(0, 4)
+
+        self.assertEqual(
+            [row_selector.itemData(index) for index in range(row_selector.count())],
+            expected,
+        )
+        self.assertEqual(
+            [dialog.bulk_selector.itemData(index)
+             for index in range(dialog.bulk_selector.count())],
+            expected,
+        )
+        dialog.bulk_selector.setCurrentIndex(dialog.bulk_selector.findData("section"))
+        dialog._apply_to_all()
+        self.assertEqual(
+            [decision["action"] for decision in dialog.get_decisions()],
+            ["section", "section"],
+        )
+        dialog.close()
+
+    def test_mixed_unknown_review_keeps_section_product_and_manual_distinct(self):
+        database = _ReviewDatabase()
+        rows = [
+            {"product_name": "IMMEUBLES", "quantity": 1, "unit_price": 0,
+             "row_index": 1},
+            {"product_name": "PORTE CHAMBRE", "quantity": 2,
+             "unit_price": 2500, "row_index": 2},
+            {"product_name": "OLD SPECIAL ITEM", "quantity": 10,
+             "unit_price": 300, "row_index": 3},
+        ]
+        selected_types = []
+        fake_dialog = SimpleNamespace(
+            database=database,
+            operation_obj=SimpleNamespace(
+                section="Sales",
+                get_value=lambda key: True if key == "is_historical" else None,
+            ),
+            items_table=SimpleNamespace(get_current_table_data=lambda: rows),
+            pending_entities=[],
+            _safe_widget_value=lambda key: "Known Client",
+            _entity_exists=lambda section, value: True,
+            _catalog_entity_exists=lambda item_type, name: False,
+            _set_row_item_type=lambda row, item_type: selected_types.append(
+                (row, item_type)
+            ),
+        )
+        _ReviewResult.decisions = [
+            {"name": "IMMEUBLES", "action": "section"},
+            {"name": "PORTE CHAMBRE", "action": "product"},
+            {"name": "OLD SPECIAL ITEM", "action": "manual"},
+        ]
+
+        with patch(
+            "ui.dialogs.edit_dialogs.base_operation_dialog.UnknownItemReviewDialog",
+            _ReviewResult,
+        ), patch(
+            "PySide6.QtWidgets.QInputDialog.getDouble",
+            side_effect=[(0.0, True), (0.0, True)],
+        ):
+            result = BaseOperationDialog._handle_missing_references(fake_dialog)
+
+        self.assertEqual(result, (True, False))
+        self.assertEqual(selected_types, [
+            (0, "section"), (1, "product"), (2, "manual"),
+        ])
+        self.assertEqual(len(fake_dialog.pending_entities), 1)
+        self.assertEqual(fake_dialog.pending_entities[0]["type"], "product")
+        self.assertEqual(fake_dialog.pending_entities[0]["name"], "PORTE CHAMBRE")
+        self.assertNotIn(("Services", "write"), database.permission_checks)
+
+    def test_existing_section_bypasses_unknown_item_review(self):
+        database = _ReviewDatabase()
+        fake_dialog = SimpleNamespace(
+            database=database,
+            operation_obj=SimpleNamespace(section="Sales"),
+            items_table=SimpleNamespace(get_current_table_data=lambda: [{
+                "item_type": "section", "product_name": "IMMEUBLES",
+                "row_index": 1,
+            }]),
+            pending_entities=[],
+            _safe_widget_value=lambda key: "Known Client",
+            _entity_exists=lambda section, value: True,
+            _catalog_entity_exists=lambda item_type, name: False,
+        )
+
+        with patch(
+            "ui.dialogs.edit_dialogs.base_operation_dialog.UnknownItemReviewDialog"
+        ) as review:
+            result = BaseOperationDialog._handle_missing_references(fake_dialog)
+
+        self.assertEqual(result, (True, False))
+        review.assert_not_called()
+        self.assertEqual(fake_dialog.pending_entities, [])
 
     def test_existing_service_selects_type_automatically(self):
         database = _Database()

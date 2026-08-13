@@ -428,11 +428,17 @@ class BaseOperationDialog(QDialog):
     
     def setup_items_section(self, parent_layout):
         """Setup items table with auto-sizing"""
-        # Items label
+        # Items heading and the existing Sales-only Section affordance.
+        items_header = QHBoxLayout()
         items_label = QLabel(f"{self.operation_obj.section[:-1]} Items")
         items_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         items_label.setStyleSheet("color: #ffffff; margin: 5px 0;")
-        parent_layout.addWidget(items_label)
+        items_header.addWidget(items_label)
+        items_header.addStretch()
+        if getattr(self.operation_obj, 'section', '') == 'Sales':
+            self.add_section_btn = QPushButton("Add Section")
+            items_header.addWidget(self.add_section_btn)
+        parent_layout.addLayout(items_header)
         
         # Items table (auto-sizing with proper policies)
         self.items_table = OperationsTableWidget(
@@ -450,6 +456,8 @@ class BaseOperationDialog(QDialog):
         
         # Connect to update totals
         self.items_table.items_changed.connect(self.update_totals)
+        if getattr(self, 'add_section_btn', None) is not None:
+            self.add_section_btn.clicked.connect(self.items_table.add_section_row)
         
         parent_layout.addWidget(self.items_table, 1)  # Give it stretch factor
     
@@ -1219,10 +1227,11 @@ class BaseOperationDialog(QDialog):
                     QMessageBox.warning(self, "Missing Item", "Every sale line needs a name.")
                     return False, False
                 item_type = str(item.get("item_type") or "").casefold()
-                if item_type not in ("product", "service", "manual"):
+                if item_type not in ("product", "service", "manual", "section"):
                     item_type = ""
-                # Keep-only lines are snapshots: no catalog link, no creation.
-                if item_type == "manual":
+                # Keep-only lines are snapshots and Sections are structural:
+                # neither needs a catalog link or creation.
+                if item_type in ("manual", "section"):
                     continue
                 if item_type == "product" and self._catalog_entity_exists("product", name):
                     continue
@@ -1256,7 +1265,11 @@ class BaseOperationDialog(QDialog):
                         )
                         return False, False
                     self._set_row_item_type(unknown["table_row"], action)
-                    if action == "manual":
+                    # Manual lines remain financial snapshots. Sections are
+                    # structural rows; changing the table selector clears and
+                    # disables their financial cells through the existing
+                    # Section row handling.
+                    if action in ("manual", "section"):
                         continue
                     section = "Products" if action == "product" else "Services"
                     if not self.database.has_permission(section, "write"):

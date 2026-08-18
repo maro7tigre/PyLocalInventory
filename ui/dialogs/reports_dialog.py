@@ -440,8 +440,15 @@ class ReportsDialog(QDialog):
     
     def _generate_html_content(self, report_type, database=None):
         """Generate HTML content based on report type"""
-        # Get template path - all templates have _templet suffix
-        template_path = resource_path("report", f"{report_type}_templet.html")
+        # Sales Bon de Livraison reuses the Devis template verbatim (same
+        # layout, columns, totals, Sections, pagination) - only the document
+        # identity/title text differs (see 'document_type_label'). This is
+        # the Sales-side BDL only; Import BL keeps its own separate template
+        # (import_bl_templet.html via ImportBdlDialog) and numbering.
+        template_filename = (
+            "devis_templet.html" if report_type == "bdl" else f"{report_type}_templet.html"
+        )
+        template_path = resource_path("report", template_filename)
         self._log_report_resources(report_type, template_path)
         if not os.path.isfile(template_path):
             raise FileNotFoundError(f"Required report template is missing: {template_path}")
@@ -540,15 +547,18 @@ class ReportsDialog(QDialog):
 
             sale_notes = self.sales_obj.get_value('notes') or ""
 
-            # Generate document reference. For Devis, use the canonical,
-            # user-editable devis reference when one exists; fall back to a
-            # deterministic DOC-<id> placeholder for legacy rows.
+            # Generate document reference. Devis and the Sales Bon de
+            # Livraison both use the canonical, user-editable devis reference
+            # (DE-YYYY-N) when one exists - the Sales BL is simply another
+            # printed representation of the same Sale/Devis, never a second
+            # persisted number. Falls back to a deterministic DOC-<id>
+            # placeholder for legacy rows with no devis reference yet.
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
             try:
                 doc_devis = str(self.sales_obj.get_value('devis') or '').strip()
             except Exception:
                 doc_devis = ''
-            if report_type == 'devis' and doc_devis:
+            if report_type in ('devis', 'bdl') and doc_devis:
                 doc_ref = html.escape(doc_devis)
             else:
                 doc_ref = f"DOC-{sales_id:06d}"
@@ -558,30 +568,6 @@ class ReportsDialog(QDialog):
             total_quantity = 0
             rendered_rows = 0
 
-            # BDL uses the service catalog to exclude product-only rows.
-            report_services = []
-            if report_type == 'bdl' and db is not None:
-                try:
-                    db.cursor.execute(
-                        "SELECT id, name, description, keywords FROM Services "
-                        "WHERE name IS NOT NULL AND name != '' ORDER BY id"
-                    )
-                    for service_id, service_name, description, keywords in db.cursor.fetchall():
-                        aliases = [service_name]
-                        aliases.extend(
-                            part.strip()
-                            for part in str(keywords or '').replace('\n', ',').replace(';', ',').split(',')
-                            if part.strip()
-                        )
-                        report_services.append({
-                            'id': service_id,
-                            'name': service_name,
-                            'description': description or '',
-                            'aliases': {str(alias).strip().casefold() for alias in aliases if alias},
-                        })
-                except Exception as e:
-                    print(f"DEBUG: Error loading report services: {e}")
-            
             # Load sales items if not already loaded
             if not hasattr(self.sales_obj, 'items') or not self.sales_obj.items:
                 print("DEBUG: Loading sales items from database...")
@@ -653,44 +639,20 @@ class ReportsDialog(QDialog):
                     quantity = _decimal(item.get_value('quantity'))
                     unit_price = _decimal(item.get_value('unit_price'))
                     subtotal = item.get_value('subtotal') or (quantity * unit_price)
-                    product_token = str(product_name or '').strip().casefold()
-                    
+
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
                     total_quantity += quantity
                     total_ht += _decimal(subtotal)
                     quantity_text = _fmt_quantity(quantity)
                     
-                    if report_type == 'bdl':
-                        info_tokens = {
-                            part.strip().casefold()
-                            for part in str(item_information or '').replace('\n', ',').replace(';', ',').split(',')
-                            if part.strip()
-                        }
-                        matched_services = [
-                            service for service in report_services
-                            if product_token in service['aliases']
-                            or bool(info_tokens.intersection(service['aliases']))
-                        ]
-
-                        # A delivery note contains services only. Product-only
-                        # sale rows stay stored and remain visible in Devis.
-                        if not matched_services:
-                            continue
-
-                        service_codes = " / ".join(html.escape(str(service['id'])) for service in matched_services)
-                        designation_html = " / ".join(
-                            f'<strong class="item-name">{html.escape(str(service["name"]))}</strong>'
-                            for service in matched_services
-                        )
-                        if item_information:
-                            designation_html += f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
-                        row_html = (
-                            f"<tr><td>{service_codes}</td>"
-                            f"<td>{designation_html}</td>"
-                            f"<td>{quantity_text}</td></tr>"
-                        )
-                    elif report_type == 'devis':
+                    if report_type in ('devis', 'bdl'):
+                        # The Sales Bon de Livraison is the same printed
+                        # representation of the Sale as the Devis: identical
+                        # columns, identical Products + Services, identical
+                        # persisted item order - only the document identity
+                        # (title/reference label) differs, applied via the
+                        # shared template's document_type_label.
                         product_code = html.escape(str(product_id)) if product_id else "-"
                         escaped_name = html.escape(str(product_name))
                         designation_html = (
@@ -730,13 +692,11 @@ class ReportsDialog(QDialog):
 
                     items_html += row_html + "\n"
                     rendered_rows += 1
-                if report_type == 'bdl' and not items_html.strip():
-                    items_html = '<tr class="empty-row"><td colspan="3">Aucun service</td></tr>'
                 # Do not add visual filler rows; they stretch the printable report table.
                 try:
                     current_rows = len(self.sales_obj.items)
                     filler_needed = 0
-                    filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
+                    filler_cols = 5 if report_type in ('devis', 'bdl') else 4
                     filler_row = (
                         '<tr class="filler">'
                         + '<td style="text-align: left">&nbsp;</td>'
@@ -748,9 +708,8 @@ class ReportsDialog(QDialog):
                     pass
             else:
                 print("DEBUG: No sales items found")
-                filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
-                empty_label = 'Aucun service' if report_type == 'bdl' else 'Aucun article'
-                items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
+                filler_cols = 5 if report_type in ('devis', 'bdl') else 4
+                items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">Aucun article</td></tr>'
                 total_ht = 0
             
             # Calculate financial totals for devis using centralized function.
@@ -785,6 +744,9 @@ class ReportsDialog(QDialog):
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
                 'date': date,
+                'document_type_label': (
+                    'BON DE LIVRAISON N°' if report_type == 'bdl' else 'DEVIS N°'
+                ),
                 'document_ref': doc_ref,
                 'client_name': client_name,
                 'client_address': client_address,

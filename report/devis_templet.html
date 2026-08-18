@@ -125,7 +125,7 @@
         <span class="column-rule rule-1"></span><span class="column-rule rule-2"></span>
         <span class="column-rule rule-3"></span><span class="column-rule rule-4"></span>
         <table class="items-table">
-          <thead><tr><th>Code</th><th>Désignation</th><th>Quantité</th><th>Prix unitaire HT</th><th>Total HT</th></tr></thead>
+          <thead><tr><th>Code</th><th>Désignation</th><th>Quantité</th><th>Prix unitaire</th><th>Total</th></tr></thead>
           <tbody>{{ items }}</tbody>
         </table>
       </div>
@@ -138,9 +138,7 @@
         <section class="totals">
           <table class="totals-table">
             <tr><th>Total remise</th><td>{{ total_remise }}</td></tr>
-            <tr><th>Total HT</th><td>{{ total_ht }}</td></tr>
-            <tr><th>TVA</th><td>{{ tva }}</td></tr>
-            <tr class="grand-total"><th>Net à payer / Total TTC</th><td>{{ total_ttc }}</td></tr>
+            <tr class="grand-total"><th>Net à payer</th><td>{{ net_a_payer }}</td></tr>
           </table>
         </section>
       </div>

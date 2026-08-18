@@ -218,11 +218,12 @@ class SalesClassDevisParameterTests(unittest.TestCase):
         self.assertIn("devis", obj.available_parameters["database"])
 
     def test_table_columns_exact_order(self):
+        """LAMIBOIS applies no VAT: only Total TTC remains (no Total HT)."""
         obj = SalesClass(0, None)
         self.assertEqual(
             list(obj.available_parameters["table"].keys()),
             ["id", "devis", "state", "client_name", "notes", "date",
-             "total_ht", "total_ttc"],
+             "total_ttc"],
         )
 
     def test_devis_is_not_calculated(self):

@@ -6,7 +6,6 @@ against an Import (import-level, no item targeting), and the statement
 reports are rendered through the supplier statement template.
 """
 
-import base64
 import html as html_lib
 import logging
 import os
@@ -40,6 +39,14 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from core.calculations import calculate_operation_totals, to_decimal
+from core.company_branding import (
+    COMPANY_ADDRESS,
+    COMPANY_EMAIL,
+    COMPANY_PHONE,
+    build_report_footer,
+    get_company_logo_block,
+    resolve_company_name,
+)
 from core.runtime_paths import resource_path
 from ui.widgets.preview_widget import PreviewWidget
 
@@ -272,18 +279,10 @@ class _SupplierReportWorker(QObject):
                 except OSError:
                     pass
 
-    def _get_lamidap_logo_block(self):
-        logo_path = resource_path("report", "lamidap_logo.png")
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, "rb") as img_f:
-            b64 = base64.b64encode(img_f.read()).decode("ascii")
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; '
-            f'object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
+    def _get_company_logo_block(self):
+        """Central company_branding source (same as Client Statement / Devis
+        / Facture / BDL) - never a locally-resolved/hardcoded logo path."""
+        return get_company_logo_block()
 
     @classmethod
     def _format_french_date(cls, value):
@@ -420,12 +419,23 @@ class _SupplierReportWorker(QObject):
         else:
             final_summary = ""
 
-        report_footer = (self.company_info or {}).get("report_footer") or ""
+        # Central company_branding source (same as Client Statement / Devis /
+        # Facture / BDL) - never the mutable per-profile company_info values.
+        report_footer = build_report_footer()
         if report_footer:
             report_footer = html_lib.escape(str(report_footer)).replace("\n", "<br>")
 
+        company_name = resolve_company_name(self.company_info)
+        company_address = html_lib.escape(COMPANY_ADDRESS)
+        company_phone = html_lib.escape(COMPANY_PHONE)
+        company_email = html_lib.escape(COMPANY_EMAIL)
+
         data = {
-            "logo_block": self._get_lamidap_logo_block(),
+            "logo_block": self._get_company_logo_block(),
+            "company_name": html_lib.escape(str(company_name)),
+            "company_address": company_address,
+            "company_phone": company_phone,
+            "company_email": company_email,
             "document_title": document_title,
             "document_date": document_date,
             "supplier_block": supplier_block,

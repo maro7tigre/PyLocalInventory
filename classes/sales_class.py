@@ -115,15 +115,16 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "date"  # NEW: Using date type instead of string
             },
-            # TVA now handled as a simple checkbox: unchecked = 0%, checked = 20%
-            # Keeps database storage numeric (0 or 20) while UX is a single toggle
+            # LAMIBOIS does not use VAT: this column is kept only because the
+            # shared PostgreSQL schema still has it (see core/database.py) -
+            # it is never shown in the UI and always persists as 0 (neutral).
             "tva": {
-                "value": 20.0,  # default active (was previously conceptually 20)
+                "value": 0.0,
                 "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
                 "required": False,
-                "default": 20.0,
+                "default": 0.0,
                 "type": "bool",  # custom widget mapped to numeric percent
-                "true_value": 20.0,
+                "true_value": 0.0,
                 "false_value": 0.0
             },
             "remise": {
@@ -232,14 +233,12 @@ class SalesClass(BaseClass):
                 "client_name": "r",
                 "notes": "r",
                 "date": "r",
-                "total_ht": "r",
                 "total_ttc": "r"
             },
             "dialog": {
                 "client_username": "rw",
                 "date": "rw",
                 "devis": "rw",
-                "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
@@ -271,7 +270,6 @@ class SalesClass(BaseClass):
                 "is_historical": "r",
                 "client_id": "r",
                 "date": "r",
-                "tva": "r",
                 "remise": "r",
                 "subtotal": "r",
                 "total_tva": "r",
@@ -312,15 +310,16 @@ class SalesClass(BaseClass):
         return sum(to_decimal(item.get_value('subtotal')) for item in items)
 
     def calculate_subtotal(self):
-        """Discounted Total HT (Original Subtotal - Remise).
+        """Net à payer: Sum(Quantity x Unit Price) - Remise.
 
-        Kept for internal/report compatibility. The visible Sales table column
-        is now "Total HT" via ``total_ht`` (see ``calculate_total_ht``).
+        LAMIBOIS never applies VAT: the stored ``tva`` column (kept only for
+        schema compatibility) is intentionally ignored here, even on legacy
+        rows that still carry a nonzero value.
         """
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
+            0,
         )
         return float(totals['total_ht'])
 
@@ -340,38 +339,33 @@ class SalesClass(BaseClass):
             return ""
 
     def calculate_total_tva(self):
-        """Calculate total VAT amount (centralized)."""
-        totals = calculate_sale_totals(
-            self._raw_subtotal(),
-            self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
-        )
-        return float(totals['vat_amount'])
+        """LAMIBOIS applies no VAT: always zero."""
+        return 0.0
 
     def calculate_total_price(self):
-        """Calculate total price including VAT (centralized)."""
+        """Net à payer: Sum(Quantity x Unit Price) - Remise. No VAT."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
+            0,
         )
         return float(totals['total_ttc'])
-    
+
     def calculate_total_ht(self):
-        """Discounted Total HT: Original Subtotal - Remise."""
+        """Net à payer: Sum(Quantity x Unit Price) - Remise. No VAT."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
+            0,
         )
         return float(totals['total_ht'])
 
     def calculate_total_ttc(self):
-        """Final Total TTC: Total HT + VAT computed on Total HT."""
+        """Net à payer: Sum(Quantity x Unit Price) - Remise. No VAT."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
+            0,
         )
         return float(totals['total_ttc'])
 

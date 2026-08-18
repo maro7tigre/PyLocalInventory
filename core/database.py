@@ -2643,12 +2643,14 @@ class Database:
         column = str(order_by)
         if column not in _ORDER_COLUMNS:
             return None
+        # LAMIBOIS applies no VAT: Total HT and Total TTC are both the same
+        # Net à payer value (Subtotal - Remise); vat_amount is always 0.
         summary_columns = {
             'subtotal': 'COALESCE(summary.subtotal, 0)',
             'total_price': 'COALESCE(summary.total_price, 0)',
             'total_ht': 'COALESCE(summary.subtotal - COALESCE(s.remise, 0), 0)',
-            'total_ttc': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (1 + COALESCE(s.tva, 0) / 100.0), 0)',
-            'vat_amount': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (COALESCE(s.tva, 0) / 100.0), 0)',
+            'total_ttc': 'COALESCE(summary.subtotal - COALESCE(s.remise, 0), 0)',
+            'vat_amount': '0',
             'information': "COALESCE(summary.information, '')",
             'total_quantity': 'COALESCE(summary.total_quantity, 0)',
             'total_production': 'COALESCE(summary.total_production, 0)',
@@ -2762,21 +2764,17 @@ class Database:
         base_table = section.lower()
         item_table = 'sales_items' if section == 'Sales' else 'import_items'
         foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
-        # The inner summary subquery joins base_table under alias "i" (see
-        # below), never "s" - "s" is only in scope in the outer query. Both
-        # sections must reference the inner join's own alias here.
-        tva_source = 'i.tva'
 
         # Remise only exists on the sales table (discounts); imports have no
         # discount column, so their computed totals reduce to the raw sums.
         remise_expr = 'COALESCE(s.remise, 0)' if section == 'Sales' else '0'
-        # Authoritative table totals, matching calculate_sale_totals():
-        #   Total HT = Original Subtotal - Remise
-        #   VAT      = Total HT * tva / 100
-        #   Total TTC = Total HT + VAT
+        # LAMIBOIS applies no VAT (the tva column is kept only for schema
+        # compatibility with legacy rows and is never read here):
+        #   Net à payer = Original Subtotal - Remise
+        # Total HT and Total TTC are both this same value; vat_amount is 0.
         total_ht_expr = f'COALESCE(summary.subtotal - {remise_expr}, 0)'
-        vat_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (COALESCE(s.tva, 0) / 100.0), 0)'
-        total_ttc_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (1 + COALESCE(s.tva, 0) / 100.0), 0)'
+        vat_expr = '0'
+        total_ttc_expr = total_ht_expr
 
         if section == 'Sales':
             information_select = (
@@ -2813,7 +2811,8 @@ class Database:
             f"LEFT JOIN ("
             f"  SELECT si.{foreign_key}, "
             f"         SUM(si.quantity * si.unit_price) AS subtotal, "
-            f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
+            # LAMIBOIS applies no VAT: total_price is the plain line-total sum.
+            f"         SUM(si.quantity * si.unit_price) AS total_price, "
             f"         {information_select} AS information, "
             f"         COALESCE(SUM(si.quantity), 0) AS total_quantity, "
             f"         {production_select} AS total_production "
@@ -3171,14 +3170,15 @@ class Database:
 
     def get_dashboard_snapshot(self):
         """Return dashboard data in three bounded queries for LAN clients."""
+        # LAMIBOIS applies no VAT: monthly totals are the plain line-total sums.
         self.cursor.execute(
             """
             SELECT
-              (SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
+              (SELECT COALESCE(SUM(si.quantity * si.unit_price), 0)
                FROM sales s JOIN sales_items si ON si.sales_id=s.id
                WHERE (s.state IS NULL OR s.state<>'on_hold')
                  AND LEFT(s.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
-              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
+              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price), 0)
                FROM imports i JOIN import_items ii ON ii.import_id=i.id
                WHERE LEFT(i.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
               (SELECT COUNT(*) FROM products),
@@ -3217,23 +3217,24 @@ class Database:
             """
         )
         low_rows = self.cursor.fetchall()
+        # LAMIBOIS applies no VAT: activity amounts are plain line-total sums.
         self.cursor.execute(
             """
             SELECT activity_type, activity_date, amount, description
             FROM (
               SELECT 'Sales' activity_type, s.date activity_date,
-                     COALESCE(SUM(si.quantity*si.unit_price*(1+s.tva/100)),0) amount,
+                     COALESCE(SUM(si.quantity*si.unit_price),0) amount,
                      'Sale to ' || COALESCE(s.client_username,'') description,
                      s.id
               FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id
               WHERE s.state IS NULL OR s.state<>'on_hold'
-              GROUP BY s.id, s.date, s.client_username, s.tva
+              GROUP BY s.id, s.date, s.client_username
               UNION ALL
               SELECT 'Imports', i.date,
-                     COALESCE(SUM(ii.quantity*ii.unit_price*(1+i.tva/100)),0),
+                     COALESCE(SUM(ii.quantity*ii.unit_price),0),
                      'Import from ' || COALESCE(i.supplier_username,''), i.id
               FROM imports i LEFT JOIN import_items ii ON ii.import_id=i.id
-              GROUP BY i.id, i.date, i.supplier_username, i.tva
+              GROUP BY i.id, i.date, i.supplier_username
             ) activity
             ORDER BY activity_date DESC, id DESC
             LIMIT 5
@@ -3247,7 +3248,7 @@ class Database:
                    COALESCE(SUM(import_amount),0)
             FROM (
               SELECT LEFT(s.date,7) month_key,
-                     SUM(si.quantity*si.unit_price*(1+s.tva/100)) sales_amount,
+                     SUM(si.quantity*si.unit_price) sales_amount,
                      0 import_amount
               FROM sales s JOIN sales_items si ON si.sales_id=s.id
               WHERE (s.state IS NULL OR s.state<>'on_hold')
@@ -3255,7 +3256,7 @@ class Database:
               GROUP BY LEFT(s.date,7)
               UNION ALL
               SELECT LEFT(i.date,7), 0,
-                     SUM(ii.quantity*ii.unit_price*(1+i.tva/100))
+                     SUM(ii.quantity*ii.unit_price)
               FROM imports i JOIN import_items ii ON ii.import_id=i.id
               WHERE LEFT(i.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
               GROUP BY LEFT(i.date,7)
@@ -3620,9 +3621,12 @@ class Database:
         from core.calculations import calculate_operation_totals, to_decimal
         sale_rows = []
         for row in rows:
-            sale_id, date, state, is_hist, devis_text, devis_number, year, vat, remise, raw = row
+            # LAMIBOIS applies no VAT: the stored ``vat`` column is
+            # intentionally ignored, even on legacy rows that still carry a
+            # nonzero value - Net à payer = Sum(Quantity x Unit Price) - Remise.
+            sale_id, date, state, is_hist, devis_text, devis_number, year, _vat, remise, raw = row
             total = calculate_operation_totals(
-                to_decimal(raw), to_decimal(remise), to_decimal(vat)
+                to_decimal(raw), to_decimal(remise), 0
             )["total_ttc"]
             if devis_text:
                 devis = devis_text

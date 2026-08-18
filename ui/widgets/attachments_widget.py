@@ -372,9 +372,11 @@ class AttachmentPanel(QWidget):
     def _render_client_sales(self, sales):
         self.client_sales_empty.setVisible(not sales)
         self.client_sales_table.setRowCount(len(sales))
-        for row, (sale_id, notes, date, vat, subtotal) in enumerate(sales):
+        for row, (sale_id, notes, date, _vat, subtotal) in enumerate(sales):
             from core.calculations import calculate_operation_totals
-            total = calculate_operation_totals(subtotal, 0, vat)['total_ttc']
+            # LAMIBOIS applies no VAT: the stored vat value is ignored, even
+            # on legacy rows that still carry a nonzero value.
+            total = calculate_operation_totals(subtotal, 0, 0)['total_ttc']
             for column, value in enumerate((sale_id, notes or '', self._sale_date(date), self._money(subtotal), self._money(total))):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.UserRole, int(sale_id))

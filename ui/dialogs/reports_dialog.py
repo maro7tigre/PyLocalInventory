@@ -753,12 +753,14 @@ class ReportsDialog(QDialog):
                 items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
                 total_ht = 0
             
-            # Calculate financial totals for devis using centralized function
+            # Calculate financial totals for devis using centralized function.
+            # LAMIBOIS applies no VAT: the stored 'tva' value is intentionally
+            # ignored, even on legacy Sales that still carry a nonzero value -
+            # Net à payer = Sum(Quantity x Unit Price) - Remise.
             total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
-            tva_percent = self.sales_obj.get_value('tva') or 0
 
             from classes.sales_class import calculate_sale_totals
-            totals = calculate_sale_totals(total_ht, total_remise, tva_percent)
+            totals = calculate_sale_totals(total_ht, total_remise, 0)
             net_ht = totals['total_ht']
             tva_amount = totals['vat_amount']
             total_ttc = totals['total_ttc']

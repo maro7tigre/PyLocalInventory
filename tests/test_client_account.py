@@ -228,6 +228,9 @@ class ClientAccountBackendTests(unittest.TestCase):
     """Exercise the real Database.get_client_sale_summaries() code path."""
 
     def test_get_client_sale_summaries_runs_without_name_error(self):
+        """LAMIBOIS applies no VAT: even though the fake row's 'tva' column is
+        20, the per-Sale total must be Sum(Quantity x Unit Price) - Remise
+        (132000 - 100033 = 31967.00), never VAT-inflated."""
         from core.database import Database
 
         db = Database.__new__(Database)
@@ -238,9 +241,9 @@ class ClientAccountBackendTests(unittest.TestCase):
         self.assertEqual(len(result["payments"]), 1)
         sale2 = result["sales"][1]
         self.assertEqual(sale2["devis"], "DE-2026-2")
-        self.assertEqual(sale2["total"], Decimal("38360.40"))
+        self.assertEqual(sale2["total"], Decimal("31967.00"))
         self.assertEqual(sale2["paid"], Decimal("10000.00"))
-        self.assertEqual(sale2["remaining"], Decimal("28360.40"))
+        self.assertEqual(sale2["remaining"], Decimal("21967.00"))
         self.assertEqual(result["payments"][0]["amount"], Decimal("10000.00"))
 
 

@@ -689,7 +689,7 @@ class SupplierWorkerTests(unittest.TestCase):
 
     def test_report_worker_full_statement_generates_complete_html(self):
         worker = self._full_statement_worker()
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertNotIn("{{", html)
         self.assertIn("Relevé de Compte Fournisseur", html)
@@ -706,7 +706,7 @@ class SupplierWorkerTests(unittest.TestCase):
     def test_report_worker_selected_import_uses_detail_title(self):
         worker = self._full_statement_worker()
         worker.report_type = "selected_import"
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertIn("Détail d'Importation", html)
         # The global/final account summary blocks are full-statement only.
@@ -721,7 +721,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker.payments = []
         worker.bl_by_import = {1: ""}
         worker.historical_by_import = {1: True}
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertIn("HISTORIQUE", html)
 
@@ -746,7 +746,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker.imports = []
         worker.payments = []
         with patch.object(sdd_module, "resource_path", side_effect=fake_resource_path), \
-                patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+                patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             with self.assertRaises(RuntimeError):
                 worker._generate_html()
 

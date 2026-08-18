@@ -15,7 +15,7 @@
     .company-panel, .document-panel { display: table-cell; vertical-align: top; }
     .company-panel { width: 56%; padding-right: 8mm; }
     .document-panel { width: 44%; text-align: right; }
-    .report-logo { display: block; width: 112px !important; max-width: 112px !important; max-height: 67px !important; height: auto !important; object-fit: contain; margin: 0 0 2.5mm !important; }
+    .report-logo { display: block; width: 128px !important; max-width: 128px !important; max-height: 128px !important; height: auto !important; object-fit: contain; margin: 0 0 2.5mm !important; }
     .company-name { margin: 0 0 1.2mm; font-size: 13px; font-weight: 700; letter-spacing: .25px; color: #18272b; }
     .company-lines { font-size: 9.5px; line-height: 1.45; }
     .company-lines strong { display: inline-block; min-width: 13mm; }
@@ -117,14 +117,12 @@
     <header class="top">
       <section class="company-panel">
         {{ logo_block }}
-        <div class="company-name">LAMIDAP SARL</div>
+        <div class="company-name">{{ company_name }}</div>
         <div class="company-lines">
-          <div>288, Zone Industrielle Gzenaya</div>
-          <div>90000 Tanger</div>
-          <div><strong>Tél :</strong> +212 539 39 45 60</div>
-          <div><strong>Email :</strong> lamidap@gmail.com</div>
+          <div>{{ company_address }}</div>
+          <div><strong>Tél :</strong> {{ company_phone }}</div>
+          <div><strong>Email :</strong> {{ company_email }}</div>
         </div>
-        <div class="company-legal">ICE: 000066710000023 - IF: 04909316 - RC: 31073 - Patente: 52981388 - CNSS: 7412042</div>
       </section>
       <section class="document-panel">
         <div class="document-title">{{ document_title }}</div>

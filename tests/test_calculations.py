@@ -170,7 +170,11 @@ class ImportItemSubtotalRegressionTests(unittest.TestCase):
         self.assertEqual(item.get_value("subtotal"), Decimal("500.00"))
 
     def test_import_operation_total_matches_formula(self):
-        """Import totals reuse the shared Decimal math end to end."""
+        """Import totals reuse the shared Decimal math end to end.
+
+        LAMIBOIS applies no VAT: setting 'tva' (a legacy/schema-only column)
+        must have zero effect on the computed total.
+        """
         item_a = ImportItemClass(0, None)
         item_a.set_value("quantity", Decimal("10"))
         item_a.set_value("unit_price", 7067.90)
@@ -185,8 +189,8 @@ class ImportItemSubtotalRegressionTests(unittest.TestCase):
         imp.items = [item_a, item_b]
 
         self.assertEqual(imp.calculate_subtotal(), Decimal("72678.98"))
-        # total_ttc = (10*7067.90 + 2*999.99) * 1.20
-        self.assertAlmostEqual(imp.calculate_total_price(), 87214.78, places=2)
+        # No VAT: total_price = 10*7067.90 + 2*999.99, unaffected by 'tva'.
+        self.assertAlmostEqual(imp.calculate_total_price(), 72678.98, places=2)
 
 
 

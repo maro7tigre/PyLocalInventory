@@ -103,7 +103,7 @@ class KeysetPaginationTests(unittest.TestCase):
         self.assertIn('left join', sql)
 
     def test_sales_summary_returns_discounted_totals(self):
-        """Sales summary query must compute Total HT/TTC with remise and VAT."""
+        """Sales summary query must compute Total HT/TTC with remise (no VAT)."""
         database = _database('Sales')
         _simulate_rows(database.cursor, ['id', 'total_ht', 'total_ttc', 'vat_amount'], [])
         database.get_operation_summary_items('Sales', limit=10)
@@ -123,7 +123,11 @@ class KeysetPaginationTests(unittest.TestCase):
         self.assertIn('as total_ht', sql)
 
     def test_summary_query_supports_keyset_on_total_ttc(self):
-        """Sorting the Sales table by Total uses the final Total TTC expression."""
+        """Sorting the Sales table by Total uses the final Total TTC expression.
+
+        LAMIBOIS applies no VAT: Total TTC is Subtotal - Remise (same as
+        Total HT), with no VAT multiplier.
+        """
         database = _database('Sales')
         _simulate_rows(database.cursor, ['id', 'total_ttc'], [(1, Decimal('98400'))])
         result = database.get_operation_summary_items(
@@ -133,8 +137,7 @@ class KeysetPaginationTests(unittest.TestCase):
         self.assertEqual(len(result), 1)
         sql, params = database.cursor.statements[0]
         self.assertIn(
-            '(coalesce((summary.subtotal - coalesce(s.remise, 0)) '
-            '* (1 + coalesce(s.tva, 0) / 100.0), 0), id) > (%s, %s)',
+            '(coalesce(summary.subtotal - coalesce(s.remise, 0), 0), id) > (%s, %s)',
             sql,
         )
         self.assertEqual(params[:2], [Decimal('90000'), 5])

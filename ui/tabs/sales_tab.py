@@ -251,7 +251,10 @@ class SalesTab(BaseTab):
 
     def _ensure_new_columns_order(self):
         """Final Sales table columns (exactly):
-        ID | Devis | State | Client Name | Notes | Date | Total HT | Total TTC."""
+        ID | Devis | State | Client Name | Notes | Date | Total TTC.
+
+        LAMIBOIS applies no VAT: Total TTC = Sum(Quantity x Unit Price) -
+        Remise (no Total HT column)."""
         try:
             if 'devis' not in self.table_columns:
                 self.table_columns.insert(1, 'devis')

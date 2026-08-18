@@ -211,12 +211,18 @@ class SalesReportRegressionTests(unittest.TestCase):
             '<strong class="item-name">porte de cuisine</strong>', data["items"]
         )
 
-    def test_sale_form_updates_subtotal_vat_and_total(self):
+    def test_sale_form_updates_net_a_payer_with_no_vat(self):
+        """LAMIBOIS: no VAT widget/field exists; the bottom summary shows only
+        Remise and Net à payer = Sum(Quantity x Unit Price) - Remise."""
         dialog = SalesEditDialog(None, None)
         lt = dialog.load_thread
         if lt is not None:
             lt.wait(5000)
         self.app.processEvents()
+        self.assertNotIn('tva', dialog.parameter_widgets)
+        self.assertFalse(hasattr(dialog, 'vat_widget'))
+        self.assertFalse(hasattr(dialog, 'total_ht_widget'))
+        self.assertFalse(hasattr(dialog, 'total_ttc_widget'))
         table = dialog.items_table.table
         columns = dialog.items_table.data_manager.table_columns
         name = table.cellWidget(0, columns.index("product_name"))
@@ -226,9 +232,10 @@ class SalesReportRegressionTests(unittest.TestCase):
         self.app.processEvents()
         dialog.update_totals()
         self.assertEqual(table.item(0, columns.index("subtotal")).text(), "125.20")
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.subtotal_widget), 125.20)
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.vat_widget), 25.04)
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_ttc_widget), 150.24)
+        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.net_payer_widget), 125.20)
+        dialog.remise_spinbox.setValue(25.20)
+        dialog.update_totals()
+        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.net_payer_widget), 100.00)
 
     def test_product_can_be_selected_before_typing_exact_quantity(self):
         table_widget = OperationsTableWidget(

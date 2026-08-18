@@ -77,14 +77,16 @@ class ImportClass(BaseClass):
                 "false_value": False,
                 "readonly": False
             },
-            # TVA now a checkbox: unchecked=0%, checked=20%
+            # LAMIBOIS does not use VAT: this column is kept only because the
+            # shared PostgreSQL schema still has it (see core/database.py) -
+            # it is never shown in the UI and always persists as 0 (neutral).
             "tva": {
-                "value": 20.0,
+                "value": 0.0,
                 "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
                 "required": False,
-                "default": 20.0,
+                "default": 0.0,
                 "type": "bool",
-                "true_value": 20.0,
+                "true_value": 0.0,
                 "false_value": 0.0
             },
             "notes": {
@@ -167,7 +169,6 @@ class ImportClass(BaseClass):
                 "supplier_username": "rw",
                 "date": "rw",
                 "bl_number": "rw",
-                "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
                 "items": "rw"
@@ -189,7 +190,6 @@ class ImportClass(BaseClass):
                 "id": "r",
                 "supplier_id": "r",
                 "date": "r",
-                "tva": "r",
                 "subtotal": "r",
                 "total_tva": "r",
                 "total_price": "r",
@@ -226,20 +226,20 @@ class ImportClass(BaseClass):
         return sum(to_decimal(item.get_value('subtotal')) for item in items)
 
     def calculate_total_tva(self):
-        """Calculate total VAT amount (centralized Decimal math)."""
-        totals = calculate_operation_totals(
-            self.calculate_subtotal(),
-            0,
-            self.get_value('tva') or 0,
-        )
-        return float(totals['vat_amount'])
+        """LAMIBOIS applies no VAT: always zero."""
+        return 0.0
 
     def calculate_total_price(self):
-        """Calculate total price including VAT (centralized Decimal math)."""
+        """Net à payer: Sum(Quantity x Unit Price). No VAT.
+
+        LAMIBOIS never applies VAT: the stored ``tva`` column (kept only for
+        schema compatibility) is intentionally ignored here, even on legacy
+        rows that still carry a nonzero value. Imports have no Remise.
+        """
         totals = calculate_operation_totals(
             self.calculate_subtotal(),
             0,
-            self.get_value('tva') or 0,
+            0,
         )
         return float(totals['total_ttc'])
     

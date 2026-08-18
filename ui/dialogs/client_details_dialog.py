@@ -348,7 +348,7 @@ class _ClientReportWorker(QObject):
         # ------------------------------------------------------------------
         # Group the canonical purchase rows by Sale and compute each Sale's
         # authoritative financial block (same formulas as the Client Account
-        # dialog: one raw/remise/vat pass per Sale, TTC never double-counted).
+        # dialog: one raw/remise pass per Sale, no VAT, total never double-counted).
         # ------------------------------------------------------------------
         if self.report_type == "selected_sale":
             filtered = [
@@ -468,8 +468,10 @@ class _ClientReportWorker(QObject):
             for r in rows
         )
         remise = to_decimal(first.get("remise") or 0)
-        vat_rate = to_decimal(first.get("vat") or 0)
-        totals = calculate_operation_totals(raw, remise, vat_rate)
+        # LAMIBOIS applies no VAT: the stored "vat" field is intentionally
+        # ignored, even on legacy rows that still carry a nonzero value -
+        # Net à payer = Sum(Quantity x Unit Price) - Remise.
+        totals = calculate_operation_totals(raw, remise, 0)
         total_ttc = totals["total_ttc"]
         paid = min(self._sale_paid(rows), total_ttc)
         remaining = max(total_ttc - paid, Decimal("0"))
@@ -512,16 +514,12 @@ class _ClientReportWorker(QObject):
         items_html = "".join(item_rows)
         items_footer = "</tbody></table>"
 
-        vat_display = vat_rate.normalize()
-        vat_display = format(vat_display, "f") if vat_display == vat_display.to_integral() else str(vat_display)
-
+        # LAMIBOIS applies no VAT: no Total HT / TVA rows are shown.
         totals_html = (
             '<table class="totals-table">'
             f"<tr><th>Sous-total</th><td>{self._fmt_money(raw)} {currency}</td></tr>"
             f"<tr><th>Remise</th><td>{self._fmt_money(totals['remise'])} {currency}</td></tr>"
-            f"<tr><th>Total HT</th><td>{self._fmt_money(totals['total_ht'])} {currency}</td></tr>"
-            f"<tr><th>TVA ({vat_display}%)</th><td>{self._fmt_money(totals['vat_amount'])} {currency}</td></tr>"
-            f'<tr class="grand-total"><th>Total TTC</th><td>{self._fmt_money(total_ttc)} {currency}</td></tr>'
+            f'<tr class="grand-total"><th>Net à payer</th><td>{self._fmt_money(total_ttc)} {currency}</td></tr>'
             f'<tr class="paid"><th>Total payé</th><td>{self._fmt_money(paid)} {currency}</td></tr>'
             f'<tr class="due"><th>Reste à payer</th><td>{self._fmt_money(remaining)} {currency}</td></tr>'
             "</table>"

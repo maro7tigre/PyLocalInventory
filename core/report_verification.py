@@ -25,7 +25,7 @@ def generate_verification_report():
         'id': 42,
         'client_name': 'Client de verification',
         'date': '20-07-2026',
-        'tva': 20,
+        'tva': 0,
         'information': 'Echantillon deterministe pour verification du packaging.',
     })
     sale.items = [item]

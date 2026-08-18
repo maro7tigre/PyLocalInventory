@@ -387,26 +387,6 @@ class BaseOperationDialog(QDialog):
                 form_layout.addRow(widget)
                 continue
 
-            # If this is the TVA field, refresh totals live when it changes
-            if param_key == 'tva':
-                # Support legacy numeric spinbox AND new checkbox-based bool widget
-                spin = getattr(widget, 'spinbox', None)
-                if spin is not None:
-                    try:
-                        spin.valueChanged.connect(lambda _val: self.update_totals())
-                    except Exception:
-                        pass
-                    try:
-                        spin.editingFinished.connect(self.update_totals)
-                    except Exception:
-                        pass
-                checkbox = getattr(widget, 'checkbox', None)
-                if checkbox is not None:
-                    try:
-                        checkbox.stateChanged.connect(lambda _state: self.update_totals())
-                    except Exception:
-                        pass
-            
             # Add to form
             display_name = self.operation_obj.get_display_name(param_key)
             if param_info.get('required', False):
@@ -449,14 +429,15 @@ class BaseOperationDialog(QDialog):
         return temp_item.get_visible_parameters("table")
     
     def setup_totals_section(self, parent_layout):
-        """Setup totals with auto-sizing horizontal layout"""
+        """Setup totals with auto-sizing horizontal layout.
+
+        LAMIBOIS applies no VAT: the bottom financial area shows only Remise
+        (Sales only) and Net à payer = Sum(Quantity x Unit Price) - Remise.
+        """
         totals_widget = QWidget()
         totals_layout = QHBoxLayout(totals_widget)
         totals_layout.setContentsMargins(5, 5, 5, 5)
-        
-        # Create total widgets
-        self.subtotal_widget = self.create_total_widget("Subtotal", "MAD")
-        
+
         # Remise is an editable input for Sales operations
         if getattr(self.operation_obj, 'section', '') == 'Sales':
             from PySide6.QtWidgets import QDoubleSpinBox
@@ -479,29 +460,20 @@ class BaseOperationDialog(QDialog):
             self.remise_spinbox.valueChanged.connect(lambda _: self.update_totals())
         else:
             self.remise_spinbox = None
-        
-        self.total_ht_widget = self.create_total_widget("Total HT", "MAD")
-        self.vat_widget = self.create_total_widget("VAT Amount", "MAD") 
-        self.total_ttc_widget = self.create_total_widget("Total TTC", "MAD")
-        
+
+        self.net_payer_widget = self.create_total_widget("Net à payer", "MAD")
+
         # Add to layout
-        totals_layout.addWidget(QLabel("Subtotal:"))
-        totals_layout.addWidget(self.subtotal_widget)
-        
         if self.remise_spinbox is not None:
             totals_layout.addWidget(QLabel("Remise:"))
             totals_layout.addWidget(self.remise_spinbox)
-        
-        totals_layout.addWidget(QLabel("Total HT:"))
-        totals_layout.addWidget(self.total_ht_widget)
-        totals_layout.addWidget(QLabel("TVA:"))
-        totals_layout.addWidget(self.vat_widget)
-        totals_layout.addWidget(QLabel("Total TTC:"))
-        totals_layout.addWidget(self.total_ttc_widget)
+
+        totals_layout.addWidget(QLabel("Net à payer:"))
+        totals_layout.addWidget(self.net_payer_widget)
         totals_layout.addStretch()
-        
+
         parent_layout.addWidget(totals_widget)
-        
+
         # Initial calculation
         self.update_totals()
     
@@ -556,7 +528,12 @@ class BaseOperationDialog(QDialog):
             self.remise_spinbox.setValue(float(remise_value))
     
     def update_totals(self):
-        """Update total calculation displays"""
+        """Update total calculation displays.
+
+        LAMIBOIS applies no VAT: Net à payer = Sum(Quantity x Unit Price) -
+        Remise. Centralized Decimal math is reused with a fixed 0% rate so
+        the rounding/precision policy stays identical to the shared helper.
+        """
         try:
             # Read the visible cells directly. Building model objects here used
             # to resolve every product/service against PostgreSQL whenever a
@@ -572,17 +549,7 @@ class BaseOperationDialog(QDialog):
                 ),
                 Decimal("0"),
             )
-            
-            # Get VAT percentage
-            vat_percent = Decimal("0")
-            if 'tva' in self.parameter_widgets:
-                try:
-                    vat_percent = Decimal(str(
-                        ParameterWidgetFactory.get_widget_value(self.parameter_widgets['tva']) or 0
-                    ))
-                except (InvalidOperation, ValueError, TypeError):
-                    vat_percent = Decimal("0")
-            
+
             # Get Remise value
             remise = Decimal("0")
             if self.remise_spinbox is not None:
@@ -590,18 +557,12 @@ class BaseOperationDialog(QDialog):
                     remise = Decimal(str(self.remise_spinbox.value() or 0))
                 except (InvalidOperation, ValueError, TypeError):
                     remise = Decimal("0")
-            
-            # Centralized Decimal math:
-            # Total HT = Subtotal - Remise, TVA = Total HT * rate,
-            # Total TTC = Total HT + TVA.
-            totals = calculate_operation_totals(subtotal, remise, vat_percent)
-            
+
+            totals = calculate_operation_totals(subtotal, remise, 0)
+
             # Update displays
-            ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
-            ParameterWidgetFactory.set_widget_value(self.total_ht_widget, totals['total_ht'])
-            ParameterWidgetFactory.set_widget_value(self.vat_widget, totals['vat_amount'])
-            ParameterWidgetFactory.set_widget_value(self.total_ttc_widget, totals['total_ttc'])
-            
+            ParameterWidgetFactory.set_widget_value(self.net_payer_widget, totals['total_ht'])
+
         except Exception as e:
             print(f"Error updating totals: {e}")
     

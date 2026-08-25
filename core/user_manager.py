@@ -25,6 +25,10 @@ SECTION_GROUP = {
     'Imports': 'Imports',
     'Import_Items': 'Imports',
     'Reports': 'Reports',
+    'Charges': 'Charges',
+    'Charge_Categories': 'Charges',
+    'Charge_Recurring_Templates': 'Charges',
+    'Charge_Items': 'Charges',
 }
 
 # Postgres identifiers used in raw SQL (core/database.py, ui/**) are unquoted
@@ -35,7 +39,7 @@ SECTION_GROUP = {
 # rejected as "no permission mapping" even though 'Sales' is a mapped section.
 _SECTION_GROUP_CASEFOLD = {key.casefold(): value for key, value in SECTION_GROUP.items()}
 
-MATRIX_SECTIONS = ['Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports', 'Reports']
+MATRIX_SECTIONS = ['Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports', 'Reports', 'Charges']
 
 _EMPTY_PERMISSIONS = {'read': False, 'write': False, 'delete': False}
 _FULL_PERMISSIONS = {'read': True, 'write': True, 'delete': True}

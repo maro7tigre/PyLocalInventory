@@ -163,7 +163,7 @@ class RemoteDatabase:
             self.registered_classes[temp_obj.section] = cls
             return True
         except Exception as e:
-            print(f"✗ Failed to register {cls.__name__}: {e}")
+            print(f"[FAIL] Failed to register {cls.__name__}: {e}")
             return False
 
     def connect(self):

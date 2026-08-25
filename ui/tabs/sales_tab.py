@@ -94,6 +94,26 @@ class SalesTab(BaseTab):
             self.attachments_btn.setMinimumHeight(20)
             controls_layout.insertWidget(controls_layout.count() - 1, self.attachments_btn)
 
+            self.profit_btn = OrangeButton("Profit")
+            self.profit_btn.setToolTip(
+                "Internal revenue / cost / margin view for the selected sale "
+                "(requires Sales and Imports read access)"
+            )
+            self.profit_btn.clicked.connect(self.show_sale_profitability)
+            self.profit_btn.setMinimumHeight(20)
+            controls_layout.insertWidget(controls_layout.count() - 1, self.profit_btn)
+
+    def show_sale_profitability(self):
+        """Open the internal profitability view for the selected sale."""
+        sale_id = self.get_selected_id()
+        if sale_id is None:
+            QMessageBox.information(
+                self, "No Selection", "Please select a sale first."
+            )
+            return
+        from ui.dialogs.sale_profitability_dialog import show_sale_profitability
+        show_sale_profitability(sale_id, self.database, self)
+
     def show_attachments(self):
         sale_id = self.get_selected_id()
         if sale_id is None:

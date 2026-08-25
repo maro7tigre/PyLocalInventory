@@ -78,6 +78,45 @@ class ProductEditDialog(BaseEditDialog):
         # Set specific window title
         self.setWindowTitle(window_title)
         self._saving = False
+
+        # Stock History is only meaningful for an existing product (a new
+        # product has no movements yet). Inserted before Save/Cancel so it
+        # reads as a viewer action, not a form action.
+        if product_id:
+            from PySide6.QtWidgets import QHBoxLayout
+            from ui.widgets.themed_widgets import BlueButton
+            self.stock_history_btn = BlueButton("Stock History")
+            self.stock_history_btn.setToolTip(
+                "Show every stock movement (imports, sales, adjustments) "
+                "explaining the current stock"
+            )
+            self.stock_history_btn.clicked.connect(self.open_stock_history)
+            button_layout = None
+            main_layout = self.layout()
+            if main_layout is not None:
+                for index in range(main_layout.count()):
+                    item = main_layout.itemAt(index)
+                    child = item.layout() if item else None
+                    if isinstance(child, QHBoxLayout) and \
+                            child.indexOf(self.save_btn) >= 0:
+                        button_layout = child
+                        break
+            if button_layout is not None:
+                button_layout.insertWidget(
+                    button_layout.count() - 2, self.stock_history_btn
+                )
+            else:
+                self.layout().addWidget(self.stock_history_btn)
+
+    def open_stock_history(self):
+        """Open the derived stock-movement ledger for this product."""
+        from ui.dialogs.stock_history_dialog import show_stock_history
+        show_stock_history(
+            self.product_id,
+            self.product.get_value("name") or "",
+            self.database,
+            self,
+        )
     
     def validate_data(self):
         """Product-specific validation (extends base validation)"""

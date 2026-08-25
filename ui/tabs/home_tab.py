@@ -897,7 +897,8 @@ class HomeTab(QWidget):
             logger.warning("Duplicate dashboard refresh requested while active. Ignoring.")
             return False
             
-        thread = QThread()
+        thread = QThread(QApplication.instance())
+        thread.setObjectName("home-dashboard-refresh")
         worker = _DashboardWorker(self.database)
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -1002,8 +1003,10 @@ class HomeTab(QWidget):
 
     @Slot()
     def _on_dashboard_thread_finished(self):
-        self._dashboard_thread = None
-        self._dashboard_worker = None
+        thread = self.sender()
+        if self._dashboard_thread is thread:
+            self._dashboard_thread = None
+            self._dashboard_worker = None
 
     def _wait_for_dashboard_thread(self, timeout_ms=5000):
         thread = getattr(self, "_dashboard_thread", None)

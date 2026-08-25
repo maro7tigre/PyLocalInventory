@@ -23,7 +23,9 @@ from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.dialogs.network_dialog import NetworkDialog
 from ui.tabs.home_tab import HomeTab
+from ui.tabs.analytics_tab import AnalyticsTab
 from ui.tabs.products_tab import ProductsTab
+from ui.tabs.charges_tab import ChargesTab
 from ui.tabs.services_tab import ServicesTab
 from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
@@ -181,6 +183,8 @@ class MainWindow(ThemedMainWindow):
         # Load tab visibility (default True = tab visible)
         self.tab_visibility = {
             'home':      _bool(self.settings.value("tab_visible/home")),
+            'analytics': _bool(self.settings.value("tab_visible/analytics")),
+            'charges':   _bool(self.settings.value("tab_visible/charges")),
             'products':  _bool(self.settings.value("tab_visible/products")),
             'services':  _bool(self.settings.value("tab_visible/services")),
             'clients':   _bool(self.settings.value("tab_visible/clients")),
@@ -393,6 +397,8 @@ class MainWindow(ThemedMainWindow):
         tabs_menu = QMenu("Tabs", self)
         tab_labels_en = {
             'home':      "🏠 Home",
+            'analytics': "📊 Analytics",
+            'charges':   "💳 Charges",
             'products':  "📦 Products",
             'services':  "🛠️ Services",
             'clients':   "👥 Clients",
@@ -696,6 +702,34 @@ class MainWindow(ThemedMainWindow):
         self._tab_key_to_index = {'home': 0}
         readable_keys = {'home'}
 
+        # Add the Analytics tab right after Home. It is not tied to a single
+        # permission section: the backend filters every metric group by the
+        # caller's role, so the tab is created for everyone and simply shows
+        # "-" for metric groups the user may not read.
+        try:
+            analytics_tab = AnalyticsTab(self.database, language=getattr(self, 'language', 'en'))
+            self._tab_key_to_index['analytics'] = tab_widget.addTab(
+                analytics_tab, labels['analytics']
+            )
+            readable_keys.add('analytics')
+        except Exception as e:
+            print(f"✗ Error adding Analytics tab: {e}")
+            self._tab_key_to_index['analytics'] = self.add_error_tab(tab_widget, "Analytics", e)
+            readable_keys.add('analytics')
+
+        # Add the Charges tab. It requires Charges:read permission.
+        if self.database.has_permission('Charges', 'read'):
+            try:
+                charges_tab = ChargesTab(self.database, language=getattr(self, 'language', 'en'))
+                self._tab_key_to_index['charges'] = tab_widget.addTab(
+                    charges_tab, labels['charges']
+                )
+                readable_keys.add('charges')
+            except Exception as e:
+                print(f"✗ Error adding Charges tab: {e}")
+                self._tab_key_to_index['charges'] = self.add_error_tab(tab_widget, "Charges", e)
+                readable_keys.add('charges')
+
         for key, section, factory in entity_tabs:
             if section != "Reports" and not self.database.has_permission(section, 'read'):
                 print(f"– Skipped {section} tab: no read permission")
@@ -924,6 +958,8 @@ class MainWindow(ThemedMainWindow):
         if l == 'fr':
             return {
                 'home': "🏠 Accueil",
+                'analytics': "📊 Analyses",
+                'charges': "💳 Charges",
                 'products': "📦 Produits",
                 'services': "🛠️ Services",
                 'clients': "👥 Clients",
@@ -936,6 +972,8 @@ class MainWindow(ThemedMainWindow):
         if l == 'es':
             return {
                 'home': "🏠 Inicio",
+                'analytics': "📊 Análisis",
+                'charges': "💳 Cargos",
                 'products': "📦 Productos",
                 'services': "🛠️ Servicios",
                 'clients': "👥 Clientes",
@@ -948,6 +986,8 @@ class MainWindow(ThemedMainWindow):
         # default English
         return {
             'home': "🏠 Home",
+            'analytics': "📊 Analytics",
+            'charges': "💳 Charges",
             'products': "📦 Products",
             'services': "🛠️ Services",
             'clients': "👥 Clients",

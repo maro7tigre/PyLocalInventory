@@ -740,6 +740,7 @@ class BaseTab(QWidget):
         worker_db.registered_classes = self.database.registered_classes
         # DO NOT connect synchronously on the GUI thread.
         # Connection will be established inside the worker's fetch() closure.
+        # Skip schema verification for worker connections to avoid repeated DDL.
         return worker_db
 
     def _start_remote_refresh(self, refresh_id, appending=False):
@@ -783,7 +784,8 @@ class BaseTab(QWidget):
                 worker_db.close()
             return
             
-        thread = QThread()
+        thread = QThread(QApplication.instance())
+        thread.setObjectName(f"{self.section}-table-refresh")
         worker = _RemoteTableFetchWorker(fetcher)
         worker._section = self.section
         worker.moveToThread(thread)
@@ -1032,8 +1034,10 @@ class BaseTab(QWidget):
 
     @Slot(object, object, object, float, int)
     def _remote_refresh_finished(self, items_data, levels, metrics, started, refresh_id):
+        success = False
         try:
             self._apply_refresh_results(items_data, levels, metrics, started, refresh_id)
+            success = True
         except Exception as error:
             logger.exception("Failed applying section=%s", self.section)
             QMessageBox.critical(
@@ -1041,7 +1045,11 @@ class BaseTab(QWidget):
             )
         finally:
             diagnostics.worker_finished("table_fetch", self.section, refresh_id)
-            self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
+            self._finish_refresh(
+                started,
+                mode=getattr(self, '_refresh_mode', 'client'),
+                success=success,
+            )
 
     @Slot(str, float)
     def _remote_refresh_failed(self, error, started):
@@ -1051,9 +1059,9 @@ class BaseTab(QWidget):
         # a modal box here would block the user for every failing tab.
         self._set_offline_banner(True)
         diagnostics.worker_failed("table_fetch", self.section, self._refresh_id)
-        self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'))
+        self._finish_refresh(started, mode=getattr(self, '_refresh_mode', 'client'), success=False)
 
-    def _finish_refresh(self, started, mode='client'):
+    def _finish_refresh(self, started, mode='client', success=True):
         self._refreshing = False
         self._appending = False
         self._in_flight_key = None
@@ -1061,15 +1069,25 @@ class BaseTab(QWidget):
         self._update_paging_controls()
         elapsed = time.perf_counter() - started
         rows = len(self.all_items)
-        logger.log(
-            logging.WARNING if elapsed >= 0.5 else logging.INFO,
-            "load_%s completed in %.3f seconds rows=%d mode=%s",
-            self.section.lower(), elapsed, rows, mode,
-        )
-        print(
-            f"[PERFORMANCE] load_{self.section.lower()} batch={self.current_page + 1} "
-            f"completed in {elapsed:.3f} seconds mode={mode} rows={rows}"
-        )
+        if success:
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "load_%s completed in %.3f seconds rows=%d mode=%s",
+                self.section.lower(), elapsed, rows, mode,
+            )
+            print(
+                f"[PERFORMANCE] load_{self.section.lower()} batch={self.current_page + 1} "
+                f"completed in {elapsed:.3f} seconds mode={mode} rows={rows}"
+            )
+        else:
+            logger.warning(
+                "load_%s failed after %.3f seconds rows=%d mode=%s",
+                self.section.lower(), elapsed, rows, mode,
+            )
+            print(
+                f"[PERFORMANCE] load_{self.section.lower()} batch={self.current_page + 1} "
+                f"FAILED after {elapsed:.3f} seconds mode={mode} rows={rows}"
+            )
         if self._refresh_pending:
             # A newer view was requested while this fetch was in flight; its
             # result was invalidated, so re-issue it now that no request is
@@ -1079,8 +1097,10 @@ class BaseTab(QWidget):
 
     @Slot()
     def _on_refresh_thread_finished(self):
-        self._refresh_thread = None
-        self._refresh_worker = None
+        thread = self.sender()
+        if self._refresh_thread is thread:
+            self._refresh_thread = None
+            self._refresh_worker = None
 
     def _wait_for_refresh_thread(self, timeout_ms=5000):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""
@@ -1135,7 +1155,7 @@ class BaseTab(QWidget):
         def fetch():
             # Establish connection inside the worker thread if not connected
             if getattr(database, 'profile_manager', None) and not getattr(database, 'conn', None):
-                if not database.connect():
+                if not database.connect(verify_schema=False):
                     raise RuntimeError("Failed to connect worker database on background thread")
             
             if hasattr(database, 'get_operation_summary_items') and section in ('Sales', 'Imports'):

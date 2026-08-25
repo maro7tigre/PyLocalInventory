@@ -5,7 +5,8 @@ import os
 from datetime import datetime
 from PySide6.QtWidgets import (QLineEdit, QSpinBox, QDoubleSpinBox, QWidget, 
                                QHBoxLayout, QVBoxLayout, QPushButton, QLabel,
-                               QFileDialog, QMessageBox, QDateEdit, QCheckBox)
+                               QFileDialog, QMessageBox, QDateEdit, QCheckBox,
+                               QComboBox, QTextEdit)
 from PySide6.QtCore import Qt, Signal, QDate
 from PySide6.QtGui import QPixmap
 
@@ -65,6 +66,8 @@ class NumericWidget(QWidget):
         min_val = param_info.get('min', -999999)
         max_val = param_info.get('max', 999999)
         self.spinbox.setRange(min_val, max_val)
+        if param_info.get('allow_blank'):
+            self.spinbox.setSpecialValueText("")
         
         # Set enabled state
         self.spinbox.setEnabled(editable)
@@ -119,7 +122,11 @@ class StringWidget(QWidget):
         # Get options for autocomplete
         options = param_info.get('options', [])
         
-        if options and AutoCompleteLineEdit:
+        if param_info.get('multiline'):
+            self.line_edit = QTextEdit()
+            self.line_edit.setMinimumHeight(param_info.get('minimum_height', 80))
+            self.line_edit.setMaximumHeight(param_info.get('maximum_height', 140))
+        elif options and AutoCompleteLineEdit:
             self.line_edit = AutoCompleteLineEdit(options=options)
         else:
             self.line_edit = QLineEdit()
@@ -129,21 +136,31 @@ class StringWidget(QWidget):
 
         # Honor an optional maximum length (e.g. the Devis reference).
         max_length = param_info.get('maxlength')
-        if max_length:
+        if max_length and hasattr(self.line_edit, 'setMaxLength'):
             self.line_edit.setMaxLength(int(max_length))
 
         # Connect validation
-        self.line_edit.textChanged.connect(self.validate_input)
+        if isinstance(self.line_edit, QTextEdit):
+            self.line_edit.textChanged.connect(
+                lambda: self.validate_input(self.line_edit.toPlainText())
+            )
+        else:
+            self.line_edit.textChanged.connect(self.validate_input)
         
         layout.addWidget(self.line_edit)
         self.apply_style()
     
     def text(self):
+        if isinstance(self.line_edit, QTextEdit):
+            return self.line_edit.toPlainText()
         return self.line_edit.text()
     
     def setText(self, text):
         if text is not None:
-            self.line_edit.setText(str(text))
+            if isinstance(self.line_edit, QTextEdit):
+                self.line_edit.setPlainText(str(text))
+            else:
+                self.line_edit.setText(str(text))
     
     def validate_input(self, text):
         """Validate input against min/max length if specified"""
@@ -153,7 +170,7 @@ class StringWidget(QWidget):
     def apply_style(self):
         if not self.editable:
             self.line_edit.setStyleSheet("""
-                QLineEdit {
+                QLineEdit, QTextEdit {
                     background-color: #1e1e1e;
                     color: #888888;
                     border: 1px solid #444444;
@@ -161,10 +178,90 @@ class StringWidget(QWidget):
             """)
         else:
             self.line_edit.setStyleSheet("""
-                QLineEdit {
+                QLineEdit, QTextEdit {
                     background-color: #2D2D2D;
                     color: white;
                     border: 1px solid #555555;
+                }
+            """)
+
+
+class ComboWidget(QWidget):
+    """Widget for combo box parameters with display name / value mapping"""
+    
+    def __init__(self, param_info, editable=True, parent=None):
+        super().__init__(parent)
+        self.param_info = param_info
+        self.editable = editable
+        self._options = []  # List of (display, value) tuples
+        
+        layout = QHBoxLayout(self)
+        layout.setContentsMargins(0, 0, 0, 0)
+        
+        self.combo = QComboBox()
+        self.combo.setEnabled(editable)
+        
+        layout.addWidget(self.combo)
+        self.apply_style()
+        self.set_options(param_info.get('options', []))
+    
+    def set_options(self, options):
+        """Set combo options as list of (display_text, value) tuples"""
+        current_value = self.value()
+        normalized = []
+        for option in options or []:
+            if isinstance(option, (tuple, list)) and len(option) == 2:
+                display, value = option
+            else:
+                display = value = option
+            normalized.append((str(display), value))
+        self._options = normalized
+        self.combo.clear()
+        for display, value in normalized:
+            self.combo.addItem(display, value)
+        if current_value is not None:
+            self.setValue(current_value)
+        elif self.combo.count():
+            self.combo.setCurrentIndex(0)
+    
+    def value(self):
+        """Get the current value (data role)"""
+        return self.combo.currentData()
+    
+    def setValue(self, value):
+        """Set value by data role"""
+        if value is None:
+            self.combo.setCurrentIndex(-1)
+            return
+        for i in range(self.combo.count()):
+            if self.combo.itemData(i) == value:
+                self.combo.setCurrentIndex(i)
+                return
+        self.combo.setCurrentIndex(-1)
+    
+    def apply_style(self):
+        if not self.editable:
+            self.combo.setStyleSheet("""
+                QComboBox {
+                    background-color: #1e1e1e;
+                    color: #888888;
+                    border: 1px solid #444444;
+                }
+            """)
+        else:
+            self.combo.setStyleSheet("""
+                QComboBox {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                }
+                QComboBox::drop-down {
+                    border: none;
+                }
+                QComboBox QAbstractItemView {
+                    background-color: #2D2D2D;
+                    color: white;
+                    selection-background-color: #3D3D3D;
                 }
             """)
 
@@ -467,10 +564,14 @@ class ParameterWidgetFactory:
     def create_widget(param_info, ui_config=None, profile_images_dir=None, editable=True):
         """Create appropriate widget based on parameter type"""
         ui_config = ui_config or {}
-        param_type = param_info.get('type', 'string')
+        resolved_info = dict(param_info)
+        resolved_info.update(ui_config)
+        param_type = resolved_info.get('type', 'string')
+        if param_type == 'text':
+            param_type = 'string'
         
         if param_type in ['int', 'float', 'decimal']:
-            return NumericWidget(param_info, editable)
+            return NumericWidget(resolved_info, editable)
         elif param_type == 'bool':
             # Checkbox that maps to true_value / false_value
             class BoolWidget(QWidget):
@@ -489,13 +590,15 @@ class ParameterWidgetFactory:
                     true_val = self.pinfo.get('true_value', 1)
                     # Consider any value equal to true_val as checked
                     self.checkbox.setChecked(value == true_val)
-            return BoolWidget(param_info, editable)
+            return BoolWidget(resolved_info, editable)
         elif param_type == 'image':
-            return ImageWidget(param_info, editable, profile_images_dir)
+            return ImageWidget(resolved_info, editable, profile_images_dir)
         elif param_type == 'date':
-            return DateWidget(param_info, editable)
+            return DateWidget(resolved_info, editable)
         elif param_type == 'button':
-            return ButtonWidget(param_info, editable)
+            return ButtonWidget(resolved_info, editable)
+        elif param_type == 'combo':
+            return ComboWidget(resolved_info, editable)
         elif param_type == 'table':
             # Table parameters are now handled directly by OperationsTableWidget
             # Return a placeholder since table parameters should be created directly
@@ -503,7 +606,7 @@ class ParameterWidgetFactory:
             placeholder.setStyleSheet("color: #ff9800; font-style: italic;")
             return placeholder
         else:  # string or unknown type
-            return StringWidget(param_info, editable)
+            return StringWidget(resolved_info, editable)
     
     @staticmethod
     def get_widget_value(widget):
@@ -519,6 +622,8 @@ class ParameterWidgetFactory:
             return widget.get_image_path()
         elif isinstance(widget, DateWidget):
             return widget.date()
+        elif isinstance(widget, ComboWidget):
+            return widget.value()
         elif isinstance(widget, ButtonWidget):
             return None  # Buttons don't have values
         else:
@@ -543,6 +648,8 @@ class ParameterWidgetFactory:
             widget.set_image_path(value, copy_to_profile=False)
         elif isinstance(widget, DateWidget):
             widget.setDate(value)
+        elif isinstance(widget, ComboWidget):
+            widget.setValue(value)
         elif isinstance(widget, ButtonWidget):
             pass  # Buttons don't have settable values
         else:

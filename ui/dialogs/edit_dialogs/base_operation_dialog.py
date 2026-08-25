@@ -5,7 +5,7 @@ Replaces the complex manual layout calculations with clean auto-sizing
 
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                                QPushButton, QMessageBox, QScrollArea, QWidget,
-                               QFormLayout, QSizePolicy)
+                               QFormLayout, QSizePolicy, QApplication)
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont
 from ui.widgets.themed_widgets import GreenButton, RedButton
@@ -22,6 +22,21 @@ import time
 import threading
 
 _active_background_threads = set()
+
+
+def _discard_background_thread(thread):
+    """Module-level, widget-free cleanup for a finished background QThread.
+
+    Connected directly to thread.finished so the registry entry is dropped
+    even when the owning dialog was destroyed mid-load (its queued bound
+    handler would be auto-disconnected and never run). Touches no widgets,
+    so the connection is safe regardless of which thread emits it."""
+    try:
+        _active_background_threads.discard(thread)
+    except RuntimeError:
+        pass
+
+
 import logging
 from core.runtime_paths import user_data_root
 
@@ -48,6 +63,15 @@ def _log_save_event(event, **fields):
     from core import sale_save_diagnostics
     sale_save_diagnostics.event(event, **fields)
 
+
+def _connect_worker_database(database):
+    try:
+        return database.connect(verify_schema=False)
+    except TypeError as error:
+        if "verify_schema" not in str(error):
+            raise
+        return database.connect()
+
 class SaveWorker(QObject):
     finished = Signal(object)
     error = Signal(str)
@@ -65,15 +89,12 @@ class SaveWorker(QObject):
         token = (self.save_kwargs.get('sale_data') or self.save_kwargs.get('import_data') or {}).get('operation_token')
         _log_save_event("SAVE_WORKER_ENTER", token=token, is_local=is_local)
         try:
-            if QThread.currentThread().isInterruptionRequested():
-                return
-
             if is_local:
                 from core.database import Database
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                if not _connect_worker_database(worker_db):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
 
             _log_save_event("RPC_REQUEST_START", token=token, is_import=self.is_import, is_local=is_local)
@@ -119,27 +140,38 @@ class LoadWorker(QObject):
         is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
         old_db = getattr(self.operation_obj, 'database', None) if self.operation_obj else None
 
-        try:
-            if QThread.currentThread().isInterruptionRequested():
-                return
+        def _trace(step):
+            import os as _os, time as _time
+            if _os.environ.get("PYLI_TRACE"):
+                print(
+                    f"[TRACE t={_time.monotonic():.3f}] LoadWorker "
+                    f"is_local={is_local} step={step}",
+                    flush=True,
+                )
 
+        _trace("enter")
+        try:
             if is_local:
                 from core.database import Database
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                _trace("local-db-created")
+                if not _connect_worker_database(worker_db):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+                _trace("local-db-connected")
 
             if self.operation_obj:
                 self.operation_obj.database = worker_db
                 self.operation_obj.load_database_data()
+                _trace("operation-loaded")
 
             if self.fetch_catalog and getattr(worker_db, 'get_sale_catalog', None):
                 self.database.sale_catalog = worker_db.get_sale_catalog(
                     include_clients=worker_db.has_permission('Clients', 'read'),
                     include_suppliers=worker_db.has_permission('Suppliers', 'read'),
                 )
+                _trace("catalog-fetched")
 
             # Advisory Devis preview for a NEW sale. Off-thread so the dialog
             # never blocks on the network; the host re-validates on save.
@@ -158,14 +190,18 @@ class LoadWorker(QObject):
                     self.bl_preview = worker_db.get_next_bl_preview()
                 except Exception:
                     self.bl_preview = None
+            _trace("emitting-finished")
             self.finished.emit()
+            _trace("finished-emitted")
         except Exception as e:
+            _trace(f"emitting-error: {e}")
             self.error.emit(str(e))
         finally:
             if self.operation_obj:
                 self.operation_obj.database = old_db
             if is_local and worker_db and worker_db != self.database:
                 worker_db.close()
+            _trace("exit")
 
 
 
@@ -186,6 +222,8 @@ class BaseOperationDialog(QDialog):
         self.pending_entities = []
         self.operation_token = uuid.uuid4().hex
         self._saving = False
+        self._load_completed = False
+        self._load_error_message = None
         
         # Create or load operation object
         if operation_id:
@@ -205,15 +243,26 @@ class BaseOperationDialog(QDialog):
         self.setEnabled(False)
         self.setWindowTitle(self.windowTitle() + " (Loading...)")
 
-        self.load_thread = QThread()
-        # Always re-fetch (off-thread, so it never blocks the UI): the
-        # catalog holds product/service prices and stock, which can change
-        # between dialog opens. Reusing a session-long snapshot here used to
-        # show stale prices until the app was restarted.
+        self.load_thread = QThread(QApplication.instance())
+        self.load_thread.setObjectName(
+            f"{self.operation_obj.section}-dialog-load"
+        )
+        catalog = getattr(database, 'sale_catalog', None)
+        required_catalog_keys = {'products', 'services'}
+        if 'client_username' in self.operation_obj.parameters:
+            required_catalog_keys.add('clients')
+        if 'supplier_username' in self.operation_obj.parameters:
+            required_catalog_keys.add('suppliers')
+        is_remote = database is not None and database.__class__.__name__ == 'RemoteDatabase'
+        fetch_catalog = (
+            not is_remote
+            or not isinstance(catalog, dict)
+            or not required_catalog_keys.issubset(catalog)
+        )
         self.load_worker = LoadWorker(
             self.operation_obj if operation_id else None,
             database,
-            fetch_catalog=not _catalog or "clients" not in _catalog,
+            fetch_catalog=fetch_catalog,
             fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters),
             fetch_bl_preview=(not operation_id and 'bl_number' in self.operation_obj.parameters)
         )
@@ -233,6 +282,10 @@ class BaseOperationDialog(QDialog):
         
         _active_background_threads.add(self.load_thread)
         self.load_thread.finished.connect(self._on_load_thread_finished)
+        # Widget-free registry cleanup that survives dialog destruction.
+        self.load_thread.finished.connect(
+            lambda t=self.load_thread: _discard_background_thread(t)
+        )
         self.load_thread.start()
         
         # Auto-size dialog
@@ -247,9 +300,8 @@ class BaseOperationDialog(QDialog):
         _preview_bl = self.load_worker.bl_preview if self.load_worker else None
         
         try:
-            self.setEnabled(True)
-            title = self.windowTitle().replace(" (Loading...)", "")
-            self.setWindowTitle(title)
+            self._finish_loading_state()
+            self._refresh_parameter_options()
             self.load_data()
             if _preview is not None:
                 self._apply_devis_preview(_preview)
@@ -260,6 +312,20 @@ class BaseOperationDialog(QDialog):
                 self.items_table.refresh_table()
         except RuntimeError:
             pass
+        except Exception:
+            logger.exception("Failed finalizing %s dialog load", self.operation_obj.section)
+
+    def _finish_loading_state(self, error_message=None):
+        self._load_completed = True
+        self._load_error_message = error_message
+        self.setEnabled(True)
+        self.setWindowTitle(self.windowTitle().replace(" (Loading...)", ""))
+
+    def _refresh_parameter_options(self):
+        for widget in self.parameter_widgets.values():
+            editor = getattr(widget, 'line_edit', None)
+            if editor is not None and hasattr(editor, 'refresh_options'):
+                editor.refresh_options()
 
     def _apply_devis_preview(self, preview):
         """Fill the Devis field with the host advisory preview (new Sales only)."""
@@ -291,11 +357,9 @@ class BaseOperationDialog(QDialog):
         # Refs are cleared in _on_load_thread_finished (see _on_save_finished).
 
         try:
-            QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
-            self.setEnabled(True)
-            title = self.windowTitle().replace(" (Loading...)", "")
-            self.setWindowTitle(title)
+            self._finish_loading_state(err_msg)
             self.load_data()
+            QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
         except RuntimeError:
             pass
 
@@ -304,12 +368,14 @@ class BaseOperationDialog(QDialog):
         after the load worker's OS thread has fully stopped, so it is now safe
         to drop the last references to the thread/worker without a QThread
         being destroyed while its native thread is still running."""
+        thread = self.sender()
         try:
-            _active_background_threads.discard(self.load_thread)
+            _active_background_threads.discard(thread)
         except RuntimeError:
             pass
-        self.load_worker = None
-        self.load_thread = None
+        if self.load_thread is thread:
+            self.load_worker = None
+            self.load_thread = None
 
         
     def setup_ui(self):
@@ -852,6 +918,9 @@ class BaseOperationDialog(QDialog):
                 
                 _active_background_threads.add(self.save_thread)
                 self.save_thread.finished.connect(self._on_save_thread_finished)
+                self.save_thread.finished.connect(
+                    lambda t=self.save_thread: _discard_background_thread(t)
+                )
                 self.save_thread.start()
                 _log_save_event("SAVE_THREAD_START", token=self.operation_token)
                 return

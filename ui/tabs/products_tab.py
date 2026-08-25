@@ -1,9 +1,12 @@
 """
 Products Tab - Updated to use BaseTab
 """
+from PySide6.QtWidgets import QMessageBox
+
 from ui.tabs.base_tab import BaseTab
 from classes.product_class import ProductClass
 from ui.dialogs.edit_dialogs.product_dialog import ProductEditDialog
+from ui.widgets.themed_widgets import BlueButton
 
 
 class ProductsTab(BaseTab):
@@ -11,6 +14,40 @@ class ProductsTab(BaseTab):
     
     def __init__(self, database=None, parent=None):
         super().__init__(ProductClass, ProductEditDialog, database, parent)
+
+    def add_additional_toolbar_buttons(self, layout):
+        """Add the Stock History viewer command."""
+        self.stock_history_btn = BlueButton("Stock History")
+        self.stock_history_btn.setToolTip(
+            "Show every stock movement (imports, sales, adjustments) "
+            "explaining the selected product's current stock"
+        )
+        self.stock_history_btn.setMinimumHeight(20)
+        self.stock_history_btn.setStyleSheet(
+            self.stock_history_btn.styleSheet()
+            + "\nQPushButton { font-size: 14px; padding: 5px 10px; }"
+        )
+        self.stock_history_btn.clicked.connect(self.view_stock_history)
+        layout.insertWidget(layout.count() - 1, self.stock_history_btn)
+
+    def view_stock_history(self):
+        """Open the stock-movement ledger for the selected product."""
+        product_id = self.get_selected_id()
+        if product_id is None:
+            QMessageBox.information(
+                self, "No Selection", "Please select a product first."
+            )
+            return
+        from ui.dialogs.stock_history_dialog import show_stock_history
+        product_name = ""
+        for obj in getattr(self, "all_items", []) or []:
+            try:
+                if obj.id == product_id:
+                    product_name = str(obj.get_value("name") or "")
+                    break
+            except Exception:
+                continue
+        show_stock_history(product_id, product_name, self.database, self)
     
     def get_preview_category(self):
         """Override to specify preview category for products"""

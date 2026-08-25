@@ -317,18 +317,18 @@ class ProfileManager:
 
                     conn.commit()
                     cursor.execute(f"SELECT COUNT(*) FROM {dest_schema}.{table_name}")
-                    print(f"✓ Copied {cursor.fetchone()[0]} records from {table_name}")
+                    print(f"[OK] Copied {cursor.fetchone()[0]} records from {table_name}")
 
                 except Exception as e:
                     conn.rollback()
-                    print(f"✗ Error copying table {table_name}: {e}")
+                    print(f"[FAIL] Error copying table {table_name}: {e}")
                     continue
 
             conn.close()
-            print(f"✓ Database tables copied successfully to schema {dest_schema}")
+            print(f"[OK] Database tables copied successfully to schema {dest_schema}")
 
         except Exception as e:
-            print(f"✗ Error copying database: {e}")
+            print(f"[FAIL] Error copying database: {e}")
     
     
 class ProfileClass:

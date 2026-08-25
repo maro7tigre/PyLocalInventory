@@ -21,6 +21,15 @@ from core import diagnostics
 
 logger = logging.getLogger(__name__)
 
+# Session options applied to every connection this application opens.
+#
+# lock_timeout converts the historical unrecoverable freeze into a catchable
+# error: several UI paths run synchronous queries on the GUI thread, and
+# PostgreSQL by default waits FOREVER when another session holds a conflicting
+# lock (e.g. another PC mid-sale-save). A bounded 8s wait lets those paths
+# surface an error message instead of hanging the window indefinitely.
+_CONNECTION_OPTIONS = "-c lock_timeout=8000"
+
 # Sort columns allowed to appear directly in ORDER BY / keyset WHERE clauses.
 # UI-generated text must be validated against this set before it ever reaches
 # SQL - never interpolate arbitrary user input into ORDER BY.
@@ -199,11 +208,11 @@ class Database:
             if self.cursor:
                 self._create_table_for_class(cls, section_name)
 
-            print(f"✓ Registered parameter class: {section_name}")
+            print(f"[OK] Registered parameter class: {section_name}")
             return True
 
         except Exception as e:
-            print(f"✗ Failed to register {cls.__name__}: {e}")
+            print(f"[FAIL] Failed to register {cls.__name__}: {e}")
             return False
 
     @staticmethod
@@ -251,8 +260,14 @@ class Database:
         finally:
             admin_conn.close()
 
-    def connect(self):
-        """Establish database connection for the selected profile."""
+    def connect(self, verify_schema=True):
+        """Establish database connection for the selected profile.
+        
+        Args:
+            verify_schema: If True (default), run full table creation and migrations.
+                          If False, only establish connection and set search_path.
+                          Should be False for worker connections to avoid repeated DDL.
+        """
         self.last_error = None
         if not self.profile_manager or not self.profile_manager.selected_profile:
             self.last_error = "No profile selected, cannot connect to database"
@@ -265,16 +280,27 @@ class Database:
             self.conn = None
             self.cursor = None
 
+        def _trace(step):
+            import os as _os, time as _time
+            if _os.environ.get("PYLI_TRACE"):
+                print(
+                    f"[TRACE t={_time.monotonic():.3f}] Database.connect "
+                    f"db={self.database_name!r} step={step}",
+                    flush=True,
+                )
+
         try:
             pg_config = load_server_config()
             profile = self.profile_manager.selected_profile
             database_name = profile.database_name or self._profile_database_name(
                 profile.get_value('company name') or profile.name
             )
+            _trace("config-loaded")
 
             if profile.database_name or not profile.schema_name:
                 profile.database_name = database_name
                 self._ensure_profile_database(pg_config, database_name)
+                _trace("profile-db-ensured")
                 self.conn = psycopg2.connect(
                     host=pg_config.get('host'),
                     port=pg_config.get('port'),
@@ -282,24 +308,30 @@ class Database:
                     user=pg_config.get('user'),
                     password=pg_config.get('password'),
                     connect_timeout=5,
+                    options=_CONNECTION_OPTIONS,
                     application_name="PyLocalInventory",
                 )
+                _trace("psycopg2-connected")
                 self.cursor = diagnostics.track_cursor(self.conn.cursor())
                 self.database_name = database_name
                 self.schema_name = None
 
-                # Create tables for all registered classes
-                self._create_all_tables()
+                if verify_schema:
+                    # Create tables for all registered classes
+                    self._create_all_tables()
+                    _trace("tables-created")
 
-                # Ensure meta/migrations and run one-time tasks
-                self._ensure_meta_table()
-                self._ensure_user_tables()
-                self._ensure_attachment_tables()
-                self._ensure_payments_table()
-                self._ensure_change_log_table()
-                self._run_one_time_migrations()
+                    # Ensure meta/migrations and run one-time tasks
+                    self._ensure_meta_table()
+                    self._ensure_user_tables()
+                    self._ensure_attachment_tables()
+                    self._ensure_payments_table()
+                    self._ensure_change_log_table()
+                    self._ensure_charges_tables()
+                    self._run_one_time_migrations()
+                    _trace("migrations-done")
 
-                print(f"✓ Connected to database: {database_name}")
+                print(f"[OK] Connected to database: {database_name}")
                 diagnostics.db_connection_opened(kind="local")
                 return True
 
@@ -315,6 +347,7 @@ class Database:
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
                 connect_timeout=5,
+                options=_CONNECTION_OPTIONS,
                 application_name="PyLocalInventory",
             )
             self.cursor = diagnostics.track_cursor(self.conn.cursor())
@@ -325,30 +358,32 @@ class Database:
             self.database_name = None
             self.schema_name = schema_name
 
-            # Create tables for all registered classes
-            self._create_all_tables()
+            if verify_schema:
+                # Create tables for all registered classes
+                self._create_all_tables()
 
-            # Ensure meta/migrations and run one-time tasks
-            self._ensure_meta_table()
-            self._ensure_user_tables()
-            self._ensure_attachment_tables()
-            self._ensure_payments_table()
-            self._ensure_change_log_table()
-            self._run_one_time_migrations()
+                # Ensure meta/migrations and run one-time tasks
+                self._ensure_meta_table()
+                self._ensure_user_tables()
+                self._ensure_attachment_tables()
+                self._ensure_payments_table()
+                self._ensure_change_log_table()
+                self._ensure_charges_tables()
+                self._run_one_time_migrations()
 
-            print(f"✓ Connected to database schema: {schema_name}")
+            print(f"[OK] Connected to database schema: {schema_name}")
             diagnostics.db_connection_opened(kind="local")
             return True
 
         except OperationalError as e:
             self.last_error = str(e)
             logger.exception("PostgreSQL connection failed")
-            print(f"✗ Failed to connect to database: {e}")
+            print(f"[FAIL] Failed to connect to database: {e}")
             return False
         except Exception as e:
             self.last_error = str(e)
             logger.exception("Database initialization failed")
-            print(f"✗ Failed to connect to database: {e}")
+            print(f"[FAIL] Failed to connect to database: {e}")
             return False
 
     @staticmethod
@@ -439,7 +474,7 @@ class Database:
                         try:
                             self.cursor.execute(f"ALTER TABLE {section_name} ADD COLUMN {param_key} {sql_type}")
                             self.conn.commit()
-                            print(f"✓ Added missing column '{param_key}' to {section_name}")
+                            print(f"[OK] Added missing column '{param_key}' to {section_name}")
                         except Exception as mig_e:
                             self.conn.rollback()
                             print(f"⚠️ Failed adding column {param_key} to {section_name}: {mig_e}")
@@ -447,11 +482,11 @@ class Database:
                 self.conn.rollback()
                 print(f"⚠️ Column migration check failed for {section_name}: {e_cols}")
 
-            print(f"✓ Created/verified table: {section_name}")
+            print(f"[OK] Created/verified table: {section_name}")
 
         except Exception as e:
             self.conn.rollback()
-            print(f"✗ Error creating table for {section_name}: {e}")
+            print(f"[FAIL] Error creating table for {section_name}: {e}")
 
     def _create_all_tables(self):
         """Create tables for all registered classes in proper order"""
@@ -598,7 +633,7 @@ class Database:
                         "TYPE BOOLEAN USING (is_historical <> 0)"
                     )
                     self.conn.commit()
-                    print(f"✓ Normalized {col_table}.is_historical to BOOLEAN")
+                    print(f"[OK] Normalized {col_table}.is_historical to BOOLEAN")
             except Exception as e_type:
                 self.conn.rollback()
                 print(
@@ -1164,6 +1199,148 @@ class Database:
             self.conn.rollback()
             print(f"Warning: could not create Meta table: {e}")
 
+    def _ensure_charges_tables(self):
+        """Create the Charges (operating expenses) tables during host startup.
+
+        Charges are business expenses (rent, salaries, electricity...) and are
+        deliberately SEPARATE from Imports: product purchases are already
+        represented in COGS, so subtracting them again as charges would
+        double-count. Opening Stock / Stock Adjustment imports are stock
+        ledger entries, never charges.
+
+        Occurrence idempotency for recurring templates is enforced by a
+        partial UNIQUE index: one charge per (template, expense_date).
+        """
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS charge_categories (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    name TEXT UNIQUE NOT NULL,
+                    active BOOLEAN NOT NULL DEFAULT TRUE
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS charge_recurring_templates (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    name TEXT NOT NULL,
+                    category_id INTEGER REFERENCES charge_categories(id),
+                    default_amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    frequency TEXT NOT NULL DEFAULT 'monthly',
+                    next_due_date TEXT NOT NULL,
+                    payment_method TEXT NOT NULL DEFAULT 'Cash',
+                    reference_template TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    enabled BOOLEAN NOT NULL DEFAULT TRUE,
+                    created_by INTEGER,
+                    created_by_username TEXT,
+                    created_at TEXT
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS charges (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    expense_date TEXT NOT NULL,
+                    category_id INTEGER REFERENCES charge_categories(id),
+                    description TEXT NOT NULL DEFAULT '',
+                    amount DOUBLE PRECISION NOT NULL DEFAULT 0,
+                    payment_method TEXT NOT NULL DEFAULT 'Cash',
+                    reference TEXT NOT NULL DEFAULT '',
+                    notes TEXT NOT NULL DEFAULT '',
+                    recurring_template_id INTEGER
+                        REFERENCES charge_recurring_templates(id)
+                        ON DELETE SET NULL,
+                    created_by INTEGER,
+                    created_by_username TEXT,
+                    created_at TEXT,
+                    updated_by INTEGER,
+                    updated_by_username TEXT,
+                    updated_at TEXT
+                )
+            """)
+            self.cursor.execute(
+                "ALTER TABLE charge_recurring_templates "
+                "ADD COLUMN IF NOT EXISTS enabled BOOLEAN NOT NULL DEFAULT TRUE"
+            )
+            # Legacy databases created these flag columns as INTEGER 0/1,
+            # which breaks SQL predicates like `WHERE rt.enabled AND ...`
+            # (argument of AND must be type boolean). Normalize the type so
+            # schema, queries and Python values agree everywhere. Values are
+            # preserved: 0 becomes FALSE, any other number becomes TRUE.
+            # Idempotent: skipped once the column is already BOOLEAN (same
+            # pattern as the imports.is_historical normalization).
+            for flag_table, flag_column in (
+                ("charge_categories", "active"),
+                ("charge_recurring_templates", "enabled"),
+            ):
+                try:
+                    self.cursor.execute(
+                        "SELECT data_type FROM information_schema.columns "
+                        "WHERE table_schema = current_schema() "
+                        "AND table_name = %s AND column_name = %s",
+                        (flag_table, flag_column),
+                    )
+                    type_row = self.cursor.fetchone()
+                    if type_row and type_row[0] != "boolean":
+                        # Legacy columns carry an INTEGER default (e.g.
+                        # DEFAULT 1), which PostgreSQL refuses to auto-cast
+                        # during TYPE conversion. Drop it first, convert the
+                        # stored values, then install the BOOLEAN default.
+                        self.cursor.execute(
+                            f"ALTER TABLE {flag_table} ALTER COLUMN "
+                            f"{flag_column} DROP DEFAULT"
+                        )
+                        self.cursor.execute(
+                            f"ALTER TABLE {flag_table} ALTER COLUMN "
+                            f"{flag_column} TYPE BOOLEAN "
+                            f"USING ({flag_column} <> 0)"
+                        )
+                        self.cursor.execute(
+                            f"ALTER TABLE {flag_table} ALTER COLUMN "
+                            f"{flag_column} SET DEFAULT TRUE"
+                        )
+                        print(
+                            f"[OK] Normalized {flag_table}.{flag_column} "
+                            "to BOOLEAN"
+                        )
+                except Exception as e_flag:
+                    self.conn.rollback()
+                    print(
+                        f"Warning: could not normalize {flag_table}."
+                        f"{flag_column} to BOOLEAN: {e_flag}"
+                    )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS charges_expense_date_idx "
+                "ON charges(expense_date)"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS charges_category_idx "
+                "ON charges(category_id)"
+            )
+            self.cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS charges_template_occurrence_uidx "
+                "ON charges(recurring_template_id, expense_date) "
+                "WHERE recurring_template_id IS NOT NULL"
+            )
+            # Seed the default category set once; user-created categories are
+            # never touched afterwards.
+            default_categories = [
+                "Rent", "Salaries", "Electricity", "Water", "Internet / Phone",
+                "Transport", "Fuel", "Maintenance", "Equipment",
+                "Office Supplies", "Bank Fees", "Taxes", "Insurance",
+                "Software / Subscriptions", "Marketing",
+                "Professional Services", "Other",
+            ]
+            for name in default_categories:
+                self.cursor.execute(
+                    "INSERT INTO charge_categories (name) VALUES (%s) "
+                    "ON CONFLICT (name) DO NOTHING",
+                    (name,),
+                )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create Charges tables: {e}")
+
     def _ensure_change_log_table(self):
         """Create the per-schema change log used for incremental client sync.
 
@@ -1336,7 +1513,7 @@ class Database:
                     """)
                     self.conn.commit()
                     self._set_meta('backfill_product_name_done', '1')
-                    print("✓ Backfilled missing product_name snapshots where possible")
+                    print("[OK] Backfilled missing product_name snapshots where possible")
                 except Exception as e:
                     self.conn.rollback()
                     print(f"Backfill product_name migration failed: {e}")
@@ -3028,7 +3205,7 @@ class Database:
                 SELECT si.product_id, SUM(si.quantity) AS quantity
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
-                WHERE s.state IS NULL OR s.state<>'on_hold'
+                WHERE (s.state IS NULL OR s.state<>'on_hold')
                   AND (s.is_historical IS NULL OR NOT s.is_historical)
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
@@ -3055,7 +3232,7 @@ class Database:
                 SELECT si.product_id, SUM(si.quantity) AS quantity
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
-                WHERE s.state IS NULL OR s.state<>'on_hold'
+                WHERE (s.state IS NULL OR s.state<>'on_hold')
                   AND (s.is_historical IS NULL OR NOT s.is_historical)
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
@@ -3064,6 +3241,205 @@ class Database:
             (product_ids,)
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    # Canonical stock-affecting Sale predicate. This is the exact condition
+    # save_sale_with_items() validates against at write time (and
+    # update_product_with_stock() recomputes from): on-hold and historical
+    # sales never consume stock. Every stock/history/analytics read path must
+    # use this same form so displayed stock always matches validated stock.
+    _SALE_STOCK_PREDICATE = (
+        "(s.state IS NULL OR s.state<>'on_hold') "
+        "AND (s.is_historical IS NULL OR NOT s.is_historical)"
+    )
+    # Canonical stock-affecting Import predicate: historical imports are
+    # books-only records that never add stock.
+    _IMPORT_STOCK_PREDICATE = "(i.is_historical IS NULL OR NOT i.is_historical)"
+
+    @staticmethod
+    def _clean_decimal_str(value):
+        """Render a numeric value as a plain string without trailing zeros
+        ('100.000' -> '100', '2.500' -> '2.5'). Never raises."""
+        try:
+            number = Decimal(str(value if value is not None else 0))
+        except Exception:
+            return str(value or 0)
+        return format(number.normalize(), 'f')
+
+    def get_product_stock_history(
+        self, product_id, movement_type='all', date_from=None, date_to=None,
+        search=None, limit=500, offset=0,
+    ):
+        """Return the derived stock-movement ledger for one product.
+
+        Stock in this application is not stored on the product row - it is
+        derived from the documents themselves (imports minus sales). This
+        method therefore derives the movement history from those same source
+        rows with running totals, so it can never disagree with the
+        authoritative stock calculation:
+
+        * every non-historical import line is an inbound movement
+          ('import', plus 'opening'/'adjustment' for the special
+          Opening Stock / Stock Adjustment imports the product dialogs
+          create),
+        * every line of a non-on_hold, non-historical sale is an outbound
+          'sale' movement,
+        * services can never appear (only products carry stock).
+
+        Editing a Sale/Import rewrites its lines, so the ledger always shows
+        each document's current net effect - the same net-difference rule the
+        derived stock itself follows. stock_before/stock_after are computed
+        over the FULL unfiltered event stream (window function) before any
+        filter is applied, so filtered views stay globally consistent.
+
+        movement_type: 'all' | 'sale' | 'import' | 'adjustment'
+        (the adjustment filter includes Opening Stock entries).
+        date_from/date_to: inclusive 'YYYY-MM-DD' strings compared against
+        each event's effective date.
+        search: case-insensitive substring match on reference/note/user.
+        """
+        try:
+            product_id = int(product_id)
+        except (TypeError, ValueError):
+            raise ValueError("Product ID must be an integer")
+        limit = max(1, min(int(limit), 2000))
+        offset = max(0, int(offset))
+        movement_type = str(movement_type or 'all').strip().casefold()
+        if movement_type not in ('all', 'sale', 'import', 'adjustment'):
+            movement_type = 'all'
+
+        type_filter = ""
+        if movement_type == 'sale':
+            type_filter = "WHERE movement_type = 'sale'"
+        elif movement_type == 'import':
+            type_filter = "WHERE movement_type IN ('import', 'opening')"
+        elif movement_type == 'adjustment':
+            type_filter = "WHERE movement_type IN ('adjustment', 'opening')"
+
+        clauses, params = [], []
+        if date_from:
+            clauses.append("ev_date >= %s")
+            params.append(str(date_from))
+        if date_to:
+            clauses.append("ev_date <= %s")
+            params.append(str(date_to))
+        if search:
+            clauses.append(
+                "(reference ILIKE %s OR note ILIKE %s OR username ILIKE %s)"
+            )
+            like = f"%{search}%"
+            params.extend([like, like, like])
+        row_filter = ("WHERE " + " AND ".join(clauses)) if clauses else ""
+
+        sql = f"""
+            WITH ev AS (
+                SELECT ii.id AS event_id,
+                       CASE WHEN i.supplier_name = 'Opening Stock'
+                            THEN 'opening'
+                            WHEN i.supplier_name = 'Stock Adjustment'
+                            THEN 'adjustment'
+                            ELSE 'import' END AS movement_type,
+                       ii.quantity AS delta,
+                       COALESCE(NULLIF(BTRIM(i.bl_number), ''),
+                                'IMP-' || i.id) AS reference,
+                       COALESCE(i.created_by_username, '') AS username,
+                       COALESCE(i.notes, '') AS note,
+                       COALESCE(NULLIF(BTRIM(i.date), ''),
+                                LEFT(COALESCE(i.created_at, ''), 10), '') AS ev_date,
+                       COALESCE(i.created_at, '') AS ev_time,
+                       0 AS kind_rank
+                FROM import_items ii
+                JOIN imports i ON i.id = ii.import_id
+                WHERE ii.product_id = %s
+                  AND {self._IMPORT_STOCK_PREDICATE}
+                UNION ALL
+                SELECT si.id,
+                       'sale',
+                       -si.quantity,
+                       COALESCE(NULLIF(BTRIM(s.devis), ''),
+                                CASE WHEN s.devis_number IS NOT NULL THEN
+                                     'DE-' || COALESCE(
+                                         NULLIF(SUBSTRING(COALESCE(s.date, '')
+                                             FROM '\\d{{4}}'), ''),
+                                         NULLIF(SUBSTRING(
+                                             COALESCE(s.created_at::text, '')
+                                             FROM '\\d{{4}}'), ''),
+                                         '0')
+                                     || '-' || s.devis_number
+                                     ELSE 'V-' || s.id END) AS reference,
+                       COALESCE(s.created_by_username, ''),
+                       COALESCE(s.notes, ''),
+                       COALESCE(NULLIF(BTRIM(s.date), ''),
+                                LEFT(COALESCE(s.created_at, ''), 10), ''),
+                       COALESCE(s.created_at, ''),
+                       1
+                FROM sales_items si
+                JOIN sales s ON s.id = si.sales_id
+                WHERE si.product_id = %s
+                  AND {self._SALE_STOCK_PREDICATE}
+            ),
+            ordered AS (
+                SELECT ev.*,
+                       SUM(delta) OVER (
+                           ORDER BY ev_date, ev_time, kind_rank, event_id
+                           ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW
+                       ) AS stock_after
+                FROM ev
+            ),
+            filtered AS (
+                SELECT event_id, movement_type, reference, delta,
+                       stock_after - delta AS stock_before,
+                       stock_after, username, note, ev_date, ev_time,
+                       kind_rank
+                FROM ordered
+                {type_filter}
+            )
+            SELECT event_id, movement_type, reference, delta,
+                   stock_before, stock_after, username, note, ev_date, ev_time,
+                   COUNT(*) OVER()
+            FROM filtered
+            {row_filter}
+            ORDER BY ev_date DESC, ev_time DESC, kind_rank DESC, event_id DESC
+            LIMIT %s OFFSET %s
+        """
+        try:
+            self.cursor.execute(
+                sql, (product_id, product_id, *params, limit, offset)
+            )
+        except Exception:
+            self.conn.rollback()
+            raise
+        movements = []
+        total_count = 0
+        for row in self.cursor.fetchall():
+            total_count = int(row[10] or 0)
+            movements.append({
+                "event_id": int(row[0]),
+                "movement_type": row[1],
+                "reference": row[2] or "",
+                "delta": self._clean_decimal_str(row[3]),
+                "stock_before": self._clean_decimal_str(row[4]),
+                "stock_after": self._clean_decimal_str(row[5]),
+                "username": row[6] or "",
+                "note": row[7] or "",
+                "date": row[8] or "",
+                "created_at": row[9] or "",
+            })
+        levels = self.get_product_stock_levels_for_product_ids([product_id])
+        name_row = None
+        try:
+            self.cursor.execute(
+                "SELECT name FROM products WHERE id = %s", (product_id,)
+            )
+            name_row = self.cursor.fetchone()
+        except Exception:
+            self.conn.rollback()
+        return {
+            "product_id": product_id,
+            "product_name": (name_row[0] if name_row else "") or "",
+            "current_stock": self._clean_decimal_str(levels.get(product_id, 0)),
+            "total_count": total_count,
+            "movements": movements,
+        }
 
     def get_sale_catalog(self, include_products=True, include_services=True, exclude_sale_id=None,
                           include_clients=False, include_suppliers=False):
@@ -3123,7 +3499,7 @@ class Database:
                         SELECT si.product_id, SUM(si.quantity) AS quantity
                         FROM sales_items si
                         JOIN sales s ON s.id=si.sales_id
-                        WHERE s.state IS NULL OR s.state<>'on_hold'
+                        WHERE (s.state IS NULL OR s.state<>'on_hold')
                           AND (s.is_historical IS NULL OR NOT s.is_historical)
                         GROUP BY si.product_id
                     ) sold ON sold.product_id=p.id
@@ -3198,7 +3574,7 @@ class Database:
             ), sold AS (
               SELECT si.product_id, SUM(si.quantity) quantity
               FROM sales_items si JOIN sales s ON s.id=si.sales_id
-              WHERE s.state IS NULL OR s.state<>'on_hold'
+              WHERE (s.state IS NULL OR s.state<>'on_hold')
                 AND (s.is_historical IS NULL OR NOT s.is_historical)
               GROUP BY si.product_id
             ), stock AS (
@@ -3293,6 +3669,946 @@ class Database:
                 for row in monthly_rows
             },
         }
+
+    # ────────────────────────── Profit / Margin engine ──────────────────────
+    #
+    # Costing method: Weighted Average Cost (WAC) derived from the immutable
+    # import_items purchase lines. A product may be purchased at several
+    # prices; historical profit must never depend on the product's current
+    # editable unit_price. For every sale line, the average cost of all
+    # non-historical purchases with an effective date/time at or before that
+    # sale line is used:
+    #
+    #   WAC(t) = SUM(quantity*unit_price of purchases <= t)
+    #            / SUM(quantity of purchases <= t)
+    #
+    # If a sale predates every recorded purchase (legacy data without an
+    # opening-stock import), the product's overall average cost is used as a
+    # stable fallback; if the product was never purchased at all the COGS
+    # contribution is 0 - no value is ever invented.
+    #
+    # Revenue basis: net HT (excl. VAT). The sale-level remise is allocated
+    # proportionally across lines so per-product profit respects discounts.
+    # Services contribute revenue but never inventory COGS (services carry no
+    # cost field in this application - none is invented).
+    #
+    # All results are derived from the same immutable document rows the rest
+    # of the app uses, so a sale's historical profitability stays stable when
+    # product master data changes.
+
+    _ANALYTICS_PURCHASE_EVENTS_SQL = """
+        SELECT ii.product_id,
+               ii.quantity AS qty,
+               ii.quantity * ii.unit_price AS val,
+               COALESCE(NULLIF(BTRIM(i.date), ''),
+                        LEFT(COALESCE(i.created_at, ''), 10), '') AS ev_date,
+               COALESCE(i.created_at, '') AS ev_time,
+               ii.id AS event_id
+        FROM import_items ii
+        JOIN imports i ON i.id = ii.import_id
+        WHERE ii.product_id IS NOT NULL
+          AND {import_pred}
+    """
+
+    _ANALYTICS_SALE_EVENTS_SQL = """
+        SELECT si.id AS sale_item_id,
+               s.id AS sale_id,
+               si.product_id,
+               si.service_id,
+               si.item_type,
+               si.product_name,
+               si.quantity AS qty,
+               si.quantity * si.unit_price AS gross,
+               COALESCE(NULLIF(BTRIM(s.date), ''),
+                        LEFT(COALESCE(s.created_at, ''), 10), '') AS ev_date,
+               COALESCE(s.created_at, '') AS ev_time,
+               si.id AS event_id
+        FROM sales_items si
+        JOIN sales s ON s.id = si.sales_id
+        WHERE (s.state IS NULL OR s.state<>'on_hold')
+          AND si.item_type = 'product'
+          AND si.product_id IS NOT NULL
+    """
+
+    @classmethod
+    def _analytics_wac_stream_sql(cls, date_filter_sql=None, sale_id_filter=False):
+        """Single-pass weighted-average-cost stream over purchases+sales.
+
+        Purchases sort before sales at identical timestamps (kind_rank), so a
+        sale always sees every same-day purchase in its average. Sale rows
+        read the running purchase totals BEFORE their own position; they never
+        modify them (average-cost method - sales do not layer inventory).
+
+        Every sale row carries its sale-level context (``raw_all`` = gross of
+        ALL lines incl. services, ``remise``) so net-of-remise revenue can be
+        computed directly from the stream.
+
+        ``date_filter_sql`` optionally scopes sale events to a period using
+        two %s placeholders (from/to). ``sale_id_filter=True`` adds one %s
+        placeholder restricting the stream to a single sale.
+        """
+        extra_filters = []
+        if date_filter_sql:
+            extra_filters.append(f"AND ({date_filter_sql})")
+        if sale_id_filter:
+            extra_filters.append("AND sal.sale_id = %s")
+        filter_sql = " ".join(extra_filters)
+        return f"""
+            pur AS (
+                {cls._ANALYTICS_PURCHASE_EVENTS_SQL.format(
+                    import_pred=cls._IMPORT_STOCK_PREDICATE)}
+            ),
+            sale_agg AS (
+                SELECT s.id AS sale_id,
+                       COALESCE(SUM(si.quantity * si.unit_price), 0) AS raw_all,
+                       COALESCE(MAX(s.remise), 0) AS remise
+                FROM sales s JOIN sales_items si ON si.sales_id = s.id
+                GROUP BY s.id
+            ),
+            sal AS (
+                {cls._ANALYTICS_SALE_EVENTS_SQL}
+            ),
+            sal_ctx AS (
+                SELECT sal.*, agg.raw_all, agg.remise
+                FROM sal JOIN sale_agg agg ON agg.sale_id = sal.sale_id
+                WHERE TRUE {filter_sql}
+            ),
+            events AS (
+                SELECT product_id, qty, val,
+                       NULL::double precision AS gross,
+                       NULL::double precision AS remise,
+                       NULL::double precision AS raw_all,
+                       NULL::text AS product_name,
+                       NULL::bigint AS sale_item_id,
+                       NULL::bigint AS sale_id,
+                       ev_date, ev_time, 0 AS kind_rank, event_id
+                FROM pur
+                UNION ALL
+                SELECT product_id, qty, NULL::double precision AS val,
+                       gross, remise, raw_all, product_name,
+                       sale_item_id, sale_id,
+                       ev_date, ev_time, 1 AS kind_rank, event_id
+                FROM sal_ctx
+            ),
+            stream AS (
+                SELECT events.*,
+                    SUM(CASE WHEN kind_rank = 0 THEN qty ELSE 0 END) OVER prev AS p_qty_prev,
+                    SUM(CASE WHEN kind_rank = 0 THEN val ELSE 0 END) OVER prev AS p_val_prev
+                FROM events
+                WINDOW prev AS (
+                    PARTITION BY product_id
+                    ORDER BY ev_date, ev_time, kind_rank, event_id
+                    ROWS BETWEEN UNBOUNDED PRECEDING AND 1 PRECEDING
+                )
+            ),
+            prod_wac AS (
+                SELECT product_id, SUM(qty) AS q, SUM(val) AS v FROM pur GROUP BY product_id
+            )
+        """
+
+    @staticmethod
+    def _user_can(user, section, action='read'):
+        return bool((user or {}).get('permissions', {}).get(section, {}).get(action))
+
+    def get_sale_profitability(self, sale_id, user=None):
+        """Return internal (never customer-facing) profitability for one Sale.
+
+        Authorization: remote callers need Sales read AND Imports read -
+        purchase costs are Imports data and revenue is Sales data. Local host
+        calls pass user=None and are fully trusted.
+        """
+        if user is not None and not user.get('is_superadmin'):
+            if not (self._user_can(user, 'Sales') and self._user_can(user, 'Imports')):
+                raise PermissionError(
+                    "Viewing sale profitability requires Sales and Imports "
+                    "read access"
+                )
+        try:
+            sale_id = int(sale_id)
+        except (TypeError, ValueError):
+            raise ValueError("Sale ID must be an integer")
+
+        self.cursor.execute(
+            """
+            SELECT id, COALESCE(devis, ''), COALESCE(date, ''),
+                   COALESCE(client_name, client_username, ''), COALESCE(remise, 0),
+                   COALESCE(tva, 0), COALESCE(state, 'pending'),
+                   COALESCE(is_historical, FALSE)
+            FROM sales WHERE id = %s
+            """,
+            (sale_id,),
+        )
+        header_row = self.cursor.fetchone()
+        if not header_row:
+            raise ValueError(f"Sale {sale_id} does not exist")
+
+        from core.calculations import (
+            calculate_operation_totals, to_decimal, round_money,
+        )
+
+        sql = f"""
+            WITH {self._analytics_wac_stream_sql(sale_id_filter=True)}
+            SELECT st.sale_item_id, st.product_name, st.qty, st.gross,
+                   CASE WHEN st.raw_all > 0
+                        THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                        ELSE st.gross END AS net_revenue,
+                   CASE
+                     WHEN st.p_qty_prev > 0 THEN st.p_val_prev / st.p_qty_prev
+                     WHEN pw.q > 0 THEN pw.v / pw.q
+                     ELSE NULL
+                   END AS avg_cost
+            FROM stream st
+            LEFT JOIN prod_wac pw ON pw.product_id = st.product_id
+            WHERE st.kind_rank = 1
+            ORDER BY st.event_id
+        """
+        self.cursor.execute(sql, (sale_id,))
+        rows = self.cursor.fetchall()
+
+        items = []
+        revenue = Decimal("0")
+        cogs = Decimal("0")
+        service_revenue = Decimal("0")
+        for row in rows:
+            name = str(row[1] or "")
+            qty = to_decimal(row[2])
+            gross = to_decimal(row[3])
+            net = to_decimal(row[4])
+            avg_cost = to_decimal(row[5]) if row[5] is not None else None
+            line_cogs = (qty * avg_cost) if avg_cost is not None else Decimal("0")
+            items.append({
+                "item_type": "product",
+                "name": name,
+                "quantity": self._clean_decimal_str(qty),
+                "unit_price": self._clean_decimal_str(
+                    gross / qty if qty else Decimal("0")
+                ),
+                "gross": str(round_money(gross)),
+                "net_revenue": str(round_money(net)),
+                "avg_cost": (
+                    self._clean_decimal_str(avg_cost)
+                    if avg_cost is not None else None
+                ),
+                "cogs": str(round_money(line_cogs)),
+                "profit": str(round_money(net - line_cogs)),
+            })
+            revenue += net
+            cogs += line_cogs
+
+        # Service + manual lines: revenue only, no inventory COGS.
+        self.cursor.execute(
+            """
+            SELECT si.item_type, si.product_name, si.quantity, si.unit_price,
+                   si.quantity * si.unit_price,
+                   COALESCE(agg.raw_all, 0)
+            FROM sales_items si
+            JOIN sales s ON s.id = si.sales_id
+            LEFT JOIN (
+                SELECT s2.id AS sale_id,
+                       COALESCE(SUM(si2.quantity * si2.unit_price), 0) AS raw_all
+                FROM sales s2 JOIN sales_items si2 ON si2.sales_id = s2.id
+                WHERE s2.id = %s GROUP BY s2.id
+            ) agg ON agg.sale_id = s.id
+            WHERE s.id = %s AND si.item_type <> 'product'
+            ORDER BY si.id
+            """,
+            (sale_id, sale_id),
+        )
+        for itype, name, qty, unit_price, gross, raw_all in self.cursor.fetchall():
+            qty_d = to_decimal(qty)
+            gross_d = to_decimal(gross)
+            raw_all_d = to_decimal(raw_all)
+            remise_d = to_decimal(header_row[4])
+            net = (
+                gross_d * (raw_all_d - remise_d) / raw_all_d
+                if raw_all_d > 0 else gross_d
+            )
+            items.append({
+                "item_type": str(itype or "manual"),
+                "name": str(name or ""),
+                "quantity": str(qty_d),
+                "unit_price": str(to_decimal(unit_price)),
+                "gross": str(gross_d),
+                "net_revenue": str(net),
+                "avg_cost": None,
+                "cogs": "0",
+                "profit": str(net),
+            })
+            revenue += net
+            service_revenue += net
+
+        gross_profit = revenue - cogs
+        margin = (
+            str(round_money(gross_profit / revenue * 100))
+            if revenue > 0 else None
+        )
+        totals = calculate_operation_totals(
+            sum(to_decimal(i["gross"]) for i in items),
+            header_row[4], header_row[5],
+        )
+        return {
+            "sale_id": sale_id,
+            "devis": header_row[1],
+            "date": header_row[2],
+            "client_name": header_row[3],
+            "state": header_row[6],
+            "is_historical": bool(header_row[7]),
+            "total_ttc": str(totals["total_ttc"]),
+            "revenue_ht": str(round_money(revenue)),
+            "product_revenue_ht": str(round_money(revenue - service_revenue)),
+            "service_revenue_ht": str(round_money(service_revenue)),
+            "cogs": str(round_money(cogs)),
+            "gross_profit": str(round_money(gross_profit)),
+            "gross_margin_pct": margin,
+            "items": items,
+        }
+
+    def get_analytics_snapshot(self, date_from, date_to, user=None):
+        """Return the full business-analytics snapshot for an inclusive date
+        range in ONE call (a small fixed number of aggregate queries - no
+        N+1 patterns).
+
+        ``date_from``/``date_to`` are 'YYYY-MM-DD' strings compared against
+        each document's effective date. Receivables/payables/stock metrics are
+        current-position values (not period-scoped) and are labelled as such
+        by the UI.
+
+        Remote callers receive only the metric groups their role may read
+        (mirroring get_dashboard_snapshot's server-side filtering):
+        Sales->revenue/profit/top lists, Imports->purchases/COGS,
+        Clients->receivables, Suppliers->payables, Products->stock.
+        Gross Profit/Margin additionally require BOTH Sales and Imports read.
+        """
+        date_from = str(date_from or "")
+        date_to = str(date_to or "")
+
+        # ---- Period revenue / COGS / profit (single WAC stream pass) -------
+        sql = f"""
+            WITH {self._analytics_wac_stream_sql(
+                date_filter_sql="sal.ev_date >= %s AND sal.ev_date <= %s")}
+            SELECT
+              COALESCE(SUM(CASE WHEN st.kind_rank = 1 THEN
+                  CASE WHEN st.raw_all > 0
+                       THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                       ELSE st.gross END END), 0),
+              COALESCE(SUM(CASE WHEN st.kind_rank = 1 THEN
+                  st.qty * COALESCE(
+                      CASE WHEN st.p_qty_prev > 0
+                           THEN st.p_val_prev / st.p_qty_prev END,
+                      CASE WHEN pw.q > 0 THEN pw.v / pw.q END,
+                      0) END), 0)
+            FROM stream st
+            LEFT JOIN prod_wac pw ON pw.product_id = st.product_id
+        """
+        self.cursor.execute(sql, (date_from, date_to))
+        revenue_raw, cogs_raw = self.cursor.fetchone()
+
+        # Sales count covers every non-on_hold sale in the period (including
+        # service-only and manual-line sales, which the product stream skips).
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(*) FROM sales s
+            WHERE (s.state IS NULL OR s.state<>'on_hold')
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        sales_count = self.cursor.fetchone()[0] or 0
+
+        # Service/manual revenue for the period (revenue-only lines).
+        self.cursor.execute(
+            f"""
+            SELECT COALESCE(SUM(
+                CASE WHEN agg.raw_all > 0
+                     THEN si.quantity * si.unit_price
+                          * (agg.raw_all - COALESCE(s.remise, 0)) / agg.raw_all
+                     ELSE si.quantity * si.unit_price END), 0)
+            FROM sales_items si
+            JOIN sales s ON s.id = si.sales_id
+            JOIN (
+                SELECT s2.id AS sale_id,
+                       COALESCE(SUM(si2.quantity * si2.unit_price), 0) AS raw_all
+                FROM sales s2 JOIN sales_items si2 ON si2.sales_id = s2.id
+                WHERE (s2.state IS NULL OR s2.state<>'on_hold')
+                GROUP BY s2.id
+            ) agg ON agg.sale_id = s.id
+            WHERE (s.state IS NULL OR s.state<>'on_hold')
+              AND si.item_type <> 'product'
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        service_revenue_raw = self.cursor.fetchone()[0] or 0
+
+        # ---- Per-period imports total (HT) + count -------------------------
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(DISTINCT i.id),
+                   COALESCE(SUM(ii.quantity * ii.unit_price), 0)
+            FROM imports i JOIN import_items ii ON ii.import_id = i.id
+            WHERE COALESCE(NULLIF(BTRIM(i.date), ''),
+                           LEFT(COALESCE(i.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(i.date), ''),
+                           LEFT(COALESCE(i.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        imports_count, purchases_raw = self.cursor.fetchone()
+
+        # ---- Per-period operating charges total (HT) + count ----------------
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(*), COALESCE(SUM(amount), 0)
+            FROM charges
+            WHERE expense_date >= %s AND expense_date <= %s
+            """,
+            (date_from, date_to),
+        )
+        charges_count, charges_total_raw = self.cursor.fetchone()
+
+        # Charges by category for the period
+        self.cursor.execute(
+            f"""
+            SELECT cc.name, COALESCE(SUM(c.amount), 0) as total
+            FROM charges c
+            JOIN charge_categories cc ON cc.id = c.category_id
+            WHERE c.expense_date >= %s AND c.expense_date <= %s
+            GROUP BY cc.id, cc.name
+            ORDER BY total DESC
+            """,
+            (date_from, date_to),
+        )
+        charges_by_category = [
+            {"category": r[0] or "", "amount": str(r[1] or 0)}
+            for r in self.cursor.fetchall()
+        ]
+
+        # ---- Evolution buckets ---------------------------------------------
+        span_days = 0
+        try:
+            from datetime import date as _date
+            y0, m0, d0 = (int(x) for x in date_from.split("-"))
+            y1, m1, d1 = (int(x) for x in date_to.split("-"))
+            span_days = (_date(y1, m1, d1) - _date(y0, m0, d0)).days
+        except Exception:
+            span_days = 0
+        monthly_buckets = span_days > 92
+        day_expr = "LEFT(ev_date, 7)" if monthly_buckets else "ev_date"
+
+        evolution_sql = f"""
+            WITH {self._analytics_wac_stream_sql(
+                date_filter_sql="sal.ev_date >= %s AND sal.ev_date <= %s")},
+            profit_lines AS (
+                SELECT {day_expr} AS bucket,
+                       CASE WHEN st.raw_all > 0
+                            THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                            ELSE st.gross END
+                       - st.qty * COALESCE(
+                             CASE WHEN st.p_qty_prev > 0
+                                  THEN st.p_val_prev / st.p_qty_prev END,
+                             CASE WHEN pw.q > 0 THEN pw.v / pw.q END,
+                             0) AS profit
+                FROM stream st
+                LEFT JOIN prod_wac pw ON pw.product_id = st.product_id
+                WHERE st.kind_rank = 1
+            ),
+            rev AS (
+                SELECT {day_expr} AS bucket, SUM(net) AS revenue FROM (
+                    SELECT st.ev_date,
+                           CASE WHEN st.raw_all > 0
+                                THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                                ELSE st.gross END AS net
+                    FROM stream st
+                    WHERE st.kind_rank = 1
+                ) r GROUP BY 1
+            ),
+            prof AS (
+                SELECT bucket, SUM(profit) AS profit FROM profit_lines GROUP BY 1
+            ),
+            purch AS (
+                SELECT {day_expr.replace('ev_date', 'i_ev')} AS bucket,
+                       SUM(val) AS purchases
+                FROM (
+                    SELECT COALESCE(NULLIF(BTRIM(i.date), ''),
+                                    LEFT(COALESCE(i.created_at, ''), 10), '') AS i_ev,
+                           ii.quantity * ii.unit_price AS val
+                    FROM imports i JOIN import_items ii ON ii.import_id = i.id
+                    WHERE COALESCE(NULLIF(BTRIM(i.date), ''),
+                                   LEFT(COALESCE(i.created_at, ''), 10), '') >= %s
+                      AND COALESCE(NULLIF(BTRIM(i.date), ''),
+                                   LEFT(COALESCE(i.created_at, ''), 10), '') <= %s
+                ) p GROUP BY 1
+            ),
+            chrg AS (
+                SELECT {day_expr.replace('ev_date', 'c_ev')} AS bucket,
+                       SUM(amount) AS charges
+                FROM (
+                    SELECT COALESCE(NULLIF(BTRIM(expense_date), ''),
+                                    LEFT(COALESCE(created_at, ''), 10), '') AS c_ev,
+                           amount
+                    FROM charges
+                    WHERE expense_date >= %s AND expense_date <= %s
+                ) c GROUP BY 1
+            )
+            SELECT COALESCE(rev.bucket, prof.bucket, purch.bucket, chrg.bucket) AS bucket,
+                   COALESCE(rev.revenue, 0), COALESCE(prof.profit, 0),
+                   COALESCE(purch.purchases, 0), COALESCE(chrg.charges, 0)
+            FROM rev
+            FULL OUTER JOIN prof ON prof.bucket = rev.bucket
+            FULL OUTER JOIN purch ON purch.bucket = COALESCE(rev.bucket, prof.bucket)
+            FULL OUTER JOIN chrg ON chrg.bucket = COALESCE(rev.bucket, prof.bucket, purch.bucket)
+            ORDER BY 1
+        """
+        self.cursor.execute(evolution_sql, (date_from, date_to, date_from, date_to, date_from, date_to))
+        evolution = [
+            {
+                "bucket": row[0] or "",
+                "revenue": str(row[1] or 0),
+                "profit": str(row[2] or 0),
+                "purchases": str(row[3] or 0),
+                "charges": str(row[4] or 0),
+            }
+            for row in self.cursor.fetchall()
+        ]
+
+        # ---- Top products: selling vs profitable are different rankings ----
+        top_sql = f"""
+            WITH {self._analytics_wac_stream_sql(
+                date_filter_sql="sal.ev_date >= %s AND sal.ev_date <= %s")},
+            lines AS (
+                SELECT st.product_id,
+                       MAX(st.product_name) AS product_name,
+                       SUM(st.qty) AS qty,
+                       SUM(CASE WHEN st.raw_all > 0
+                                THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                                ELSE st.gross END) AS revenue,
+                       SUM(st.qty * COALESCE(
+                               CASE WHEN st.p_qty_prev > 0
+                                    THEN st.p_val_prev / st.p_qty_prev END,
+                               CASE WHEN pw.q > 0 THEN pw.v / pw.q END,
+                               0)) AS cogs
+                FROM stream st
+                LEFT JOIN prod_wac pw ON pw.product_id = st.product_id
+                WHERE st.kind_rank = 1
+                GROUP BY st.product_id
+            )
+            SELECT product_id, product_name, qty, revenue, cogs
+            FROM lines
+            ORDER BY {{order}}
+            LIMIT 10
+        """
+        self.cursor.execute(top_sql.format(order="revenue DESC"), (date_from, date_to))
+        top_selling = [
+            {
+                "product_id": int(r[0]), "name": r[1] or "", "qty": str(r[2] or 0),
+                "revenue": str(r[3] or 0), "cogs": str(r[4] or 0),
+                "profit": str((r[3] or 0) - (r[4] or 0)),
+            }
+            for r in self.cursor.fetchall()
+        ]
+        self.cursor.execute(top_sql.format(order="(revenue - cogs) DESC"), (date_from, date_to))
+        most_profitable = [
+            {
+                "product_id": int(r[0]), "name": r[1] or "", "qty": str(r[2] or 0),
+                "revenue": str(r[3] or 0), "cogs": str(r[4] or 0),
+                "profit": str((r[3] or 0) - (r[4] or 0)),
+            }
+            for r in self.cursor.fetchall()
+        ]
+
+        # ---- Top clients (net HT revenue per client, mirrors account math) --
+        self.cursor.execute(
+            f"""
+            SELECT COALESCE(NULLIF(BTRIM(s.client_name), ''),
+                            NULLIF(BTRIM(s.client_username), ''), '') AS cname,
+                   COUNT(DISTINCT s.id) AS sales_count,
+                   COALESCE(SUM(agg.raw_all - COALESCE(s.remise, 0)), 0) AS revenue
+            FROM sales s
+            JOIN (
+                SELECT s2.id AS sale_id,
+                       COALESCE(SUM(si2.quantity * si2.unit_price), 0) AS raw_all
+                FROM sales s2 JOIN sales_items si2 ON si2.sales_id = s2.id
+                WHERE (s2.state IS NULL OR s2.state<>'on_hold')
+                GROUP BY s2.id
+            ) agg ON agg.sale_id = s.id
+            WHERE (s.state IS NULL OR s.state<>'on_hold')
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') <= %s
+            GROUP BY cname
+            ORDER BY revenue DESC
+            LIMIT 10
+            """,
+            (date_from, date_to),
+        )
+        top_clients = [
+            {"name": r[0] or "", "sales_count": int(r[1] or 0), "revenue": str(r[2] or 0)}
+            for r in self.cursor.fetchall()
+        ]
+
+        # ---- Client receivables (current position; mirrors
+        #      get_client_sale_summaries: TTC, paid capped, remaining>=0) ----
+        self.cursor.execute(
+            """
+            WITH sale_raw AS (
+                SELECT s.id AS sale_id, s.client_id,
+                       COALESCE(NULLIF(BTRIM(s.client_name), ''),
+                                NULLIF(BTRIM(s.client_username), ''), '') AS cname,
+                       COALESCE(SUM(si.quantity * si.unit_price), 0) AS raw,
+                       COALESCE(s.remise, 0) AS remise,
+                       COALESCE(s.tva, 0) AS tva
+                FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id
+                GROUP BY s.id, s.client_id,
+                         NULLIF(BTRIM(s.client_name), ''),
+                         NULLIF(BTRIM(s.client_username), ''),
+                         s.remise, s.tva
+            ),
+            ttc AS (
+                SELECT sale_id, client_id, cname,
+                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2)
+                       + ROUND(ROUND(ROUND(raw::numeric, 2)
+                                     - ROUND(remise::numeric, 2), 2)
+                               * tva::numeric / 100, 2) AS total
+                FROM sale_raw
+            ),
+            paid AS (
+                SELECT sale_id, SUM(amount)::numeric AS amt
+                FROM payments WHERE sale_id IS NOT NULL GROUP BY sale_id
+            ),
+            remaining AS (
+                SELECT t.client_id, t.cname,
+                       GREATEST(t.total - LEAST(COALESCE(p.amt, 0), t.total), 0)
+                           AS remaining
+                FROM ttc t LEFT JOIN paid p ON p.sale_id = t.sale_id
+            )
+            SELECT COALESCE(SUM(remaining), 0),
+                   COUNT(*) FILTER (WHERE remaining > 0),
+                   COUNT(*) FILTER (WHERE client_id IS NOT NULL)
+            FROM remaining
+            """
+        )
+        receivables_total, receivables_clients, _total_client_rows = \
+            self.cursor.fetchone()
+        self.cursor.execute(
+            """
+            WITH sale_raw AS (
+                SELECT s.id AS sale_id, s.client_id,
+                       COALESCE(NULLIF(BTRIM(s.client_name), ''),
+                                NULLIF(BTRIM(s.client_username), ''), '') AS cname,
+                       COALESCE(SUM(si.quantity * si.unit_price), 0) AS raw,
+                       COALESCE(s.remise, 0) AS remise,
+                       COALESCE(s.tva, 0) AS tva
+                FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id
+                GROUP BY s.id, s.client_id,
+                         NULLIF(BTRIM(s.client_name), ''),
+                         NULLIF(BTRIM(s.client_username), ''),
+                         s.remise, s.tva
+            ),
+            ttc AS (
+                SELECT sale_id, client_id, cname,
+                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2)
+                       + ROUND(ROUND(ROUND(raw::numeric, 2)
+                                     - ROUND(remise::numeric, 2), 2)
+                               * tva::numeric / 100, 2) AS total
+                FROM sale_raw
+            ),
+            paid AS (
+                SELECT sale_id, SUM(amount)::numeric AS amt
+                FROM payments WHERE sale_id IS NOT NULL GROUP BY sale_id
+            )
+            SELECT cname, GREATEST(t.total - LEAST(COALESCE(p.amt, 0), t.total), 0)
+                   AS remaining
+            FROM ttc t LEFT JOIN paid p ON p.sale_id = t.sale_id
+            WHERE t.client_id IS NOT NULL
+            ORDER BY remaining DESC
+            LIMIT 64
+            """
+        )
+        debtor_rows = [
+            [r[0] or "", r[1]] for r in self.cursor.fetchall() if (r[1] or 0) > 0
+        ]
+        # Aggregate the per-sale rows into per-client balances client-side
+        # (bounded by LIMIT 64 above to keep the payload small).
+        debt_by_client = {}
+        for cname, remaining in debtor_rows:
+            key = cname or "Unknown"
+            debt_by_client[key] = debt_by_client.get(key, 0) + (remaining or 0)
+        top_debtors = sorted(
+            (
+                [{"name": k, "balance": str(v)}
+                 for k, v in debt_by_client.items()]
+            ),
+            key=lambda d: float(d["balance"] or 0), reverse=True,
+        )[:10]
+
+        # ---- Supplier payables (current position; mirrors
+        #      get_supplier_import_summaries) ---------------------------------
+        self.cursor.execute(
+            """
+            WITH imp_raw AS (
+                SELECT i.id AS import_id, i.supplier_id,
+                       COALESCE(NULLIF(BTRIM(i.supplier_name), ''),
+                                NULLIF(BTRIM(i.supplier_username), ''), '') AS sname,
+                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw,
+                       COALESCE(i.tva, 0) AS tva
+                FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id
+                GROUP BY i.id, i.supplier_id,
+                         NULLIF(BTRIM(i.supplier_name), ''),
+                         NULLIF(BTRIM(i.supplier_username), ''), i.tva
+            ),
+            ttc AS (
+                SELECT import_id, supplier_id, sname,
+                       ROUND(ROUND(raw::numeric, 2), 2)
+                       + ROUND(ROUND(raw::numeric, 2) * tva::numeric / 100, 2)
+                           AS total
+                FROM imp_raw
+            ),
+            paid AS (
+                SELECT import_id, SUM(amount)::numeric AS amt
+                FROM payments WHERE import_id IS NOT NULL GROUP BY import_id
+            )
+            SELECT COALESCE(SUM(GREATEST(
+                       t.total - LEAST(COALESCE(p.amt, 0), t.total), 0)), 0),
+                   COUNT(*) FILTER (WHERE
+                       GREATEST(t.total - LEAST(COALESCE(p.amt, 0), t.total), 0) > 0)
+            FROM ttc t LEFT JOIN paid p ON p.import_id = t.import_id
+            """
+        )
+        payables_total, payables_suppliers = self.cursor.fetchone()
+        self.cursor.execute(
+            """
+            WITH imp_raw AS (
+                SELECT i.id AS import_id, i.supplier_id,
+                       COALESCE(NULLIF(BTRIM(i.supplier_name), ''),
+                                NULLIF(BTRIM(i.supplier_username), ''), '') AS sname,
+                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw,
+                       COALESCE(i.tva, 0) AS tva
+                FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id
+                GROUP BY i.id, i.supplier_id,
+                         NULLIF(BTRIM(i.supplier_name), ''),
+                         NULLIF(BTRIM(i.supplier_username), ''), i.tva
+            ),
+            ttc AS (
+                SELECT import_id, supplier_id, sname,
+                       ROUND(ROUND(raw::numeric, 2), 2)
+                       + ROUND(ROUND(raw::numeric, 2) * tva::numeric / 100, 2)
+                           AS total
+                FROM imp_raw
+            ),
+            paid AS (
+                SELECT import_id, SUM(amount)::numeric AS amt
+                FROM payments WHERE import_id IS NOT NULL GROUP BY import_id
+            )
+            SELECT sname, GREATEST(t.total - LEAST(COALESCE(p.amt, 0), t.total), 0)
+                   AS remaining
+            FROM ttc t LEFT JOIN paid p ON p.import_id = t.import_id
+            WHERE t.supplier_id IS NOT NULL
+            ORDER BY remaining DESC
+            LIMIT 64
+            """
+        )
+        credit_by_supplier = {}
+        for sname, remaining in self.cursor.fetchall():
+            if (remaining or 0) > 0:
+                key = sname or "Unknown"
+                credit_by_supplier[key] = credit_by_supplier.get(key, 0) + (remaining or 0)
+        top_creditors = sorted(
+            ({"name": k, "balance": str(v)} for k, v in credit_by_supplier.items()),
+            key=lambda d: float(d["balance"] or 0), reverse=True,
+        )[:10]
+
+        # ---- Current stock value + alerts (Products only, never services) ---
+        self.cursor.execute(
+            f"""
+            WITH imported AS (
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii JOIN imports i ON i.id = ii.import_id
+                WHERE ii.product_id IS NOT NULL AND {self._IMPORT_STOCK_PREDICATE}
+                GROUP BY ii.product_id
+            ),
+            sold AS (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si JOIN sales s ON s.id = si.sales_id
+                WHERE si.product_id IS NOT NULL AND {self._SALE_STOCK_PREDICATE}
+                GROUP BY si.product_id
+            ),
+            stock AS (
+                SELECT p.id, p.name, p.username, COALESCE(p.stock_alert, 0) AS alert,
+                       COALESCE(imp.quantity, 0) - COALESCE(sol.quantity, 0) AS qty
+                FROM products p
+                LEFT JOIN imported imp ON imp.product_id = p.id
+                LEFT JOIN sold sol ON sol.product_id = p.id
+            ),
+            wac AS (
+                SELECT ii.product_id,
+                       SUM(ii.quantity) AS q,
+                       SUM(ii.quantity * ii.unit_price) AS v
+                FROM import_items ii JOIN imports i ON i.id = ii.import_id
+                WHERE ii.product_id IS NOT NULL AND {self._IMPORT_STOCK_PREDICATE}
+                GROUP BY ii.product_id
+            )
+            SELECT
+              COALESCE(SUM(CASE WHEN s.qty > 0
+                  THEN s.qty * COALESCE(w.v / NULLIF(w.q, 0), 0) END), 0),
+              COUNT(*) FILTER (WHERE s.qty > 0
+                  AND s.qty <= CASE WHEN s.alert > 0 THEN s.alert ELSE 5 END),
+              COUNT(*) FILTER (WHERE s.qty <= 0)
+            FROM stock s LEFT JOIN wac w ON w.product_id = s.id
+            """
+        )
+        stock_value_raw, low_stock_count, out_of_stock_count = self.cursor.fetchone()
+        self.cursor.execute(
+            f"""
+            WITH imported AS (
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii JOIN imports i ON i.id = ii.import_id
+                WHERE ii.product_id IS NOT NULL AND {self._IMPORT_STOCK_PREDICATE}
+                GROUP BY ii.product_id
+            ),
+            sold AS (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si JOIN sales s ON s.id = si.sales_id
+                WHERE si.product_id IS NOT NULL AND {self._SALE_STOCK_PREDICATE}
+                GROUP BY si.product_id
+            )
+            SELECT p.id, p.name, p.username,
+                   COALESCE(imp.quantity, 0) - COALESCE(sol.quantity, 0) AS qty,
+                   COALESCE(p.stock_alert, 0) AS alert
+            FROM products p
+            LEFT JOIN imported imp ON imp.product_id = p.id
+            LEFT JOIN sold sol ON sol.product_id = p.id
+            WHERE COALESCE(imp.quantity, 0) - COALESCE(sol.quantity, 0)
+                  <= CASE WHEN COALESCE(p.stock_alert, 0) > 0
+                          THEN p.stock_alert ELSE 5 END
+            ORDER BY 4, p.name
+            LIMIT 50
+            """
+        )
+        low_stock_products = [
+            {
+                "product_id": int(r[0]),
+                "name": r[1] or r[2] or "Unknown Product",
+                "username": r[2] or "",
+                "stock": str(r[3] or 0),
+                "alert": str(r[4] or 0),
+            }
+            for r in self.cursor.fetchall()
+        ]
+
+        snapshot = {
+            "period": {"from": date_from, "to": date_to},
+            "sales_count": int(sales_count or 0),
+            "imports_count": int(imports_count or 0),
+            "revenue_total": str(revenue_raw or 0),
+            "product_revenue": str((revenue_raw or 0) - (service_revenue_raw or 0)),
+            "service_revenue": str(service_revenue_raw or 0),
+            "cogs_total": str(cogs_raw or 0),
+            "gross_profit": str((revenue_raw or 0) - (cogs_raw or 0)),
+            "gross_margin_pct": (
+                str(round(
+                    (float(revenue_raw) - float(cogs_raw or 0))
+                    / float(revenue_raw) * 100, 2))
+                if (revenue_raw or 0) > 0 else None
+            ),
+            "purchases_total": str(purchases_raw or 0),
+            "charges_total": str(charges_total_raw or 0),
+            "charges_count": int(charges_count or 0),
+            "charges_by_category": charges_by_category,
+            "net_profit": str((revenue_raw or 0) - (cogs_raw or 0) - (charges_total_raw or 0)),
+            "net_margin_pct": (
+                str(round(
+                    (float(revenue_raw) - float(cogs_raw or 0) - float(charges_total_raw or 0))
+                    / float(revenue_raw) * 100, 2))
+                if (revenue_raw or 0) > 0 else None
+            ),
+            "purchases_total": str(purchases_raw or 0),
+            "receivables_total": str(receivables_total or 0),
+            "receivables_clients": int(receivables_clients or 0),
+            "top_debtors": top_debtors,
+            "payables_total": str(payables_total or 0),
+            "payables_suppliers": int(payables_suppliers or 0),
+            "top_creditors": top_creditors,
+            "stock_value": str(stock_value_raw or 0),
+            "low_stock_count": int(low_stock_count or 0),
+            "out_of_stock_count": int(out_of_stock_count or 0),
+            "low_stock_products": low_stock_products,
+            "evolution": evolution,
+            "top_selling_products": top_selling,
+            "most_profitable_products": most_profitable,
+            "top_clients": top_clients,
+            "charges_by_category": charges_by_category,
+            "bucket_mode": "month" if monthly_buckets else "day",
+        }
+
+        # Server-side permission filtering (remote callers only): strip every
+        # group the caller's role may not read. Unauthorized clients can never
+        # pull sensitive financial data through RPC.
+        if user is not None and not user.get('is_superadmin'):
+            scalar_keys = (
+                'sales_count', 'imports_count', 'revenue_total', 'product_revenue',
+                'service_revenue', 'cogs_total', 'gross_profit', 'gross_margin_pct',
+                'purchases_total', 'charges_total', 'charges_count', 'net_profit',
+                'net_margin_pct', 'receivables_total', 'receivables_clients',
+                'payables_total', 'payables_suppliers', 'stock_value',
+                'low_stock_count', 'out_of_stock_count',
+            )
+            list_keys = (
+                'top_debtors', 'top_creditors', 'low_stock_products',
+                'top_selling_products', 'most_profitable_products', 'top_clients',
+                'charges_by_category',
+            )
+
+            def _strip(keys):
+                for key in keys:
+                    snapshot[key] = [] if key in list_keys else None
+
+            can_sales = self._user_can(user, 'Sales')
+            can_imports = self._user_can(user, 'Imports')
+            if not can_sales:
+                _strip((
+                    'sales_count', 'revenue_total', 'product_revenue',
+                    'service_revenue', 'top_selling_products',
+                    'most_profitable_products', 'top_clients',
+                ))
+                snapshot['evolution'] = [
+                    {**row, "revenue": None, "profit": None}
+                    for row in snapshot['evolution']
+                ]
+            if not (can_sales and can_imports):
+                _strip(('cogs_total', 'gross_profit', 'gross_margin_pct'))
+                snapshot['evolution'] = [
+                    {**row, "profit": None} for row in snapshot['evolution']
+                ]
+            if not can_imports:
+                _strip(('purchases_total', 'imports_count'))
+                snapshot['evolution'] = [
+                    {**row, "purchases": None} for row in snapshot['evolution']
+                ]
+            can_charges = self._user_can(user, 'Charges')
+            if not can_charges:
+                _strip(('charges_total', 'charges_count', 'charges_by_category'))
+                snapshot['evolution'] = [
+                    {**row, "charges": None} for row in snapshot['evolution']
+                ]
+            if not (can_sales and can_imports and can_charges):
+                _strip(('net_profit', 'net_margin_pct'))
+            if not self._user_can(user, 'Clients'):
+                _strip(('receivables_total', 'receivables_clients', 'top_debtors'))
+            if not self._user_can(user, 'Suppliers'):
+                _strip(('payables_total', 'payables_suppliers', 'top_creditors'))
+            if not self._user_can(user, 'Products'):
+                _strip((
+                    'stock_value', 'low_stock_count', 'out_of_stock_count',
+                    'low_stock_products',
+                ))
+        return snapshot
 
     def get_operation_items_for_user(self, operation_id, section, user):
         return self.get_items_by_operation_id(operation_id, section)
@@ -4372,6 +5688,586 @@ class Database:
 
     # Attachment operations transfer bytes as base64 over LAN RPC. The host's
     # data directory is never returned to a workstation.
+    # ────────────────────────── Charges / Operating Expenses ──────────────────
+    #
+    # Charges are business operating expenses (rent, salaries, electricity...).
+    # They are distinct from product imports (COGS) and stock adjustments.
+    # A charge may be linked to a recurring template for idempotent due-date
+    # confirmation. All operations are transactional.
+
+    def get_charge_categories(self, user=None):
+        """Return all charge categories with their active status."""
+        try:
+            self.cursor.execute(
+                """SELECT cc.id, cc.name, cc.active,
+                          COUNT(DISTINCT ch.id), COUNT(DISTINCT rt.id)
+                   FROM charge_categories cc
+                   LEFT JOIN charges ch ON ch.category_id = cc.id
+                   LEFT JOIN charge_recurring_templates rt ON rt.category_id = cc.id
+                   GROUP BY cc.id, cc.name, cc.active
+                   ORDER BY cc.name"""
+            )
+            rows = self.cursor.fetchall()
+            return [
+                {
+                    "id": r[0], "name": r[1], "active": bool(r[2]),
+                    "charges_count": int(r[3] or 0),
+                    "templates_count": int(r[4] or 0),
+                }
+                for r in rows
+            ]
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def add_charge_category(self, name, user=None):
+        """Create a new charge category."""
+        if not name or not name.strip():
+            raise ValueError("Category name cannot be empty")
+        try:
+            self.cursor.execute(
+                "INSERT INTO charge_categories (name) VALUES (%s) RETURNING id",
+                (name.strip(),),
+            )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_charge_category(self, category_id, name=None, active=None, user=None):
+        """Update an existing charge category."""
+        if name is not None and not name.strip():
+            raise ValueError("Category name cannot be empty")
+        updates = []
+        params = []
+        if name is not None:
+            updates.append("name = %s")
+            params.append(name.strip())
+        if active is not None:
+            updates.append("active = %s")
+            params.append(bool(active))
+        if not updates:
+            return True
+        params.append(category_id)
+        try:
+            self.cursor.execute(
+                f"UPDATE charge_categories SET {', '.join(updates)} WHERE id = %s",
+                params,
+            )
+            if self.cursor.rowcount == 0:
+                raise ValueError(f"Category {category_id} does not exist")
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_charge_category(self, category_id, user=None):
+        """Delete a charge category if not referenced by any charge."""
+        try:
+            self.cursor.execute(
+                "SELECT 1 FROM charges WHERE category_id = %s LIMIT 1",
+                (category_id,),
+            )
+            if self.cursor.fetchone():
+                raise ValueError("Cannot delete category: it is referenced by charges")
+            self.cursor.execute(
+                "SELECT 1 FROM charge_recurring_templates WHERE category_id = %s LIMIT 1",
+                (category_id,),
+            )
+            if self.cursor.fetchone():
+                raise ValueError(
+                    "Cannot delete category: it is used by recurring templates"
+                )
+            self.cursor.execute(
+                "DELETE FROM charge_categories WHERE id = %s", (category_id,)
+            )
+            if self.cursor.rowcount == 0:
+                raise ValueError(f"Category {category_id} does not exist")
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_charges(self, date_from, date_to, category_id=None, search=None,
+                    limit=100, offset=0, order_by=None, order_dir='desc',
+                    user=None):
+        """List charges in a date range with optional filters."""
+        try:
+            from decimal import Decimal
+            clauses = ["expense_date >= %s", "expense_date <= %s"]
+            params = [date_from, date_to]
+            if category_id:
+                clauses.append("category_id = %s")
+                params.append(category_id)
+            if search:
+                clauses.append(
+                    "(ch.description ILIKE %s OR ch.reference ILIKE %s OR ch.notes ILIKE %s)"
+                )
+                like = f"%{search}%"
+                params.extend([like, like, like])
+            where_sql = " AND ".join(clauses)
+            qualified_where = where_sql.replace("expense_date", "ch.expense_date")
+            qualified_where = qualified_where.replace("category_id", "ch.category_id")
+            allowed_order = {
+                'expense_date': 'ch.expense_date',
+                'date': 'ch.expense_date',
+                'category_id': 'cc.name',
+                'amount': 'ch.amount',
+                'description': 'ch.description',
+            }
+            order_column = allowed_order.get(order_by, 'ch.expense_date')
+            direction = 'ASC' if str(order_dir).lower() == 'asc' else 'DESC'
+
+            # Total count
+            self.cursor.execute(
+                f"SELECT COUNT(*) FROM charges ch WHERE {qualified_where}",
+                params,
+            )
+            total = self.cursor.fetchone()[0] or 0
+
+            # Period total amount
+            self.cursor.execute(
+                f"SELECT COALESCE(SUM(ch.amount), 0) FROM charges ch WHERE {qualified_where}",
+                params,
+            )
+            period_total = self.cursor.fetchone()[0] or 0
+
+            # Paginated list
+            self.cursor.execute(
+                f"""SELECT ch.id, ch.expense_date, ch.category_id, ch.description,
+                           ch.amount, ch.payment_method, ch.reference, ch.notes,
+                           ch.recurring_template_id, ch.created_by,
+                           ch.created_by_username, ch.created_at, ch.updated_by,
+                           ch.updated_by_username, ch.updated_at,
+                           cc.name, rt.name
+                    FROM charges ch
+                    JOIN charge_categories cc ON cc.id = ch.category_id
+                    LEFT JOIN charge_recurring_templates rt
+                           ON rt.id = ch.recurring_template_id
+                    WHERE {qualified_where}
+                    ORDER BY {order_column} {direction}, ch.id {direction}
+                    LIMIT %s OFFSET %s""",
+                params + [limit, offset],
+            )
+            rows = self.cursor.fetchall()
+            charges = []
+            for r in rows:
+                charges.append({
+                    "id": r[0],
+                    "expense_date": r[1],
+                    "category_id": r[2],
+                    "description": r[3] or "",
+                    "amount": str(r[4] or 0),
+                    "payment_method": r[5] or "Cash",
+                    "reference": r[6] or "",
+                    "notes": r[7] or "",
+                    "recurring_template_id": r[8],
+                    "created_by": r[9],
+                    "created_by_username": r[10] or "",
+                    "created_at": r[11] or "",
+                    "updated_by": r[12],
+                    "updated_by_username": r[13] or "",
+                    "updated_at": r[14] or "",
+                    "category_name": r[15] or "",
+                    "recurring_template_name": r[16] or "No recurring template",
+                })
+            return {
+                "charges": charges,
+                "total_count": total,
+                "period_total": str(period_total or 0),
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_charge(self, charge_id, user=None):
+        """Get a single charge by ID."""
+        try:
+            self.cursor.execute(
+                """SELECT ch.id, ch.expense_date, ch.category_id, ch.description,
+                          ch.amount, ch.payment_method, ch.reference, ch.notes,
+                          ch.recurring_template_id, ch.created_by,
+                          ch.created_by_username, ch.created_at, ch.updated_by,
+                          ch.updated_by_username, ch.updated_at, cc.name, rt.name
+                   FROM charges ch
+                   JOIN charge_categories cc ON cc.id = ch.category_id
+                   LEFT JOIN charge_recurring_templates rt
+                          ON rt.id = ch.recurring_template_id
+                   WHERE ch.id = %s""",
+                (charge_id,),
+            )
+            r = self.cursor.fetchone()
+            if not r:
+                return None
+            return {
+                "id": r[0], "expense_date": r[1], "category_id": r[2],
+                "description": r[3] or "", "amount": str(r[4] or 0),
+                "payment_method": r[5] or "Cash", "reference": r[6] or "",
+                "notes": r[7] or "", "recurring_template_id": r[8],
+                "created_by": r[9], "created_by_username": r[10] or "",
+                "created_at": r[11] or "", "updated_by": r[12],
+                "updated_by_username": r[13] or "", "updated_at": r[14] or "",
+                "category_name": r[15] or "",
+                "recurring_template_name": r[16] or "No recurring template",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_charge(self, charge_data, charge_id=None, user=None):
+        """Create or update a charge."""
+        try:
+            from decimal import Decimal
+            actor = self._actor_fields(user)
+            amount = Decimal(str(charge_data.get("amount") or 0))
+            if amount <= 0:
+                raise ValueError("Charge amount must be greater than zero")
+
+            category_id = charge_data.get("category_id")
+            if not category_id:
+                raise ValueError("Category is required")
+
+            expense_date = charge_data.get("expense_date")
+            if not expense_date:
+                raise ValueError("Expense date is required")
+            from datetime import datetime
+            try:
+                datetime.strptime(str(expense_date), "%Y-%m-%d")
+            except ValueError as error:
+                raise ValueError("Expense date must use YYYY-MM-DD") from error
+            payment_method = charge_data.get("payment_method") or "Cash"
+            if payment_method not in ("Cash", "Bank", "Check", "Card", "Other"):
+                raise ValueError("Invalid payment method")
+            self.cursor.execute(
+                "SELECT active FROM charge_categories WHERE id = %s", (category_id,)
+            )
+            category_row = self.cursor.fetchone()
+            if not category_row:
+                raise ValueError("Selected category does not exist")
+            if not charge_id and not category_row[0]:
+                raise ValueError("Selected category is inactive")
+            recurring_template_id = charge_data.get("recurring_template_id") or None
+            if recurring_template_id:
+                self.cursor.execute(
+                    "SELECT 1 FROM charge_recurring_templates WHERE id = %s",
+                    (recurring_template_id,),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("Selected recurring template does not exist")
+
+            if charge_id:
+                # Update
+                self.cursor.execute(
+                    """UPDATE charges SET expense_date=%s, category_id=%s,
+                          description=%s, amount=%s, payment_method=%s,
+                           reference=%s, notes=%s, recurring_template_id=%s,
+                           updated_by=%s,
+                          updated_by_username=%s, updated_at=%s
+                    WHERE id=%s RETURNING id""",
+                    (charge_data.get("expense_date"), charge_data.get("category_id"),
+                     charge_data.get("description", ""), amount,
+                      payment_method,
+                      charge_data.get("reference", ""), charge_data.get("notes", ""),
+                      recurring_template_id,
+                      actor["created_by"], actor["created_by_username"],
+                     actor["created_at"], charge_id),
+                )
+                row = self.cursor.fetchone()
+                if not row:
+                    raise ValueError(f"Charge {charge_id} not found")
+                self.conn.commit()
+                return {"id": row[0], "transaction": "committed"}
+            else:
+                # Create new
+                self.cursor.execute(
+                    """INSERT INTO charges
+                         (expense_date, category_id, description, amount,
+                          payment_method, reference, notes, recurring_template_id,
+                          created_by, created_by_username, created_at)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     RETURNING id""",
+                    (charge_data.get("expense_date"), charge_data.get("category_id"),
+                     charge_data.get("description", ""), amount,
+                      payment_method,
+                     charge_data.get("reference", ""), charge_data.get("notes", ""),
+                      recurring_template_id,
+                     actor["created_by"], actor["created_by_username"],
+                     actor["created_at"]),
+                )
+                row = self.cursor.fetchone()
+                self.conn.commit()
+                return {"id": row[0], "transaction": "committed"}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_charge(self, charge_id, user=None):
+        """Delete a charge by ID."""
+        try:
+            from core.attachments import AttachmentService
+            AttachmentService(self).delete_owner("charge", int(charge_id))
+            self.cursor.execute(
+                "DELETE FROM charges WHERE id = %s RETURNING id",
+                (charge_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Charge {charge_id} does not exist")
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ────────────────────────── Recurring Charges ──────────────────────────────
+    
+    def get_recurring_templates(self, user=None):
+        """List all recurring charge templates."""
+        try:
+            self.cursor.execute(
+                """SELECT rt.id, rt.name, rt.category_id, rt.default_amount, rt.frequency,
+                          next_due_date, payment_method, reference_template,
+                          notes, enabled, created_by, created_by_username, created_at,
+                          cc.name
+                   FROM charge_recurring_templates rt
+                   JOIN charge_categories cc ON cc.id = rt.category_id
+                   ORDER BY rt.name"""
+            )
+            return [
+                {
+                    "id": r[0], "name": r[1], "category_id": r[2],
+                    "default_amount": str(r[3] or 0), "frequency": r[4],
+                    "next_due_date": r[5], "payment_method": r[6] or "Cash",
+                    "reference_template": r[7] or "", "notes": r[8] or "",
+                    "enabled": bool(r[9]),
+                    "created_by": r[10], "created_by_username": r[11] or "",
+                    "created_at": r[12] or "",
+                    "category_name": r[13] or "",
+                }
+                for r in self.cursor.fetchall()
+            ]
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_due_recurring_charges(self, date_str, user=None):
+        """Return recurring templates that are due on or before the given date."""
+        try:
+            self.cursor.execute(
+                """SELECT rt.id, rt.name, rt.category_id, rt.default_amount, rt.frequency,
+                          next_due_date, payment_method, reference_template, notes
+                          , cc.name
+                   FROM charge_recurring_templates rt
+                   JOIN charge_categories cc ON cc.id = rt.category_id
+                   WHERE rt.enabled AND rt.next_due_date <= %s
+                   ORDER BY rt.next_due_date""",
+                (date_str,),
+            )
+            return [
+                {
+                    "id": r[0], "name": r[1], "category_id": r[2],
+                    "default_amount": str(r[3] or 0), "frequency": r[4],
+                    "next_due_date": r[5], "payment_method": r[6] or "Cash",
+                    "reference_template": r[7] or "", "notes": r[8] or "",
+                    "category_name": r[9] or "",
+                }
+                for r in self.cursor.fetchall()
+            ]
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def confirm_recurring_charge(self, template_id, expense_date=None,
+                                  amount=None, user=None):
+        """Confirm one occurrence of a recurring charge.
+        
+        Creates the actual charge record, advances the template's next_due_date
+        by its frequency, and returns the created charge ID.
+        The unique index on (recurring_template_id, expense_date) prevents
+        duplicate confirmations.
+        """
+        try:
+            import calendar
+            from datetime import date, datetime, timedelta
+            from decimal import Decimal
+
+            self.cursor.execute(
+                """SELECT id, name, category_id, default_amount, frequency,
+                          next_due_date, payment_method, reference_template, notes
+                   FROM charge_recurring_templates WHERE id = %s""",
+                (template_id,),
+            )
+            tpl = self.cursor.fetchone()
+            if not tpl:
+                raise ValueError(f"Recurring template {template_id} not found")
+
+            name, category_id, default_amount, frequency, next_due, payment_method, ref_template, notes = tpl[1:]
+            if not amount:
+                amount = Decimal(str(default_amount or 0))
+            if not expense_date:
+                expense_date = next_due
+
+            # Create the charge
+            self.cursor.execute(
+                """INSERT INTO charges
+                     (expense_date, category_id, description, amount,
+                      payment_method, reference, notes, recurring_template_id)
+                 VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+                 RETURNING id""",
+                (expense_date, category_id, name, amount,
+                 payment_method or "Cash", ref_template, notes or "", template_id),
+            )
+            charge_row = self.cursor.fetchone()
+            charge_id = int(charge_row[0])
+
+            # Advance next_due_date
+            if isinstance(next_due, datetime):
+                next_due = next_due.date()
+            elif not isinstance(next_due, date):
+                next_due = datetime.strptime(str(next_due), "%Y-%m-%d").date()
+            if frequency == "monthly":
+                month = 1 if next_due.month == 12 else next_due.month + 1
+                year = next_due.year + 1 if next_due.month == 12 else next_due.year
+                next_due = next_due.replace(
+                    year=year, month=month,
+                    day=min(next_due.day, calendar.monthrange(year, month)[1]),
+                )
+            elif frequency == "weekly":
+                next_due = next_due + timedelta(days=7)
+            elif frequency == "yearly":
+                next_due = next_due.replace(year=next_due.year + 1)
+            next_due_str = next_due.isoformat()
+
+            self.cursor.execute(
+                "UPDATE charge_recurring_templates SET next_due_date = %s WHERE id = %s",
+                (next_due_str, template_id),
+            )
+            self.conn.commit()
+            return {"charge_id": charge_id, "next_due_date": next_due_str}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_recurring_template(self, data, template_id=None, user=None):
+        """Create or update a recurring charge template."""
+        try:
+            actor = self._actor_fields(user)
+            freq = data.get("frequency", "monthly")
+            if freq not in ("monthly", "weekly", "yearly"):
+                freq = "monthly"
+
+            if template_id:
+                # Update
+                self.cursor.execute(
+                    """UPDATE charge_recurring_templates SET
+                         name=%s, category_id=%s, default_amount=%s,
+                         frequency=%s, next_due_date=%s, payment_method=%s,
+                         reference_template=%s, notes=%s, enabled=%s
+                     WHERE id=%s RETURNING id""",
+                     (data.get("name"), data.get("category_id"),
+                      data.get("default_amount", 0), freq,
+                      data.get("next_due_date"), data.get("payment_method", "Cash"),
+                      data.get("reference_template", ""), data.get("notes", ""),
+                      bool(data.get("enabled")), template_id),
+                )
+                if self.cursor.rowcount == 0:
+                    raise ValueError(f"Template {template_id} not found")
+            else:
+                self.cursor.execute(
+                    """INSERT INTO charge_recurring_templates
+                         (name, category_id, default_amount, frequency,
+                          next_due_date, payment_method, reference_template,
+                          notes, enabled, created_by, created_by_username, created_at)
+                     VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s)
+                     RETURNING id""",
+                    (data.get("name"), data.get("category_id"),
+                     data.get("default_amount", 0), freq,
+                     data.get("next_due_date"), data.get("payment_method", "Cash"),
+                     data.get("reference_template", ""), data.get("notes", ""),
+                     bool(data.get("enabled")),
+                     actor["created_by"], actor["created_by_username"],
+                     actor["created_at"]),
+                )
+            row = self.cursor.fetchone()
+            self.conn.commit()
+            return {"id": row[0], "transaction": "committed"}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_recurring_template(self, template_id, user=None):
+        """Delete a recurring template (cascades NULL on charges)."""
+        try:
+            self.cursor.execute(
+                "DELETE FROM charge_recurring_templates WHERE id = %s RETURNING id",
+                (template_id,),
+            )
+            if self.cursor.rowcount == 0:
+                raise ValueError(f"Template {template_id} not found")
+            self.conn.commit()
+            return True
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_charge_summary(self, date_from, date_to, category_id=None, user=None):
+        """Get charge summary for a date range."""
+        try:
+            from decimal import Decimal
+            clauses = ["expense_date >= %s", "expense_date <= %s"]
+            params = [date_from, date_to]
+            if category_id:
+                clauses.append("category_id = %s")
+                params.append(category_id)
+            where_sql = " AND ".join(clauses)
+
+            # Total count
+            self.cursor.execute(
+                f"SELECT COUNT(*) FROM charges WHERE {where_sql}",
+                params,
+            )
+            total_count = self.cursor.fetchone()[0] or 0
+
+            # Total amount
+            self.cursor.execute(
+                f"SELECT COALESCE(SUM(amount), 0) FROM charges WHERE {where_sql}",
+                params,
+            )
+            total_amount = self.cursor.fetchone()[0] or 0
+
+            # By category
+            self.cursor.execute(
+                f"""SELECT c.name, COUNT(ch.id), COALESCE(SUM(ch.amount), 0)
+                   FROM charges ch
+                   JOIN charge_categories c ON c.id = ch.category_id
+                   WHERE {where_sql}
+                   GROUP BY c.id, c.name
+                   ORDER BY c.name""",
+                params,
+            )
+            by_category = []
+            for row in self.cursor.fetchall():
+                by_category.append({
+                    "category": row[0],
+                    "count": row[1],
+                    "total": str(row[2] or 0)
+                })
+
+            return {
+                "date_from": date_from,
+                "date_to": date_to,
+                "total_count": total_count,
+                "total_amount": str(total_amount),
+                "by_category": by_category,
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def list_attachments(self, entity_type, entity_id):
         from core.attachments import AttachmentService
         return AttachmentService(self).list(entity_type, int(entity_id))

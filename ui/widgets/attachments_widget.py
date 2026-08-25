@@ -20,6 +20,20 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
 _active_attachment_threads = set()
 
 
+def _open_worker_database(database):
+    if (database is None
+            or database.__class__.__name__ == 'RemoteDatabase'
+            or not hasattr(database, 'profile_manager')):
+        return database, False
+    from core.database import Database
+    worker_db = Database(database.profile_manager)
+    worker_db.language = getattr(database, 'language', 'en')
+    worker_db.registered_classes = database.registered_classes
+    if not worker_db.connect(verify_schema=False):
+        raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+    return worker_db, True
+
+
 class _AttachmentFetchWorker(QObject):
     """Fetches + filters attachment records and their thumbnails off the GUI
     thread. list_attachments()/get_attachment_thumbnails_bulk() are a
@@ -40,10 +54,13 @@ class _AttachmentFetchWorker(QObject):
 
     @Slot()
     def run(self):
+        worker_db = None
+        owns_database = False
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-            records = self.database.list_attachments(self.entity_type, self.entity_id)
+            worker_db, owns_database = _open_worker_database(self.database)
+            records = worker_db.list_attachments(self.entity_type, self.entity_id)
             needle, kind = self.needle, self.kind
             shown = [
                 r for r in records
@@ -58,14 +75,17 @@ class _AttachmentFetchWorker(QObject):
             ]
             image_ids = [r['id'] for r in shown if r['mime_type'].startswith('image/')]
             thumbnails = {}
-            if image_ids and hasattr(self.database, 'get_attachment_thumbnails_bulk'):
+            if image_ids and hasattr(worker_db, 'get_attachment_thumbnails_bulk'):
                 try:
-                    thumbnails = self.database.get_attachment_thumbnails_bulk(image_ids)
+                    thumbnails = worker_db.get_attachment_thumbnails_bulk(image_ids)
                 except Exception as e:
                     print(f"Error fetching bulk thumbnails: {e}")
             self.finished.emit(shown, thumbnails)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if owns_database and worker_db is not None:
+                worker_db.close()
 
 
 class _ClientSalesFetchWorker(QObject):
@@ -81,13 +101,19 @@ class _ClientSalesFetchWorker(QObject):
 
     @Slot()
     def run(self):
+        worker_db = None
+        owns_database = False
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-            sales = self.database.get_client_sales(self.client_id)
+            worker_db, owns_database = _open_worker_database(self.database)
+            sales = worker_db.get_client_sales(self.client_id)
             self.finished.emit(list(sales))
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if owns_database and worker_db is not None:
+                worker_db.close()
 
 
 def _scan_with_windows_wia(output_path):

@@ -83,7 +83,24 @@ _SUPPLIER_PAYMENT_WRITE_METHODS = {
     'add_supplier_payment', 'update_supplier_payment', 'delete_supplier_payment',
 }
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
-_PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
+_PRODUCT_READ_METHODS = {
+    'get_product_stock_levels', 'get_product_stock_levels_for_product_ids',
+    'get_product_stock_history',
+}
+# Internal financial analytics: revenue needs Sales read, purchase costs are
+# Imports data - seeing COGS/profit requires both. Enforced here so an
+# unauthorized client cannot even request the data (the backend filters the
+# snapshot per-metric as a second layer).
+_FINANCIAL_ANALYTICS_METHODS = {'get_sale_profitability', 'get_analytics_snapshot'}
+
+# Charges / Operating Expenses
+_CHARGE_METHODS = {
+    'get_charge_categories', 'add_charge_category', 'update_charge_category',
+    'delete_charge_category', 'get_charges', 'get_charge', 'save_charge',
+    'delete_charge', 'get_recurring_templates', 'get_due_recurring_charges',
+    'confirm_recurring_charge', 'save_recurring_template', 'delete_recurring_template',
+    'get_charge_summary',
+}
 _ALWAYS_ALLOWED = {
     'begin_transaction', 'commit_transaction', 'rollback_transaction',
     'get_dashboard_snapshot',
@@ -168,6 +185,49 @@ def _check_permission(user, method, args, kwargs):
             return False, "You don't have read access to Products"
         return True, None
 
+    if method in _FINANCIAL_ANALYTICS_METHODS:
+        if method == 'get_sale_profitability':
+            # Internal per-sale cost/profit view: revenue is Sales data,
+            # purchase costs are Imports data. Both reads are required.
+            if not user['permissions'].get('Sales', {}).get('read'):
+                return False, "You don't have read access to Sales"
+            if not user['permissions'].get('Imports', {}).get('read'):
+                return False, "You don't have read access to Imports"
+            return True, None
+        # get_analytics_snapshot is callable by any authenticated user; the
+        # backend strips every metric group the caller's role may not read
+        # (same model as get_dashboard_snapshot), so the response only ever
+        # contains permitted data.
+        return True, None
+
+    if method in _CHARGE_METHODS:
+        # Charges/Operating Expenses: revenue is Sales data, purchase costs are
+        # Imports data, charges are Charges data. For write operations, both
+        # Sales and Charges write are required; for read, Charges read is minimum.
+        if method in ('get_charges', 'get_charge', 'get_charge_summary',
+                      'get_recurring_templates', 'get_due_recurring_charges',
+                      'get_charge_categories'):
+            if not user['permissions'].get('Charges', {}).get('read'):
+                return False, "You don't have read access to Charges"
+            return True, None
+        if method in ('delete_charge', 'delete_recurring_template',
+                      'delete_charge_category'):
+            if not (user['permissions'].get('Charges', {}).get('read')
+                    and user['permissions'].get('Charges', {}).get('delete')):
+                return False, "You don't have delete access to Charges"
+            return True, None
+        if method in ('save_charge', 'confirm_recurring_charge',
+                      'save_recurring_template', 'add_charge_category',
+                      'update_charge_category'):
+            if not (user['permissions'].get('Charges', {}).get('read')
+                    and user['permissions'].get('Charges', {}).get('write')):
+                return False, "You don't have write access to Charges"
+            return True, None
+        # get_charge_summary and get_recurring_templates also need Charges read
+        if not user['permissions'].get('Charges', {}).get('read'):
+            return False, "You don't have read access to Charges"
+        return True, None
+
     if method == 'get_next_devis_preview':
         # Read-only advisory Devis proposal; gated by Sales read/write access.
         if not (user['permissions'].get('Sales', {}).get('read')
@@ -243,7 +303,13 @@ def _check_permission(user, method, args, kwargs):
             'Suppliers': _flag(4, 'include_suppliers', False),
         }
         for section, wanted in requested.items():
-            if wanted and not user['permissions'].get(section, {}).get('read'):
+            workflow_section = 'Imports' if section == 'Suppliers' else 'Sales'
+            workflow_allowed = (
+                user['permissions'].get(workflow_section, {}).get('read')
+                or user['permissions'].get(workflow_section, {}).get('write')
+            )
+            if (wanted and not user['permissions'].get(section, {}).get('read')
+                    and not workflow_allowed):
                 return False, f"You don't have read access to {section}"
         return True, None
 
@@ -322,17 +388,25 @@ def _check_permission(user, method, args, kwargs):
         if index is None:
             permitted = any(
                 user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind])
-                for section in ('Clients', 'Sales')
+                for section in ('Clients', 'Sales', 'Charges')
             )
         else:
             entity = args[index] if len(args) > index else ''
-            section = 'Clients' if entity == 'client' else 'Sales' if entity == 'sale' else None
+            section = {
+                'client': 'Clients', 'sale': 'Sales', 'charge': 'Charges'
+            }.get(entity)
             permitted = bool(section and user['permissions'].get(section, {}).get(_ACTION_FOR_KIND[kind]))
         if not permitted:
             return False, "You don't have permission to manage these attachments"
         return True, None
 
     return False, f"Method '{method}' is not permitted over the network"
+
+
+# Bounded lock waits for pooled RPC connections (mirrors
+# core.database._CONNECTION_OPTIONS): a blocked query must fail with an
+# error the client can display, never hang a host session forever.
+_POOL_CONNECTION_OPTIONS = "-c lock_timeout=8000"
 
 
 class DatabaseServer:
@@ -374,6 +448,7 @@ class DatabaseServer:
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
                 connect_timeout=5,
+                options=_POOL_CONNECTION_OPTIONS,
                 application_name="PyLocalInventory-LAN",
             )
         else:
@@ -390,7 +465,8 @@ class DatabaseServer:
                 dbname=pg_config.get('database'),
                 user=pg_config.get('user'),
                 password=pg_config.get('password'),
-                options=f'-c search_path={schema_name}',
+                options=f'-c search_path={schema_name} '
+                        f'{_POOL_CONNECTION_OPTIONS}',
                 connect_timeout=5,
                 application_name="PyLocalInventory-LAN",
             )
@@ -584,6 +660,12 @@ class DatabaseServer:
                 return request_db.delete_report_for_user(*args, user=user)
             if method == 'get_product_stock_levels':
                 return request_db.get_product_stock_levels()
+            if method == 'get_product_stock_history':
+                return request_db.get_product_stock_history(*args, **kwargs)
+            if method == 'get_sale_profitability':
+                return request_db.get_sale_profitability(*args, **kwargs, user=user)
+            if method == 'get_analytics_snapshot':
+                return request_db.get_analytics_snapshot(*args, **kwargs, user=user)
             if method == 'get_dashboard_snapshot':
                 snapshot = request_db.get_dashboard_snapshot()
                 if not user.get("is_superadmin"):
@@ -646,11 +728,16 @@ class DatabaseServer:
             if method == 'delete_item' and len(args) > 1 and args[1] == 'Reports':
                 return request_db.delete_report_for_user(args[0], user)
 
+            # Charges / Operating Expenses
+            if method in _CHARGE_METHODS:
+                return getattr(request_db, method)(*args, **kwargs, user=user)
+
             if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
                     or method in _CLIENT_ACCOUNT_METHODS
                     or method in _SUPPLIER_ACCOUNT_METHODS
                     or method in _REPORT_METHODS
                     or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED
+                    or method in _CHARGE_METHODS
                     or method in (
                         'save_product_with_opening_stock',
                         'update_product_with_stock',

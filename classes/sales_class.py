@@ -469,6 +469,13 @@ class SalesClass(BaseClass):
     
     def get_client_options(self):
         """Get list of available client usernames for autocomplete"""
+        catalog = getattr(self.database, 'sale_catalog', None)
+        if isinstance(catalog, dict) and 'clients' in catalog:
+            return [
+                row.get('username') or row.get('name')
+                for row in catalog.get('clients', [])
+                if row.get('username') or row.get('name')
+            ]
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return []
         

@@ -23,15 +23,12 @@ import logging
 import time
 from datetime import date, timedelta
 
-from PySide6.QtCore import Qt, QObject, QThread, QDate, QTimer, Signal, Slot
-from PySide6.QtGui import QColor, QPainter
+from PySide6.QtCore import Qt, QObject, QThread, QDate, QTimer, Signal, Slot, QRectF
+from PySide6.QtGui import QColor, QPainter, QPen, QBrush, QFontMetrics, QPainterPath
 from PySide6.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel,
     QComboBox, QPushButton, QDateEdit, QFrame, QTableWidget,
     QTableWidgetItem, QHeaderView, QScrollArea, QListWidget, QListWidgetItem,
-)
-from PySide6.QtCharts import (
-    QChart, QChartView, QBarSeries, QBarSet, QValueAxis, QBarCategoryAxis,
 )
 
 from ui.widgets.themed_widgets import GreenButton
@@ -119,7 +116,10 @@ class GroupedBarChart(QWidget):
         self._labels = []
         self._series = []          # list of (name, color, [values])
         self._empty_text = "No data"
+        self._tooltips = {}        # dict of (series_index, label_index) -> tooltip text
+        self._hover_index = -1     # currently hovered label index
         self.setMinimumHeight(260)
+        self.setMouseTracking(True)
 
     def set_empty_text(self, text):
         self._empty_text = str(text)
@@ -132,6 +132,13 @@ class GroupedBarChart(QWidget):
                                 for v in values])
             for name, color, values in series
         ]
+        # Build tooltips
+        self._tooltips = {}
+        for s_idx, (_name, _color, values) in enumerate(self._series):
+            for l_idx, value in enumerate(values):
+                if l_idx < len(self._labels):
+                    label = self._labels[l_idx]
+                    self._tooltips[(s_idx, l_idx)] = f"{label}\n{_name}: {value:,.2f} MAD"
         self.update()
 
     def paintEvent(self, event):
@@ -140,7 +147,7 @@ class GroupedBarChart(QWidget):
         try:
             rect = self.rect()
             margin_left, margin_right, margin_top, margin_bottom = (
-                46, 10, 26, 30
+                50, 12, 30, 36
             )
             plot = rect.adjusted(margin_left, margin_top,
                                  -margin_right, -margin_bottom)
@@ -158,25 +165,31 @@ class GroupedBarChart(QWidget):
             if not math.isfinite(max_value) or max_value <= 0:
                 max_value = 1.0
 
-            # Gridlines + Y labels (4 divisions).
-            painter.setPen(QPen(QColor("#3a3a3a")))
+            # Gridlines + Y labels (4 divisions) - subtle grid
+            painter.setPen(QPen(QColor("#2a2a2a")))
             font = painter.font()
-            font.setPointSize(7)
+            font.setPointSize(8)
             painter.setFont(font)
             for i in range(5):
                 ratio = i / 4.0
                 y = plot.bottom() - int(plot.height() * ratio)
                 painter.drawLine(plot.left(), y, plot.right(), y)
                 painter.setPen(QPen(QColor(_MUTED)))
+                # Compact Y-axis formatting
+                y_val = max_value * ratio
+                if y_val >= 1000:
+                    label_text = f"{y_val/1000:.0f}K"
+                else:
+                    label_text = f"{y_val:,.0f}"
                 painter.drawText(
-                    0, y - 6, margin_left - 6, 12, Qt.AlignRight | Qt.AlignVCenter,
-                    f"{max_value * ratio:,.0f}",
+                    0, y - 7, margin_left - 8, 14, Qt.AlignRight | Qt.AlignVCenter,
+                    label_text,
                 )
-                painter.setPen(QPen(QColor("#3a3a3a")))
+                painter.setPen(QPen(QColor("#2a2a2a")))
 
             group_width = plot.width() / count
             series_count = len(self._series)
-            bar_width = max(2.0, group_width / (series_count + 1))
+            bar_width = max(3.0, group_width / (series_count + 1))
             for index in range(count):
                 group_x = plot.left() + index * group_width
                 total_bar_w = bar_width * series_count
@@ -185,9 +198,18 @@ class GroupedBarChart(QWidget):
                     value = values[index] if index < len(values) else 0.0
                     bar_h = int(plot.height() * min(abs(value) / max_value, 1.0))
                     x = start_x + s_index * bar_width
-                    painter.fillRect(
-                        int(x), plot.bottom() - bar_h,
-                        max(1, int(bar_width) - 2), bar_h, QColor(color),
+                    # Rounded corners for bars
+                    bar_rect = QRectF(
+                        x, plot.bottom() - bar_h,
+                        max(1, bar_width - 2), bar_h
+                    )
+                    painter.fillRect(bar_rect, QColor(color))
+                # Highlight hovered group
+                if index == self._hover_index:
+                    painter.setPen(QPen(QColor("#444444"), 1))
+                    painter.drawRect(
+                        int(group_x), plot.top(),
+                        int(group_width), plot.height()
                     )
                 label = self._labels[index]
                 metrics = QFontMetrics(font)
@@ -196,8 +218,8 @@ class GroupedBarChart(QWidget):
                 )
                 painter.setPen(QPen(QColor(_MUTED)))
                 painter.drawText(
-                    int(group_x), plot.bottom() + 4,
-                    int(group_width), 14, Qt.AlignHCenter | Qt.AlignTop,
+                    int(group_x), plot.bottom() + 6,
+                    int(group_width), 16, Qt.AlignHCenter | Qt.AlignTop,
                     elided,
                 )
 
@@ -206,14 +228,324 @@ class GroupedBarChart(QWidget):
             for name, color, _values in reversed(self._series):
                 text_width = painter.fontMetrics().horizontalAdvance(name) + 14
                 legend_x -= text_width
-                painter.fillRect(legend_x, 6, 8, 8, QColor(color))
+                painter.fillRect(legend_x, 8, 10, 10, QColor(color))
                 painter.setPen(QPen(QColor(_MUTED)))
                 painter.drawText(
-                    legend_x + 11, 5, text_width, 12,
+                    legend_x + 13, 5, text_width, 14,
                     Qt.AlignLeft | Qt.AlignVCenter, name,
                 )
         finally:
             painter.end()
+
+    def mouseMoveEvent(self, event):
+        from PySide6.QtGui import QFontMetrics
+        rect = self.rect()
+        margin_left, margin_right, margin_top, margin_bottom = (
+            50, 12, 30, 36
+        )
+        plot = rect.adjusted(margin_left, margin_top,
+                             -margin_right, -margin_bottom)
+        if not self._labels or plot.width() < 40:
+            self._hover_index = -1
+            self.update()
+            return
+        count = len(self._labels)
+        group_width = plot.width() / count
+        rel_x = event.position().x() - plot.left()
+        if 0 <= rel_x < plot.width():
+            self._hover_index = int(rel_x / group_width)
+        else:
+            self._hover_index = -1
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_index = -1
+        self.update()
+        super().leaveEvent(event)
+
+
+class LineAreaChart(QWidget):
+    """Professional line/area chart for time-series data (pure QPainter).
+
+    Features:
+    - Smooth lines with subtle area fill
+    - Professional date label formatting
+    - Hover tooltip with all series values
+    - Compact Y-axis formatting (K, M suffixes)
+    - Subtle grid lines
+    - Legend support
+    """
+
+    def __init__(self, parent=None):
+        super().__init__(parent)
+        self._labels = []
+        self._series = []          # list of (name, color, [values], is_area)
+        self._empty_text = "No data"
+        self._hover_index = -1
+        self._hover_x = -1
+        self.setMinimumHeight(260)
+        self.setMouseTracking(True)
+
+    def set_empty_text(self, text):
+        self._empty_text = str(text)
+        self.update()
+
+    def set_data(self, labels, series):
+        """Set chart data.
+        
+        Args:
+            labels: List of date labels (strings)
+            series: List of (name, color, values, is_area) tuples
+                    is_area: if True, fill area under the line
+        """
+        self._labels = [str(label) for label in labels]
+        self._series = [
+            (str(name), color, [float(v) if v is not None else 0.0
+                                for v in values], is_area)
+            for name, color, values, is_area in series
+        ]
+        self.update()
+
+    def _format_compact(self, value):
+        """Format value compactly for Y-axis labels."""
+        abs_val = abs(value)
+        if abs_val >= 1_000_000:
+            return f"{value/1_000_000:.1f}M".rstrip('0').rstrip('.')
+        elif abs_val >= 1_000:
+            return f"{value/1_000:.0f}K"
+        else:
+            return f"{value:,.0f}"
+
+    def _format_full(self, value):
+        """Format value fully for tooltips."""
+        return f"{value:,.2f} MAD"
+
+    def paintEvent(self, event):
+        from PySide6.QtGui import QPainter, QPen, QFontMetrics, QPainterPath, QBrush, QColor
+        painter = QPainter(self)
+        painter.setRenderHint(QPainter.Antialiasing)
+        try:
+            rect = self.rect()
+            margin_left, margin_right, margin_top, margin_bottom = (
+                60, 12, 30, 36
+            )
+            plot = rect.adjusted(margin_left, margin_top,
+                                 -margin_right, -margin_bottom)
+            if not self._series or not self._labels or plot.width() < 40 \
+                    or plot.height() < 30:
+                painter.setPen(QPen(QColor(_MUTED)))
+                painter.drawText(rect, Qt.AlignCenter, self._empty_text)
+                return
+
+            count = len(self._labels)
+            all_values = [v for _, _, values, _ in self._series for v in values]
+            max_value = max([abs(v) for v in all_values] + [1.0])
+            min_value = min([v for v in all_values] + [0.0])
+            if not math.isfinite(max_value) or max_value <= 0:
+                max_value = 1.0
+            if not math.isfinite(min_value):
+                min_value = 0.0
+
+            # Use zero baseline for financial charts
+            if min_value > 0:
+                min_value = 0.0
+            value_range = max_value - min_value
+            if value_range <= 0:
+                value_range = 1.0
+
+            # Gridlines + Y labels (5 divisions) - subtle grid
+            painter.setPen(QPen(QColor("#222222")))
+            font = painter.font()
+            font.setPointSize(8)
+            painter.setFont(font)
+            for i in range(6):
+                ratio = i / 5.0
+                y = plot.bottom() - int(plot.height() * ratio)
+                painter.drawLine(plot.left(), y, plot.right(), y)
+                painter.setPen(QPen(QColor(_MUTED)))
+                y_val = min_value + value_range * ratio
+                label_text = self._format_compact(y_val)
+                painter.drawText(
+                    0, y - 7, margin_left - 8, 14, Qt.AlignRight | Qt.AlignVCenter,
+                    label_text,
+                )
+                painter.setPen(QPen(QColor("#222222")))
+
+            # Draw each series
+            point_radius = 3
+            for s_index, (name, color, values, is_area) in enumerate(self._series):
+                if len(values) != count:
+                    continue
+
+                # Calculate points
+                points = []
+                for index in range(count):
+                    value = values[index]
+                    x = plot.left() + (index + 0.5) * plot.width() / count
+                    y = plot.bottom() - (value - min_value) / value_range * plot.height()
+                    points.append((x, y))
+
+                # Draw area fill first (behind lines)
+                if is_area and len(points) >= 2:
+                    path = QPainterPath()
+                    path.moveTo(points[0][0], plot.bottom())
+                    for x, y in points:
+                        path.lineTo(x, y)
+                    path.lineTo(points[-1][0], plot.bottom())
+                    path.closeSubpath()
+                    area_color = QColor(color)
+                    area_color.setAlpha(35)
+                    painter.fillPath(path, QBrush(area_color))
+
+                # Draw line
+                if len(points) >= 2:
+                    pen = QPen(QColor(color), 2.5)
+                    painter.setPen(pen)
+                    path = QPainterPath()
+                    path.moveTo(points[0][0], points[0][1])
+                    for x, y in points[1:]:
+                        path.lineTo(x, y)
+                    painter.drawPath(path)
+
+                # Draw data points
+                painter.setPen(QPen(QColor(color), 1.5))
+                for index, (x, y) in enumerate(points):
+                    is_hovered = (index == self._hover_index)
+                    r = point_radius + (2 if is_hovered else 0)
+                    # White outline
+                    painter.setBrush(QBrush(QColor("#1e1e1e")))
+                    painter.setPen(QPen(QColor("#1e1e1e"), 2))
+                    painter.drawEllipse(int(x - r), int(y - r), int(r * 2), int(r * 2))
+                    # Colored fill
+                    painter.setBrush(QBrush(QColor(color)))
+                    painter.setPen(QPen(QColor(color), 1))
+                    painter.drawEllipse(int(x - r), int(y - r), int(r * 2), int(r * 2))
+
+            # Draw hover tooltip
+            if 0 <= self._hover_index < count:
+                self._draw_tooltip(painter, plot, self._hover_index)
+
+            # X-axis labels (dates)
+            painter.setPen(QPen(QColor(_MUTED)))
+            font.setPointSize(8)
+            painter.setFont(font)
+            for index in range(count):
+                x = plot.left() + (index + 0.5) * plot.width() / count
+                label = self._labels[index]
+                metrics = QFontMetrics(font)
+                elided = metrics.elidedText(
+                    label, Qt.ElideRight, int(plot.width() / count) - 4
+                )
+                painter.drawText(
+                    int(x - (plot.width() / count) / 2), plot.bottom() + 6,
+                    int(plot.width() / count), 16, Qt.AlignHCenter | Qt.AlignTop,
+                    elided,
+                )
+
+            # Legend
+            legend_y = 8
+            legend_x = plot.right()
+            for name, color, _values, _is_area in reversed(self._series):
+                text_width = painter.fontMetrics().horizontalAdvance(name) + 16
+                legend_x -= text_width
+                # Line sample
+                painter.setPen(QPen(QColor(color), 3))
+                painter.drawLine(legend_x, legend_y + 6, legend_x + 12, legend_y + 6)
+                # Area indicator if applicable
+                for s_name, s_color, _s_values, s_is_area in self._series:
+                    if s_name == name and s_is_area:
+                        painter.fillRect(legend_x, legend_y + 2, 12, 8, QColor(color))
+                        s_color_alpha = QColor(s_color)
+                        s_color_alpha.setAlpha(35)
+                        painter.fillRect(legend_x, legend_y + 2, 12, 8, QBrush(s_color_alpha))
+                        break
+                painter.setPen(QPen(QColor(_MUTED)))
+                painter.drawText(
+                    legend_x + 15, 4, text_width, 14,
+                    Qt.AlignLeft | Qt.AlignVCenter, name,
+                )
+        finally:
+            painter.end()
+
+    def _draw_tooltip(self, painter, plot, index):
+        from PySide6.QtGui import QFontMetrics, QColor
+        # Tooltip background
+        tooltip_lines = [self._labels[index]]
+        for name, color, values, _ in self._series:
+            if index < len(values):
+                tooltip_lines.append(f"{name}: {self._format_full(values[index])}")
+        
+        font = painter.font()
+        font.setPointSize(8)
+        painter.setFont(font)
+        metrics = QFontMetrics(font)
+        
+        max_width = max(metrics.horizontalAdvance(line) for line in tooltip_lines)
+        line_height = metrics.height()
+        tooltip_width = max_width + 20
+        tooltip_height = len(tooltip_lines) * line_height + 12
+        
+        x = plot.left() + (index + 0.5) * plot.width() / len(self._labels)
+        # Position tooltip above the point, centered
+        tx = int(x - tooltip_width / 2)
+        ty = plot.top() + 8
+        
+        # Keep tooltip within bounds
+        if tx < plot.left():
+            tx = plot.left()
+        elif tx + tooltip_width > plot.right():
+            tx = plot.right() - tooltip_width
+        
+        # Draw tooltip background
+        tooltip_rect = QRectF(tx, ty, tooltip_width, tooltip_height)
+        painter.setBrush(QBrush(QColor("#1e1e1e")))
+        painter.setPen(QPen(QColor("#444444"), 1))
+        painter.drawRoundedRect(tooltip_rect, 6, 6)
+        
+        # Draw tooltip text
+        painter.setPen(QPen(QColor("#ffffff")))
+        for i, line in enumerate(tooltip_lines):
+            line_y = ty + 8 + i * line_height
+            # Color the series name
+            if ':' in line:
+                name_part, value_part = line.split(':', 1)
+                painter.drawText(tx + 10, line_y, metrics.horizontalAdvance(name_part + ':'), line_height,
+                                Qt.AlignLeft | Qt.AlignVCenter, name_part + ':')
+                painter.setPen(QPen(QColor(_MUTED)))
+                painter.drawText(tx + 10 + metrics.horizontalAdvance(name_part + ':'), line_y,
+                                metrics.horizontalAdvance(value_part), line_height,
+                                Qt.AlignLeft | Qt.AlignVCenter, value_part.strip())
+                painter.setPen(QPen(QColor("#ffffff")))
+            else:
+                painter.drawText(tx + 10, line_y, tooltip_width - 20, line_height,
+                                Qt.AlignLeft | Qt.AlignVCenter, line)
+
+    def mouseMoveEvent(self, event):
+        rect = self.rect()
+        margin_left, margin_right, margin_top, margin_bottom = (
+            60, 12, 30, 36
+        )
+        plot = rect.adjusted(margin_left, margin_top,
+                             -margin_right, -margin_bottom)
+        if not self._labels or plot.width() < 40:
+            self._hover_index = -1
+            self.update()
+            return
+        count = len(self._labels)
+        rel_x = event.position().x() - plot.left()
+        if 0 <= rel_x < plot.width():
+            self._hover_index = int(rel_x / (plot.width() / count))
+            self._hover_index = max(0, min(self._hover_index, count - 1))
+        else:
+            self._hover_index = -1
+        self.update()
+        super().mouseMoveEvent(event)
+
+    def leaveEvent(self, event):
+        self._hover_index = -1
+        self.update()
+        super().leaveEvent(event)
 
 
 class AnalyticsCard(QFrame):
@@ -382,6 +714,8 @@ class AnalyticsTab(QWidget):
             ("receivables", "Client Receivables", _RED, True),
             ("payables", "Supplier Payables", _ORANGE, True),
             ("stock_value", "Stock Value (cost)", _BLUE, False),
+            ("total_stock_sale_value", "Total Stock Sale Value", _TEAL, False),
+            ("potential_stock_profit", "Potential Stock Profit", _GREEN, False),
             ("low_stock", "Low Stock Products", _ORANGE, False),
             ("out_of_stock", "Out of Stock Products", _RED, False),
         ]
@@ -465,16 +799,10 @@ class AnalyticsTab(QWidget):
         outer_layout.addWidget(scroll, 1)
 
     def _create_revenue_chart(self):
-        if not self._charts_enabled():
-            widget = GroupedBarChart()
-            widget.set_empty_text("Revenue & Profit Evolution (no data)")
-            return widget
-        chart = self._build_revenue_chart()
-        self._capture_revenue_chart_refs(chart)
-        chart_view = QChartView(chart)
-        chart_view.setRenderHint(QPainter.Antialiasing)
-        chart_view.setMinimumHeight(260)
-        return chart_view
+        # Always use the new professional LineAreaChart (no QtCharts dependency)
+        widget = LineAreaChart()
+        widget.set_empty_text("Revenue & Profit Evolution (no data)")
+        return widget
 
     def _build_revenue_chart(self):
         """Build a pristine Revenue & Profit chart.
@@ -526,16 +854,10 @@ class AnalyticsTab(QWidget):
             old_chart.deleteLater()
 
     def _create_flow_chart(self):
-        if not self._charts_enabled():
-            widget = GroupedBarChart()
-            widget.set_empty_text("Sales vs Purchases (no data)")
-            return widget
-        chart = self._build_flow_chart()
-        self._capture_flow_chart_refs(chart)
-        chart_view = QChartView(chart)
-        chart_view.setRenderHint(QPainter.Antialiasing)
-        chart_view.setMinimumHeight(260)
-        return chart_view
+        # Always use the improved GroupedBarChart (no QtCharts dependency)
+        widget = GroupedBarChart()
+        widget.set_empty_text("Sales vs Purchases (no data)")
+        return widget
 
     def _build_flow_chart(self):
         chart = QChart()
@@ -876,6 +1198,18 @@ class AnalyticsTab(QWidget):
             subtitle="quantity x weighted average cost",
             tooltip=None if stock_value is not None else "No Products read permission",
         )
+        total_stock_sale = val("total_stock_sale_value")
+        self.cards["total_stock_sale_value"].set_value(
+            _fmt_money(total_stock_sale) if total_stock_sale is not None else "-",
+            subtitle="If all current stock is sold at selling price",
+            tooltip=None if total_stock_sale is not None else "No Products read permission",
+        )
+        potential_stock_profit = val("potential_stock_profit")
+        self.cards["potential_stock_profit"].set_value(
+            _fmt_money(potential_stock_profit) if potential_stock_profit is not None else "-",
+            subtitle="Potential profit if all current stock is sold",
+            tooltip=None if potential_stock_profit is not None else "No Products read permission",
+        )
         low_stock = val("low_stock_count")
         self.cards["low_stock"].set_value(
             _fmt_int(low_stock) if low_stock is not None else "-",
@@ -899,8 +1233,36 @@ class AnalyticsTab(QWidget):
         return os.environ.get("PYLI_QTCHARTS") == "1"
 
     def _bucket_label(self, bucket, monthly):
+        """Format bucket labels nicely for display."""
         text = str(bucket or "")
-        return text[7:] if (not monthly and len(text) == 10) else text
+        if not text:
+            return ""
+        if monthly:
+            # Format: "2026-08" -> "Aug 2026"
+            try:
+                year, month = text.split('-')[:2]
+                month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                               "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                month_idx = int(month) - 1
+                if 0 <= month_idx < 12:
+                    return f"{month_names[month_idx]} {year}"
+            except Exception:
+                pass
+            return text
+        else:
+            # Format: "2026-08-01" -> "01 Aug"
+            try:
+                if len(text) == 10 and text[4] == '-' and text[7] == '-':
+                    year, month, day = text.split('-')
+                    month_names = ["Jan", "Feb", "Mar", "Apr", "May", "Jun",
+                                   "Jul", "Aug", "Sep", "Oct", "Nov", "Dec"]
+                    month_idx = int(month) - 1
+                    if 0 <= month_idx < 12:
+                        return f"{day} {month_names[month_idx]}"
+            except Exception:
+                pass
+            # Fallback: return last 5 chars (MM-DD or similar)
+            return text[-5:] if len(text) >= 5 else text
 
     def _render_charts(self, snapshot):
         evolution = snapshot.get("evolution") or []
@@ -936,15 +1298,21 @@ class AnalyticsTab(QWidget):
                 f"Sales vs Purchases (per {bucket_word})"
             )
 
-        # Lightweight QPainter renderer (default): no QtCharts scene graph.
-        if isinstance(self.revenue_chart_view, GroupedBarChart):
+        # Revenue & Profit Evolution - Line/Area chart
+        if isinstance(self.revenue_chart_view, LineAreaChart):
             self.revenue_chart_view.set_data(
                 labels,
-                [("Revenue", _GREEN, revenues), ("Profit", _BLUE, profits)],
+                [
+                    ("Revenue", _GREEN, revenues, True),   # Revenue with area fill
+                    ("Profit", _BLUE, profits, False),     # Profit as line only
+                ],
             )
             self.revenue_chart_view.set_empty_text(
                 "Revenue & Profit Evolution (no data)"
             )
+
+        # Sales vs Purchases - Grouped Bar Chart
+        if isinstance(self.flow_chart_view, GroupedBarChart):
             self.flow_chart_view.set_data(
                 labels,
                 [("Sales", _BLUE, revenues),
@@ -953,21 +1321,6 @@ class AnalyticsTab(QWidget):
             self.flow_chart_view.set_empty_text(
                 "Sales vs Purchases (no data)"
             )
-            return
-
-        # Legacy QtCharts renderer (PYLI_QTCHARTS=1): rebuild pristine charts
-        # per render; in-place mutation of reused charts is avoided.
-        self._swap_revenue_chart()
-        self._replace_bar_categories(self._revenue_axis_x, labels)
-        self._reset_bar_set(self._revenue_set, revenues)
-        self._reset_bar_set(self._profit_set, profits)
-        max_rev = max([abs(v) for v in revenues + profits] + [1.0])
-        if math.isfinite(max_rev) and max_rev > 0:
-            self._revenue_axis_y.setRange(0, max_rev * 1.15)
-
-        self._swap_flow_chart()
-        self._replace_bar_categories(self._flow_axis_x, labels)
-        self._reset_bar_set(self._sales_set, revenues)
         self._reset_bar_set(self._purchases_set, purchases)
         max_flow = max([abs(v) for v in purchases] + [1.0])
         if math.isfinite(max_flow) and max_flow > 0:

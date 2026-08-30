@@ -4441,6 +4441,7 @@ class Database:
             ),
             stock AS (
                 SELECT p.id, p.name, p.username, COALESCE(p.stock_alert, 0) AS alert,
+                       p.unit_price, p.sale_price,
                        COALESCE(imp.quantity, 0) - COALESCE(sol.quantity, 0) AS qty
                 FROM products p
                 LEFT JOIN imported imp ON imp.product_id = p.id
@@ -4457,13 +4458,17 @@ class Database:
             SELECT
               COALESCE(SUM(CASE WHEN s.qty > 0
                   THEN s.qty * COALESCE(w.v / NULLIF(w.q, 0), 0) END), 0),
+              COALESCE(SUM(CASE WHEN s.qty > 0
+                  THEN s.qty * COALESCE(s.sale_price, 0) END), 0),
+              COALESCE(SUM(CASE WHEN s.qty > 0
+                  THEN s.qty * COALESCE(s.sale_price - s.unit_price, 0) END), 0),
               COUNT(*) FILTER (WHERE s.qty > 0
                   AND s.qty <= CASE WHEN s.alert > 0 THEN s.alert ELSE 5 END),
               COUNT(*) FILTER (WHERE s.qty <= 0)
             FROM stock s LEFT JOIN wac w ON w.product_id = s.id
             """
         )
-        stock_value_raw, low_stock_count, out_of_stock_count = self.cursor.fetchone()
+        stock_value_raw, total_stock_sale_value_raw, potential_stock_profit_raw, low_stock_count, out_of_stock_count = self.cursor.fetchone()
         self.cursor.execute(
             f"""
             WITH imported AS (
@@ -4536,6 +4541,8 @@ class Database:
             "payables_suppliers": int(payables_suppliers or 0),
             "top_creditors": top_creditors,
             "stock_value": str(stock_value_raw or 0),
+            "total_stock_sale_value": str(total_stock_sale_value_raw or 0),
+            "potential_stock_profit": str(potential_stock_profit_raw or 0),
             "low_stock_count": int(low_stock_count or 0),
             "out_of_stock_count": int(out_of_stock_count or 0),
             "low_stock_products": low_stock_products,
@@ -4557,6 +4564,7 @@ class Database:
                 'purchases_total', 'charges_total', 'charges_count', 'net_profit',
                 'net_margin_pct', 'receivables_total', 'receivables_clients',
                 'payables_total', 'payables_suppliers', 'stock_value',
+                'total_stock_sale_value', 'potential_stock_profit',
                 'low_stock_count', 'out_of_stock_count',
             )
             list_keys = (
@@ -4605,7 +4613,8 @@ class Database:
                 _strip(('payables_total', 'payables_suppliers', 'top_creditors'))
             if not self._user_can(user, 'Products'):
                 _strip((
-                    'stock_value', 'low_stock_count', 'out_of_stock_count',
+                    'stock_value', 'total_stock_sale_value', 'potential_stock_profit',
+                    'low_stock_count', 'out_of_stock_count',
                     'low_stock_products',
                 ))
         return snapshot

@@ -238,9 +238,10 @@ class ClientAccountBackendTests(unittest.TestCase):
         self.assertEqual(len(result["payments"]), 1)
         sale2 = result["sales"][1]
         self.assertEqual(sale2["devis"], "DE-2026-2")
-        self.assertEqual(sale2["total"], Decimal("38360.40"))
+        # New calculation without TVA: total = raw - remise = 132000 - 100033 = 31967
+        self.assertEqual(sale2["total"], Decimal("31967.00"))
         self.assertEqual(sale2["paid"], Decimal("10000.00"))
-        self.assertEqual(sale2["remaining"], Decimal("28360.40"))
+        self.assertEqual(sale2["remaining"], Decimal("21967.00"))
         self.assertEqual(result["payments"][0]["amount"], Decimal("10000.00"))
 
 
@@ -258,7 +259,7 @@ class ClientAccountDialogTests(unittest.TestCase):
         return dialog
 
     def test_single_sale_shows_total_and_remaining(self):
-        expected = calculate_operation_totals(100, 0, 20)["total_ttc"]
+        expected = calculate_operation_totals(100, 0)["total"]
         account = {
             "sales": [
                 _canonical_sale(1, total=expected, paid=Decimal("0"),

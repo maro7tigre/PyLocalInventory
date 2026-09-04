@@ -917,7 +917,7 @@ class DatabaseServer:
                     server_obj._write_sales_log(
                         f"received user={user.get('username')} sale_id={args[2] if len(args) > 2 else None} "
                         f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
-                        f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
+                        
                         f"items_array={isinstance(items, list)} items_received={len(items) if isinstance(items, list) else 'invalid'} "
                         f"items={items}"
                     )

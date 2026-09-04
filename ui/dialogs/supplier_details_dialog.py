@@ -464,11 +464,10 @@ class _SupplierReportWorker(QObject):
             (to_decimal(r.get("quantity") or 0) * to_decimal(r.get("unit_price") or 0))
             for r in rows
         )
-        vat_rate = to_decimal(first.get("vat") or 0)
-        totals = calculate_operation_totals(raw, Decimal("0"), vat_rate)
-        total_ttc = totals["total_ttc"]
-        paid = min(self._import_paid(rows), total_ttc)
-        remaining = max(total_ttc - paid, Decimal("0"))
+        totals = calculate_operation_totals(raw, Decimal("0"))
+        total = totals["total"]
+        paid = min(self._import_paid(rows), total)
+        remaining = max(total - paid, Decimal("0"))
 
         import_date = self._format_french_date(first.get("date") or "")
         bl_number = (self.bl_by_import or {}).get(import_id) or ""
@@ -512,15 +511,10 @@ class _SupplierReportWorker(QObject):
         items_html = "".join(item_rows)
         items_footer = "</tbody></table>"
 
-        vat_display = vat_rate.normalize()
-        vat_display = format(vat_display, "f") if vat_display == vat_display.to_integral() else str(vat_display)
-
         totals_html = (
             '<table class="totals-table">'
             f"<tr><th>Sous-total</th><td>{self._fmt_money(raw)} {currency}</td></tr>"
-            f"<tr><th>Total HT</th><td>{self._fmt_money(totals['total_ht'])} {currency}</td></tr>"
-            f"<tr><th>TVA ({vat_display}%)</th><td>{self._fmt_money(totals['vat_amount'])} {currency}</td></tr>"
-            f'<tr class="grand-total"><th>Total TTC</th><td>{self._fmt_money(total_ttc)} {currency}</td></tr>'
+            f'<tr class="grand-total"><th>Total</th><td>{self._fmt_money(total)} {currency}</td></tr>'
             f'<tr class="paid"><th>Total payé</th><td>{self._fmt_money(paid)} {currency}</td></tr>'
             f'<tr class="due"><th>Reste à payer</th><td>{self._fmt_money(remaining)} {currency}</td></tr>'
             "</table>"
@@ -533,7 +527,7 @@ class _SupplierReportWorker(QObject):
             if self._payment_belongs_to(pay, import_id)
         ]
         import_payments.sort(key=self._payment_sort_key)
-        balance = total_ttc
+        balance = total
         payment_rows_html = []
         for pay in import_payments:
             amount = to_decimal(pay.get("amount") or 0)
@@ -547,8 +541,8 @@ class _SupplierReportWorker(QObject):
             (to_decimal(pay.get("amount") or 0) for pay in import_payments),
             Decimal("0"),
         )
-        payments_paid = min(payments_paid, total_ttc)
-        payments_remaining = max(total_ttc - payments_paid, Decimal("0"))
+        payments_paid = min(payments_paid, total)
+        payments_remaining = max(total - payments_paid, Decimal("0"))
 
         if payment_rows_html:
             payments_html = (
@@ -578,7 +572,7 @@ class _SupplierReportWorker(QObject):
             "</section></div>"
         )
 
-        self.import_ttc_by_id[import_id] = total_ttc
+        self.import_ttc_by_id[import_id] = total
         self.import_paid_by_id[import_id] = paid
         return header + items_html + items_footer + bottom + "</div>"
 

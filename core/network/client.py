@@ -257,7 +257,7 @@ class RemoteDatabase:
             self._write_network_log(
                 f"request_url={url} method={method} sale_id={safe_args[2] if len(safe_args) > 2 else None} "
                 f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
-                f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
+                
                 f"items_sent={len(items)} items={items}"
             )
         req = urllib.request.Request(

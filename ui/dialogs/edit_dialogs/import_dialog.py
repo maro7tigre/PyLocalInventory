@@ -293,25 +293,11 @@ class ImportEditDialog(QDialog):
         ParameterWidgetFactory.set_widget_value(subtotal_widget, 0.0)
         self.subtotal_widget = subtotal_widget
         
-        # VAT Amount  
-        vat_widget = ParameterWidgetFactory.create_widget(
-            {
-                'type': 'float',
-                'display_name': {'en': 'VAT Amount'},
-                'unit': 'MAD'
-            },
-            {},
-            None,
-            editable=False
-        )
-        ParameterWidgetFactory.set_widget_value(vat_widget, 0.0)
-        self.vat_widget = vat_widget
-        
         # Total
         total_widget = ParameterWidgetFactory.create_widget(
             {
                 'type': 'float',
-                'display_name': {'en': 'Total Price'},
+                'display_name': {'en': 'Total'},
                 'unit': 'MAD'
             },
             {},
@@ -324,8 +310,6 @@ class ImportEditDialog(QDialog):
         # Add labels and widgets to horizontal layout
         parent_layout.addWidget(QLabel("Subtotal:"))
         parent_layout.addWidget(subtotal_widget)
-        parent_layout.addWidget(QLabel("VAT:"))
-        parent_layout.addWidget(vat_widget)
         parent_layout.addWidget(QLabel("Total:"))
         parent_layout.addWidget(total_widget)
         parent_layout.addStretch()  # Push everything to the left
@@ -348,29 +332,18 @@ class ImportEditDialog(QDialog):
             # Calculate subtotal (sum of Decimal line totals)
             subtotal = sum(item.get_value('subtotal') or 0 for item in items)
 
-            # Get VAT percentage from the tva parameter widget
-            vat_percent = 0
-            if 'tva' in self.parameter_widgets:
-                try:
-                    vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
-                except Exception:
-                    vat_percent = 0
-
             # All money math runs through the shared Decimal utility so a
             # Decimal subtotal is never multiplied by a raw float.
-            totals = calculate_operation_totals(subtotal, 0, vat_percent)
+            totals = calculate_operation_totals(subtotal, 0)
 
             # Update widgets
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             if hasattr(self, 'subtotal_widget'):
                 ParameterWidgetFactory.set_widget_value(
                     self.subtotal_widget, totals['original_subtotal'])
-            if hasattr(self, 'vat_widget'):
-                ParameterWidgetFactory.set_widget_value(
-                    self.vat_widget, totals['vat_amount'])
             if hasattr(self, 'total_widget'):
                 ParameterWidgetFactory.set_widget_value(
-                    self.total_widget, totals['total_ttc'])
+                    self.total_widget, totals['total'])
 
         except Exception as e:
             print(f"Error updating totals: {e}")

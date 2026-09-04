@@ -42,7 +42,7 @@ class SaleEditDialog(QDialog):
             'client_username': {
                 'autocomplete': True
             },
-            # TVA now a checkbox -> no numeric constraints needed
+            # No TVA - totals: Subtotal - Remise = Total
         }
         
         # Initialize QDialog directly, not BaseEditDialog to avoid layout conflicts
@@ -124,15 +124,6 @@ class SaleEditDialog(QDialog):
             )
             
             self.parameter_widgets[param_key] = widget
-            
-            # Connect TVA widget to update totals when value changes
-            if param_key == 'tva':
-                # Support both legacy numeric and new checkbox widget.
-                # Use lambda to ignore the emitted value/state argument so our slot signature matches.
-                if hasattr(widget, 'spinbox'):
-                    widget.spinbox.valueChanged.connect(lambda _val: self.update_totals())
-                if hasattr(widget, 'checkbox'):
-                    widget.checkbox.stateChanged.connect(lambda _state: self.update_totals())
             
             # Get display name
             display_name = self.sale_obj.get_display_name(param_key)
@@ -285,25 +276,25 @@ class SaleEditDialog(QDialog):
         ParameterWidgetFactory.set_widget_value(subtotal_widget, 0.0)
         self.subtotal_widget = subtotal_widget
         
-        # VAT Amount  
-        vat_widget = ParameterWidgetFactory.create_widget(
+        # Remise
+        remise_widget = ParameterWidgetFactory.create_widget(
             {
                 'type': 'float',
-                'display_name': {'en': 'VAT Amount'},
+                'display_name': {'en': 'Remise'},
                 'unit': 'MAD'
             },
             {},
             None,
             editable=False
         )
-        ParameterWidgetFactory.set_widget_value(vat_widget, 0.0)
-        self.vat_widget = vat_widget
+        ParameterWidgetFactory.set_widget_value(remise_widget, 0.0)
+        self.remise_widget = remise_widget
         
         # Total
         total_widget = ParameterWidgetFactory.create_widget(
             {
                 'type': 'float',
-                'display_name': {'en': 'Total Price'},
+                'display_name': {'en': 'Total'},
                 'unit': 'MAD'
             },
             {},
@@ -316,8 +307,8 @@ class SaleEditDialog(QDialog):
         # Add labels and widgets to horizontal layout
         parent_layout.addWidget(QLabel("Subtotal:"))
         parent_layout.addWidget(subtotal_widget)
-        parent_layout.addWidget(QLabel("VAT:"))
-        parent_layout.addWidget(vat_widget)
+        parent_layout.addWidget(QLabel("Remise:"))
+        parent_layout.addWidget(remise_widget)
         parent_layout.addWidget(QLabel("Total:"))
         parent_layout.addWidget(total_widget)
         parent_layout.addStretch()  # Push everything to the left
@@ -339,25 +330,25 @@ class SaleEditDialog(QDialog):
             # Calculate subtotal (Decimal line totals through the shared helper)
             subtotal = sum(to_decimal(item.get_value('subtotal') or 0) for item in items)
             
-            # Get VAT percentage from the tva parameter widget
-            vat_percent = Decimal("0")
-            if 'tva' in self.parameter_widgets:
+            # Get remise from the remise parameter widget
+            remise = Decimal("0")
+            if 'remise' in self.parameter_widgets:
                 try:
-                    vat_percent = Decimal(str(self.get_widget_value(self.parameter_widgets['tva']) or 0))
+                    remise = Decimal(str(self.get_widget_value(self.parameter_widgets['remise']) or 0))
                 except (InvalidOperation, ValueError, TypeError):
-                    vat_percent = Decimal("0")
+                    remise = Decimal("0")
             
-            # Centralized Decimal math: TVA = Subtotal * rate, Total = Subtotal + TVA.
-            totals = calculate_operation_totals(subtotal, 0, vat_percent)
+            # Centralized Decimal math: Total = Subtotal - Remise.
+            totals = calculate_operation_totals(subtotal, remise)
             
             # Update widgets
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             if hasattr(self, 'subtotal_widget'):
                 ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
-            if hasattr(self, 'vat_widget'):
-                ParameterWidgetFactory.set_widget_value(self.vat_widget, totals['vat_amount'])
+            if hasattr(self, 'remise_widget'):
+                ParameterWidgetFactory.set_widget_value(self.remise_widget, totals['remise'])
             if hasattr(self, 'total_widget'):
-                ParameterWidgetFactory.set_widget_value(self.total_widget, totals['total_ttc'])
+                ParameterWidgetFactory.set_widget_value(self.total_widget, totals['total'])
                 
         except Exception as e:
             print(f"Error updating totals: {e}")

@@ -7,7 +7,7 @@ from classes.sales_item_class import SalesItemClass
 from core.calculations import to_decimal, calculate_operation_totals
 
 
-def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
+def calculate_sale_totals(raw_subtotal, remise=0):
     """Centralized monetary calculation for sales.
 
     Parameters
@@ -16,15 +16,13 @@ def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
         Sum of all Sale Item line totals (before any discount).
     remise : Decimal|int|float|str|None
         Discount amount.
-    tva_rate : Decimal|int|float|str|None
-        VAT percentage, e.g. 20 for 20 %.
 
     Returns
     -------
-    dict with keys: original_subtotal, remise, total_ht, vat_amount, total_ttc
+    dict with keys: original_subtotal, remise, total
     All values are Decimal rounded to 2 decimal places.
     """
-    return calculate_operation_totals(raw_subtotal, remise, tva_rate)
+    return calculate_operation_totals(raw_subtotal, remise)
 
 
 class SalesClass(BaseClass):
@@ -115,17 +113,6 @@ class SalesClass(BaseClass):
                 "options": [],
                 "type": "date"  # NEW: Using date type instead of string
             },
-            # TVA now handled as a simple checkbox: unchecked = 0%, checked = 20%
-            # Keeps database storage numeric (0 or 20) while UX is a single toggle
-            "tva": {
-                "value": 20.0,  # default active (was previously conceptually 20)
-                "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
-                "required": False,
-                "default": 20.0,
-                "type": "bool",  # custom widget mapped to numeric percent
-                "true_value": 20.0,
-                "false_value": 0.0
-            },
             "remise": {
                 "value": 0.0,
                 "display_name": {"en": "Remise", "fr": "Remise", "es": "Descuento"},
@@ -177,28 +164,11 @@ class SalesClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_subtotal
             },
-            "total_tva": {
-                "display_name": {"en": "VAT Amount", "fr": "Montant TVA", "es": "Monto IVA"},
+            "total": {
+                "display_name": {"en": "Total", "fr": "Total", "es": "Total"},
                 "required": False,
                 "type": "float",
-                "method": self.calculate_total_tva
-            },
-            # Discounted Total HT (Original Subtotal - Remise) shown in the
-            # Sales table "Total HT" column. Values are authoritative from the
-            # summary query when present, otherwise recomputed centrally.
-            "total_ht": {
-                "display_name": {"en": "Total HT", "fr": "Total HT", "es": "Total HT"},
-                "required": False,
-                "type": "float",
-                "method": self.calculate_total_ht
-            },
-            # Final Total TTC (Total HT + VAT on Total HT) shown in the
-            # Sales table "Total TTC" column.
-            "total_ttc": {
-                "display_name": {"en": "Total TTC", "fr": "Total TTC", "es": "Total TTC"},
-                "required": False,
-                "type": "float",
-                "method": self.calculate_total_ttc
+                "method": self.calculate_total_price
             },
             "total_quantity": {
                 "value": 0,
@@ -232,14 +202,13 @@ class SalesClass(BaseClass):
                 "client_name": "r",
                 "notes": "r",
                 "date": "r",
-                "total_ht": "r",
-                "total_ttc": "r"
+                "total": "r"
             },
             "dialog": {
                 "client_username": "rw",
                 "date": "rw",
                 "devis": "rw",
-                "tva": "rw",
+                "remise": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
@@ -251,7 +220,6 @@ class SalesClass(BaseClass):
                 "client_name": "rw",  # snapshot
                 "date": "rw",
                 "devis": "rw",
-                "tva": "rw",
                 "remise": "rw",
                 "notes": "rw",
                 "created_by": "r",
@@ -271,11 +239,9 @@ class SalesClass(BaseClass):
                 "is_historical": "r",
                 "client_id": "r",
                 "date": "r",
-                "tva": "r",
                 "remise": "r",
                 "subtotal": "r",
-                "total_tva": "r",
-                "total_price": "r",
+                "total": "r",
                 "items": "r"
             }
         }
@@ -312,17 +278,12 @@ class SalesClass(BaseClass):
         return sum(to_decimal(item.get_value('subtotal')) for item in items)
 
     def calculate_subtotal(self):
-        """Discounted Total HT (Original Subtotal - Remise).
-
-        Kept for internal/report compatibility. The visible Sales table column
-        is now "Total HT" via ``total_ht`` (see ``calculate_total_ht``).
-        """
+        """Total after discount (Original Subtotal - Remise)."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
         )
-        return float(totals['total_ht'])
+        return float(totals['total'])
 
     def get_sale_information(self):
         """Summarize item information values for display in the sales table."""
@@ -339,41 +300,31 @@ class SalesClass(BaseClass):
             print(f"Error getting sale information for sales {self.id}: {e}")
             return ""
 
-    def calculate_total_tva(self):
-        """Calculate total VAT amount (centralized)."""
-        totals = calculate_sale_totals(
-            self._raw_subtotal(),
-            self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
-        )
-        return float(totals['vat_amount'])
+    pass  # TVA removed - no VAT calculation
 
     def calculate_total_price(self):
-        """Calculate total price including VAT (centralized)."""
+        """Calculate total price (centralized, no VAT)."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
         )
-        return float(totals['total_ttc'])
+        return float(totals['total'])
     
     def calculate_total_ht(self):
-        """Discounted Total HT: Original Subtotal - Remise."""
+        """Total after discount: Original Subtotal - Remise."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
         )
-        return float(totals['total_ht'])
+        return float(totals['total'])
 
     def calculate_total_ttc(self):
-        """Final Total TTC: Total HT + VAT computed on Total HT."""
+        """Final Total: same as total_ht (no VAT)."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
             self.get_value('remise') or 0,
-            self.get_value('tva') or 0,
         )
-        return float(totals['total_ttc'])
+        return float(totals['total'])
 
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this sales operation"""

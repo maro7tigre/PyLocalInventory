@@ -468,11 +468,10 @@ class _ClientReportWorker(QObject):
             for r in rows
         )
         remise = to_decimal(first.get("remise") or 0)
-        vat_rate = to_decimal(first.get("vat") or 0)
-        totals = calculate_operation_totals(raw, remise, vat_rate)
-        total_ttc = totals["total_ttc"]
-        paid = min(self._sale_paid(rows), total_ttc)
-        remaining = max(total_ttc - paid, Decimal("0"))
+        totals = calculate_operation_totals(raw, remise)
+        total = totals["total"]
+        paid = min(self._sale_paid(rows), total)
+        remaining = max(total - paid, Decimal("0"))
 
         sale_date = self._format_french_date(first.get("date") or "")
         devis = (self.devis_by_sale or {}).get(sale_id) or ""
@@ -512,16 +511,11 @@ class _ClientReportWorker(QObject):
         items_html = "".join(item_rows)
         items_footer = "</tbody></table>"
 
-        vat_display = vat_rate.normalize()
-        vat_display = format(vat_display, "f") if vat_display == vat_display.to_integral() else str(vat_display)
-
         totals_html = (
             '<table class="totals-table">'
             f"<tr><th>Sous-total</th><td>{self._fmt_money(raw)} {currency}</td></tr>"
             f"<tr><th>Remise</th><td>{self._fmt_money(totals['remise'])} {currency}</td></tr>"
-            f"<tr><th>Total HT</th><td>{self._fmt_money(totals['total_ht'])} {currency}</td></tr>"
-            f"<tr><th>TVA ({vat_display}%)</th><td>{self._fmt_money(totals['vat_amount'])} {currency}</td></tr>"
-            f'<tr class="grand-total"><th>Total TTC</th><td>{self._fmt_money(total_ttc)} {currency}</td></tr>'
+            f'<tr class="grand-total"><th>Total</th><td>{self._fmt_money(total)} {currency}</td></tr>'
             f'<tr class="paid"><th>Total payé</th><td>{self._fmt_money(paid)} {currency}</td></tr>'
             f'<tr class="due"><th>Reste à payer</th><td>{self._fmt_money(remaining)} {currency}</td></tr>'
             "</table>"
@@ -534,7 +528,7 @@ class _ClientReportWorker(QObject):
             if self._payment_belongs_to(pay, sale_id)
         ]
         sale_payments.sort(key=self._payment_sort_key)
-        balance = total_ttc
+        balance = total
         payment_rows_html = []
         for pay in sale_payments:
             amount = to_decimal(pay.get("amount") or 0)
@@ -548,8 +542,8 @@ class _ClientReportWorker(QObject):
             (to_decimal(pay.get("amount") or 0) for pay in sale_payments),
             Decimal("0"),
         )
-        payments_paid = min(payments_paid, total_ttc)
-        payments_remaining = max(total_ttc - payments_paid, Decimal("0"))
+        payments_paid = min(payments_paid, total)
+        payments_remaining = max(total - payments_paid, Decimal("0"))
 
         if payment_rows_html:
             payments_html = (
@@ -579,7 +573,7 @@ class _ClientReportWorker(QObject):
             "</section></div>"
         )
 
-        self.sale_ttc_by_id[sale_id] = total_ttc
+        self.sale_ttc_by_id[sale_id] = total
         self.sale_paid_by_id[sale_id] = paid
         return header + items_html + items_footer + bottom + "</div>"
 
@@ -719,6 +713,7 @@ class ClientDetailsDialog(QDialog):
         self._payment_edit_thread = None
         self._payment_edit_worker = None
         self._payment_edit_inflight = False
+        self._payment_delete_inflight = False
         self.refresh_data()
 
     def _ensure_payments_table(self):
@@ -925,6 +920,14 @@ class ClientDetailsDialog(QDialog):
         self.edit_payment_btn.setEnabled(False)
         self.edit_payment_btn.clicked.connect(self._edit_selected_payment)
         payments_header_layout.addWidget(self.edit_payment_btn)
+        self.delete_payment_btn = QPushButton("Delete Payment")
+        self.delete_payment_btn.setObjectName("dangerBtn")
+        self.delete_payment_btn.setToolTip(
+            "Delete the selected payment permanently"
+        )
+        self.delete_payment_btn.setEnabled(False)
+        self.delete_payment_btn.clicked.connect(self._delete_selected_payment)
+        payments_header_layout.addWidget(self.delete_payment_btn)
         payments_header_layout.addWidget(self.payments_count_label)
         payments_layout.addWidget(payments_header)
 
@@ -1229,7 +1232,15 @@ class ClientDetailsDialog(QDialog):
         total_bought = sum(
             (sale["total"] for sale in self.sales), Decimal("0")
         )
-        total_paid = sum((sale["paid"] for sale in self.sales), Decimal("0"))
+        # Sum payments specific to each sale
+        total_paid_from_sales = sum((sale["paid"] for sale in self.sales), Decimal("0"))
+        # Add general client payments (sale_id is None)
+        general_paid = sum(
+            (to_decimal(pay.get("amount") or 0) for pay in self.payments
+             if pay.get("sale_id") is None),
+            Decimal("0"),
+        )
+        total_paid = total_paid_from_sales + general_paid
         remaining = max(total_bought - total_paid, 0)
 
         self.total_bought_label.setText(f"{_format_money(total_bought)} {self.currency}")
@@ -1373,11 +1384,16 @@ class ClientDetailsDialog(QDialog):
         self.payments_table.setRowCount(len(rows))
         for row_index, payment in enumerate(rows):
             sale_id = payment["sale_id"]
-            devis = self.devis_by_sale.get(sale_id) or "-"
-            devis_display = f"Devis N° {devis}" if devis != "-" else "-"
+            if sale_id is not None:
+                devis = self.devis_by_sale.get(sale_id) or "-"
+                devis_display = f"Devis N° {devis}" if devis != "-" else "-"
+                sale_display = f"#{sale_id}"
+            else:
+                devis_display = "General"
+                sale_display = "-"
             values = [
                 f"#{payment['payment_id']}",
-                f"#{sale_id}",
+                sale_display,
                 self._format_date(payment["date"]),
                 _format_money(payment["amount"]),
                 devis_display,
@@ -1406,10 +1422,11 @@ class ClientDetailsDialog(QDialog):
     def _payment_selected(self, current_row, _current_col, _previous_row, _previous_col):
         if not getattr(self, "can_record_payment", False):
             self.edit_payment_btn.setEnabled(False)
+            self.delete_payment_btn.setEnabled(False)
             return
-        self.edit_payment_btn.setEnabled(
-            current_row >= 0 and current_row < len(self.payments)
-        )
+        enabled = current_row >= 0 and current_row < len(self.payments)
+        self.edit_payment_btn.setEnabled(enabled)
+        self.delete_payment_btn.setEnabled(enabled)
 
     def _purchase_selected(self, current_row, _current_col, _previous_row, _previous_col):
         self._update_print_selected_enabled()
@@ -1419,8 +1436,11 @@ class ClientDetailsDialog(QDialog):
             self.selected_remaining_label.setText("Remaining: —")
             self._apply_selected_bar_style(Decimal("0"), has_selection=False)
             self.amount_input.clear()
-            self.amount_input.setEnabled(False)
-            self.add_payment_button.setEnabled(False)
+            self.amount_input.setEnabled(True)
+            self.amount_input.setPlaceholderText(
+                f"Enter amount for general payment {self.currency}"
+            )
+            self.add_payment_button.setEnabled(True)
             return
 
         sale = self.sales[current_row]
@@ -1582,15 +1602,8 @@ class ClientDetailsDialog(QDialog):
             )
             return
         selected_row = self.purchases_table.currentRow()
-        if selected_row < 0 or selected_row >= len(self.sales):
-            QMessageBox.information(
-                self,
-                "Select Sale",
-                "Select the sale that this payment is for.",
-            )
-            return
-
-        sale = self.sales[selected_row]
+        has_sale_selection = selected_row >= 0 and selected_row < len(self.sales)
+        
         amount_text = self.amount_input.text()
         from core.calculations import parse_decimal_input, InputState
         state, amount_dec = parse_decimal_input(amount_text)
@@ -1604,25 +1617,41 @@ class ClientDetailsDialog(QDialog):
             return
 
         amount = float(amount_dec)
-        outstanding = sale["remaining"]
-        if outstanding <= 0:
-            QMessageBox.information(
-                self, "Sale Paid", "This sale is already fully paid."
-            )
-            return
-        if amount_dec <= 0 or amount_dec > outstanding + Decimal("0.001"):
-            QMessageBox.warning(
-                self,
-                "Invalid Amount",
-                f"Enter an amount between 0.01 and {_format_money(outstanding)} {self.currency}.",
-            )
-            return
+        
+        if has_sale_selection:
+            sale = self.sales[selected_row]
+            outstanding = sale["remaining"]
+            if outstanding <= 0:
+                QMessageBox.information(
+                    self, "Sale Paid", "This sale is already fully paid."
+                )
+                return
+            if amount_dec <= 0 or amount_dec > outstanding + Decimal("0.001"):
+                QMessageBox.warning(
+                    self,
+                    "Invalid Amount",
+                    f"Enter an amount between 0.01 and {_format_money(outstanding)} {self.currency}.",
+                )
+                return
+            sale_id = sale["sale_id"]
+            devis_text = f"sale #{sale_id} (Devis {sale['devis'] or '-'})"
+        else:
+            # General/client-level payment - no sale selected
+            if amount_dec <= 0:
+                QMessageBox.warning(
+                    self,
+                    "Invalid Amount",
+                    f"Enter an amount greater than 0.",
+                )
+                return
+            sale_id = None
+            devis_text = "general client payment"
 
         date = self.date_input.date().toString("dd-MM-yyyy")
         try:
             self.database.add_client_payment(
                 self.client_obj.id,
-                sale["sale_id"],
+                sale_id,
                 None,
                 amount,
                 date,
@@ -1635,7 +1664,7 @@ class ClientDetailsDialog(QDialog):
             self,
             "Payment Saved",
             f"Payment of {_format_money(amount)} {self.currency} was recorded for "
-            f"sale #{sale['sale_id']} (Devis {sale['devis'] or '-'}).",
+            f"{devis_text}.",
         )
         self.refresh_data()
 
@@ -1750,3 +1779,130 @@ class ClientDetailsDialog(QDialog):
             self.refresh_data()
         except RuntimeError:
             pass
+
+    def _delete_selected_payment(self):
+        if not self.can_record_payment:
+            QMessageBox.information(
+                self, "Read-Only Access", "You don't have permission to delete payments."
+            )
+            return
+        if self._payment_delete_inflight:
+            return  # a delete is already being saved
+        if self._payment_edit_inflight:
+            return  # an edit is already being saved
+        payment = self._selected_payment()
+        if not payment:
+            QMessageBox.information(
+                self, "Delete Payment", "Please select a payment to delete."
+            )
+            return
+
+        sale = next(
+            (s for s in self.sales if s["sale_id"] == payment["sale_id"]), None
+        )
+        if sale is None:
+            QMessageBox.warning(
+                self, "Delete Payment", "The sale of this payment could not be resolved."
+            )
+            return
+
+        devis = sale.get("devis") or "-"
+        if not self._confirm_payment_delete(payment, devis):
+            return
+        self._start_payment_delete(payment["payment_id"])
+
+    def _confirm_payment_delete(self, payment, devis):
+        """Modal confirmation before a payment is permanently deleted."""
+        box = QMessageBox(self)
+        box.setIcon(QMessageBox.Warning)
+        box.setWindowTitle("Delete Payment")
+        box.setText(
+            f"Are you sure you want to delete Payment #{payment['payment_id']}\n"
+            f"Amount: {_format_money(payment['amount'])} {self.currency}\n"
+            f"Sale: #{payment['sale_id']}\n"
+            f"Devis: {devis}\n\n"
+            "This action will remove this payment permanently."
+        )
+        delete_btn = box.addButton("Delete", QMessageBox.DestructiveRole)
+        box.addButton("Cancel", QMessageBox.RejectRole)
+        box.exec()
+        return box.clickedButton() is delete_btn
+
+    def _start_payment_delete(self, payment_id):
+        self._payment_delete_inflight = True
+        self.edit_payment_btn.setEnabled(False)
+        self.delete_payment_btn.setEnabled(False)
+        self.delete_payment_btn.setText("Deleting...")
+        self.add_payment_button.setEnabled(False)
+
+        thread = QThread()
+        worker = _PaymentDeleteWorker(self.database, payment_id)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+
+        worker.finished.connect(thread.quit)
+        worker.finished.connect(worker.deleteLater)
+        worker.error.connect(thread.quit)
+        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_payment_delete_thread_finished)
+
+        worker.finished.connect(self._on_payment_delete_finished)
+        worker.error.connect(self._on_payment_delete_failed)
+
+        self._payment_delete_thread = thread
+        self._payment_delete_worker = worker
+        thread.start()
+
+    def _on_payment_delete_thread_finished(self):
+        self._payment_delete_thread = None
+        self._payment_delete_worker = None
+
+    @Slot(object)
+    def _on_payment_delete_finished(self, _payload):
+        self._payment_delete_inflight = False
+        self.delete_payment_btn.setText("Delete Payment")
+        try:
+            QMessageBox.information(
+                self, "Payment Deleted", "The payment was deleted."
+            )
+            self.refresh_data()
+        except RuntimeError:
+            pass
+
+    @Slot(str)
+    def _on_payment_delete_failed(self, error):
+        self._payment_delete_inflight = False
+        self.delete_payment_btn.setText("Delete Payment")
+        try:
+            QMessageBox.critical(
+                self, "Delete Payment", f"Could not delete the payment:\n{error}"
+            )
+            self.refresh_data()
+        except RuntimeError:
+            pass
+
+
+class _PaymentDeleteWorker(QObject):
+    """Deletes one payment off the GUI thread."""
+
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, database, payment_id):
+        super().__init__()
+        self.database = database
+        self.payment_id = payment_id
+
+    @Slot()
+    def run(self):
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+            self.database.delete_client_payment(self.payment_id)
+            self.finished.emit({"payment_id": self.payment_id})
+        except Exception as e:
+            logger.exception(
+                "Payment delete failed: payment_id=%s", self.payment_id,
+            )
+            self.error.emit(str(e))

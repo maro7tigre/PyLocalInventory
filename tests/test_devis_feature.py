@@ -222,7 +222,7 @@ class SalesClassDevisParameterTests(unittest.TestCase):
         self.assertEqual(
             list(obj.available_parameters["table"].keys()),
             ["id", "devis", "state", "client_name", "notes", "date",
-             "total_ht", "total_ttc"],
+             "total"],
         )
 
     def test_devis_is_not_calculated(self):

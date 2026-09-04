@@ -643,6 +643,8 @@ class AnalyticsTab(QWidget):
         self._loaded_once = False
         self._needs_refresh = True
         self._last_refresh_at = 0.0
+        self._purchases_set = None
+        self._flow_axis_y = None
 
         self._build_ui()
 
@@ -1321,9 +1323,11 @@ class AnalyticsTab(QWidget):
             self.flow_chart_view.set_empty_text(
                 "Sales vs Purchases (no data)"
             )
-        self._reset_bar_set(self._purchases_set, purchases)
+        # Update purchases bar set only if captured
+        if self._purchases_set is not None:
+            self._reset_bar_set(self._purchases_set, purchases)
         max_flow = max([abs(v) for v in purchases] + [1.0])
-        if math.isfinite(max_flow) and max_flow > 0:
+        if math.isfinite(max_flow) and max_flow > 0 and self._flow_axis_y is not None:
             self._flow_axis_y.setRange(0, max_flow * 1.15)
 
     @staticmethod

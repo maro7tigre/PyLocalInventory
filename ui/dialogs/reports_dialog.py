@@ -661,36 +661,7 @@ class ReportsDialog(QDialog):
                     total_ht += _decimal(subtotal)
                     quantity_text = _fmt_quantity(quantity)
                     
-                    if report_type == 'bdl':
-                        info_tokens = {
-                            part.strip().casefold()
-                            for part in str(item_information or '').replace('\n', ',').replace(';', ',').split(',')
-                            if part.strip()
-                        }
-                        matched_services = [
-                            service for service in report_services
-                            if product_token in service['aliases']
-                            or bool(info_tokens.intersection(service['aliases']))
-                        ]
-
-                        # A delivery note contains services only. Product-only
-                        # sale rows stay stored and remain visible in Devis.
-                        if not matched_services:
-                            continue
-
-                        service_codes = " / ".join(html.escape(str(service['id'])) for service in matched_services)
-                        designation_html = " / ".join(
-                            f'<strong class="item-name">{html.escape(str(service["name"]))}</strong>'
-                            for service in matched_services
-                        )
-                        if item_information:
-                            designation_html += f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
-                        row_html = (
-                            f"<tr><td>{service_codes}</td>"
-                            f"<td>{designation_html}</td>"
-                            f"<td>{quantity_text}</td></tr>"
-                        )
-                    elif report_type == 'devis':
+                    if report_type in ('bdl', 'devis'):
                         product_code = html.escape(str(product_id)) if product_id else "-"
                         escaped_name = html.escape(str(product_name))
                         designation_html = (
@@ -731,12 +702,12 @@ class ReportsDialog(QDialog):
                     items_html += row_html + "\n"
                     rendered_rows += 1
                 if report_type == 'bdl' and not items_html.strip():
-                    items_html = '<tr class="empty-row"><td colspan="3">Aucun service</td></tr>'
+                    items_html = '<tr class="empty-row"><td colspan="5">Aucun article</td></tr>'
                 # Do not add visual filler rows; they stretch the printable report table.
                 try:
                     current_rows = len(self.sales_obj.items)
                     filler_needed = 0
-                    filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
+                    filler_cols = 5 if report_type in ('devis', 'bdl') else 4
                     filler_row = (
                         '<tr class="filler">'
                         + '<td style="text-align: left">&nbsp;</td>'
@@ -749,19 +720,21 @@ class ReportsDialog(QDialog):
             else:
                 print("DEBUG: No sales items found")
                 filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
-                empty_label = 'Aucun service' if report_type == 'bdl' else 'Aucun article'
+                empty_label = 'Aucun article'
                 items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
-                total_ht = 0
+                total_ht = _decimal(self.sales_obj.get_value("total_ht") or self.sales_obj.get_value("total") or self.sales_obj.get_value("subtotal") or Decimal("0"))
             
-            # Calculate financial totals for devis using centralized function
+            # Calculate financial totals using centralized function
             total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
-            tva_percent = self.sales_obj.get_value('tva') or 0
 
             from classes.sales_class import calculate_sale_totals
-            totals = calculate_sale_totals(total_ht, total_remise, tva_percent)
-            net_ht = totals['total_ht']
-            tva_amount = totals['vat_amount']
-            total_ttc = totals['total_ttc']
+            totals = calculate_sale_totals(total_ht, total_remise)
+            # calculate_operation_totals returns: original_subtotal, remise, total
+            # TVA is removed; total = original_subtotal - remise
+            original_subtotal = totals['original_subtotal']
+            total_after_discount = totals['total']
+            tva_amount = Decimal("0")
+            total_ttc = total_after_discount
             total_regle = Decimal("0")
             net_a_payer = total_ttc
             
@@ -794,12 +767,12 @@ class ReportsDialog(QDialog):
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
                 'table_frame_class': 'fill-page' if rendered_rows <= 8 else '',
-                # Financial fields for devis / facture
+                # Financial fields for devis / facture / bdl
                 'total_remise': _fmt_fr(total_remise),
-                'total_ht': _fmt_fr(net_ht),
+                'total': _fmt_fr(total_after_discount),
+                'total_ht': _fmt_fr(original_subtotal),
                 'total_regle': _fmt_fr(total_regle),
                 'net_a_payer': _fmt_fr(net_a_payer),
-                # BDL specific pricing fields
                 'tva': _fmt_fr(tva_amount),
                 'total_ttc': _fmt_fr(total_ttc),
                 # Logo block

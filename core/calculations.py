@@ -1,7 +1,7 @@
 """Authoritative monetary and quantity calculation helpers.
 
-Every quantity/price that flows into a line subtotal, Remise, Total HT, TVA,
-or Total TTC is normalized through :func:`to_decimal` first, so a value may
+Every quantity/price that flows into a line subtotal, Remise, Total
+is normalized through :func:`to_decimal` first, so a value may
 arrive as a ``Decimal``, ``int``, ``float``, numeric ``str`` (including a
 comma decimal separator and thousands separators), empty string, or ``None``
 and still be combined without ever performing ``Decimal`` arithmetic with a
@@ -32,7 +32,6 @@ class InputState(Enum):
     INVALID = "INVALID"
 
 _PENNY = Decimal("0.01")
-_HUNDRED = Decimal("100")
 
 
 def to_decimal(value):
@@ -128,40 +127,31 @@ def calculate_line_subtotal(quantity, unit_price):
         raise
 
 
-def calculate_operation_totals(raw_subtotal, remise=0, tva_rate=0):
-    """Subtotal / Remise / Total HT / VAT / Total TTC for an operation.
+def calculate_operation_totals(raw_subtotal, remise=0):
+    """Subtotal / Remise / Total for an operation (no VAT).
 
-    Formulas (unchanged from the original implementation):
-
+    Formulas:
         original_subtotal = sum(quantity * unit_price)
-        total_ht          = original_subtotal - remise
-        vat_amount        = total_ht * tva_rate / 100
-        total_ttc         = total_ht + vat_amount
+        total             = original_subtotal - remise
 
     Final monetary values are quantized to two decimal places with
     ``ROUND_HALF_UP``. All values returned are ``Decimal``.
     """
     original = round_money(raw_subtotal)
     discount = round_money(remise)
-    rate = to_decimal(tva_rate)
     try:
-        total_ht = round_money(original - discount)
-        vat_amount = round_money(total_ht * rate / _HUNDRED)
-        total_ttc = round_money(total_ht + vat_amount)
+        total = round_money(original - discount)
     except Exception as error:
         logger.error(
             "Operation totals failed raw_subtotal=%r type=%s remise=%r "
-            "type=%s tva_rate=%r type=%s error=%s",
+            "type=%s error=%s",
             raw_subtotal, type(raw_subtotal).__name__,
-            remise, type(remise).__name__,
-            tva_rate, type(tva_rate).__name__, error,
+            remise, type(remise).__name__, error,
         )
         traceback.print_exc()
         raise
     return {
         "original_subtotal": original,
         "remise": discount,
-        "total_ht": total_ht,
-        "vat_amount": vat_amount,
-        "total_ttc": total_ttc,
+        "total": total,
     }

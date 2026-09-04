@@ -99,49 +99,39 @@ class LineSubtotalTests(unittest.TestCase):
 
 
 class OperationTotalsTests(unittest.TestCase):
-    """calculate_operation_totals formulas and 2-dp ROUND_HALF_UP policy."""
+    """calculate_operation_totals formulas and 2-dp ROUND_HALF_UP policy (no VAT)."""
 
     def test_full_chain(self):
-        totals = calculate_operation_totals(1000, 100, 20)
+        totals = calculate_operation_totals(1000, 100)
         self.assertEqual(totals["original_subtotal"], Decimal("1000.00"))
         self.assertEqual(totals["remise"], Decimal("100.00"))
-        self.assertEqual(totals["total_ht"], Decimal("900.00"))
-        self.assertEqual(totals["vat_amount"], Decimal("180.00"))
-        self.assertEqual(totals["total_ttc"], Decimal("1080.00"))
+        self.assertEqual(totals["total"], Decimal("900.00"))
 
     def test_mixed_input_types(self):
-        totals = calculate_operation_totals("1000,00", 100.0, Decimal("20"))
-        self.assertEqual(totals["total_ht"], Decimal("900.00"))
-        self.assertEqual(totals["vat_amount"], Decimal("180.00"))
-        self.assertEqual(totals["total_ttc"], Decimal("1080.00"))
+        totals = calculate_operation_totals("1000,00", 100.0)
+        self.assertEqual(totals["total"], Decimal("900.00"))
 
     def test_negative_remise(self):
-        totals = calculate_operation_totals(1000, -50, 20)
-        self.assertEqual(totals["total_ht"], Decimal("1050.00"))
+        totals = calculate_operation_totals(1000, -50)
+        self.assertEqual(totals["total"], Decimal("1050.00"))
 
     def test_negative_subtotal(self):
-        totals = calculate_operation_totals(-100, 0, 20)
-        self.assertEqual(totals["total_ht"], Decimal("-100.00"))
-        self.assertEqual(totals["vat_amount"], Decimal("-20.00"))
-        self.assertEqual(totals["total_ttc"], Decimal("-120.00"))
+        totals = calculate_operation_totals(-100, 0)
+        self.assertEqual(totals["total"], Decimal("-100.00"))
 
     def test_half_up_rounding(self):
         # 1.005 must round to 1.01 (ROUND_HALF_UP), never 1.00 (banker's).
-        totals = calculate_operation_totals("1.005", 0, 0)
-        self.assertEqual(totals["total_ttc"], Decimal("1.01"))
+        totals = calculate_operation_totals("1.005", 0)
+        self.assertEqual(totals["total"], Decimal("1.01"))
 
-    def test_zero_vat_rate(self):
-        totals = calculate_operation_totals(5000, 500, 0)
-        self.assertEqual(totals["total_ht"], Decimal("4500.00"))
-        self.assertEqual(totals["vat_amount"], Decimal("0.00"))
-        self.assertEqual(totals["total_ttc"], Decimal("4500.00"))
+    def test_zero_remise(self):
+        totals = calculate_operation_totals(5000, 0)
+        self.assertEqual(totals["total"], Decimal("5000.00"))
 
     def test_delegation_from_sales_module(self):
-        # calculate_sale_totals keeps its public contract and returns Decimals.
-        totals = calculate_sale_totals(raw_subtotal=70679.00, remise=5654.32, tva_rate=20)
-        self.assertEqual(totals["total_ht"], Decimal("65024.68"))
-        self.assertEqual(totals["vat_amount"], Decimal("13004.94"))
-        self.assertEqual(totals["total_ttc"], Decimal("78029.62"))
+        # calculate_sale_totals keeps its public contract and returns Decimals (no TVA).
+        totals = calculate_sale_totals(raw_subtotal=70679.00, remise=5654.32)
+        self.assertEqual(totals["total"], Decimal("65024.68"))
 
 
 class ImportItemSubtotalRegressionTests(unittest.TestCase):
@@ -170,7 +160,7 @@ class ImportItemSubtotalRegressionTests(unittest.TestCase):
         self.assertEqual(item.get_value("subtotal"), Decimal("500.00"))
 
     def test_import_operation_total_matches_formula(self):
-        """Import totals reuse the shared Decimal math end to end."""
+        """Import totals reuse the shared Decimal math end to end (no VAT)."""
         item_a = ImportItemClass(0, None)
         item_a.set_value("quantity", Decimal("10"))
         item_a.set_value("unit_price", 7067.90)
@@ -181,12 +171,11 @@ class ImportItemSubtotalRegressionTests(unittest.TestCase):
 
         imp = ImportClass(0, None)
         imp.database = type("D", (), {"cursor": object()})()
-        imp.set_value("tva", 20)
         imp.items = [item_a, item_b]
 
         self.assertEqual(imp.calculate_subtotal(), Decimal("72678.98"))
-        # total_ttc = (10*7067.90 + 2*999.99) * 1.20
-        self.assertAlmostEqual(imp.calculate_total_price(), 87214.78, places=2)
+        # total = subtotal (no VAT)
+        self.assertAlmostEqual(imp.calculate_total_price(), 72678.98, places=2)
 
 
 

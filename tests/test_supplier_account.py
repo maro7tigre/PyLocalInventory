@@ -51,8 +51,7 @@ class _FakeCursor:
              Decimal("20"), "", False, "host"),
         ]
         self.summary_rows = [
-            (1, "2026-07-01", "BL-2026-1", False, Decimal("20"),
-             Decimal("240.00")),
+            (1, "2026-07-01", "BL-2026-1", False, Decimal("240.00")),
         ]
         self.payment_rows = [
             (7, 2, None, "2026-07-06", Decimal("100.00")),
@@ -168,10 +167,10 @@ class SupplierAccountBackendTests(unittest.TestCase):
         summary = result["imports"][0]
         self.assertEqual(summary["import_id"], 1)
         self.assertEqual(summary["bl_number"], "BL-2026-1")
-        # raw 240.00 at 20% VAT => 288.00 TTC; no payments on import 1.
-        self.assertEqual(summary["total"], Decimal("288.00"))
+        # raw 240.00 (no VAT) => total 240.00; no payments on import 1.
+        self.assertEqual(summary["total"], Decimal("240.00"))
         self.assertEqual(summary["paid"], Decimal("0"))
-        self.assertEqual(summary["remaining"], Decimal("288.00"))
+        self.assertEqual(summary["remaining"], Decimal("240.00"))
 
     def test_get_supplier_import_items_returns_block_and_payments(self):
         result = self.db.get_supplier_import_items(2)

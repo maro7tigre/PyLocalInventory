@@ -1,0 +1,110 @@
+get_analytics_snapshot(self, date_from, date_to, user=None):
+        """Return the full business-analytics snapshot for an inclusive date
+        range in ONE call (a small fixed number of aggregate queries - no
+        N+1 patterns).
+
+        ``date_from``/``date_to`` are 'YYYY-MM-DD' strings compared against
+        each document's effective date. Receivables/payables/stock metrics are
+        current-position values (not period-scoped) and are labelled as such
+        by the UI.
+
+        Remote callers receive only the metric groups their role may read
+        (mirroring get_dashboard_snapshot's server-side filtering):
+        Sales->revenue/profit/top lists, Imports->purchases/COGS,
+        Clients->receivables, Suppliers->payables, Products->stock.
+        Gross Profit/Margin additionally require BOTH Sales and Imports read.
+        """
+        date_from = str(date_from or "")
+        date_to = str(date_to or "")
+
+        # ---- Period revenue / COGS / profit (single WAC stream pass) -------
+        sql = f"""
+            WITH {self._analytics_wac_stream_sql(
+                date_filter_sql="sal.ev_date >= %s AND sal.ev_date <= %s")}
+            SELECT
+              COALESCE(SUM(CASE WHEN st.kind_rank = 1 THEN
+                  CASE WHEN st.raw_all > 0
+                       THEN st.gross * (st.raw_all - st.remise) / st.raw_all
+                       ELSE st.gross END END), 0),
+              COALESCE(SUM(CASE WHEN st.kind_rank = 1 THEN
+                  st.qty * COALESCE(
+                      CASE WHEN st.p_qty_prev > 0
+                           THEN st.p_val_prev / st.p_qty_prev END,
+                      CASE WHEN pw.q > 0 THEN pw.v / pw.q END,
+                      0) END), 0)
+            FROM stream st
+            LEFT JOIN prod_wac pw ON pw.product_id = st.product_id
+        """
+        self.cursor.execute(sql, (date_from, date_to))
+        revenue_raw, cogs_raw = self.cursor.fetchone()
+
+        # Sales count covers every non-on_hold sale in the period (including
+        # service-only and manual-line sales, which the product stream skips).
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(*) FROM sales s
+            WHERE (s.state IS NULL OR s.state<>'on_hold')
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        sales_count = self.cursor.fetchone()[0] or 0
+
+        # Service/manual revenue for the period (revenue-only lines).
+        self.cursor.execute(
+            f"""
+            SELECT COALESCE(SUM(
+                CASE WHEN agg.raw_all > 0
+                     THEN si.quantity * si.unit_price
+                          * (agg.raw_all - COALESCE(s.remise, 0.0)) / agg.raw_all
+                     ELSE si.quantity * si.unit_price END), 0)
+            FROM sales_items si
+            JOIN sales s ON s.id = si.sales_id
+            JOIN (
+                SELECT s2.id AS sale_id,
+                       COALESCE(SUM(si2.quantity * si2.unit_price), 0) AS raw_all
+                FROM sales s2 JOIN sales_items si2 ON si2.sales_id = s2.id
+                WHERE (s2.state IS NULL OR s2.state<>'on_hold')
+                GROUP BY s2.id
+            ) agg ON agg.sale_id = s.id
+            WHERE (s.state IS NULL OR s.state<>'on_hold')
+              AND si.item_type <> 'product'
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(s.date), ''),
+                           LEFT(COALESCE(s.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        service_revenue_raw = self.cursor.fetchone()[0] or 0
+
+        # ---- Per-period imports total (HT) + count -------------------------
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(DISTINCT i.id),
+                   COALESCE(SUM(ii.quantity * ii.unit_price), 0)
+            FROM imports i JOIN import_items ii ON ii.import_id = i.id
+            WHERE COALESCE(NULLIF(BTRIM(i.date), ''),
+                           LEFT(COALESCE(i.created_at, ''), 10), '') >= %s
+              AND COALESCE(NULLIF(BTRIM(i.date), ''),
+                           LEFT(COALESCE(i.created_at, ''), 10), '') <= %s
+            """,
+            (date_from, date_to),
+        )
+        imports_count, purchases_raw = self.cursor.fetchone()
+
+        # ---- Per-period operating charges total (HT) + count ----------------
+        self.cursor.execute(
+            f"""
+            SELECT COUNT(*), COALESCE(SUM(amount), 0)
+            FROM charges
+            WHERE expense_date >= %s AND expense_date <= %s
+            """,
+            (date_from, date_to),
+        )
+        charges_count, charges_total_raw = self.cursor.fetchone()
+
+        # Ch

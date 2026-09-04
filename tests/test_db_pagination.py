@@ -90,51 +90,57 @@ class KeysetPaginationTests(unittest.TestCase):
 
     def test_summary_query_supports_keyset_on_total_price(self):
         database = _database('Sales')
-        _simulate_rows(database.cursor, ['id', 'total_price'], [(1, Decimal('50'))])
+        _simulate_rows(database.cursor, ['id', 'total'], [(1, Decimal('50'))])
         result = database.get_operation_summary_items(
-            'Sales', order_by='total_price', order_dir='asc', limit=10,
+            'Sales', order_by='total', order_dir='asc', limit=10,
             after_id=5, after_sort=Decimal('100'),
         )
         self.assertEqual(len(result), 1)
         sql, params = database.cursor.statements[0]
-        self.assertIn('(coalesce(summary.total_price, 0), id) > (%s, %s)', sql)
+        # The keyset condition uses the computed total expression
+        self.assertIn(
+            '(coalesce(summary.subtotal - coalesce(s.remise, 0.0), 0), id) > (%s, %s)',
+            sql,
+        )
         self.assertEqual(params[:2], [Decimal('100'), 5])
-        self.assertIn('order by coalesce(summary.total_price, 0) asc, s.id asc', sql)
+        self.assertIn('order by coalesce(summary.subtotal - coalesce(s.remise, 0.0), 0) asc, s.id asc', sql)
         self.assertIn('left join', sql)
 
     def test_sales_summary_returns_discounted_totals(self):
-        """Sales summary query must compute Total HT/TTC with remise and VAT."""
+        """Sales summary query must compute Total = Subtotal - Remise (no VAT)."""
         database = _database('Sales')
-        _simulate_rows(database.cursor, ['id', 'total_ht', 'total_ttc', 'vat_amount'], [])
+        _simulate_rows(database.cursor, ['id', 'total'], [])
         database.get_operation_summary_items('Sales', limit=10)
         sql, _params = database.cursor.statements[0]
-        self.assertIn('coalesce(s.remise, 0)', sql)
-        self.assertIn('as total_ht', sql)
-        self.assertIn('as total_ttc', sql)
-        self.assertIn('as vat_amount', sql)
+        self.assertIn('coalesce(s.remise, 0.0)', sql)
+        self.assertIn('as total', sql)
+        # No VAT columns
+        self.assertNotIn('as vat_amount', sql)
+        self.assertNotIn('as total_ht', sql)
+        self.assertNotIn('as total_ttc', sql)
 
     def test_imports_summary_has_no_remise_reference(self):
         """Imports have no remise column; the shared query must not reference it."""
         database = _database('Imports')
-        _simulate_rows(database.cursor, ['id', 'total_ht'], [])
+        _simulate_rows(database.cursor, ['id', 'total'], [])
         database.get_operation_summary_items('Imports', limit=10)
         sql, _params = database.cursor.statements[0]
         self.assertNotIn('remise', sql)
-        self.assertIn('as total_ht', sql)
+        self.assertIn('as total', sql)
 
-    def test_summary_query_supports_keyset_on_total_ttc(self):
-        """Sorting the Sales table by Total uses the final Total TTC expression."""
+    def test_summary_query_supports_keyset_on_total(self):
+        """Sorting the Sales table by Total uses the final Total expression (no VAT)."""
         database = _database('Sales')
-        _simulate_rows(database.cursor, ['id', 'total_ttc'], [(1, Decimal('98400'))])
+        _simulate_rows(database.cursor, ['id', 'total'], [(1, Decimal('98400'))])
         result = database.get_operation_summary_items(
-            'Sales', order_by='total_ttc', order_dir='asc', limit=10,
+            'Sales', order_by='total', order_dir='asc', limit=10,
             after_id=5, after_sort=Decimal('90000'),
         )
         self.assertEqual(len(result), 1)
         sql, params = database.cursor.statements[0]
+        # The keyset condition uses the computed total expression
         self.assertIn(
-            '(coalesce((summary.subtotal - coalesce(s.remise, 0)) '
-            '* (1 + coalesce(s.tva, 0) / 100.0), 0), id) > (%s, %s)',
+            '(coalesce(summary.subtotal - coalesce(s.remise, 0.0), 0), id) > (%s, %s)',
             sql,
         )
         self.assertEqual(params[:2], [Decimal('90000'), 5])
@@ -171,9 +177,10 @@ class KeysetPaginationTests(unittest.TestCase):
         self.assertEqual(Database._order_column_expression('id'), None)
 
     def test_summary_order_expression_handles_aliases(self):
+        # Total is computed as subtotal - remise, so the order expression is the computation
         self.assertEqual(
-            Database._summary_order_expression('total_price'),
-            'COALESCE(summary.total_price, 0)',
+            Database._summary_order_expression('total'),
+            'COALESCE(summary.subtotal - COALESCE(s.remise, 0.0), 0)',
         )
         self.assertEqual(
             Database._summary_order_expression('name'),

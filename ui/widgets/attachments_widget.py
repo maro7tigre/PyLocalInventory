@@ -400,7 +400,7 @@ class AttachmentPanel(QWidget):
         self.client_sales_table.setRowCount(len(sales))
         for row, (sale_id, notes, date, vat, subtotal) in enumerate(sales):
             from core.calculations import calculate_operation_totals
-            total = calculate_operation_totals(subtotal, 0, vat)['total_ttc']
+            total = calculate_operation_totals(subtotal, 0)['total']
             for column, value in enumerate((sale_id, notes or '', self._sale_date(date), self._money(subtotal), self._money(total))):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.UserRole, int(sale_id))

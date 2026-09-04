@@ -117,6 +117,13 @@ class _ImportBdlWorker(QObject):
         except Exception:
             return str(value)
 
+    def _fmt_money(self, value):
+        try:
+            s = f"{float(value or 0):,.2f}"
+            return s.replace(",", " ").replace(".", ",")
+        except (TypeError, ValueError):
+            return "0,00"
+
     def _get_company_logo_block(self):
         return get_company_logo_block()
 
@@ -172,17 +179,24 @@ class _ImportBdlWorker(QObject):
             product_id = item.get('product_id') or ""
             product_name = item.get('product_name') or ""
             quantity = item.get('quantity') or 0
+            unit_price = item.get('unit_price') or 0
             code = html_lib.escape(str(product_id)) if product_id else "-"
             designation = f'<strong class="item-name">{html_lib.escape(str(product_name))}</strong>'
+            from core.calculations import to_decimal
+            qty_dec = to_decimal(quantity)
+            price_dec = to_decimal(unit_price)
+            subtotal = qty_dec * price_dec
             rows_html += (
                 f"<tr><td>{code}</td>"
                 f"<td>{designation}</td>"
-                f"<td>{self._fmt_quantity(quantity)}</td></tr>\n"
+                f"<td>{self._fmt_quantity(quantity)}</td>"
+                f"<td>{self._fmt_money(price_dec)}</td>"
+                f"<td>{self._fmt_money(subtotal)}</td></tr>\n"
             )
             rendered_rows += 1
 
         if not rows_html.strip():
-            rows_html = '<tr class="empty-row"><td colspan="3">Aucun article</td></tr>'
+            rows_html = '<tr class="empty-row"><td colspan="5">Aucun article</td></tr>'
 
         profile = None
         if getattr(self, "profile_manager", None) is not None:

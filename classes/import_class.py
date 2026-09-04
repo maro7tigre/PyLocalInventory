@@ -77,16 +77,6 @@ class ImportClass(BaseClass):
                 "false_value": False,
                 "readonly": False
             },
-            # TVA now a checkbox: unchecked=0%, checked=20%
-            "tva": {
-                "value": 20.0,
-                "display_name": {"en": "20% VAT", "fr": "TVA 20%", "es": "IVA 20%"},
-                "required": False,
-                "default": 20.0,
-                "type": "bool",
-                "true_value": 20.0,
-                "false_value": 0.0
-            },
             "notes": {
                 "value": "",
                 "display_name": {"en": "Notes", "fr": "Notes", "es": "Notas"},
@@ -123,14 +113,8 @@ class ImportClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_subtotal
             },
-            "total_tva": {
-                "display_name": {"en": "VAT Amount", "fr": "Montant TVA", "es": "Monto IVA"},
-                "required": False,
-                "type": "float",
-                "method": self.calculate_total_tva
-            },
-            "total_price": {
-                "display_name": {"en": "Total Price", "fr": "Prix Total", "es": "Precio Total"},
+            "total": {
+                "display_name": {"en": "Total", "fr": "Total", "es": "Total"},
                 "required": False,
                 "type": "float",
                 "method": self.calculate_total_price
@@ -160,14 +144,13 @@ class ImportClass(BaseClass):
                 "supplier_name": "r",
                 "date": "r",
                 "bl_number": "r",
-                "total_price": "r",
+                "total": "r",
                 "details": "r"
             },
             "dialog": {
                 "supplier_username": "rw",
                 "date": "rw",
                 "bl_number": "rw",
-                "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
                 "items": "rw"
@@ -177,7 +160,6 @@ class ImportClass(BaseClass):
                 "supplier_name": "rw",
                 "date": "rw",
                 "bl_number": "rw",
-                "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
                 "created_by": "r",
@@ -189,10 +171,8 @@ class ImportClass(BaseClass):
                 "id": "r",
                 "supplier_id": "r",
                 "date": "r",
-                "tva": "r",
                 "subtotal": "r",
-                "total_tva": "r",
-                "total_price": "r",
+                "total": "r",
                 "items": "r"
             }
         }
@@ -225,23 +205,15 @@ class ImportClass(BaseClass):
         items = self.get_import_items()
         return sum(to_decimal(item.get_value('subtotal')) for item in items)
 
-    def calculate_total_tva(self):
-        """Calculate total VAT amount (centralized Decimal math)."""
-        totals = calculate_operation_totals(
-            self.calculate_subtotal(),
-            0,
-            self.get_value('tva') or 0,
-        )
-        return float(totals['vat_amount'])
+    pass  # TVA removed - no VAT calculation
 
     def calculate_total_price(self):
-        """Calculate total price including VAT (centralized Decimal math)."""
+        """Calculate total price (no VAT)."""
         totals = calculate_operation_totals(
             self.calculate_subtotal(),
             0,
-            self.get_value('tva') or 0,
         )
-        return float(totals['total_ttc'])
+        return float(totals['total'])
     
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this import operation"""

@@ -271,7 +271,7 @@ class SalesTab(BaseTab):
 
     def _ensure_new_columns_order(self):
         """Final Sales table columns (exactly):
-        ID | Devis | State | Client Name | Notes | Date | Total HT | Total TTC."""
+        ID | Bon de livraison | State | Client Name | Notes | Date | Total HT | Total TTC."""
         try:
             if 'devis' not in self.table_columns:
                 self.table_columns.insert(1, 'devis')
@@ -287,7 +287,7 @@ class SalesTab(BaseTab):
                     headers.append(key.capitalize())
             self.table.setColumnCount(len(self.table_columns))
             self.table.setHorizontalHeaderLabels(headers)
-            # Keep the Devis reference column at a readable fixed width.
+            # Keep the Bon de livraison reference column at a readable fixed width.
             if 'devis' in self.table_columns:
                 devis_col = self.table_columns.index('devis')
                 self.table.setColumnWidth(devis_col, 120)

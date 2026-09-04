@@ -37,8 +37,7 @@ _ORDER_COLUMNS = {
     'id', 'username', 'name', 'description', 'keywords', 'client_username',
     'client_name', 'supplier_username', 'supplier_name', 'date',
     'unit_price', 'sale_price', 'quantity', 'category', 'ice',
-    'subtotal', 'total_price', 'total_ht', 'total_ttc', 'vat_amount',
-    'information', 'total_quantity',
+    'subtotal', 'total', 'information', 'total_quantity',
     'total_production', 'department', 'report_type', 'created_by',
     'created_at', 'report', 'is_historical', 'state', 'notes',
 }
@@ -49,8 +48,7 @@ _ORDER_COLUMNS = {
 # which would silently drop rows sharing a NULL sort value.
 _ORDER_NUMERIC_COLUMNS = {
     'id', 'unit_price', 'sale_price', 'quantity', 'ice', 'subtotal',
-    'total_price', 'total_ht', 'total_ttc', 'vat_amount',
-    'total_quantity', 'total_production', 'created_by',
+    'total', 'total_quantity', 'total_production', 'created_by',
 }
 
 # Canonical Client Account schema.
@@ -246,7 +244,7 @@ class Database:
             password=pg_config.get('password'),
             connect_timeout=5,
             application_name="PyLocalInventory",
-        )
+         )
 
     def _ensure_profile_database(self, pg_config, database_name):
         """Create the profile database if it does not already exist."""
@@ -1864,9 +1862,9 @@ class Database:
             if quantity > 0:
                 self.cursor.execute(
                     "INSERT INTO imports "
-                    "(supplier_username, supplier_name, date, tva, notes, "
+                    "(supplier_username, supplier_name, date, notes, "
                     "created_by, created_by_username, created_at) "
-                    "VALUES ('', 'Opening Stock', %s, 0, %s, %s, %s, %s) RETURNING id",
+                    "VALUES ('', 'Opening Stock', %s, %s, %s, %s, %s) RETURNING id",
                     (
                         datetime.now().strftime("%Y-%m-%d"),
                         f"Opening stock for {name}",
@@ -2822,10 +2820,7 @@ class Database:
             return None
         summary_columns = {
             'subtotal': 'COALESCE(summary.subtotal, 0)',
-            'total_price': 'COALESCE(summary.total_price, 0)',
-            'total_ht': 'COALESCE(summary.subtotal - COALESCE(s.remise, 0), 0)',
-            'total_ttc': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (1 + COALESCE(s.tva, 0) / 100.0), 0)',
-            'vat_amount': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (COALESCE(s.tva, 0) / 100.0), 0)',
+            'total': 'COALESCE(summary.subtotal - COALESCE(s.remise, 0.0), 0)',
             'information': "COALESCE(summary.information, '')",
             'total_quantity': 'COALESCE(summary.total_quantity, 0)',
             'total_production': 'COALESCE(summary.total_production, 0)',
@@ -2939,21 +2934,13 @@ class Database:
         base_table = section.lower()
         item_table = 'sales_items' if section == 'Sales' else 'import_items'
         foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
-        # The inner summary subquery joins base_table under alias "i" (see
-        # below), never "s" - "s" is only in scope in the outer query. Both
-        # sections must reference the inner join's own alias here.
-        tva_source = 'i.tva'
 
         # Remise only exists on the sales table (discounts); imports have no
         # discount column, so their computed totals reduce to the raw sums.
-        remise_expr = 'COALESCE(s.remise, 0)' if section == 'Sales' else '0'
-        # Authoritative table totals, matching calculate_sale_totals():
-        #   Total HT = Original Subtotal - Remise
-        #   VAT      = Total HT * tva / 100
-        #   Total TTC = Total HT + VAT
-        total_ht_expr = f'COALESCE(summary.subtotal - {remise_expr}, 0)'
-        vat_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (COALESCE(s.tva, 0) / 100.0), 0)'
-        total_ttc_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (1 + COALESCE(s.tva, 0) / 100.0), 0)'
+        remise_expr = 'COALESCE(s.remise, 0.0)' if section == 'Sales' else '0'
+        # Authoritative table totals (no VAT):
+        #   Total = Subtotal - Remise
+        total_expr = f'COALESCE(summary.subtotal - {remise_expr}, 0)'
 
         if section == 'Sales':
             information_select = (
@@ -2968,10 +2955,7 @@ class Database:
         query = (
             f"SELECT s.*, "
             f"COALESCE(summary.subtotal, 0) AS subtotal, "
-            f"COALESCE(summary.total_price, 0) AS total_price, "
-            f"{total_ht_expr} AS total_ht, "
-            f"{total_ttc_expr} AS total_ttc, "
-            f"{vat_expr} AS vat_amount, "
+            f"{total_expr} AS total, "
             f"COALESCE(summary.information, '') AS information, "
             f"COALESCE(summary.total_quantity, 0) AS total_quantity, "
             f"COALESCE(summary.total_production, 0) AS total_production"
@@ -2990,7 +2974,6 @@ class Database:
             f"LEFT JOIN ("
             f"  SELECT si.{foreign_key}, "
             f"         SUM(si.quantity * si.unit_price) AS subtotal, "
-            f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
             f"         {information_select} AS information, "
             f"         COALESCE(SUM(si.quantity), 0) AS total_quantity, "
             f"         {production_select} AS total_production "
@@ -3550,11 +3533,11 @@ class Database:
         self.cursor.execute(
             """
             SELECT
-              (SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
+              (SELECT COALESCE(SUM(si.quantity * si.unit_price), 0)
                FROM sales s JOIN sales_items si ON si.sales_id=s.id
                WHERE (s.state IS NULL OR s.state<>'on_hold')
                  AND LEFT(s.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
-              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
+              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price), 0)
                FROM imports i JOIN import_items ii ON ii.import_id=i.id
                WHERE LEFT(i.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
               (SELECT COUNT(*) FROM products),
@@ -3591,30 +3574,30 @@ class Database:
             ORDER BY quantity, name
             LIMIT 50
             """
-        )
+)
         low_rows = self.cursor.fetchall()
         self.cursor.execute(
             """
             SELECT activity_type, activity_date, amount, description
             FROM (
               SELECT 'Sales' activity_type, s.date activity_date,
-                     COALESCE(SUM(si.quantity*si.unit_price*(1+s.tva/100)),0) amount,
+                     COALESCE(SUM(si.quantity*si.unit_price),0) amount,
                      'Sale to ' || COALESCE(s.client_username,'') description,
                      s.id
-              FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id
-              WHERE s.state IS NULL OR s.state<>'on_hold'
-              GROUP BY s.id, s.date, s.client_username, s.tva
-              UNION ALL
-              SELECT 'Imports', i.date,
-                     COALESCE(SUM(ii.quantity*ii.unit_price*(1+i.tva/100)),0),
-                     'Import from ' || COALESCE(i.supplier_username,''), i.id
-              FROM imports i LEFT JOIN import_items ii ON ii.import_id=i.id
-              GROUP BY i.id, i.date, i.supplier_username, i.tva
+                FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id
+                WHERE s.state IS NULL OR s.state<>'on_hold'
+                GROUP BY s.id, s.date, s.client_username
+                UNION ALL
+                SELECT 'Imports', i.date,
+                       COALESCE(SUM(ii.quantity*ii.unit_price),0),
+                       'Import from ' || COALESCE(i.supplier_username,''), i.id
+                FROM imports i LEFT JOIN import_items ii ON ii.import_id=i.id
+                GROUP BY i.id, i.date, i.supplier_username
             ) activity
             ORDER BY activity_date DESC, id DESC
             LIMIT 5
             """
-        )
+)
         activity_rows = self.cursor.fetchall()
         self.cursor.execute(
             """
@@ -3623,22 +3606,22 @@ class Database:
                    COALESCE(SUM(import_amount),0)
             FROM (
               SELECT LEFT(s.date,7) month_key,
-                     SUM(si.quantity*si.unit_price*(1+s.tva/100)) sales_amount,
+                     SUM(si.quantity*si.unit_price) sales_amount,
                      0 import_amount
-              FROM sales s JOIN sales_items si ON si.sales_id=s.id
-              WHERE (s.state IS NULL OR s.state<>'on_hold')
-                AND LEFT(s.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
-              GROUP BY LEFT(s.date,7)
+               FROM sales s JOIN sales_items si ON si.sales_id=s.id
+               WHERE (s.state IS NULL OR s.state<>'on_hold')
+                 AND LEFT(s.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+               GROUP BY LEFT(s.date,7)
               UNION ALL
               SELECT LEFT(i.date,7), 0,
-                     SUM(ii.quantity*ii.unit_price*(1+i.tva/100))
-              FROM imports i JOIN import_items ii ON ii.import_id=i.id
-              WHERE LEFT(i.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
-              GROUP BY LEFT(i.date,7)
-            ) monthly
-            GROUP BY month_key
-            ORDER BY month_key
-            """
+                     SUM(ii.quantity*ii.unit_price)
+               FROM imports i JOIN import_items ii ON ii.import_id=i.id
+               WHERE LEFT(i.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+               GROUP BY LEFT(i.date,7)
+           ) monthly
+           GROUP BY month_key
+           ORDER BY month_key
+           """
         )
         monthly_rows = self.cursor.fetchall()
         return {
@@ -3831,8 +3814,8 @@ class Database:
         self.cursor.execute(
             """
             SELECT id, COALESCE(devis, ''), COALESCE(date, ''),
-                   COALESCE(client_name, client_username, ''), COALESCE(remise, 0),
-                   COALESCE(tva, 0), COALESCE(state, 'pending'),
+                   COALESCE(client_name, client_username, ''), COALESCE(remise, 0.0),
+                   COALESCE(state, 'pending'),
                    COALESCE(is_historical, FALSE)
             FROM sales WHERE id = %s
             """,
@@ -3944,7 +3927,7 @@ class Database:
         )
         totals = calculate_operation_totals(
             sum(to_decimal(i["gross"]) for i in items),
-            header_row[4], header_row[5],
+            header_row[4],
         )
         return {
             "sale_id": sale_id,
@@ -4024,7 +4007,7 @@ class Database:
             SELECT COALESCE(SUM(
                 CASE WHEN agg.raw_all > 0
                      THEN si.quantity * si.unit_price
-                          * (agg.raw_all - COALESCE(s.remise, 0)) / agg.raw_all
+                          * (agg.raw_all - COALESCE(s.remise, 0.0)) / agg.raw_all
                      ELSE si.quantity * si.unit_price END), 0)
             FROM sales_items si
             JOIN sales s ON s.id = si.sales_id
@@ -4228,7 +4211,7 @@ class Database:
             SELECT COALESCE(NULLIF(BTRIM(s.client_name), ''),
                             NULLIF(BTRIM(s.client_username), ''), '') AS cname,
                    COUNT(DISTINCT s.id) AS sales_count,
-                   COALESCE(SUM(agg.raw_all - COALESCE(s.remise, 0)), 0) AS revenue
+                   COALESCE(SUM(agg.raw_all - COALESCE(s.remise, 0.0)), 0) AS revenue
             FROM sales s
             JOIN (
                 SELECT s2.id AS sale_id,
@@ -4253,8 +4236,8 @@ class Database:
             for r in self.cursor.fetchall()
         ]
 
-        # ---- Client receivables (current position; mirrors
-        #      get_client_sale_summaries: TTC, paid capped, remaining>=0) ----
+# ---- Client receivables (current position; mirrors
+        #      get_client_sale_summaries: Total, paid capped, remaining>=0) ----
         self.cursor.execute(
             """
             WITH sale_raw AS (
@@ -4262,20 +4245,16 @@ class Database:
                        COALESCE(NULLIF(BTRIM(s.client_name), ''),
                                 NULLIF(BTRIM(s.client_username), ''), '') AS cname,
                        COALESCE(SUM(si.quantity * si.unit_price), 0) AS raw,
-                       COALESCE(s.remise, 0) AS remise,
-                       COALESCE(s.tva, 0) AS tva
+                       COALESCE(s.remise, 0.0) AS remise
                 FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id
                 GROUP BY s.id, s.client_id,
                          NULLIF(BTRIM(s.client_name), ''),
                          NULLIF(BTRIM(s.client_username), ''),
-                         s.remise, s.tva
+                         s.remise
             ),
-            ttc AS (
+ttc AS (
                 SELECT sale_id, client_id, cname,
-                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2)
-                       + ROUND(ROUND(ROUND(raw::numeric, 2)
-                                     - ROUND(remise::numeric, 2), 2)
-                               * tva::numeric / 100, 2) AS total
+                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2) AS total
                 FROM sale_raw
             ),
             paid AS (
@@ -4291,9 +4270,9 @@ class Database:
             SELECT COALESCE(SUM(remaining), 0),
                    COUNT(*) FILTER (WHERE remaining > 0),
                    COUNT(*) FILTER (WHERE client_id IS NOT NULL)
-            FROM remaining
-            """
-        )
+           FROM remaining
+           """
+       )
         receivables_total, receivables_clients, _total_client_rows = \
             self.cursor.fetchone()
         self.cursor.execute(
@@ -4303,20 +4282,16 @@ class Database:
                        COALESCE(NULLIF(BTRIM(s.client_name), ''),
                                 NULLIF(BTRIM(s.client_username), ''), '') AS cname,
                        COALESCE(SUM(si.quantity * si.unit_price), 0) AS raw,
-                       COALESCE(s.remise, 0) AS remise,
-                       COALESCE(s.tva, 0) AS tva
+                       COALESCE(s.remise, 0.0) AS remise
                 FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id
                 GROUP BY s.id, s.client_id,
                          NULLIF(BTRIM(s.client_name), ''),
                          NULLIF(BTRIM(s.client_username), ''),
-                         s.remise, s.tva
+                         s.remise
             ),
             ttc AS (
                 SELECT sale_id, client_id, cname,
-                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2)
-                       + ROUND(ROUND(ROUND(raw::numeric, 2)
-                                     - ROUND(remise::numeric, 2), 2)
-                               * tva::numeric / 100, 2) AS total
+                       ROUND(ROUND(raw::numeric, 2) - ROUND(remise::numeric, 2), 2) AS total
                 FROM sale_raw
             ),
             paid AS (
@@ -4356,18 +4331,15 @@ class Database:
                 SELECT i.id AS import_id, i.supplier_id,
                        COALESCE(NULLIF(BTRIM(i.supplier_name), ''),
                                 NULLIF(BTRIM(i.supplier_username), ''), '') AS sname,
-                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw,
-                       COALESCE(i.tva, 0) AS tva
+                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw
                 FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id
                 GROUP BY i.id, i.supplier_id,
                          NULLIF(BTRIM(i.supplier_name), ''),
-                         NULLIF(BTRIM(i.supplier_username), ''), i.tva
+                         NULLIF(BTRIM(i.supplier_username), '')
             ),
             ttc AS (
                 SELECT import_id, supplier_id, sname,
-                       ROUND(ROUND(raw::numeric, 2), 2)
-                       + ROUND(ROUND(raw::numeric, 2) * tva::numeric / 100, 2)
-                           AS total
+                       ROUND(raw::numeric, 2) AS total
                 FROM imp_raw
             ),
             paid AS (
@@ -4388,18 +4360,15 @@ class Database:
                 SELECT i.id AS import_id, i.supplier_id,
                        COALESCE(NULLIF(BTRIM(i.supplier_name), ''),
                                 NULLIF(BTRIM(i.supplier_username), ''), '') AS sname,
-                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw,
-                       COALESCE(i.tva, 0) AS tva
+                       COALESCE(SUM(ii.quantity * ii.unit_price), 0) AS raw
                 FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id
                 GROUP BY i.id, i.supplier_id,
                          NULLIF(BTRIM(i.supplier_name), ''),
-                         NULLIF(BTRIM(i.supplier_username), ''), i.tva
+                         NULLIF(BTRIM(i.supplier_username), '')
             ),
             ttc AS (
                 SELECT import_id, supplier_id, sname,
-                       ROUND(ROUND(raw::numeric, 2), 2)
-                       + ROUND(ROUND(raw::numeric, 2) * tva::numeric / 100, 2)
-                           AS total
+                       ROUND(raw::numeric, 2) AS total
                 FROM imp_raw
             ),
             paid AS (
@@ -4838,8 +4807,8 @@ class Database:
         sql = (
             "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
             "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
-            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
-            "COALESCE(s.remise, 0), "
+            "COALESCE(si.unit_price, 0), "
+            "COALESCE(s.remise, 0.0), "
             "COALESCE(si.information, ''), COALESCE(si.production, 0), "
             "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
             "COALESCE(s.created_by_username, '') "
@@ -4855,10 +4824,20 @@ class Database:
                 """
                 SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
                 FROM payments p
-                WHERE p.sale_id = ANY(%s)
+                WHERE p.sale_id = ANY(%s) OR (p.sale_id IS NULL AND p.import_id IS NULL)
                 ORDER BY p.id DESC
                 """,
                 (sale_ids,),
+            )
+            payment_rows = self.cursor.fetchall()
+        else:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id IS NULL AND p.import_id IS NULL
+                ORDER BY p.id DESC
+                """,
             )
             payment_rows = self.cursor.fetchall()
 
@@ -4915,13 +4894,14 @@ class Database:
             f"COALESCE(s.is_historical, FALSE), "
             f"COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number, "
             f"{_DEVIS_YEAR_EXPR} AS devis_year, "
-            f"COALESCE(s.tva, 0), COALESCE(s.remise, 0), "
+            f"{_DEVIS_YEAR_EXPR} AS year, "
+            f"COALESCE(s.remise, 0.0), "
             f"COALESCE(SUM(si.quantity * si.unit_price), 0) "
             f"FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id "
             f"WHERE {match_clause} "
             f"GROUP BY s.id, s.date, s.state, s.is_historical, s.devis, "
             f"s.devis_number, "
-            f"devis_year, s.tva, s.remise, s.created_at "
+            f"devis_year, year, s.remise, s.created_at "
             f"ORDER BY s.id"
         )
         self.cursor.execute(sql, tuple(match_params))
@@ -4945,10 +4925,10 @@ class Database:
         from core.calculations import calculate_operation_totals, to_decimal
         sale_rows = []
         for row in rows:
-            sale_id, date, state, is_hist, devis_text, devis_number, year, vat, remise, raw = row
+            sale_id, date, state, is_hist, devis_text, devis_number, year, devis_year, remise, raw = row
             total = calculate_operation_totals(
-                to_decimal(raw), to_decimal(remise), to_decimal(vat)
-            )["total_ttc"]
+                to_decimal(raw), to_decimal(remise)
+            )["total"]
             if devis_text:
                 devis = devis_text
             elif devis_number is not None:
@@ -4966,10 +4946,20 @@ class Database:
                 """
                 SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
                 FROM payments p
-                WHERE p.sale_id = ANY(%s)
+                WHERE p.sale_id = ANY(%s) OR (p.sale_id IS NULL AND p.import_id IS NULL)
                 ORDER BY p.id DESC
                 """,
                 ([sale[0] for sale in sale_rows],),
+            )
+            payment_rows = self.cursor.fetchall()
+        else:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id IS NULL AND p.import_id IS NULL
+                ORDER BY p.id DESC
+                """,
             )
             payment_rows = self.cursor.fetchall()
 
@@ -5007,8 +4997,8 @@ class Database:
         sql = (
             "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
             "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
-            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
-            "COALESCE(s.remise, 0), "
+            "COALESCE(si.unit_price, 0), "
+            "COALESCE(s.remise, 0.0), "
             "COALESCE(si.information, ''), COALESCE(si.production, 0), "
             "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
             "COALESCE(s.created_by_username, '') "
@@ -5129,9 +5119,9 @@ class Database:
 
         sql = (
             "SELECT s.id, COALESCE(s.notes, ''), COALESCE(s.date, ''), "
-            "COALESCE(s.tva, 0), COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
+            "COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
             "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
-            f"WHERE {match_clause} GROUP BY s.id, s.notes, s.date, s.tva ORDER BY s.date DESC, s.id DESC"
+            f"WHERE {match_clause} GROUP BY s.id, s.notes, s.date ORDER BY s.date DESC, s.id DESC"
         )
         try:
             self.cursor.execute(sql, params)
@@ -5162,15 +5152,19 @@ class Database:
         ``sales_item_id`` may be ``None`` for a sale-level payment: the Sales
         History table is one row per Sale, so payments no longer need to target
         a single item. When an item id is given it must belong to the sale.
+
+        ``sale_id`` may be ``None`` for a general client-level payment that is
+        not associated with any specific sale/devis.
         """
         client_id = int(client_id)
-        sale_id = int(sale_id)
+        sale_id = int(sale_id) if sale_id is not None else None
         sales_item_id = int(sales_item_id) if sales_item_id else None
         amount = float(amount)
         if amount <= 0:
             raise ValueError("Payment amount must be greater than zero")
 
         try:
+            # Verify the client exists
             self.cursor.execute(
                 "SELECT username FROM clients WHERE id=%s", (client_id,)
             )
@@ -5186,34 +5180,35 @@ class Database:
                 owner_clause = " AND s.created_by = %s"
                 owner_params.append(int(user.get("id") or 0))
 
-            if sales_item_id:
-                self.cursor.execute(
-                    f"""
-                    SELECT 1
-                    FROM sales s
-                    JOIN sales_items si ON si.sales_id = s.id
-                    WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
-                    """,
-                    (sale_id, sales_item_id, client_id, *owner_params),
-                )
-                if not self.cursor.fetchone():
-                    raise ValueError("The selected purchase does not belong to this client")
-            else:
-                if norm:
-                    match_clause = (
-                        "(s.client_id=%s OR "
-                        "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            if sale_id is not None:
+                if sales_item_id:
+                    self.cursor.execute(
+                        f"""
+                        SELECT 1
+                        FROM sales s
+                        JOIN sales_items si ON si.sales_id = s.id
+                        WHERE s.id = %s AND si.id = %s AND s.client_id = %s{owner_clause}
+                        """,
+                        (sale_id, sales_item_id, client_id, *owner_params),
                     )
-                    match_params = [client_id, norm]
+                    if not self.cursor.fetchone():
+                        raise ValueError("The selected purchase does not belong to this client")
                 else:
-                    match_clause = "s.client_id=%s"
-                    match_params = [client_id]
-                self.cursor.execute(
-                    f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}{owner_clause}",
-                    (sale_id, *match_params, *owner_params),
-                )
-                if not self.cursor.fetchone():
-                    raise ValueError("The selected sale does not belong to this client")
+                    if norm:
+                        match_clause = (
+                            "(s.client_id=%s OR "
+                            "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+                        )
+                        match_params = [client_id, norm]
+                    else:
+                        match_clause = "s.client_id=%s"
+                        match_params = [client_id]
+                    self.cursor.execute(
+                        f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}{owner_clause}",
+                        (sale_id, *match_params, *owner_params),
+                    )
+                    if not self.cursor.fetchone():
+                        raise ValueError("The selected sale does not belong to this client")
 
             self.cursor.execute(
                 """
@@ -5319,7 +5314,7 @@ class Database:
         return (
             "SELECT i.id, COALESCE(i.date, ''), "
             "ii.id, COALESCE(ii.product_name, ''), COALESCE(ii.quantity, 0), "
-            "COALESCE(ii.unit_price, 0), COALESCE(i.tva, 0), "
+            "COALESCE(ii.unit_price, 0), "
             "COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE), "
             "COALESCE(i.created_by_username, '') "
             "FROM imports i JOIN import_items ii ON ii.import_id = i.id "
@@ -5406,11 +5401,10 @@ class Database:
             "SELECT i.id, COALESCE(i.date, ''), "
             "COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''), "
             "COALESCE(i.is_historical, FALSE), "
-            "COALESCE(i.tva, 0), "
             "COALESCE(SUM(ii.quantity * ii.unit_price), 0) "
             "FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id "
             f"WHERE {match_clause} "
-            "GROUP BY i.id, i.date, i.bl_number, i.is_historical, i.tva, "
+            "GROUP BY i.id, i.date, i.bl_number, i.is_historical, "
             "i.created_at ORDER BY i.id"
         )
         self.cursor.execute(sql, tuple(match_params))
@@ -5419,10 +5413,10 @@ class Database:
         from core.calculations import calculate_operation_totals, to_decimal
         import_rows = []
         for row in rows:
-            import_id, date, bl_number, is_hist, vat, raw = row
+            import_id, date, bl_number, is_hist, raw = row
             total = calculate_operation_totals(
-                to_decimal(raw), to_decimal(0), to_decimal(vat)
-            )["total_ttc"]
+                to_decimal(raw), to_decimal(0)
+            )["total"]
             import_rows.append([
                 import_id, date, bl_number, is_hist, total,
                 Decimal("0"), Decimal("0"),
@@ -5491,7 +5485,7 @@ class Database:
 
         self.cursor.execute(
             """
-            SELECT i.id, COALESCE(i.date, ''), COALESCE(i.tva, 0),
+            SELECT i.id, COALESCE(i.date, ''),
                    COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE),
                    COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''),
                    COALESCE(i.supplier_username, ''), COALESCE(i.supplier_name, '')

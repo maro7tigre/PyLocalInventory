@@ -190,7 +190,7 @@ class SalesReportRegressionTests(unittest.TestCase):
         self.assertIn('<span class="product-item-name">Transport</span><span class="item-detail"> Casablanca to Tanger</span>', data["items"])
         self.assertNotIn('<strong class="item-name">Transport</strong>', data["items"])
         self.assertNotIn(" — ", data["items"])
-        self.assertEqual(data["total_ht"], "125,20")
+        self.assertEqual(data["total"], "125,20")
 
     def test_report_keeps_service_designation_bold(self):
         item = SalesItemClass(0, None)
@@ -227,8 +227,8 @@ class SalesReportRegressionTests(unittest.TestCase):
         dialog.update_totals()
         self.assertEqual(table.item(0, columns.index("subtotal")).text(), "125.20")
         self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.subtotal_widget), 125.20)
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.vat_widget), 25.04)
-        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_ttc_widget), 150.24)
+        self.assertAlmostEqual(float((ParameterWidgetFactory.get_widget_value(dialog.remise_spinbox) or "0").replace(" MAD", "")), 0.00)
+        self.assertAlmostEqual(ParameterWidgetFactory.get_widget_value(dialog.total_widget), 125.20)
 
     def test_product_can_be_selected_before_typing_exact_quantity(self):
         table_widget = OperationsTableWidget(

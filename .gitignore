@@ -52,7 +52,7 @@ out*.txt
 output*.txt
 temp*.txt
 *.pdf
-
+*.txt
 # Repomix/generated context
 repomix-output.xml
 
@@ -87,3 +87,4 @@ Thumbs.db
 *.json
 /node_modules
 /raport stage files
+external_files/

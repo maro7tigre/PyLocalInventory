@@ -674,6 +674,13 @@ class SupplierWorkerTests(unittest.TestCase):
         self.assertEqual(_SupplierReportWorker._format_french_date(""), "")
         self.assertEqual(_SupplierReportWorker._format_french_date("garbage"), "garbage")
 
+    def test_supplier_report_uses_central_company_branding(self):
+        worker = self._report_worker("full_statement")
+        html = worker._generate_html()
+        self.assertIn("data:image/png;base64", html)
+        self.assertIn("LAMIBOIS", html)
+        self.assertNotIn("LAMIDAP", html)
+
     def _full_statement_worker(self):
         worker = self._report_worker("full_statement")
         worker.imports = [
@@ -689,7 +696,7 @@ class SupplierWorkerTests(unittest.TestCase):
 
     def test_report_worker_full_statement_generates_complete_html(self):
         worker = self._full_statement_worker()
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertNotIn("{{", html)
         self.assertIn("Relevé de Compte Fournisseur", html)
@@ -697,16 +704,16 @@ class SupplierWorkerTests(unittest.TestCase):
         self.assertIn("BL N° BL-2026-1", html)
         self.assertIn("IMPORTATION N°1", html)
         self.assertIn("Porte", html)
-        # raw 200.00 at 20% VAT => 240.00 TTC, 60.00 paid => 180.00 due.
-        self.assertIn("240,00", html)
-        self.assertIn("180,00", html)
+        # Supplier reports use the existing no-VAT import total calculation.
+        self.assertIn("200,00", html)
+        self.assertIn("140,00", html)
         self.assertIn("Total des achats", html)
         self.assertIn("Solde restant", html)
 
     def test_report_worker_selected_import_uses_detail_title(self):
         worker = self._full_statement_worker()
         worker.report_type = "selected_import"
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertIn("Détail d'Importation", html)
         # The global/final account summary blocks are full-statement only.
@@ -721,7 +728,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker.payments = []
         worker.bl_by_import = {1: ""}
         worker.historical_by_import = {1: True}
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             html = worker._generate_html()
         self.assertIn("HISTORIQUE", html)
 
@@ -731,7 +738,8 @@ class SupplierWorkerTests(unittest.TestCase):
         self.addCleanup(os.unlink, path)
         with open(path, "w", encoding="utf-8") as f:
             f.write(
-                "<html>{{ logo_block }}{{ document_title }}{{ document_date }}"
+                "<html>{{ logo_block }}{{ company_name }}{{ company_address }}"
+                "{{ company_phone }}{{ company_email }}{{ document_title }}{{ document_date }}"
                 "{{ supplier_block }}{{ global_summary }}{{ import_content }}"
                 "{{ final_summary }}{{ report_footer }}{{ unknown_tag }}</html>"
             )
@@ -746,7 +754,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker.imports = []
         worker.payments = []
         with patch.object(sdd_module, "resource_path", side_effect=fake_resource_path), \
-                patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+                patch.object(_SupplierReportWorker, "_get_company_logo_block", return_value="LOGO"):
             with self.assertRaises(RuntimeError):
                 worker._generate_html()
 

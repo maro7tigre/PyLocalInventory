@@ -10,17 +10,41 @@ if not browser_root.is_dir():
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
+report_root = project_root / 'report'
+report_asset_extensions = {
+    '.html', '.htm', '.css', '.png', '.jpg', '.jpeg', '.gif', '.svg',
+    '.ttf', '.otf', '.woff', '.woff2',
+}
+required_report_assets = (
+    'bdl_templet.html',
+    'client_statement_templet.html',
+    'devis_templet.html',
+    'facture_templet.html',
+    'import_bl_templet.html',
+    'Receipt_templat.html',
+    'supplier_statement_templet.html',
+    'lamidap_logo.png',  # Compatibility asset for LAMIDAP-branded deployments.
+)
+for relative_path in required_report_assets:
+    source = report_root / relative_path
+    if not source.is_file():
+        raise SystemExit(f'Required report asset is missing: {source}')
+
+report_datas = []
+for source in sorted(report_root.rglob('*')):
+    if source.is_file() and source.suffix.lower() in report_asset_extensions:
+        destination = str(Path('report') / source.parent.relative_to(report_root))
+        report_datas.append((str(source), destination))
+
+company_logo = project_root / 'assets' / 'lamibois.png'
+if not company_logo.is_file():
+    raise SystemExit(f'Required company logo is missing: {company_logo}')
+
 application_datas = [
     (str(project_root / 'logo.png'), '.'),
-    (str(project_root / 'report'), 'report'),
+    (str(company_logo), 'assets'),
     (str(browser_root), 'playwright-browsers'),
-]
-
-# Automatically include future runtime-only asset directories when present.
-for resource_dir in ('assets', 'static', 'fonts', 'images', 'icons', 'translations', 'config'):
-    source = project_root / resource_dir
-    if source.is_dir():
-        application_datas.append((str(source), resource_dir))
+] + report_datas
 
 # Include tracked database initialization resources, but never user databases.
 database_dir = project_root / 'database'

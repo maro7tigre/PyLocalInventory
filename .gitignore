@@ -78,6 +78,9 @@ test_worker.py
 docs/ANTIGRAVITY_STABILITY_FIX_PROMPT.md
 docs/PYLOCALINVENTORY_ANTIGRAVITY_CONTEXT.md
 tests/
+!tests/
+tests/*
+!tests/test_runtime_paths.py
 # Editor and OS metadata
 .vscode/
 .idea/

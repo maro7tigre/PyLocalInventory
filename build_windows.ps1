@@ -135,7 +135,11 @@ try {
 
     $SourceReportPath = Join-Path $RepositoryRoot "report"
     $PackagedReportPath = Join-Path $InternalPath "report"
-    $SourceReportAssets = @(Get-ChildItem -LiteralPath $SourceReportPath -File -Recurse)
+    $ReportAssetExtensions = @(".html", ".htm", ".css", ".png", ".jpg", ".jpeg", ".gif", ".svg", ".ttf", ".otf", ".woff", ".woff2")
+    $SourceReportAssets = @(
+        Get-ChildItem -LiteralPath $SourceReportPath -File -Recurse |
+            Where-Object { $ReportAssetExtensions -contains $_.Extension.ToLowerInvariant() }
+    )
     foreach ($SourceAsset in $SourceReportAssets) {
         $RelativeAsset = $SourceAsset.FullName.Substring($SourceReportPath.Length).TrimStart([char[]]"\/")
         $PackagedAsset = Join-Path $PackagedReportPath $RelativeAsset

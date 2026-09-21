@@ -5,7 +5,8 @@ from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser, QMessageBox
 )
 from PySide6.QtGui import QTextDocument
-import os
+
+from core.runtime_paths import resource_path
 
 
 class ReceiptDialog(QDialog):
@@ -29,9 +30,7 @@ class ReceiptDialog(QDialog):
         rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
         status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} {self.currency} REMAINING'
 
-        template_path = os.path.normpath(os.path.join(
-            os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'Receipt_templat.html'
-        ))
+        template_path = resource_path("report", "Receipt_templat.html")
         try:
             with open(template_path, 'r', encoding='utf-8') as f:
                 template = f.read()

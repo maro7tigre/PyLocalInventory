@@ -52,10 +52,10 @@ out*.txt
 output*.txt
 temp*.txt
 *.pdf
-
+*.txt
 # Repomix/generated context
 repomix-output.xml
-
+external_files/*
 # One-off debug / patch / migration helper scripts (kept locally, not published)
 add_report_worker.py
 append_methods.py

@@ -18,42 +18,18 @@ from core.calculations import calculate_line_subtotal, calculate_operation_total
 import os
 import uuid
 import shiboken6
-import time
-import threading
 
 _active_background_threads = set()
 import logging
 from core.runtime_paths import user_data_root
 
 logger = logging.getLogger(__name__)
-_save_timeline_logger = logging.getLogger("save_timeline")
 
 # QDoubleSpinBox clamps setValue() to its configured range.  Financial fields
 # need an explicit business-sized range instead of NumericWidget's deliberately
 # conservative generic default (999999), which is also used by quantities and
 # other unrelated numeric parameters.
 FINANCIAL_WIDGET_MAX = 999_999_999_999.99
-
-# Root logger defaults to WARNING app-wide (no setLevel anywhere in this
-# codebase), which would silently drop these diagnostic events - opt this
-# specific logger into INFO regardless, so app.log actually captures them.
-_save_timeline_logger.setLevel(logging.INFO)
-
-
-def _log_save_event(event, **fields):
-    """TEMPORARY Sale Save freeze diagnostic. Writes to both app.log (via the
-    standard logger, for context) and the dedicated
-    logs/sale_save_hang_diagnostic.log (via core.sale_save_diagnostics),
-    which is the file to read when reproducing a hang. Delete once the
-    freeze investigation is closed out."""
-    t = threading.current_thread()
-    extra = " ".join(f"{k}={v!r}" for k, v in fields.items())
-    _save_timeline_logger.info(
-        "%s t=%.6f thread=%s(id=%s) %s",
-        event, time.perf_counter(), t.name, t.ident, extra,
-    )
-    from core import sale_save_diagnostics
-    sale_save_diagnostics.event(event, **fields)
 
 class SaveWorker(QObject):
     finished = Signal(object)
@@ -70,7 +46,6 @@ class SaveWorker(QObject):
         worker_db = self.database
         is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
         token = (self.save_kwargs.get('sale_data') or self.save_kwargs.get('import_data') or {}).get('operation_token')
-        _log_save_event("SAVE_WORKER_ENTER", token=token, is_local=is_local)
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
@@ -83,7 +58,6 @@ class SaveWorker(QObject):
                 if not worker_db.connect():
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
 
-            _log_save_event("RPC_REQUEST_START", token=token, is_import=self.is_import, is_local=is_local)
             if self.is_import:
                 res = worker_db.save_import_with_items(**self.save_kwargs)
                 if not isinstance(res, dict) or res.get("transaction") != "committed":
@@ -94,19 +68,16 @@ class SaveWorker(QObject):
                 if not isinstance(res, dict) or res.get('transaction') != 'committed':
                     raise RuntimeError(f"Host returned an invalid sale-save result: {res!r}")
                 res['expected'] = len(self.save_kwargs.get('items', []))
-            _log_save_event("RPC_REQUEST_END", token=token, result="committed")
             self.finished.emit(res)
-            _log_save_event("SAVE_SUCCESS_EMIT", token=token)
         except Exception as e:
-            _log_save_event("RPC_REQUEST_END", token=token, result="error", error=str(e))
             self.error.emit(str(e))
-            _log_save_event("SAVE_ERROR_EMIT", token=token, error=str(e))
         finally:
             if is_local and worker_db and worker_db != self.database:
                 worker_db.close()
 
 class LoadWorker(QObject):
     finished = Signal()
+    loaded = Signal(object)
     error = Signal(str)
 
     def __init__(self, operation_obj, database, fetch_catalog, fetch_devis_preview=False,
@@ -119,6 +90,7 @@ class LoadWorker(QObject):
         self.fetch_bl_preview = fetch_bl_preview
         self.devis_preview = None
         self.bl_preview = None
+        self.catalog = None
 
     @Slot()
     def process(self):
@@ -143,7 +115,7 @@ class LoadWorker(QObject):
                 self.operation_obj.load_database_data()
 
             if self.fetch_catalog and getattr(worker_db, 'get_sale_catalog', None):
-                self.database.sale_catalog = worker_db.get_sale_catalog(
+                self.catalog = worker_db.get_sale_catalog(
                     include_clients=worker_db.has_permission('Clients', 'read'),
                     include_suppliers=worker_db.has_permission('Suppliers', 'read'),
                 )
@@ -165,6 +137,13 @@ class LoadWorker(QObject):
                     self.bl_preview = worker_db.get_next_bl_preview()
                 except Exception:
                     self.bl_preview = None
+            # Emit plain data before cleanup. The GUI must never dereference a
+            # worker which may already have received deleteLater().
+            self.loaded.emit({
+                'catalog': self.catalog,
+                'devis_preview': self.devis_preview,
+                'bl_preview': self.bl_preview,
+            })
             self.finished.emit()
         except Exception as e:
             self.error.emit(str(e))
@@ -234,7 +213,7 @@ class BaseOperationDialog(QDialog):
         self.load_worker.error.connect(self.load_worker.deleteLater)
         
         # Business logic callbacks
-        self.load_worker.finished.connect(self._on_load_finished)
+        self.load_worker.loaded.connect(self._on_load_finished)
         self.load_worker.error.connect(self._on_load_error)
         
         _active_background_threads.add(self.load_thread)
@@ -245,14 +224,14 @@ class BaseOperationDialog(QDialog):
         self.resize(900, 700)
 
         self.setMinimumSize(600, 500)
-    def _on_load_finished(self):
-        # NOTE: self.load_thread / self.load_worker are intentionally NOT
-        # cleared here - see _on_save_finished. Refs are cleared in
-        # _on_load_thread_finished, queued to fire only after load_thread.finished.
-        _preview = self.load_worker.devis_preview if self.load_worker else None
-        _preview_bl = self.load_worker.bl_preview if self.load_worker else None
-        
+    def _on_load_finished(self, loaded=None):
+        loaded = loaded or {}
+        catalog = loaded.get('catalog')
+        _preview = loaded.get('devis_preview')
+        _preview_bl = loaded.get('bl_preview')
         try:
+            if catalog is not None:
+                self.database.sale_catalog = catalog
             self.setEnabled(True)
             title = self.windowTitle().replace(" (Loading...)", "")
             self.setWindowTitle(title)
@@ -294,8 +273,6 @@ class BaseOperationDialog(QDialog):
             pass
 
     def _on_load_error(self, err_msg):
-        # Refs are cleared in _on_load_thread_finished (see _on_save_finished).
-
         try:
             QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
             self.setEnabled(True)
@@ -591,6 +568,7 @@ class BaseOperationDialog(QDialog):
                     calculate_line_subtotal(
                         row.get("quantity") or 0,
                         row.get("unit_price") or 0,
+                        row.get("discount_percentage") or 0,
                     )
                     for row in rows
                 ),
@@ -686,7 +664,6 @@ class BaseOperationDialog(QDialog):
     
     def save_changes(self):
         """Prevent double-clicks from starting the same transaction twice."""
-        _log_save_event("SAVE_CLICK", token=self.operation_token, operation_id=self.operation_id)
         if self._saving:
             return
         self._saving = True
@@ -704,19 +681,13 @@ class BaseOperationDialog(QDialog):
     def _save_changes_impl(self):
         """Save operation and items to database (simple, reliable)"""
         # Validate first
-        _log_save_event("GUI_VALIDATION_START", token=self.operation_token)
         errors = self.validate_data()
         if errors:
-            _log_save_event("GUI_VALIDATION_END", token=self.operation_token, result="errors")
             QMessageBox.warning(self, "Validation Error", "\n".join(errors))
             return
 
         # Check for missing related entities (client/supplier, products) and offer creation
         proceed, allow_unresolved = self._handle_missing_references()
-        _log_save_event(
-            "GUI_VALIDATION_END", token=self.operation_token,
-            result="ok" if proceed else "cancelled",
-        )
         if not proceed:
             return  # User cancelled
 
@@ -774,7 +745,6 @@ class BaseOperationDialog(QDialog):
                         return
                         
                 # BUILD PAYLOAD ON GUI THREAD
-                _log_save_event("PAYLOAD_BUILD_START", token=self.operation_token)
                 raw_items = self.items_table.get_current_table_data()
                 prepared = []
                 if is_import:
@@ -825,16 +795,11 @@ class BaseOperationDialog(QDialog):
                     }
 
                 action = "updated" if self.operation_id else "created"
-                _log_save_event(
-                    "PAYLOAD_BUILD_END", token=self.operation_token,
-                    item_count=len(prepared),
-                )
 
                 self.save_thread = QThread()
                 self.save_worker = SaveWorker(self.database, is_import, save_kwargs)
                 self.save_worker.moveToThread(self.save_thread)
                 self.save_thread.started.connect(self.save_worker.process)
-                _log_save_event("SAVE_THREAD_CREATE", token=self.operation_token)
 
                 # Safe thread cleanup lifecycle
                 self.save_worker.finished.connect(self.save_thread.quit)
@@ -842,9 +807,6 @@ class BaseOperationDialog(QDialog):
                 self.save_thread.finished.connect(self.save_thread.deleteLater)
                 self.save_worker.error.connect(self.save_thread.quit)
                 self.save_worker.error.connect(self.save_worker.deleteLater)
-                self.save_thread.finished.connect(
-                    lambda tok=self.operation_token: _log_save_event("SAVE_THREAD_FINISHED", token=tok)
-                )
 
                 # Business logic callbacks.
                 #
@@ -877,7 +839,6 @@ class BaseOperationDialog(QDialog):
                 _active_background_threads.add(self.save_thread)
                 self.save_thread.finished.connect(self._on_save_thread_finished)
                 self.save_thread.start()
-                _log_save_event("SAVE_THREAD_START", token=self.operation_token)
                 return
 
             success = self.operation_obj.save_to_database()
@@ -959,7 +920,6 @@ class BaseOperationDialog(QDialog):
         self._on_save_finished(result, self._pending_save_action)
 
     def _on_save_finished(self, result, action):
-        _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action=action)
         # NOTE: self.save_thread / self.save_worker are intentionally NOT
         # cleared here. The worker's OS thread may still be winding down when
         # this queued callback runs; dropping the last references here lets the
@@ -992,11 +952,8 @@ class BaseOperationDialog(QDialog):
                     f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
                     f"deleted: {result.get('deleted', 0)}."
                 )
-                _log_save_event("DIALOG_ACCEPT", token=self.operation_token)
                 self.accept()
-                _log_save_event("POST_SAVE_REFRESH_START", token=self.operation_token)
                 self._refresh_related_tabs("Sales", "Products", "Clients")
-                _log_save_event("POST_SAVE_REFRESH_END", token=self.operation_token)
 
             elif getattr(self.operation_obj, 'section', '') == 'Imports':
                 self.operation_id = result["import_id"]
@@ -1008,16 +965,12 @@ class BaseOperationDialog(QDialog):
                     f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
                     f"Products created: {result.get('created_products', 0)}.",
                 )
-                _log_save_event("DIALOG_ACCEPT", token=self.operation_token)
                 self.accept()
-                _log_save_event("POST_SAVE_REFRESH_START", token=self.operation_token)
                 self._refresh_related_tabs("Imports", "Products")
-                _log_save_event("POST_SAVE_REFRESH_END", token=self.operation_token)
         except RuntimeError:
             pass
 
     def _on_save_error(self, err_msg):
-        _log_save_event("SAVE_GUI_CALLBACK", token=self.operation_token, action="error")
         # Refs are cleared in _on_save_thread_finished (see _on_save_finished).
 
         try:
@@ -1105,22 +1058,7 @@ class BaseOperationDialog(QDialog):
             elif hasattr(tab, "mark_dirty"):
                 tab.mark_dirty()
 
-    @staticmethod
-    def _write_sale_save_log(message):
-        try:
-            log_dir = os.path.join(user_data_root(), 'logs')
-            os.makedirs(log_dir, exist_ok=True)
-            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
-                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] ui {message}\n")
-        except OSError:
-            logger.exception("Could not write sale diagnostic log")
-    
     def closeEvent(self, event):
-        # TEMPORARY Sale Save freeze diagnostic marker - see _log_save_event.
-        _log_save_event(
-            "DIALOG_CLOSE", token=getattr(self, "operation_token", None),
-            saving=getattr(self, "_saving", None),
-        )
         load_thread = getattr(self, "load_thread", None)
         if load_thread is not None:
             try:

@@ -1,0 +1,142 @@
+# PROJECT STATUS AND NEXT STEPS
+
+## 1. Project Overview
+
+* **Project name:** PyLocalInventory
+* **Short description:** A Windows desktop business-management application for inventory, commercial operations (sales/imports), and PDF report generation, operating over a LAN network.
+* **Main objective:** Centralize business operations, replace fragmented manual processes, and provide a unified, multi-user, and persistent database environment for business management.
+* **Technologies:** Python, PySide6 (Qt), PostgreSQL, HTML/CSS (for PDF templates), PyInstaller, PowerShell.
+* **Current overall status:** The core software is considered highly stable and feature-complete. The active current focus is writing the official 60-page ENSI internship report.
+
+## 2. What We Have Already Done
+
+### Analysis & Requirements
+* [x] Defined functional requirements for Sales, Imports, Products, Clients, and Suppliers.
+* [x] Established business rules (e.g., normal sales decrease stock, historical sales do not).
+* [x] Defined Host/Client LAN architecture requirements.
+
+### Architecture & Conception
+* [x] Abandoned SQLite replication to prevent synchronization conflicts (Single source of truth established).
+* [x] Designed asynchronous GUI architecture using QThread workers (preventing UI freezes).
+* [x] Designed API/RPC network layer for Client-to-Host communication.
+
+### Database
+* [x] Configured PostgreSQL as the authoritative engine.
+* [x] Implemented `ThreadedConnectionPool` for concurrent access.
+* [x] Created schemas for Products, Services, Clients, Suppliers, Sales, Imports, and Payments.
+* [x] Implemented database backup functionality (`core/pg_backup.py`).
+
+### UI/UX
+* [x] Designed PySide6 tab-based interface.
+* [x] Created Dashboard with visual analytics, low-stock alerts, and financial overview.
+* [x] Designed reusable operation dialogs (`BaseOperationDialog`) and tables (`OperationsTableWidget`).
+
+### Backend
+* [x] Implemented Python business logic for stock calculations (HT, TVA, TTC).
+* [x] Built the HTTP/JSON-based local network server (`core/network/server.py`).
+* [x] Built safe thread lifecycle management (cooperative cancellation, no forced `terminate()`).
+
+### Features & Integration
+* [x] Implemented Product and Service management.
+* [x] Implemented Client and Supplier management.
+* [x] Implemented Sales creation, editing, and stock deduction.
+* [x] Implemented Imports management.
+* [x] Implemented Payments tracking and client balance calculations.
+* [x] Implemented document attachment functionality.
+* [x] Implemented PDF generation using HTML templates and rendering engines (Playwright/WeasyPrint).
+* [x] Added "Charges" module (categories, recurring charges, analytics).
+
+### Authentication & Authorization
+* [x] Implemented profile-level protection using Fernet encryption (`core/password.py`).
+* [x] Implemented server-side role-based access control (RBAC) for network users.
+
+### Report Preparation (ENSI)
+* [x] Page de garde.
+* [x] Dédicace.
+* [x] Remerciements.
+* [x] Résumé en français + mots clés.
+* [x] Abstract en anglais + keywords.
+* [x] Table des matières, Figures, Tableaux, Abréviations (Configured in Word).
+* [x] Introduction générale.
+* [x] Chapitre 1 — Contexte et état de l'art.
+
+## 3. Currently In Progress
+
+* [ ] **Internship Report (Rapport de Stage)**
+  * **Current state:** Main chapters writing phase.
+  * **What has already been done:** Preliminary pages, Intro, and Chapter 1.
+  * **What remains:** Chapters 2, 3, Conclusion, and annexes.
+
+## 4. What Still Needs To Be Done
+
+### 🔴 High Priority
+* [ ] **Draft Chapitre 2: Méthodologie / conception** (Next immediate ENSI requirement - UML & Database).
+* [ ] **Draft Chapitre 3: Réalisation et résultats**.
+* [ ] **Write "Conclusion générale et perspectives"**.
+
+### 🟡 Medium Priority
+* [ ] Generate UML diagrams (Use Case, Class, Sequence) for Chapitre 2.
+* [ ] Capture high-resolution screenshots of the final PyLocalInventory dashboard and UI tabs for Chapitre 3.
+
+## 5. NEXT STEP
+
+**Current situation:**
+Chapter 1 is completed. We have established the context of LAMIDAP and the requirements for PyLocalInventory.
+
+**Next step:**
+Draft **Chapitre 2: Méthodologie / conception**.
+
+**Why:**
+Chapter 2 translates the requirements from Chapter 1 into technical architecture. This chapter relies heavily on visual diagrams (UML Use Case, Class diagrams) to show the jury *how* the system was engineered before the actual code was written.
+
+## 6. Development Sequence
+
+To finish the project (specifically the report deliverable):
+1. Generate all UML/Architectural diagrams for Chapter 2.
+2. Draft Chapter 2 (Design & Architecture).
+3. Take screenshots of the final application.
+4. Draft Chapter 3 (Implementation & Results).
+5. Write Conclusion générale.
+6. Click "Update Field" in Word to auto-generate the lists.
+7. Final formatting review against ENSI 60-page / 1.15 spacing rules.
+
+## 7. Report Preparation
+
+* **Preliminary Pages**
+  * [x] Page de garde
+  * [x] Dédicace
+  * [x] Remerciements
+  * [x] Résumé en français + mots clés
+  * [x] Abstract en anglais + keywords
+  * [x] Table des matières (Word auto-generation)
+  * [x] Liste des figures (Word auto-generation)
+  * [x] Liste des tableaux (Word auto-generation)
+  * [x] Liste des abréviations (Placeholder)
+* **Main Content**
+  * [x] Introduction générale
+  * [x] Chapitre 1 — Contexte et état de l’art
+  * [ ] Chapitre 2 — Méthodologie / conception *(Missing: Formal UML diagrams)*
+  * [ ] Chapitre 3 — Réalisation et résultats *(Missing: Final screenshots)*
+  * [ ] Conclusion générale et perspectives
+* **End Pages**
+  * [ ] Références bibliographiques
+  * [ ] Annexes
+
+## 8. Missing Information
+
+To complete the report accurately, the following information must be provided by the user:
+* [ ] **Exact internship dates** (Start date and end date for the 2-month period).
+* [ ] **Final list of User Roles** (Needed for UML Use Case diagram in Chapter 2).
+
+## 10. Change Log
+
+| Date | Change | Status |
+| ---- | ------ | ------ |
+| Pre-Report | Migrated app architecture from SQLite cache to direct PostgreSQL / RPC. | Completed |
+| 2026-09-01 | Initialized ENSI Report tracking. | Completed |
+| 2026-09-01 | Finalized Page de garde, Dédicace, Remerciements. | Completed |
+| 2026-09-01 | Created PROJECT_STATUS_AND_NEXT_STEPS.md roadmap. | Completed |
+| 2026-09-01 | Finalized Résumé, Abstract, and Word Configs. | Completed |
+| 2026-09-01 | Finalized Introduction générale. | Completed |
+| 2026-09-01 | Finalized Chapitre 1 (Context & Requirements). | Completed |
+| 2026-09-04 | Established Chapitre 2 Action Plan, Diagram & Table specs. | Completed |

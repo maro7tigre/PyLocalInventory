@@ -572,7 +572,7 @@ class Database:
             },
             'sales_items': {
                 'product_name': 'TEXT', 'service_id': 'INTEGER', 'item_type': 'TEXT',
-                'sort_order': 'INTEGER',
+                'sort_order': 'INTEGER', 'discount_percentage': 'DOUBLE PRECISION NOT NULL DEFAULT 0',
             },
             'import_items': {'product_name': 'TEXT'}
         }
@@ -1927,6 +1927,11 @@ class Database:
             unit_price = None if is_section else self._sale_decimal(
                 raw.get('unit_price'), f"item {index} unit price", '0'
             )
+            discount_percentage = None if is_section else self._sale_decimal(
+                raw.get('discount_percentage', 0), f"item {index} remise percent", '0'
+            )
+            if discount_percentage is not None and not 0 <= discount_percentage <= 100:
+                raise ValueError(f"Item {index}: remise percent must be between 0 and 100")
             item_id = raw.get('id')
             product_id = raw.get('product_id')
             service_id = raw.get('service_id')
@@ -1950,16 +1955,12 @@ class Database:
                 'information': '' if is_section else str(raw.get('information') or '').strip(),
                 'quantity': quantity,
                 'unit_price': unit_price,
+                'discount_percentage': discount_percentage,
                 'production': None if is_section else int(raw.get('production') or 0),
                 'item_type': requested_type,
                 'sort_order': int(raw.get('sort_order') or index),
             })
 
-        # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
-        from core import sale_save_diagnostics
-        sale_save_diagnostics.event(
-            "DB_TRANSACTION_START", sale_id=sale_id, item_count=len(validated),
-        )
         try:
             header_token = str(sale_data.get("operation_token") or "").strip()
             if not sale_id and header_token:
@@ -1971,9 +1972,6 @@ class Database:
                     self.cursor.execute(
                         "SELECT COUNT(*) FROM sales_items WHERE sales_id = %s",
                         (int(duplicate[0]),),
-                    )
-                    sale_save_diagnostics.event(
-                        "DB_TRANSACTION_END", result="duplicate_token", sale_id=int(duplicate[0]),
                     )
                     return {
                         "sale_id": int(duplicate[0]), "saved": int(self.cursor.fetchone()[0]),
@@ -2126,7 +2124,7 @@ class Database:
                     item['product_id'], item['service_id'], item['item_type'],
                     item['product_name'], item['information'],
                     item['quantity'], item['unit_price'], item['production'],
-                    item['sort_order'],
+                    item['sort_order'], item['discount_percentage'],
                 )
                 if item['id'] is not None:
                     if item['id'] not in existing_ids:
@@ -2134,7 +2132,7 @@ class Database:
                     self.cursor.execute(
                         "UPDATE sales_items SET product_id=%s, service_id=%s, item_type=%s, "
                         "product_name=%s, information=%s, quantity=%s, unit_price=%s, "
-                        "production=%s, sort_order=%s WHERE id=%s AND sales_id=%s",
+                        "production=%s, sort_order=%s, discount_percentage=%s WHERE id=%s AND sales_id=%s",
                         (*values, item['id'], sale_id),
                     )
                     retained_ids.add(item['id'])
@@ -2143,8 +2141,8 @@ class Database:
                     self.cursor.execute(
                         "INSERT INTO sales_items "
                         "(sales_id, product_id, service_id, item_type, product_name, "
-                        "information, quantity, unit_price, production, sort_order) "
-                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        "information, quantity, unit_price, production, sort_order, discount_percentage) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
                         (sale_id, *values),
                     )
                     row = self.cursor.fetchone()
@@ -2206,9 +2204,7 @@ class Database:
                             f"Insufficient stock for product ID {product_id}: "
                             f"requested {requested}, available {imported - sold_elsewhere}"
                         )
-            sale_save_diagnostics.event("DB_TRANSACTION_END", result="committing", sale_id=sale_id)
             self.conn.commit()
-            sale_save_diagnostics.event("DB_TRANSACTION_END", result="committed", sale_id=sale_id)
             return {
                 'sale_id': sale_id,
                 'saved': len(validated),
@@ -2222,12 +2218,8 @@ class Database:
                 ],
                 'transaction': 'committed',
             }
-        except Exception as e:
-            sale_save_diagnostics.event(
-                "DB_TRANSACTION_END", result="rolling_back", sale_id=sale_id, error=str(e),
-            )
+        except Exception:
             self.conn.rollback()
-            sale_save_diagnostics.event("DB_TRANSACTION_END", result="rolled_back", sale_id=sale_id)
             raise
 
     def save_import_with_items(
@@ -4528,13 +4520,13 @@ class Database:
 
     # Attachment operations transfer bytes as base64 over LAN RPC. The host's
     # data directory is never returned to a workstation.
-    def list_attachments(self, entity_type, entity_id):
+    def list_attachments(self, entity_type, entity_id, scope=None):
         from core.attachments import AttachmentService
-        return AttachmentService(self).list(entity_type, int(entity_id))
+        return AttachmentService(self).list(entity_type, int(entity_id), scope)
 
-    def upload_attachment(self, entity_type, entity_id, filename, content_b64, description='', category=''):
+    def upload_attachment(self, entity_type, entity_id, filename, content_b64, description='', category='', sale_id=None):
         from core.attachments import AttachmentService
-        return AttachmentService(self).upload(entity_type, int(entity_id), filename, content_b64, description, category)
+        return AttachmentService(self).upload(entity_type, int(entity_id), filename, content_b64, description, category, sale_id)
 
     def download_attachment(self, attachment_id):
         from core.attachments import AttachmentService

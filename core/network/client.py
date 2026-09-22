@@ -240,17 +240,10 @@ class RemoteDatabase:
             raise AuthError("Not connected")
         diagnostics.network_call(method)
 
-        is_save_call = method in ('save_sale_with_items', 'save_import_with_items')
         url = f"http://{self.host}:{self.port}/rpc"
         safe_args = self._json_safe(args or [])
         safe_kwargs = self._json_safe(kwargs or {})
         payload = json.dumps({'method': method, 'args': safe_args, 'kwargs': safe_kwargs}).encode('utf-8')
-        if is_save_call:
-            # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
-            from core import sale_save_diagnostics
-            sale_save_diagnostics.event(
-                "RPC_REQUEST_START", method=method, url=url, timeout=timeout,
-            )
         if method == 'save_sale_with_items':
             sale_data = safe_args[0] if safe_args else {}
             items = safe_args[1] if len(safe_args) > 1 else []
@@ -279,21 +272,12 @@ class RemoteDatabase:
                 self._write_network_log(
                     f"response_url={url} http_status={e.code} validation=failed error={message}"
                 )
-            if is_save_call:
-                sale_save_diagnostics.event(
-                    "RPC_REQUEST_END", method=method, result="http_error",
-                    http_status=e.code, error=message,
-                )
             if e.code == 401:
                 raise AuthError(message)
             if e.code == 403:
                 raise PermissionDeniedError(message)
             raise RemoteError(message)
         except (AuthError, PermissionDeniedError, RemoteError) as e:
-            if is_save_call:
-                sale_save_diagnostics.event(
-                    "RPC_REQUEST_END", method=method, result="error", error=str(e),
-                )
             raise
         except Exception as e:
             logger.warning(
@@ -304,18 +288,9 @@ class RemoteDatabase:
                 self._write_network_log(
                     f"response_url={url} http_status=unavailable connection_error={e}"
                 )
-            if is_save_call:
-                sale_save_diagnostics.event(
-                    "RPC_REQUEST_END", method=method, result="connection_error", error=str(e),
-                )
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
         elapsed_ms = (time.perf_counter() - started) * 1000
-        if is_save_call:
-            sale_save_diagnostics.event(
-                "RPC_REQUEST_END", method=method, result="ok",
-                http_status=http_status, elapsed_ms=round(elapsed_ms, 1),
-            )
         logger.log(
             logging.WARNING if elapsed_ms >= 500 else logging.INFO,
             "LAN RPC method=%s host=%s port=%s duration_ms=%.1f build_id=%s host_build_id=%s",
@@ -440,7 +415,7 @@ class RemoteDatabase:
             return self._call(name, list(args), kwargs)
         return _proxy
 
-    def list_attachments(self, entity_type, entity_id):
+    def list_attachments(self, entity_type, entity_id, scope=None):
         """Return attachment metadata for one entity.
 
         Online: asks the host (authoritative) exactly like before. Offline:
@@ -458,7 +433,10 @@ class RemoteDatabase:
                     if record.get('entity_type') == entity_type
                     and int(record.get('entity_id')) == entity_id
                 ]
-        return self._call('list_attachments', [entity_type, entity_id])
+        args = [entity_type, entity_id]
+        if scope is not None:
+            args.append(scope)
+        return self._call('list_attachments', args)
 
     def get_changes(self, section, since_seq=0, limit=500, timeout=4):
         """Fetch incremental changes for ``section`` since sequence

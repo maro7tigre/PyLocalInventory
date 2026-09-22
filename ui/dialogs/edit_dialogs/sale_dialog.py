@@ -157,7 +157,7 @@ class SaleEditDialog(QDialog):
             item_class=SalesItemClass,
             parent_operation=self.sale_obj,
             database=self.database,
-            columns=['product_preview', 'product_description','product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
+            columns=['product_preview', 'product_description','product_name', 'quantity', 'unit_price', 'discount_percentage', 'subtotal', 'delete_action'],
             parent=self,
             highlight_stock_exceed=True
         )

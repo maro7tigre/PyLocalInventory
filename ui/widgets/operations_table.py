@@ -3,7 +3,7 @@ Operations Table Widget - Clean architecture with proper separation of concerns
 """
 from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView,
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
-                             QStyledItemDelegate, QComboBox, QInputDialog)
+                              QStyledItemDelegate, QComboBox, QInputDialog, QDoubleSpinBox)
 from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
 from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer, QSignalBlocker
 from ui.widgets.preview_widget import PreviewWidget
@@ -109,6 +109,7 @@ class TableDataManager:
             row_data['subtotal'] = calculate_line_subtotal(
                 row_data.get('quantity', 0),
                 row_data.get('unit_price', 0),
+                row_data.get('discount_percentage', 0),
             )
         
         return row_data
@@ -240,7 +241,7 @@ class TableRowFactory:
         except (ValueError, AttributeError):
             pass
 
-        for param_key in ('quantity', 'unit_price', 'subtotal'):
+        for param_key in ('quantity', 'unit_price', 'discount_percentage', 'subtotal'):
             try:
                 col = self.data_manager.table_columns.index(param_key)
             except ValueError:
@@ -580,7 +581,7 @@ class TableEventHandler:
         if col < len(self.data_manager.table_columns):
             param_key = self.data_manager.table_columns[col]
             
-            if param_key in ['quantity', 'unit_price']:
+            if param_key in ['quantity', 'unit_price', 'discount_percentage']:
                 self._updating = True
                 try:
                     self._update_row_subtotal(row)
@@ -936,15 +937,22 @@ class TableEventHandler:
             
             qty_item = self.table.item(row, qty_col)
             price_item = self.table.item(row, price_col)
+            try:
+                discount_col = self.data_manager.table_columns.index('discount_percentage')
+                discount_item = self.table.item(row, discount_col)
+            except ValueError:
+                discount_item = None
             
             qty_state, quantity = parse_decimal_input(qty_item.text() if qty_item else "")
             price_state, unit_price = parse_decimal_input(price_item.text() if price_item else "")
+            discount_state, discount = parse_decimal_input(discount_item.text() if discount_item else "0")
             
             if qty_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
-               price_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID):
+                price_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+                discount_state in (InputState.INTERMEDIATE, InputState.INVALID) or not Decimal('0') <= discount <= Decimal('100'):
                 return
             
-            subtotal = calculate_line_subtotal(quantity, unit_price)
+            subtotal = calculate_line_subtotal(quantity, unit_price, discount)
             
             blocker = QSignalBlocker(self.table)
             
@@ -1157,6 +1165,30 @@ class QuantityDelegate(QStyledItemDelegate):
             editor.setToolTip("")
 
 
+class DecimalSpinBoxDelegate(QStyledItemDelegate):
+    """Bounded decimal editor used for per-line sale discounts."""
+    def __init__(self, decimals=2, minimum=0.0, maximum=100.0, parent=None):
+        super().__init__(parent)
+        self.decimals, self.minimum, self.maximum = decimals, minimum, maximum
+
+    def createEditor(self, parent, option, index):
+        editor = QDoubleSpinBox(parent)
+        editor.setDecimals(self.decimals)
+        editor.setRange(self.minimum, self.maximum)
+        editor.setSingleStep(0.25)
+        editor.setSuffix(' %')
+        return editor
+
+    def setEditorData(self, editor, index):
+        try:
+            editor.setValue(float(str(index.data() or '0').replace(',', '.').replace(' ', '')))
+        except ValueError:
+            editor.setValue(0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, format(editor.value(), f'.{self.decimals}f').rstrip('0').rstrip('.'), Qt.EditRole)
+
+
 class OperationsTableWidget(QWidget):
     """Clean operations table with proper separation of concerns
 
@@ -1202,6 +1234,7 @@ class OperationsTableWidget(QWidget):
         # Install delegates after initial setup (only if highlighting enabled)
         if self.highlight_stock_exceed:
             self._install_delegates()
+        self._install_discount_delegate()
     
     def _setup_ui(self):
         """Setup user interface"""
@@ -1276,6 +1309,15 @@ class OperationsTableWidget(QWidget):
             return
         delegate = QuantityDelegate(self.event_handler, self.table)
         self.table.setItemDelegateForColumn(qty_col, delegate)
+
+    def _install_discount_delegate(self):
+        try:
+            discount_col = self.data_manager.table_columns.index('discount_percentage')
+        except ValueError:
+            return
+        self.table.setItemDelegateForColumn(
+            discount_col, DecimalSpinBoxDelegate(2, 0.0, 100.0, self.table)
+        )
     
     def get_current_table_data(self):
         """Get all non-empty rows as data dictionaries"""

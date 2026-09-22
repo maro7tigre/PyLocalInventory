@@ -817,13 +817,6 @@ class DatabaseServer:
                 method = body.get('method', '')
                 args = body.get('args', [])
                 kwargs = body.get('kwargs', {})
-                is_save_call = method in ('save_sale_with_items', 'save_import_with_items')
-                if is_save_call:
-                    # TEMPORARY Sale Save freeze diagnostic - see core/sale_save_diagnostics.py.
-                    from core import sale_save_diagnostics
-                    sale_save_diagnostics.event(
-                        "RPC_REQUEST_RECEIVED", method=method, user=user.get('username'),
-                    )
 
                 if method == 'save_sale_with_items':
                     sale_data = args[0] if args else {}
@@ -838,34 +831,18 @@ class DatabaseServer:
 
                 allowed, reason = _check_permission(user, method, args, kwargs)
                 if not allowed:
-                    if is_save_call:
-                        sale_save_diagnostics.event(
-                            "RPC_REQUEST_END", method=method, result="permission_denied", reason=reason,
-                        )
                     return self._send_json(403, {'error': reason})
 
                 try:
                     started = time.perf_counter()
-                    if is_save_call:
-                        sale_save_diagnostics.event("SERVER_DISPATCH_START", method=method)
                     result = server_obj._dispatch(method, args, kwargs, user=user)
-                    if is_save_call:
-                        sale_save_diagnostics.event("SERVER_DISPATCH_END", method=method, result="ok")
                 except ValueError as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation=failed transaction=rollback error={e}")
-                    if is_save_call:
-                        sale_save_diagnostics.event(
-                            "SERVER_DISPATCH_END", method=method, result="value_error", error=str(e),
-                        )
                     return self._send_json(400, {'error': str(e)})
                 except Exception as e:
                     if method == 'save_sale_with_items':
                         server_obj._write_sales_log(f"validation_or_transaction=rollback error={e}")
-                    if is_save_call:
-                        sale_save_diagnostics.event(
-                            "SERVER_DISPATCH_END", method=method, result="exception", error=str(e),
-                        )
                     logger.exception(
                         "LAN RPC failed method=%s user=%s",
                         method, user.get("username"),
@@ -879,10 +856,6 @@ class DatabaseServer:
                 )
                 if method == 'save_sale_with_items':
                     server_obj._write_sales_log(f"validation=ok transaction=commit result={result}")
-                if is_save_call:
-                    sale_save_diagnostics.event(
-                        "RPC_REQUEST_END", method=method, result="ok", elapsed_ms=round(elapsed * 1000, 1),
-                    )
                 self._send_json(200, {'result': result})
 
         return Handler

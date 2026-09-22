@@ -789,6 +789,16 @@ class ClientDetailsDialog(QDialog):
         self._payment_delete_inflight = False
         self.refresh_data()
 
+    def _show_attachments(self):
+        """Manage documents owned by this client; sale association is optional."""
+        from ui.widgets.attachments_widget import AttachmentPanel
+        dialog = QDialog(self)
+        dialog.setWindowTitle("Client Attachments")
+        dialog.resize(950, 680)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(AttachmentPanel(self.database, 'client', int(self.client_obj.id), dialog))
+        dialog.exec()
+
     def _ensure_payments_table(self):
         self.database.cursor.execute(
             """
@@ -856,11 +866,16 @@ class ClientDetailsDialog(QDialog):
         self.print_statement_btn.setEnabled(False)
         self.print_statement_btn.clicked.connect(self._print_full_statement)
 
+        self.attachments_btn = QPushButton("Attachments")
+        self.attachments_btn.setToolTip("Add and manage general or sale-specific client documents")
+        self.attachments_btn.clicked.connect(self._show_attachments)
+
         self.close_btn = QPushButton("Close")
         self.close_btn.clicked.connect(self.accept)
 
         action_layout.addWidget(self.print_selected_btn)
         action_layout.addWidget(self.print_statement_btn)
+        action_layout.addWidget(self.attachments_btn)
         action_layout.addStretch(1)
         action_layout.addWidget(self.close_btn)
         root.addWidget(action_bar)

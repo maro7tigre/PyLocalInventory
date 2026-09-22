@@ -40,10 +40,19 @@ class _AttachmentFetchWorker(QObject):
 
     @Slot()
     def run(self):
+        worker_db = self.database
+        from core.database import Database
+        is_local = isinstance(self.database, Database)
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-            records = self.database.list_attachments(self.entity_type, self.entity_id)
+            if is_local:
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect():
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+            records = worker_db.list_attachments(self.entity_type, self.entity_id)
             needle, kind = self.needle, self.kind
             shown = [
                 r for r in records
@@ -58,14 +67,17 @@ class _AttachmentFetchWorker(QObject):
             ]
             image_ids = [r['id'] for r in shown if r['mime_type'].startswith('image/')]
             thumbnails = {}
-            if image_ids and hasattr(self.database, 'get_attachment_thumbnails_bulk'):
+            if image_ids and hasattr(worker_db, 'get_attachment_thumbnails_bulk'):
                 try:
-                    thumbnails = self.database.get_attachment_thumbnails_bulk(image_ids)
+                    thumbnails = worker_db.get_attachment_thumbnails_bulk(image_ids)
                 except Exception as e:
                     print(f"Error fetching bulk thumbnails: {e}")
             self.finished.emit(shown, thumbnails)
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if is_local and worker_db is not self.database:
+                worker_db.close()
 
 
 class _ClientSalesFetchWorker(QObject):
@@ -81,13 +93,25 @@ class _ClientSalesFetchWorker(QObject):
 
     @Slot()
     def run(self):
+        worker_db = self.database
+        from core.database import Database
+        is_local = isinstance(self.database, Database)
         try:
             if QThread.currentThread().isInterruptionRequested():
                 return
-            sales = self.database.get_client_sales(self.client_id)
+            if is_local:
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect():
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+            sales = worker_db.get_client_sales(self.client_id)
             self.finished.emit(list(sales))
         except Exception as e:
             self.error.emit(str(e))
+        finally:
+            if is_local and worker_db is not self.database:
+                worker_db.close()
 
 
 def _scan_with_windows_wia(output_path):
@@ -142,15 +166,11 @@ class AttachmentPanel(QWidget):
         self._fetch_worker = None
         self._sales_thread = None
         self._sales_worker = None
+        self._refresh_after_sales = False
+        self.client_sales_table = None
+        self.client_sales_empty = None
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
-        # The client window now focuses solely on that client's sales. Client
-        # For clients, show the sales list (attachments for sales are opened
-        # per-sale). Do not show a separate Attachments tab here.
-        if self.entity_type == 'client':
-            self._setup_client_sales(layout)
-            self.refresh_sales()
-            return
         tools = QHBoxLayout()
         self.search = QLineEdit(); self.search.setPlaceholderText('Search filename or file type…')
         self.search.textChanged.connect(self.refresh)
@@ -170,6 +190,14 @@ class AttachmentPanel(QWidget):
         if self.entity_type == 'sale':
             button = QPushButton('Copy client files'); button.clicked.connect(self.copy_from_client); tools.addWidget(button)
         tools.addWidget(self.search, 1); tools.addWidget(self.filter); layout.addLayout(tools)
+        if self.entity_type == 'client':
+            association = QHBoxLayout()
+            association.addWidget(QLabel('Associate with sale:'))
+            self.sale_selector = QComboBox()
+            self.sale_selector.addItem('General / No Sale', None)
+            association.addWidget(self.sale_selector, 1)
+            layout.addLayout(association)
+            self._setup_client_sales(layout)
         self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Preview', 'Name', 'Type', 'Size', 'Uploaded'])
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setSelectionMode(QTableWidget.ExtendedSelection)
         self.table.setIconSize(QSize(150, 150))
@@ -179,11 +207,11 @@ class AttachmentPanel(QWidget):
         for label, slot in [('Preview', self.preview), ('Open', self.open_selected), ('Export', self.export_selected), ('Print', self.print_selected), ('Rename', self.rename_selected), ('Delete', self.delete_selected)]:
             button = QPushButton(label); button.clicked.connect(slot); actions.addWidget(button)
         actions.addStretch(); layout.addLayout(actions)
-        self.client_sales_table = None
-        self.client_sales_empty = None
-        self.refresh()
-
-    # Note: client attachments UI removed — sales view handles per-sale attachments
+        if self.entity_type == 'client':
+            self.refresh_sales()
+            self.refresh()
+        else:
+            self.refresh()
 
     def _setup_client_sales(self, layout):
         self.client_sales_table = None
@@ -227,8 +255,11 @@ class AttachmentPanel(QWidget):
         the GUI thread (that used to freeze this panel on open and on every
         keystroke in the search box).
         """
-        if self.entity_type == 'client':
-            self.refresh_sales()
+        # Local workers intentionally use independent PostgreSQL connections.
+        # Do not open both during panel startup: each connection performs the
+        # application's idempotent startup migration sequence.
+        if self.entity_type == 'client' and self._sales_thread is not None:
+            self._refresh_after_sales = True
             return
         if self._fetch_thread is not None:
             return  # a fetch is already in flight; it will render current results
@@ -322,12 +353,14 @@ class AttachmentPanel(QWidget):
         """Kick off an async load of sales whose persisted client_id matches
         this client. get_client_sales() is a synchronous RPC round-trip for
         a RemoteDatabase - never run it on the GUI thread."""
-        if self.entity_type != 'client' or self.client_sales_table is None:
+        if self.entity_type != 'client':
             return
         if self._sales_thread is not None:
             return  # a fetch is already in flight
-        self.client_sales_table.setRowCount(0)
-        self.client_sales_empty.setVisible(False)
+        if self.client_sales_table is not None:
+            self.client_sales_table.setRowCount(0)
+        if self.client_sales_empty is not None:
+            self.client_sales_empty.setVisible(False)
 
         thread = QThread()
         worker = _ClientSalesFetchWorker(self.database, self.entity_id)
@@ -353,6 +386,9 @@ class AttachmentPanel(QWidget):
     def _on_sales_thread_finished(self):
         self._sales_thread = None
         self._sales_worker = None
+        if self._refresh_after_sales:
+            self._refresh_after_sales = False
+            self.refresh()
 
     @Slot(str)
     def _on_client_sales_fetch_error(self, err_msg):
@@ -371,7 +407,20 @@ class AttachmentPanel(QWidget):
 
     def _render_client_sales(self, sales):
         from core.database import format_devis_display
-        self.client_sales_empty.setVisible(not sales)
+        if hasattr(self, 'sale_selector'):
+            self.sale_selector.blockSignals(True)
+            self.sale_selector.clear()
+            self.sale_selector.addItem('General / No Sale', None)
+            for sale_id, devis, date, _vat, _subtotal in sales:
+                label = f'Sale #{sale_id}'
+                if devis:
+                    label += f' ({format_devis_display(devis)})'
+                self.sale_selector.addItem(label, int(sale_id))
+            self.sale_selector.blockSignals(False)
+        if self.client_sales_table is None:
+            return
+        if self.client_sales_empty is not None:
+            self.client_sales_empty.setVisible(not sales)
         self.client_sales_table.setRowCount(len(sales))
         for row, (sale_id, devis, date, vat, subtotal) in enumerate(sales):
             from core.calculations import calculate_operation_totals
@@ -450,7 +499,13 @@ class AttachmentPanel(QWidget):
     def _upload_bytes(self, filename, data):
         """Upload to this scope and mirror sale uploads to the linked client."""
         encoded = base64.b64encode(data).decode('ascii')
-        self.database.upload_attachment(self.entity_type, self.entity_id, filename, encoded)
+        if self.entity_type == 'client':
+            self.database.upload_attachment(
+                self.entity_type, self.entity_id, filename, encoded,
+                sale_id=self.sale_selector.currentData(),
+            )
+        else:
+            self.database.upload_attachment(self.entity_type, self.entity_id, filename, encoded)
         if self.entity_type != 'sale':
             return
         client_id = None

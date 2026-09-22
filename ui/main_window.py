@@ -783,9 +783,9 @@ class MainWindow(ThemedMainWindow):
         index = next(iter(self._preload_tabs))
         widget = self._preload_tabs.pop(index)
         try:
-            widget.refresh_table()
+            widget.refresh_table(force=True)
         except Exception as error:
-            print(f"✗ Preload failed for {self.tab_widget.tabText(index)}: {error}")
+            print(f"✗ Preload failed for tab_{index}: {error}")
         if self._preload_tabs:
             self._preload_timer.start()
 

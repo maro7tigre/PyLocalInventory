@@ -123,6 +123,17 @@ class SalesItemClass(BaseClass):
                 "type": "float",
                 "min": 0.0
             },
+            "discount_percentage": {
+                "value": 0.0,
+                "display_name": {"en": "Remise %", "fr": "Remise %", "es": "Descuento %"},
+                "required": False,
+                "default": 0.0,
+                "options": [],
+                "type": "float",
+                "min": 0.0,
+                "max": 100.0,
+                "precision": 2,
+            },
             "subtotal": {
                 "display_name": {"en": "Subtotal", "fr": "Sous-total", "es": "Subtotal"},
                 "required": False,
@@ -149,6 +160,7 @@ class SalesItemClass(BaseClass):
                 "information": "rw",
                 "quantity": "rw", 
                 "unit_price": "rw",
+                "discount_percentage": "rw",
                 "subtotal": "r",
                 "delete_action": "r"  # Delete button visible in table
             },
@@ -170,6 +182,7 @@ class SalesItemClass(BaseClass):
                 "information": "rw",
                 "quantity": "rw",
                 "unit_price": "rw",
+                "discount_percentage": "rw",
                 "production": "rw"
             },
             "report": {
@@ -177,6 +190,7 @@ class SalesItemClass(BaseClass):
                 "information": "r",
                 "quantity": "r",
                 "unit_price": "r",
+                "discount_percentage": "r",
                 "subtotal": "r"
                 # No delete button in reports
             }
@@ -352,6 +366,7 @@ class SalesItemClass(BaseClass):
         return calculate_line_subtotal(
             self.get_value('quantity'),
             self.get_value('unit_price'),
+            self.get_value('discount_percentage') or 0,
         )
     
     def delete_self(self):
@@ -449,7 +464,7 @@ class SalesItemClass(BaseClass):
         super().set_value(param_key, value)
         
         # Handle quantity or unit_price changes to update subtotal
-        if param_key in ['quantity', 'unit_price']:
+        if param_key in ['quantity', 'unit_price', 'discount_percentage']:
             # Subtotal will be recalculated automatically via the method
             pass
     

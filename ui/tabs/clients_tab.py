@@ -45,9 +45,14 @@ class ClientsTab(BaseTab):
         from ui.widgets.attachments_widget import AttachmentPanel
         dialog = QDialog(self)
         dialog.setWindowTitle("Client Sales")
-        dialog.resize(1100, 820)
+        dialog.setMinimumSize(1100, 720)
+        dialog.resize(1180, 780)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(AttachmentPanel(self.database, 'client', client_id, dialog))
+        panel = AttachmentPanel(self.database, 'client', client_id, dialog)
+        layout.addWidget(panel)
+        # Workers use dedicated connections/RPC calls. Mark this panel closed
+        # before Qt destroys its widgets so a prior dialog cannot keep loading.
+        dialog.finished.connect(panel.shutdown)
         dialog.exec()
 
     def view_client(self):

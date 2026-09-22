@@ -105,7 +105,34 @@ class TestClientAttachmentsIntegration(unittest.TestCase):
             time.sleep(0.02)
         self.fail("Attachment panel workers did not finish")
 
-    def test_client_panel_keeps_general_and_sale_attachments(self):
+    def _open_client_attachments_dialog(self, fixture_database, client_id):
+        """Mirror ClientsTab.show_attachments without user interaction."""
+        from PySide6.QtCore import QTimer
+        from PySide6.QtWidgets import QDialog, QVBoxLayout
+        from ui.widgets.attachments_widget import AttachmentPanel
+
+        dialog = QDialog()
+        dialog.setMinimumSize(1100, 720)
+        dialog.resize(1180, 780)
+        layout = QVBoxLayout(dialog)
+        panel = AttachmentPanel(fixture_database, "client", client_id, dialog)
+        layout.addWidget(panel)
+        dialog.finished.connect(panel.shutdown)
+        captured = []
+
+        def close_when_loaded():
+            if panel._sales_thread is not None or panel._fetch_thread is not None:
+                QTimer.singleShot(10, close_when_loaded)
+                return
+            captured.append((panel.client_sales_table.rowCount(), panel.table.rowCount()))
+            dialog.accept()
+
+        QTimer.singleShot(0, close_when_loaded)
+        dialog.exec()
+        self.app.processEvents()
+        return captured[0], panel
+
+    def _seed_attachments(self):
         pdf = base64.b64encode(b"%PDF-1.4 test").decode("ascii")
         png = base64.b64encode(b"\x89PNG\r\n\x1a\nimage").decode("ascii")
         with patch("core.attachments.storage_root", return_value=Path(self.storage)):
@@ -113,6 +140,10 @@ class TestClientAttachmentsIntegration(unittest.TestCase):
             sale1_id = self.service.upload("client", 1, "sale1.pdf", pdf, sale_id=11)
             sale2_id = self.service.upload("client", 1, "sale2.jpg", png, sale_id=12)
             client_b_id = self.service.upload("client", 2, "client_b.pdf", pdf, sale_id=21)
+        return pdf, general_id, sale1_id, sale2_id, client_b_id
+
+    def test_client_panel_keeps_general_and_sale_attachments(self):
+        _pdf, general_id, sale1_id, sale2_id, client_b_id = self._seed_attachments()
 
         records_a = self.service.list("client", 1)
         records_b = self.service.list("client", 2)
@@ -132,6 +163,8 @@ class TestClientAttachmentsIntegration(unittest.TestCase):
 
         panel = AttachmentPanel(fixture_database, "client", 1)
         self._wait_for(panel)
+        self.assertEqual(panel.client_splitter.count(), 2)
+        self.assertEqual(panel.table.maximumHeight(), 16777215)
         self.assertEqual(panel.client_sales_table.rowCount(), 2)
         self.assertEqual(panel.sale_selector.count(), 3)
         self.assertEqual(panel.table.rowCount(), 3)
@@ -146,3 +179,53 @@ class TestClientAttachmentsIntegration(unittest.TestCase):
         self.assertEqual([record["id"] for record in panel._shown], [sale2_id])
         self.assertEqual(panel.client_sales_table.rowCount(), 2)
         panel.deleteLater()
+
+    def test_client_dialog_reopens_and_switches_clients_without_stale_rows(self):
+        pdf, _general_id, _sale1_id, _sale2_id, _client_b_id = self._seed_attachments()
+        records_by_client = {
+            1: self.service.list("client", 1),
+            2: self.service.list("client", 2),
+        }
+        sales_by_client = {
+            1: self.database.get_client_sales(1),
+            2: self.database.get_client_sales(2),
+        }
+        fixture_database = SimpleNamespace(
+            list_attachments=lambda _kind, client_id: records_by_client[client_id],
+            get_client_sales=lambda client_id: sales_by_client[client_id],
+            get_attachment_thumbnails_bulk=lambda *_args: {},
+        )
+
+        for _ in range(5):
+            self.assertEqual(self._open_client_attachments_dialog(fixture_database, 1)[0], (2, 3))
+        self.assertEqual(self._open_client_attachments_dialog(fixture_database, 2)[0], (1, 1))
+        self.assertEqual(self._open_client_attachments_dialog(fixture_database, 1)[0], (2, 3))
+
+        with patch("core.attachments.storage_root", return_value=Path(self.storage)):
+            self.service.upload("client", 1, "new-general.pdf", pdf)
+        records_by_client[1] = self.service.list("client", 1)
+        self.assertEqual(self._open_client_attachments_dialog(fixture_database, 1)[0], (2, 4))
+
+    def test_client_dialog_uses_the_rpc_data_path(self):
+        _pdf, _general_id, _sale1_id, _sale2_id, _client_b_id = self._seed_attachments()
+        records = self.service.list("client", 1)
+        sales = self.database.get_client_sales(1)
+        from core.network.client import RemoteDatabase
+
+        remote = RemoteDatabase.__new__(RemoteDatabase)
+        remote.offline = False
+        remote.cache = None
+
+        def rpc(method, args=None, kwargs=None, timeout=10):
+            if method == "list_attachments":
+                self.assertEqual(args, ["client", 1])
+                return records
+            if method == "get_client_sales":
+                self.assertEqual(args, [1])
+                return sales
+            if method == "get_attachment_thumbnails_bulk":
+                return {}
+            self.fail(f"Unexpected RPC method: {method}")
+
+        remote._call = rpc
+        self.assertEqual(self._open_client_attachments_dialog(remote, 1)[0], (2, 3))

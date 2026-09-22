@@ -15,7 +15,8 @@ from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Sign
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
-    QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView)
+    QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView,
+    QSplitter)
 
 _active_attachment_threads = set()
 
@@ -45,6 +46,7 @@ class _AttachmentFetchWorker(QObject):
         is_local = isinstance(self.database, Database)
         try:
             if QThread.currentThread().isInterruptionRequested():
+                self.finished.emit([], {})
                 return
             if is_local:
                 worker_db = Database(self.database.profile_manager)
@@ -98,6 +100,7 @@ class _ClientSalesFetchWorker(QObject):
         is_local = isinstance(self.database, Database)
         try:
             if QThread.currentThread().isInterruptionRequested():
+                self.finished.emit([])
                 return
             if is_local:
                 worker_db = Database(self.database.profile_manager)
@@ -168,8 +171,14 @@ class AttachmentPanel(QWidget):
         self._sales_thread = None
         self._sales_worker = None
         self._refresh_after_sales = False
+        self._sales_refresh_pending = False
+        self._closing = False
         self.client_sales_table = None
         self.client_sales_empty = None
+        logger.debug(
+            "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s opening",
+            id(self), self.entity_id,
+        )
         self.setAcceptDrops(True)
         layout = QVBoxLayout(self)
         tools = QHBoxLayout()
@@ -198,27 +207,34 @@ class AttachmentPanel(QWidget):
             self.sale_selector.addItem('General / No Sale', None)
             association.addWidget(self.sale_selector, 1)
             layout.addLayout(association)
-            self._setup_client_sales(layout)
         self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(['Preview', 'Name', 'Type', 'Size', 'Uploaded'])
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setSelectionMode(QTableWidget.ExtendedSelection)
-        self.table.setIconSize(QSize(150, 150))
+        self.table.setIconSize(QSize(96, 96))
         self.table.cellDoubleClicked.connect(lambda *_: self.preview())
-        self.table.horizontalHeader().setStretchLastSection(False); layout.addWidget(self.table)
+        attachment_header = self.table.horizontalHeader()
+        attachment_header.setSectionResizeMode(0, QHeaderView.Fixed)
+        attachment_header.setSectionResizeMode(1, QHeaderView.Stretch)
+        for column in (2, 3, 4):
+            attachment_header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        self.table.setColumnWidth(0, 120)
+        if self.entity_type == 'client':
+            self._setup_client_sales()
+            self._setup_client_splitter(layout)
+        else:
+            layout.addWidget(self.table)
         actions = QHBoxLayout()
         for label, slot in [('Preview', self.preview), ('Open', self.open_selected), ('Export', self.export_selected), ('Print', self.print_selected), ('Rename', self.rename_selected), ('Delete', self.delete_selected)]:
             button = QPushButton(label); button.clicked.connect(slot); actions.addWidget(button)
         actions.addStretch(); layout.addLayout(actions)
         if self.entity_type == 'client':
-            self.refresh_sales()
-            self.refresh()
+            self.refresh_all_data()
         else:
             self.refresh()
 
-    def _setup_client_sales(self, layout):
+    def _setup_client_sales(self):
         self.client_sales_table = None
-        sales_label = QLabel('Sales for this client')
-        sales_label.setStyleSheet('font-size: 18px; font-weight: bold;')
-        layout.addWidget(sales_label)
+        self.client_sales_label = QLabel('Sales for this client')
+        self.client_sales_label.setStyleSheet('font-size: 18px; font-weight: bold;')
         self.client_sales_empty = QLabel('No sales found for this client')
         self.client_sales_empty.setAlignment(Qt.AlignCenter)
         self.client_sales_empty.setStyleSheet('color: #9e9e9e; padding: 14px;')
@@ -227,12 +243,39 @@ class AttachmentPanel(QWidget):
         self.client_sales_table.setSelectionBehavior(QTableWidget.SelectRows)
         self.client_sales_table.setEditTriggers(QTableWidget.NoEditTriggers)
         header = self.client_sales_table.horizontalHeader()
+        header.setSectionResizeMode(0, QHeaderView.ResizeToContents)
         header.setSectionResizeMode(1, QHeaderView.Stretch)
-        header.setSectionResizeMode(5, QHeaderView.ResizeToContents)
-        for column, width in ((0, 60), (2, 110), (3, 115), (4, 115)):
+        for column in (2, 3, 4, 5):
+            header.setSectionResizeMode(column, QHeaderView.ResizeToContents)
+        for column, width in ((0, 60), (2, 110), (3, 115), (4, 115), (5, 240)):
             self.client_sales_table.setColumnWidth(column, width)
-        layout.addWidget(self.client_sales_empty)
-        layout.addWidget(self.client_sales_table, 1)
+
+    def _setup_client_splitter(self, layout):
+        splitter = QSplitter(Qt.Vertical, self)
+        splitter.setChildrenCollapsible(False)
+        self.client_splitter = splitter
+
+        sales_widget = QWidget(splitter)
+        sales_layout = QVBoxLayout(sales_widget)
+        sales_layout.setContentsMargins(0, 0, 0, 0)
+        sales_layout.addWidget(self.client_sales_label)
+        sales_layout.addWidget(self.client_sales_empty)
+        sales_layout.addWidget(self.client_sales_table, 1)
+
+        attachments_widget = QWidget(splitter)
+        attachments_layout = QVBoxLayout(attachments_widget)
+        attachments_layout.setContentsMargins(0, 0, 0, 0)
+        attachments_label = QLabel('Attachments')
+        attachments_label.setStyleSheet('font-size: 18px; font-weight: bold;')
+        attachments_layout.addWidget(attachments_label)
+        attachments_layout.addWidget(self.table, 1)
+
+        splitter.addWidget(sales_widget)
+        splitter.addWidget(attachments_widget)
+        splitter.setStretchFactor(0, 1)
+        splitter.setStretchFactor(1, 2)
+        splitter.setSizes([250, 500])
+        layout.addWidget(splitter, 1)
 
     def dragEnterEvent(self, event):
         if event.mimeData().hasUrls(): event.acceptProposedAction()
@@ -259,6 +302,8 @@ class AttachmentPanel(QWidget):
         # Local workers intentionally use independent PostgreSQL connections.
         # Do not open both during panel startup: each connection performs the
         # application's idempotent startup migration sequence.
+        if self._closing:
+            return
         if self.entity_type == 'client' and self._sales_thread is not None:
             self._refresh_after_sales = True
             return
@@ -291,6 +336,8 @@ class AttachmentPanel(QWidget):
     def _on_fetch_thread_finished(self):
         self._fetch_thread = None
         self._fetch_worker = None
+        if self._closing:
+            return
         if self._refresh_pending:
             self._refresh_pending = False
             self.refresh()
@@ -305,6 +352,10 @@ class AttachmentPanel(QWidget):
     @Slot(list, dict)
     def _on_attachments_fetched(self, shown, thumbnails):
         try:
+            logger.debug(
+                "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s attachments=%s",
+                id(self), self.entity_id, len(shown),
+            )
             self._render_attachments(shown, thumbnails)
         except RuntimeError:
             pass  # panel was closed/destroyed while the fetch was in flight
@@ -322,12 +373,9 @@ class AttachmentPanel(QWidget):
             values = [record['display_name'], record['mime_type'].split('/')[-1].upper(), self._size(record['file_size']), str(record['created_at'])[:16]]
             for col, value in enumerate(values, 1): self.table.setItem(row, col, QTableWidgetItem(str(value)))
             # PDFs remain compact; only image rows need room for the preview.
-            self.table.setRowHeight(row, 162 if record['mime_type'].startswith('image/') else 46)
-        self.table.setColumnWidth(0, 175)
-        self.table.setColumnWidth(1, 250)
-        self.table.setColumnWidth(2, 95)
-        self.table.setColumnWidth(3, 95)
-        self.table.setColumnWidth(4, 175)
+            self.table.setRowHeight(row, 112 if record['mime_type'].startswith('image/') else 42)
+        if self.entity_type == 'client':
+            return
         # Keep a short list compact instead of leaving a large empty table.
         content_height = self.table.horizontalHeader().height() + sum(
             self.table.rowHeight(row) for row in range(self.table.rowCount())
@@ -358,8 +406,11 @@ class AttachmentPanel(QWidget):
         a RemoteDatabase - never run it on the GUI thread."""
         if self.entity_type != 'client':
             return
+        if self._closing:
+            return
         if self._sales_thread is not None:
-            return  # a fetch is already in flight
+            self._sales_refresh_pending = True
+            return
         if self.client_sales_table is not None:
             self.client_sales_table.setRowCount(0)
         if self.client_sales_empty is not None:
@@ -389,6 +440,12 @@ class AttachmentPanel(QWidget):
     def _on_sales_thread_finished(self):
         self._sales_thread = None
         self._sales_worker = None
+        if self._closing:
+            return
+        if self._sales_refresh_pending:
+            self._sales_refresh_pending = False
+            self.refresh_sales()
+            return
         if self._refresh_after_sales:
             self._refresh_after_sales = False
             self.refresh()
@@ -404,6 +461,10 @@ class AttachmentPanel(QWidget):
     @Slot(list)
     def _on_client_sales_fetched(self, sales):
         try:
+            logger.debug(
+                "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s sales=%s",
+                id(self), self.entity_id, len(sales),
+            )
             self._render_client_sales(sales)
         except RuntimeError:
             pass  # panel was closed/destroyed while the fetch was in flight
@@ -438,11 +499,49 @@ class AttachmentPanel(QWidget):
             action_layout.setContentsMargins(4, 2, 4, 2)
             add_button = QPushButton('Add Attachments')
             edit_button = QPushButton('Edit Sale')
+            add_button.setMinimumWidth(118)
+            edit_button.setMinimumWidth(82)
             add_button.clicked.connect(lambda _=False, sid=int(sale_id): self.open_sale_attachments(sid))
             edit_button.clicked.connect(lambda _=False, sid=int(sale_id): self.edit_sale(sid))
             action_layout.addWidget(add_button); action_layout.addWidget(edit_button)
             self.client_sales_table.setCellWidget(row, 5, action_cell)
         self.client_sales_table.resizeRowsToContents()
+
+    def refresh_all_data(self):
+        """Reload the selected client's sales and attachment source of truth."""
+        if self.entity_type != 'client' or self._closing:
+            return
+        logger.debug(
+            "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s refresh_all_data",
+            id(self), self.entity_id,
+        )
+        self._shown = []
+        self._thumbnails_cache = {}
+        self.table.setRowCount(0)
+        self.client_sales_table.setRowCount(0)
+        self.client_sales_empty.setVisible(False)
+        self.sale_selector.blockSignals(True)
+        self.sale_selector.clear()
+        self.sale_selector.addItem('General / No Sale', None)
+        self.sale_selector.blockSignals(False)
+        self._refresh_after_sales = True
+        self.refresh_sales()
+
+    def shutdown(self):
+        """Stop this dialog's pending work without touching the shared DB/RPC."""
+        if self._closing:
+            return
+        self._closing = True
+        self._refresh_pending = False
+        self._refresh_after_sales = False
+        self._sales_refresh_pending = False
+        logger.debug(
+            "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s closing",
+            id(self), self.entity_id,
+        )
+        for thread in (self._fetch_thread, self._sales_thread):
+            if thread is not None and thread.isRunning():
+                thread.requestInterruption()
 
     def open_sale_attachments(self, sale_id):
         dialog = QDialog(self)

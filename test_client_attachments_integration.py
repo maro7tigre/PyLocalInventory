@@ -5,6 +5,7 @@ import tempfile
 import time
 import unittest
 import uuid
+from threading import Event
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -229,3 +230,51 @@ class TestClientAttachmentsIntegration(unittest.TestCase):
 
         remote._call = rpc
         self.assertEqual(self._open_client_attachments_dialog(remote, 1)[0], (2, 3))
+
+    def test_repeated_save_refresh_and_close_during_load_are_safe(self):
+        pdf, _general_id, _sale1_id, _sale2_id, _client_b_id = self._seed_attachments()
+        records_by_client = {1: self.service.list("client", 1)}
+        sales = self.database.get_client_sales(1)
+        fixture_database = SimpleNamespace(
+            list_attachments=lambda _kind, client_id: records_by_client[client_id],
+            get_client_sales=lambda _client_id: sales,
+            get_attachment_thumbnails_bulk=lambda *_args: {},
+        )
+        from ui.widgets.attachments_widget import AttachmentPanel, _active_attachment_jobs
+
+        panel = AttachmentPanel(fixture_database, "client", 1)
+        self._wait_for(panel)
+        for index in range(5):
+            with patch("core.attachments.storage_root", return_value=Path(self.storage)):
+                self.service.upload("client", 1, f"new-{index}.pdf", pdf)
+            records_by_client[1] = self.service.list("client", 1)
+            panel.refresh()
+            self._wait_for(panel)
+            self.assertEqual(panel.table.rowCount(), 4 + index)
+        panel.shutdown()
+
+        started, release = Event(), Event()
+
+        def slow_sales(_client_id):
+            started.set()
+            release.wait(2)
+            return sales
+
+        slow_database = SimpleNamespace(
+            list_attachments=lambda _kind, client_id: records_by_client[client_id],
+            get_client_sales=slow_sales,
+            get_attachment_thumbnails_bulk=lambda *_args: {},
+        )
+        closing_panel = AttachmentPanel(slow_database, "client", 1)
+        deadline = time.monotonic() + 2
+        while not started.is_set() and time.monotonic() < deadline:
+            self.app.processEvents()
+            time.sleep(0.01)
+        self.assertTrue(started.is_set())
+        closing_panel.shutdown()
+        release.set()
+        self._wait_for(closing_panel)
+        self.app.processEvents()
+        self.assertFalse(_active_attachment_jobs)
+
+        self.assertEqual(self._open_client_attachments_dialog(fixture_database, 1)[0], (2, 8))

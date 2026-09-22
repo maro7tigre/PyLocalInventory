@@ -164,6 +164,31 @@ class TestClientAttachments(unittest.TestCase):
         self.assertEqual(received, [[]])
         self.assertEqual(errors, [])
 
+    def test_workers_emit_nested_python_dicts_without_qt_conversion(self):
+        from ui.widgets.attachments_widget import _AttachmentFetchWorker, _ClientSalesFetchWorker
+
+        sales = [{"id": 15, "devis_no": "DE-TEST-1", "subtotal": 100}]
+        attachments = [{
+            "id": 3, "display_name": "sale1.pdf", "original_filename": "sale1.pdf",
+            "mime_type": "application/pdf", "file_size": 8,
+        }]
+        database = MagicMock()
+        database.get_client_sales.return_value = sales
+        database.list_attachments.return_value = attachments
+
+        sales_worker = _ClientSalesFetchWorker(database, 4)
+        sales_received = []
+        sales_worker.finished.connect(sales_received.append)
+        sales_worker.run()
+        self.assertIs(sales_received[0][0], sales[0])
+
+        attachment_worker = _AttachmentFetchWorker(database, "client", 4, "", "All files")
+        attachment_received = []
+        attachment_worker.finished.connect(lambda records, thumbnails: attachment_received.append((records, thumbnails)))
+        attachment_worker.run()
+        self.assertIs(attachment_received[0][0][0], attachments[0])
+        self.assertEqual(attachment_received[0][1], {})
+
     def test_load_worker_passes_catalog_to_gui_slot(self):
         from ui.dialogs.edit_dialogs.base_operation_dialog import LoadWorker
 

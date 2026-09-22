@@ -19,6 +19,19 @@ from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QSplitter)
 
 _active_attachment_threads = set()
+# A QThread does not own a QObject moved to it. Retain each worker until the
+# thread reports completion, even if its dialog is closed in the meantime.
+_active_attachment_jobs = {}
+
+
+def _release_attachment_job(thread):
+    worker = _active_attachment_jobs.get(thread)
+    logger.debug(
+        "[ATTACH WORKER] thread finished thread=%s worker=%s; scheduling deletion",
+        id(thread), id(worker) if worker is not None else None,
+    )
+    _active_attachment_jobs.pop(thread, None)
+    _active_attachment_threads.discard(thread)
 
 
 class _AttachmentFetchWorker(QObject):
@@ -28,7 +41,7 @@ class _AttachmentFetchWorker(QObject):
     them directly on the GUI thread freezes the window while attachments
     load, and this panel used to do that on every open and on every
     keystroke in the search box."""
-    finished = Signal(list, dict)
+    finished = Signal(object, object)
     error = Signal(str)
 
     def __init__(self, database, entity_type, entity_id, needle, kind):
@@ -45,6 +58,10 @@ class _AttachmentFetchWorker(QObject):
         from core.database import Database
         is_local = isinstance(self.database, Database)
         try:
+            logger.debug(
+                "[ATTACH WORKER] attachment run start worker=%s client_or_sale=%s",
+                id(self), self.entity_id,
+            )
             if QThread.currentThread().isInterruptionRequested():
                 self.finished.emit([], {})
                 return
@@ -74,18 +91,23 @@ class _AttachmentFetchWorker(QObject):
                     thumbnails = worker_db.get_attachment_thumbnails_bulk(image_ids)
                 except Exception as e:
                     print(f"Error fetching bulk thumbnails: {e}")
+            logger.debug(
+                "[ATTACH WORKER] attachment query worker=%s records=%s; emit finished",
+                id(self), len(shown),
+            )
             self.finished.emit(shown, thumbnails)
         except Exception as e:
             self.error.emit(str(e))
         finally:
             if is_local and worker_db is not self.database:
                 worker_db.close()
+            logger.debug("[ATTACH WORKER] attachment run end worker=%s", id(self))
 
 
 class _ClientSalesFetchWorker(QObject):
     """Fetches a client's sales list off the GUI thread (see
     _AttachmentFetchWorker - same RPC-blocking concern)."""
-    finished = Signal(list)
+    finished = Signal(object)
     error = Signal(str)
 
     def __init__(self, database, client_id):
@@ -99,6 +121,10 @@ class _ClientSalesFetchWorker(QObject):
         from core.database import Database
         is_local = isinstance(self.database, Database)
         try:
+            logger.debug(
+                "[ATTACH WORKER] sales run start worker=%s client_id=%s",
+                id(self), self.client_id,
+            )
             if QThread.currentThread().isInterruptionRequested():
                 self.finished.emit([])
                 return
@@ -109,12 +135,17 @@ class _ClientSalesFetchWorker(QObject):
                 if not worker_db.connect():
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
             sales = worker_db.get_client_sales(self.client_id)
+            logger.debug(
+                "[ATTACH WORKER] sales query worker=%s records=%s; emit finished",
+                id(self), len(sales),
+            )
             self.finished.emit(list(sales))
         except Exception as e:
             self.error.emit(str(e))
         finally:
             if is_local and worker_db is not self.database:
                 worker_db.close()
+            logger.debug("[ATTACH WORKER] sales run end worker=%s", id(self))
 
 
 def _scan_with_windows_wia(output_path):
@@ -304,6 +335,11 @@ class AttachmentPanel(QWidget):
         # application's idempotent startup migration sequence.
         if self._closing:
             return
+        logger.debug(
+            "[ATTACH REFRESH] panel=%s client_id=%s fetch_thread=%s running=%s",
+            id(self), self.entity_id, id(self._fetch_thread) if self._fetch_thread else None,
+            bool(self._fetch_thread and self._fetch_thread.isRunning()),
+        )
         if self.entity_type == 'client' and self._sales_thread is not None:
             self._refresh_after_sales = True
             return
@@ -318,9 +354,8 @@ class AttachmentPanel(QWidget):
         thread.started.connect(worker.run)
 
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         worker.error.connect(thread.quit)
-        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_fetch_thread_finished)
 
@@ -330,7 +365,8 @@ class AttachmentPanel(QWidget):
         self._fetch_thread = thread
         self._fetch_worker = worker
         _active_attachment_threads.add(thread)
-        thread.finished.connect(lambda t=thread: _active_attachment_threads.discard(t))
+        _active_attachment_jobs[thread] = worker
+        thread.finished.connect(lambda t=thread: _release_attachment_job(t))
         thread.start()
 
     def _on_fetch_thread_finished(self):
@@ -422,9 +458,8 @@ class AttachmentPanel(QWidget):
         thread.started.connect(worker.run)
 
         worker.finished.connect(thread.quit)
-        worker.finished.connect(worker.deleteLater)
         worker.error.connect(thread.quit)
-        worker.error.connect(worker.deleteLater)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
         thread.finished.connect(self._on_sales_thread_finished)
 
@@ -434,7 +469,8 @@ class AttachmentPanel(QWidget):
         self._sales_thread = thread
         self._sales_worker = worker
         _active_attachment_threads.add(thread)
-        thread.finished.connect(lambda t=thread: _active_attachment_threads.discard(t))
+        _active_attachment_jobs[thread] = worker
+        thread.finished.connect(lambda t=thread: _release_attachment_job(t))
         thread.start()
 
     def _on_sales_thread_finished(self):
@@ -471,6 +507,7 @@ class AttachmentPanel(QWidget):
 
     def _render_client_sales(self, sales):
         from core.database import format_devis_display
+        sales = [self._client_sale_row(sale) for sale in sales]
         if hasattr(self, 'sale_selector'):
             self.sale_selector.blockSignals(True)
             self.sale_selector.clear()
@@ -506,6 +543,19 @@ class AttachmentPanel(QWidget):
             action_layout.addWidget(add_button); action_layout.addWidget(edit_button)
             self.client_sales_table.setCellWidget(row, 5, action_cell)
         self.client_sales_table.resizeRowsToContents()
+
+    @staticmethod
+    def _client_sale_row(sale):
+        """Accept the list rows from PostgreSQL and dict rows from RPC."""
+        if isinstance(sale, dict):
+            return (
+                sale.get('id', sale.get('sale_id')),
+                sale.get('devis', sale.get('devis_no', sale.get('devis_number', ''))),
+                sale.get('date', ''),
+                sale.get('tva', sale.get('vat', 0)),
+                sale.get('subtotal', sale.get('total_ht', 0)),
+            )
+        return sale
 
     def refresh_all_data(self):
         """Reload the selected client's sales and attachment source of truth."""

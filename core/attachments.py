@@ -119,15 +119,22 @@ class AttachmentService:
                 # rows. The association picker controls only the next upload;
                 # it must never filter this complete client document list.
                 query = (
+                    "WITH target_client AS (SELECT username FROM clients WHERE id=%s) "
                     "SELECT a.id, a.entity_type, a.entity_id, "
                     "COALESCE(a.client_id, CASE WHEN a.entity_type='client' THEN a.entity_id END) AS client_id, "
                     "COALESCE(a.sale_id, CASE WHEN a.entity_type='sale' THEN a.entity_id END) AS sale_id, "
                     "a.original_filename, a.display_name, a.description, a.category, a.mime_type, a.file_size, a.relative_path, a.created_at, a.modified_at "
                     "FROM attachments a "
-                    "WHERE (a.entity_type='client' AND a.entity_id=%s) "
-                    "OR (a.entity_type='sale' AND EXISTS (SELECT 1 FROM sales s WHERE s.id=a.entity_id AND s.client_id=%s))"
+                    "WHERE (a.entity_type='client' AND COALESCE(a.client_id, a.entity_id)=%s) "
+                    "OR EXISTS ("
+                    "SELECT 1 FROM sales s CROSS JOIN target_client c "
+                    "WHERE s.id=COALESCE(a.sale_id, CASE WHEN a.entity_type='sale' THEN a.entity_id END) "
+                    "AND (s.client_id=%s OR (c.username IS NOT NULL AND "
+                    "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = "
+                    "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(c.username, '')), '\\s+', ' ', 'g'))))"
+                    ")"
                 )
-                params = (entity_id, entity_id)
+                params = (entity_id, entity_id, entity_id)
                 if scope == 'general':
                     query = (
                         "SELECT id, entity_type, entity_id, client_id, sale_id, original_filename, display_name, description, category, mime_type, file_size, relative_path, created_at, modified_at "
@@ -155,6 +162,15 @@ class AttachmentService:
             if entity_type != 'client':
                 raise ValueError("Only client attachments can be associated with a sale")
             sale_id = int(sale_id)
+            self.database.cursor.execute(
+                "SELECT 1 FROM sales s JOIN clients c ON c.id=%s "
+                "WHERE s.id=%s AND (s.client_id=c.id OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(c.username, '')), '\\s+', ' ', 'g')))",
+                (entity_id, sale_id),
+            )
+            if not self.database.cursor.fetchone():
+                raise ValueError("The selected sale does not belong to this client")
         try:
             data = base64.b64decode(content_b64, validate=True)
         except Exception as exc:

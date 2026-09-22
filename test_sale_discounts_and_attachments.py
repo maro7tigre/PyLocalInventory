@@ -71,9 +71,55 @@ class TestClientAttachments(unittest.TestCase):
         ]
         records = self.service.list("client", 4)
         query, params = self.cursor.execute.call_args.args
-        self.assertIn("a.entity_type='sale'", query)
-        self.assertEqual(params, (4, 4))
+        self.assertIn("target_client", query)
+        self.assertIn("s.client_id=%s", query)
+        self.assertIn("s.client_username", query)
+        self.assertEqual(params, (4, 4, 4))
         self.assertEqual([record["sale_id"] for record in records], [None, 15])
+
+    def test_sale_association_must_belong_to_client(self):
+        self.cursor.fetchone.return_value = None
+        with self.assertRaisesRegex(ValueError, "does not belong"):
+            self.service.upload("client", 4, "ignored.pdf", "", sale_id=15)
+        self.cursor.execute.assert_called_once()
+
+    def test_client_attachment_refresh_does_not_clear_sales_table(self):
+        from ui.widgets.attachments_widget import AttachmentPanel
+
+        panel = AttachmentPanel.__new__(AttachmentPanel)
+        panel.entity_type = "client"
+        panel.table = MagicMock()
+        panel.table.rowCount.return_value = 0
+        panel.table.horizontalHeader.return_value.height.return_value = 20
+        panel.window = MagicMock(return_value=None)
+        panel._thumbnail = MagicMock(return_value=None)
+        panel.refresh_sales = MagicMock()
+
+        AttachmentPanel._render_attachments(panel, [], {})
+        panel.refresh_sales.assert_not_called()
+
+    def test_offline_client_attachments_include_owned_sales_only(self):
+        from core.network.client import RemoteDatabase
+
+        cache = MagicMock()
+        cache.get_records.side_effect = lambda section: {
+            "attachments": {
+                1: {"id": 1, "entity_type": "client", "entity_id": 4, "sale_id": None},
+                2: {"id": 2, "entity_type": "sale", "entity_id": 15},
+                3: {"id": 3, "entity_type": "sale", "entity_id": 20},
+            },
+            "Clients": {4: {"id": 4, "username": "Client A"}},
+            "Sales": {
+                15: {"id": 15, "client_id": 4, "client_username": "Client A"},
+                20: {"id": 20, "client_id": 5, "client_username": "Client B"},
+            },
+        }.get(section, {})
+        remote = RemoteDatabase.__new__(RemoteDatabase)
+        remote.offline = True
+        remote.cache = cache
+
+        records = remote.list_attachments("client", 4)
+        self.assertEqual([record["id"] for record in records], [1, 2])
 
     def test_sale_attachment_retrieval_is_unfiltered(self):
         self.cursor.fetchall.return_value = []

@@ -428,10 +428,39 @@ class RemoteDatabase:
             cache = getattr(self, 'cache', None)
             if cache is not None:
                 records = cache.get_records('attachments') or {}
+                if entity_type != 'client':
+                    return [
+                        record for record in records.values()
+                        if record.get('entity_type') == entity_type
+                        and int(record.get('entity_id')) == entity_id
+                    ]
+
+                clients = cache.get_records('Clients') or {}
+                selected = next(
+                    (record for record in clients.values()
+                     if int(record.get('id', 0) or 0) == entity_id),
+                    {},
+                )
+                username = " ".join(str(selected.get('username') or '').split()).casefold()
+                sales = cache.get_records('Sales') or {}
+                sale_ids = {
+                    int(record.get('id', 0) or 0)
+                    for record in sales.values()
+                    if int(record.get('client_id', 0) or 0) == entity_id
+                    or (username and " ".join(
+                        str(record.get('client_username') or '').split()
+                    ).casefold() == username)
+                }
                 return [
                     record for record in records.values()
-                    if record.get('entity_type') == entity_type
-                    and int(record.get('entity_id')) == entity_id
+                    if (
+                        record.get('entity_type') == 'client'
+                        and int(record.get('client_id') or record.get('entity_id') or 0) == entity_id
+                    ) or int(
+                        record.get('sale_id')
+                        or (record.get('entity_id') if record.get('entity_type') == 'sale' else 0)
+                        or 0
+                    ) in sale_ids
                 ]
         args = [entity_type, entity_id]
         if scope is not None:

@@ -164,6 +164,7 @@ class AttachmentPanel(QWidget):
         self._records = []
         self._fetch_thread = None
         self._fetch_worker = None
+        self._refresh_pending = False
         self._sales_thread = None
         self._sales_worker = None
         self._refresh_after_sales = False
@@ -262,7 +263,8 @@ class AttachmentPanel(QWidget):
             self._refresh_after_sales = True
             return
         if self._fetch_thread is not None:
-            return  # a fetch is already in flight; it will render current results
+            self._refresh_pending = True
+            return
 
         needle, kind = self.search.text().lower().strip(), self.filter.currentText()
         thread = QThread()
@@ -289,6 +291,9 @@ class AttachmentPanel(QWidget):
     def _on_fetch_thread_finished(self):
         self._fetch_thread = None
         self._fetch_worker = None
+        if self._refresh_pending:
+            self._refresh_pending = False
+            self.refresh()
 
     @Slot(str)
     def _on_attachments_fetch_error(self, err_msg):
@@ -333,8 +338,6 @@ class AttachmentPanel(QWidget):
         host = self.window()
         if self.entity_type != 'client' and isinstance(host, QDialog):
             host.resize(max(host.width(), 900), min(760, table_height + 165))
-        if self.entity_type == 'client':
-            self.refresh_sales()
 
     @staticmethod
     def _money(value):

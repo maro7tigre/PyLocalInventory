@@ -112,23 +112,33 @@ def round_money(value):
     return to_decimal(value).quantize(_PENNY, rounding=ROUND_HALF_UP)
 
 
-def calculate_line_subtotal(quantity, unit_price, remise_percent=0):
-    """Discounted line total: ``quantity * unit_price * (1 - remise / 100)``."""
+def calculate_line_discount(quantity, unit_price, remise_percent=0):
+    """Monetary discount represented by a line's Remise % value."""
     qty = to_decimal(quantity)
     price = to_decimal(unit_price)
     remise = to_decimal(remise_percent)
     if not Decimal("0") <= remise <= _HUNDRED:
         raise ValueError("Line remise percent must be between 0 and 100")
     try:
-        return qty * price * (_HUNDRED - remise) / _HUNDRED
+        return qty * price * remise / _HUNDRED
     except Exception as error:
         logger.error(
-            "Line subtotal failed quantity=%r type=%s unit_price=%r type=%s error=%s",
+            "Line discount failed quantity=%r type=%s unit_price=%r type=%s error=%s",
             quantity, type(quantity).__name__,
             unit_price, type(unit_price).__name__, error,
         )
         traceback.print_exc()
         raise
+
+
+def calculate_line_subtotal(quantity, unit_price, remise_percent=0):
+    """Discounted line total: gross line minus its percentage discount."""
+    qty = to_decimal(quantity)
+    price = to_decimal(unit_price)
+    remise = to_decimal(remise_percent)
+    if not Decimal("0") <= remise <= _HUNDRED:
+        raise ValueError("Line remise percent must be between 0 and 100")
+    return qty * price - calculate_line_discount(qty, price, remise)
 
 
 def calculate_operation_totals(raw_subtotal, remise=0, tva_rate=0):

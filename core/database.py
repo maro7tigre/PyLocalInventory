@@ -539,6 +539,7 @@ class Database:
                 # Default FALSE so every existing sale stays a normal sale.
                 'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
                 'remise': 'DOUBLE PRECISION',
+                'remise_includes_line_discounts': 'BOOLEAN NOT NULL DEFAULT FALSE',
                 # Persistent per-year sequential Devis reference (DE-YEAR-N).
                 # NULL until the one-time/on-read backfill assigns it - see
                 # _ensure_devis_numbers(). Never part of Sale Save logic.
@@ -630,6 +631,27 @@ class Database:
                     f"Warning: could not normalize {col_table}.is_historical "
                     f"to BOOLEAN: {e_type}"
                 )
+
+        try:
+            self.cursor.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'sales' "
+                "AND column_name = 'remise_includes_line_discounts'"
+            )
+            type_row = self.cursor.fetchone()
+            if type_row and type_row[0] != "boolean":
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN remise_includes_line_discounts "
+                    "TYPE BOOLEAN USING (COALESCE(remise_includes_line_discounts, 0) <> 0)"
+                )
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN remise_includes_line_discounts SET DEFAULT FALSE"
+                )
+                self.conn.commit()
+                print("Normalized sales.remise_includes_line_discounts to BOOLEAN")
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not normalize sales remise marker to BOOLEAN: {exc}")
 
         try:
             index_statements = (

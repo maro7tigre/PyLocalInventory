@@ -615,7 +615,7 @@ class ReportsDialog(QDialog):
             
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
-                total_ht = 0
+                subtotal_before_discount = Decimal("0")
                 
                 # Bulk prefetch missing product names
                 missing_product_ids = set()
@@ -689,7 +689,7 @@ class ReportsDialog(QDialog):
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
                     total_quantity += quantity
-                    total_ht += _decimal(subtotal)
+                    subtotal_before_discount += quantity * unit_price
                     quantity_text = _fmt_quantity(quantity)
                     
                     if report_type == 'bdl':
@@ -782,14 +782,30 @@ class ReportsDialog(QDialog):
                 filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
                 empty_label = 'Aucun service' if report_type == 'bdl' else 'Aucun article'
                 items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
-                total_ht = 0
+                subtotal_before_discount = Decimal("0")
             
-            # Calculate financial totals for devis using centralized function
+            # New-format sales persist the exact final Remise visible in the
+            # Sale dialog. Do not independently recalculate it for the Devis.
             total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
+            if not self.sales_obj.get_value('remise_includes_line_discounts'):
+                total_remise += sum(
+                    _decimal(item.get_value('quantity')) * _decimal(item.get_value('unit_price'))
+                    * _decimal(item.get_value('discount_percentage') or 0) / 100
+                    for item in getattr(self.sales_obj, 'items', [])
+                    if str(item.get_value('item_type') or '').casefold() != 'section'
+                )
             tva_percent = self.sales_obj.get_value('tva') or 0
 
             from classes.sales_class import calculate_sale_totals
-            totals = calculate_sale_totals(total_ht, total_remise, tva_percent)
+            totals = calculate_sale_totals(
+                subtotal_before_discount, total_remise, tva_percent
+            )
+            logger.info(
+                "[DEVIS REMISE DEBUG] module=%s sale_id=%s stored_sales_remise=%s "
+                "remise_includes_line_discounts=%s final_remise_used_by_report=%s",
+                __file__, sales_id, self.sales_obj.get_value('remise'),
+                self.sales_obj.get_value('remise_includes_line_discounts'), total_remise,
+            )
             net_ht = totals['total_ht']
             tva_amount = totals['vat_amount']
             total_ttc = totals['total_ttc']

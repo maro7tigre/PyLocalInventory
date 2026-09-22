@@ -14,7 +14,9 @@ from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
 from datetime import datetime
 from decimal import Decimal, InvalidOperation
-from core.calculations import calculate_line_subtotal, calculate_operation_totals
+from core.calculations import (
+    calculate_line_discount, calculate_operation_totals, to_decimal,
+)
 import os
 import uuid
 import shiboken6
@@ -172,6 +174,10 @@ class BaseOperationDialog(QDialog):
         self.pending_entities = []
         self.operation_token = uuid.uuid4().hex
         self._saving = False
+        self._manual_remise_adjustment = Decimal("0")
+        self._line_discount_total = Decimal("0")
+        self._loaded_final_remise = None
+        self._updating_remise_display = False
         
         # Create or load operation object
         if operation_id:
@@ -243,6 +249,7 @@ class BaseOperationDialog(QDialog):
             
             if hasattr(self, 'items_table') and self.items_table:
                 self.items_table.refresh_table()
+                self.update_totals()
         except RuntimeError:
             pass
 
@@ -471,7 +478,7 @@ class BaseOperationDialog(QDialog):
                     border: 1px solid #4CAF50;
                 }
             """)
-            self.remise_spinbox.valueChanged.connect(lambda _: self.update_totals())
+            self.remise_spinbox.valueChanged.connect(self._on_remise_edited)
         else:
             self.remise_spinbox = None
         
@@ -551,10 +558,23 @@ class BaseOperationDialog(QDialog):
             current_value = self.operation_obj.get_value(param_key)
             ParameterWidgetFactory.set_widget_value(widget, current_value)
         
-        # Load remise value if the spinbox exists
+        # sales.remise is the final value for new records. Legacy records used
+        # it as an extra amount beyond their line discounts.
         if self.remise_spinbox is not None:
-            remise_value = self.operation_obj.get_value('remise') or 0.0
-            self.remise_spinbox.setValue(float(remise_value))
+            self._loaded_final_remise = to_decimal(
+                self.operation_obj.get_value('remise') or 0
+            )
+
+    def _on_remise_edited(self, value):
+        """Keep a user-entered final remise stable across line recalculation."""
+        if self._updating_remise_display:
+            return
+        self._manual_remise_adjustment = to_decimal(value) - self._line_discount_total
+        logger.info(
+            "[REMISE DEBUG] user edit value=%s automatic=%s adjustment=%s",
+            value, self._line_discount_total, self._manual_remise_adjustment,
+        )
+        self.update_totals()
     
     def update_totals(self):
         """Update total calculation displays"""
@@ -563,17 +583,37 @@ class BaseOperationDialog(QDialog):
             # to resolve every product/service against PostgreSQL whenever a
             # quantity changed, which made rapid editing feel frozen.
             rows = self.items_table.get_current_table_data()
-            subtotal = sum(
-                (
-                    calculate_line_subtotal(
-                        row.get("quantity") or 0,
-                        row.get("unit_price") or 0,
-                        row.get("discount_percentage") or 0,
+            gross_subtotal = Decimal("0")
+            line_discount_total = Decimal("0")
+            for row in rows:
+                if str(row.get("item_type") or "").casefold() == "section":
+                    continue
+                quantity = row.get("quantity") or 0
+                unit_price = row.get("unit_price") or 0
+                discount_percent = row.get("discount_percentage") or 0
+                gross_subtotal += to_decimal(quantity) * to_decimal(unit_price)
+                line_discount_total += calculate_line_discount(
+                    quantity, unit_price, discount_percent
+                )
+            self._line_discount_total = line_discount_total
+            if self._loaded_final_remise is not None:
+                if self.operation_obj.get_value('remise_includes_line_discounts'):
+                    self._manual_remise_adjustment = (
+                        self._loaded_final_remise - line_discount_total
                     )
-                    for row in rows
-                ),
-                Decimal("0"),
+                else:
+                    self._manual_remise_adjustment = self._loaded_final_remise
+                self._loaded_final_remise = None
+            final_remise = max(
+                Decimal("0"), line_discount_total + self._manual_remise_adjustment
             )
+            before = self.remise_spinbox.value() if self.remise_spinbox is not None else None
+            if self.remise_spinbox is not None:
+                self._updating_remise_display = True
+                try:
+                    self.remise_spinbox.setValue(float(final_remise))
+                finally:
+                    self._updating_remise_display = False
             
             # Get VAT percentage
             vat_percent = Decimal("0")
@@ -585,18 +625,18 @@ class BaseOperationDialog(QDialog):
                 except (InvalidOperation, ValueError, TypeError):
                     vat_percent = Decimal("0")
             
-            # Get Remise value
-            remise = Decimal("0")
-            if self.remise_spinbox is not None:
-                try:
-                    remise = Decimal(str(self.remise_spinbox.value() or 0))
-                except (InvalidOperation, ValueError, TypeError):
-                    remise = Decimal("0")
-            
-            # Centralized Decimal math:
-            # Total HT = Subtotal - Remise, TVA = Total HT * rate,
-            # Total TTC = Total HT + TVA.
-            totals = calculate_operation_totals(subtotal, remise, vat_percent)
+            totals = calculate_operation_totals(
+                gross_subtotal, final_remise, vat_percent
+            )
+            logger.info(
+                "[REMISE DEBUG] update_totals module=%s gross_subtotal=%s "
+                "line_discount_total=%s manual_adjustment=%s final_remise=%s "
+                "bottom_before=%s bottom_after=%s total_ht=%s tva=%s total_ttc=%s",
+                __file__, gross_subtotal, line_discount_total,
+                self._manual_remise_adjustment, final_remise, before,
+                self.remise_spinbox.value() if self.remise_spinbox is not None else None,
+                totals['total_ht'], totals['vat_amount'], totals['total_ttc'],
+            )
             
             # Update displays
             ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
@@ -706,6 +746,11 @@ class BaseOperationDialog(QDialog):
             # Set remise value from spinbox if it exists
             if getattr(self, 'remise_spinbox', None) is not None:
                 self.operation_obj.set_value('remise', float(self.remise_spinbox.value()))
+                self.operation_obj.set_value('remise_includes_line_discounts', True)
+                logger.info(
+                    "[REMISE DEBUG] save sale_id=%s final_remise=%s marker=True",
+                    self.operation_id, self.remise_spinbox.value(),
+                )
             
             # For snapshots: if client_name/supplier_name empty set from username
             try:

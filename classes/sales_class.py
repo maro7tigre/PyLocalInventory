@@ -133,6 +133,13 @@ class SalesClass(BaseClass):
                 "default": 0.0,
                 "type": "float"
             },
+            "remise_includes_line_discounts": {
+                "value": True,
+                "display_name": {"en": "Final Remise"},
+                "required": False,
+                "default": True,
+                "type": "bool"
+            },
             "notes": {
                 "value": "",
                 "display_name": {"en": "Notes", "fr": "Notes", "es": "Notas"},
@@ -253,6 +260,7 @@ class SalesClass(BaseClass):
                 "devis": "rw",
                 "tva": "rw",
                 "remise": "rw",
+                "remise_includes_line_discounts": "rw",
                 "notes": "rw",
                 "created_by": "r",
                 "created_by_username": "r",
@@ -314,8 +322,20 @@ class SalesClass(BaseClass):
         """Internal: sum of all Sale Item line totals before any discount."""
         items = self.get_sales_items()
         return sum(
-            to_decimal(item.get_value('subtotal'))
+            to_decimal(item.get_value('quantity')) * to_decimal(item.get_value('unit_price'))
             for item in items
+            if str(item.get_value('item_type') or '').casefold() != 'section'
+        )
+
+    def _final_remise(self):
+        """Use the stored final remise, preserving pre-migration sale meaning."""
+        remise = to_decimal(self.get_value('remise') or 0)
+        if self.get_value('remise_includes_line_discounts'):
+            return remise
+        return remise + sum(
+            to_decimal(item.get_value('quantity')) * to_decimal(item.get_value('unit_price'))
+            * to_decimal(item.get_value('discount_percentage') or 0) / 100
+            for item in self.get_sales_items()
             if str(item.get_value('item_type') or '').casefold() != 'section'
         )
 
@@ -327,7 +347,7 @@ class SalesClass(BaseClass):
         """
         totals = calculate_sale_totals(
             self._raw_subtotal(),
-            self.get_value('remise') or 0,
+            self._final_remise(),
             self.get_value('tva') or 0,
         )
         return float(totals['total_ht'])
@@ -351,7 +371,7 @@ class SalesClass(BaseClass):
         """Calculate total VAT amount (centralized)."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
-            self.get_value('remise') or 0,
+            self._final_remise(),
             self.get_value('tva') or 0,
         )
         return float(totals['vat_amount'])
@@ -360,7 +380,7 @@ class SalesClass(BaseClass):
         """Calculate total price including VAT (centralized)."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
-            self.get_value('remise') or 0,
+            self._final_remise(),
             self.get_value('tva') or 0,
         )
         return float(totals['total_ttc'])
@@ -369,7 +389,7 @@ class SalesClass(BaseClass):
         """Discounted Total HT: Original Subtotal - Remise."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
-            self.get_value('remise') or 0,
+            self._final_remise(),
             self.get_value('tva') or 0,
         )
         return float(totals['total_ht'])
@@ -378,7 +398,7 @@ class SalesClass(BaseClass):
         """Final Total TTC: Total HT + VAT computed on Total HT."""
         totals = calculate_sale_totals(
             self._raw_subtotal(),
-            self.get_value('remise') or 0,
+            self._final_remise(),
             self.get_value('tva') or 0,
         )
         return float(totals['total_ttc'])

@@ -22,6 +22,8 @@ SECTION_GROUP = {
     'Sales': 'Sales',
     'Sales_Items': 'Sales',
     'Payments': 'Sales',
+    'Factures': 'Factures',
+    'Facture_Items': 'Factures',
     'Imports': 'Imports',
     'Import_Items': 'Imports',
     'Reports': 'Reports',
@@ -35,7 +37,7 @@ SECTION_GROUP = {
 # rejected as "no permission mapping" even though 'Sales' is a mapped section.
 _SECTION_GROUP_CASEFOLD = {key.casefold(): value for key, value in SECTION_GROUP.items()}
 
-MATRIX_SECTIONS = ['Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports', 'Reports']
+MATRIX_SECTIONS = ['Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports', 'Factures', 'Reports']
 
 _EMPTY_PERMISSIONS = {'read': False, 'write': False, 'delete': False}
 _FULL_PERMISSIONS = {'read': True, 'write': True, 'delete': True}

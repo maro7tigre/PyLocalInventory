@@ -85,6 +85,14 @@ _SUPPLIER_PAYMENT_WRITE_METHODS = {
 }
 _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_report'}
 _PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
+_FACTURE_METHODS = {
+    'get_next_facture_preview', 'get_facture', 'list_factures',
+    'get_facture_payments', 'save_facture_with_items', 'create_facture_from_sale',
+    'add_facture_payment', 'delete_facture',
+}
+_FACTURE_WRITE_METHODS = {
+    'save_facture_with_items', 'create_facture_from_sale', 'add_facture_payment',
+}
 _ALWAYS_ALLOWED = {
     'begin_transaction', 'commit_transaction', 'rollback_transaction',
     'get_dashboard_snapshot',
@@ -173,6 +181,15 @@ def _check_permission(user, method, args, kwargs):
         # Read-only advisory Devis proposal; gated by Sales read/write access.
         if not (user['permissions'].get('Sales', {}).get('read')
                 or user['permissions'].get('Sales', {}).get('write')):
+            return False, "You don't have read access to Sales"
+        return True, None
+
+    if method in _FACTURE_METHODS:
+        needed = 'delete' if method == 'delete_facture' else ('write' if method in _FACTURE_WRITE_METHODS else 'read')
+        if not user['permissions'].get('Factures', {}).get(needed):
+            return False, f"You don't have {needed} access to Factures"
+        # Copying a Devis reads Sales data but never changes it.
+        if method == 'create_facture_from_sale' and not user['permissions'].get('Sales', {}).get('read'):
             return False, "You don't have read access to Sales"
         return True, None
 
@@ -557,6 +574,9 @@ class DatabaseServer:
             if method == 'get_next_devis_preview':
                 return request_db.get_next_devis_preview(*args, **kwargs)
 
+            if method in _FACTURE_METHODS:
+                return getattr(request_db, method)(*args, **kwargs, user=user)
+
             if method == 'get_import_bl_number':
                 return request_db.get_import_bl_number(*args, **kwargs)
 
@@ -650,6 +670,7 @@ class DatabaseServer:
             if (method in _SECTION_METHODS or method in _ATTACHMENT_METHODS
                     or method in _CLIENT_ACCOUNT_METHODS
                     or method in _SUPPLIER_ACCOUNT_METHODS
+                    or method in _FACTURE_METHODS
                     or method in _REPORT_METHODS
                     or method in _PRODUCT_READ_METHODS or method in _ALWAYS_ALLOWED
                     or method in (

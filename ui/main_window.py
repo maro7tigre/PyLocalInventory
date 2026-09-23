@@ -29,6 +29,7 @@ from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
 from ui.tabs.imports_tab import ImportsTab
+from ui.tabs.factures_tab import FacturesTab
 from ui.tabs.reports_tab import ReportsTab
 # from ui.tabs.log_tab import LogTab  # Hidden per request
 
@@ -42,6 +43,7 @@ from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
+from classes.facture_class import FactureClass
 from classes.reports_class import ReportsClass
 
 from core.profiles import ProfileManager
@@ -143,6 +145,7 @@ class MainWindow(ThemedMainWindow):
         self.database.register_class(SalesItemClass)
         self.database.register_class(ImportClass)
         self.database.register_class(ImportItemClass)
+        self.database.register_class(FactureClass)
         self.database.register_class(ReportsClass)
 
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
@@ -187,6 +190,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': _bool(self.settings.value("tab_visible/suppliers")),
             'sales':     _bool(self.settings.value("tab_visible/sales")),
             'imports':   _bool(self.settings.value("tab_visible/imports")),
+            'factures':  _bool(self.settings.value("tab_visible/factures")),
             'reports':   _bool(self.settings.value("tab_visible/reports")),
         }
     
@@ -399,6 +403,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales':     "💰 Sales",
             'imports':   "📥 Imports",
+            'factures':  "🧾 Factures",
             'reports':   "📝 Reports",
         }
         self._tab_visibility_actions = {}
@@ -690,6 +695,7 @@ class MainWindow(ThemedMainWindow):
             ('suppliers', 'Suppliers', lambda: SuppliersTab(self.database, self)),
             ('sales',     'Sales',     lambda: SalesTab(self.database, self)),
             ('imports',   'Imports',   lambda: ImportsTab(self.database, self)),
+            ('factures',  'Factures',  lambda: FacturesTab(self.database, self)),
             ('reports',   'Reports',   lambda: ReportsTab(self.database, self)),
         ]
 
@@ -930,6 +936,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Fournisseurs",
                 'sales': "💰 Ventes",
                 'imports': "📥 Importations",
+                'factures': "🧾 Factures",
                 'reports': "📝 Rapports",
                 'log': "📋 Journal",
             }
@@ -942,6 +949,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Proveedores",
                 'sales': "💰 Ventas",
                 'imports': "📥 Importaciones",
+                'factures': "🧾 Facturas",
                 'reports': "📝 Informes",
                 'log': "📋 Registro",
             }
@@ -954,6 +962,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales': "💰 Sales",
             'imports': "📥 Imports",
+            'factures': "🧾 Invoices",
             'reports': "📝 Reports",
             'log': "📋 Log",
         }

@@ -960,7 +960,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales': "💰 Sales",
             'imports': "📥 Imports",
-            'factures': "🧾 Invoices",
+            'factures': "🧾 Factures",
             'reports': "📝 Reports",
             'log': "📋 Log",
         }

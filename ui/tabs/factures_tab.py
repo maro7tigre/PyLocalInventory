@@ -1,7 +1,6 @@
 """Factures management UI backed by the dedicated invoice API."""
 
 from decimal import Decimal
-from html import escape
 from uuid import uuid4
 
 from PySide6.QtCore import QDate, Qt
@@ -9,13 +8,13 @@ from PySide6.QtGui import QTextDocument
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
-    QFormLayout, QFileDialog, QHBoxLayout, QHeaderView, QInputDialog, QLabel, QLineEdit,
+    QFormLayout, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
     QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
     QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.calculations import calculate_line_subtotal, calculate_operation_totals, round_money, to_decimal
-from core.moroccan_dirham_words import amount_to_words
+from ui.facture_document import build_facture_html
 from ui.widgets.themed_widgets import BlueButton, GreenButton, OrangeButton, RedButton
 
 
@@ -32,6 +31,7 @@ class FactureEditor(QDialog):
         super().__init__(parent)
         self.database = database
         self.facture = facture
+        self.draft = None
         self.operation_token = uuid4().hex if facture is None else ""
         self.setWindowTitle("Modifier la facture" if facture else "Nouvelle facture")
         self.resize(1050, 680)
@@ -47,14 +47,16 @@ class FactureEditor(QDialog):
         self.type.addItem("Facture d'acompte / avance", "advance")
         self.type.addItem("Facture de solde", "balance")
         self.tva = QDoubleSpinBox(); self.tva.setRange(0, 100); self.tva.setDecimals(3); self.tva.setValue(20)
-        self.city = QLineEdit()
+        self.address = QLineEdit(); self.city = QLineEdit(); self.ice = QLineEdit()
         self.notes = QTextEdit(); self.notes.setMaximumHeight(70)
         form.addRow("Facture N°", self.number)
         form.addRow("Date", self.date)
         form.addRow("Client", self.client)
         form.addRow("Type", self.type)
         form.addRow("TVA %", self.tva)
+        form.addRow("Adresse", self.address)
         form.addRow("Ville", self.city)
+        form.addRow("ICE", self.ice)
         form.addRow("Notes", self.notes)
         layout.addLayout(form)
         self.items = QTableWidget(0, len(self.columns)); self.items.setHorizontalHeaderLabels(self.columns)
@@ -80,8 +82,24 @@ class FactureEditor(QDialog):
                 pass
             self.add_line()
 
+    def load_draft(self, draft):
+        """Populate a new editor from a selected Devis without issuing it yet."""
+        self.draft = draft
+        self.date.setDate(QDate.fromString(str(draft.get("date") or ""), "yyyy-MM-dd"))
+        self.type.setCurrentIndex(max(0, self.type.findData(draft.get("facture_type") or "normal")))
+        self.tva.setValue(float(draft.get("tva_rate") or 0)); self.notes.setPlainText(str(draft.get("notes") or ""))
+        self.client.setCurrentIndex(self.client.findData(draft["client_id"]))
+        self.items.setRowCount(0)
+        for item in draft.get("items", []): self.add_line(item)
+        self.update_totals()
+
     def _load_clients(self):
-        catalog = self.database.get_sale_catalog(False, False, include_clients=True)
+        catalog = self.database.get_sale_catalog(True, True, include_clients=True)
+        self.line_catalog = {
+            "product": {str(row["name"]): row for row in catalog.get("products", [])},
+            "service": {str(row["name"]): row for row in catalog.get("services", [])},
+        }
+        self.client_records = {}
         for client in catalog.get("clients", []):
             client_id = client.get("id")
             if client_id is None:
@@ -92,32 +110,88 @@ class FactureEditor(QDialog):
             if username and username != label:
                 label = f"{label} ({username})"
             self.client.addItem(label, int(client_id))
+            self.client_records[int(client_id)] = client
+        self.client.currentIndexChanged.connect(self._populate_client_snapshot)
+
+    def _populate_client_snapshot(self):
+        client = self.client_records.get(self.client.currentData())
+        if client:
+            self.address.setText(str(client.get("address") or ""))
+            self.ice.setText(str(client.get("ice") or ""))
 
     def _load_facture(self, facture):
         self.date.setDate(QDate.fromString(str(facture["date"]), "yyyy-MM-dd"))
         self.type.setCurrentIndex(max(0, self.type.findData(facture["facture_type"])))
-        self.tva.setValue(float(facture["tva_rate"])); self.city.setText(facture.get("client_city") or "")
+        self.tva.setValue(float(facture["tva_rate"])); self.address.setText(facture.get("client_address") or "")
+        self.city.setText(facture.get("client_city") or ""); self.ice.setText(facture.get("client_ice") or "")
         self.notes.setPlainText(facture.get("notes") or "")
-        self.client.setCurrentIndex(max(0, self.client.findData(facture["client_id"])))
+        index = self.client.findData(facture["client_id"])
+        if index < 0:
+            # Preserve historical invoices whose live client was removed; do
+            # not silently replace their identity with the first client.
+            client_id = int(facture["client_id"])
+            self.client.addItem(f"{facture.get('client_name') or 'Client'} (historique)", client_id)
+            self.client_records[client_id] = {"id": client_id}
+            index = self.client.count() - 1
+        self.client.setCurrentIndex(index)
         for item in facture["items"]:
             self.add_line(item)
 
     def add_line(self, item=None):
         row = self.items.rowCount(); self.items.insertRow(row)
         values = item or {}
-        for col, key in enumerate(("item_type", "designation", "information", "unit", "quantity", "unit_price", "discount_percentage")):
+        type_box = QComboBox()
+        for label, value in (("Produit", "product"), ("Service", "service"), ("Texte libre", "manual"), ("Section", "section")):
+            type_box.addItem(label, value)
+        type_box.setCurrentIndex(max(0, type_box.findData(values.get("item_type") or "manual")))
+        type_box.currentIndexChanged.connect(lambda _index, current=row: self._set_line_type(current))
+        self.items.setCellWidget(row, 0, type_box)
+        designation = QComboBox(); designation.setEditable(True)
+        designation.setCurrentText(str(values.get("designation") or ""))
+        designation.activated.connect(lambda _index, current=row: self._catalog_line_selected(current))
+        self.items.setCellWidget(row, 1, designation)
+        for col, key in enumerate(("information", "unit", "quantity", "unit_price", "discount_percentage"), 2):
             self.items.setItem(row, col, QTableWidgetItem(str(values.get(key, ""))))
+        self._set_line_type(row)
         total = "" if values.get("item_type") == "section" else _money(calculate_line_subtotal(values.get("quantity", 0), values.get("unit_price", 0), values.get("discount_percentage", 0)))
         total_item = QTableWidgetItem(total); total_item.setFlags(total_item.flags() & ~Qt.ItemIsEditable)
         self.items.setItem(row, 7, total_item)
 
+    def _set_line_type(self, row):
+        type_box = self.items.cellWidget(row, 0)
+        designation = self.items.cellWidget(row, 1)
+        if not type_box or not designation:
+            return
+        current = str(type_box.currentData() or "manual")
+        old = designation.currentText()
+        designation.blockSignals(True); designation.clear()
+        for name in self.line_catalog.get(current, {}):
+            designation.addItem(name)
+        designation.setCurrentText(old); designation.blockSignals(False)
+
+    def _catalog_line_selected(self, row):
+        type_box = self.items.cellWidget(row, 0); designation = self.items.cellWidget(row, 1)
+        record = self.line_catalog.get(str(type_box.currentData()), {}).get(designation.currentText())
+        if not record:
+            return
+        if not (self.items.item(row, 4).text().strip() if self.items.item(row, 4) else ""):
+            self.items.item(row, 4).setText("1")
+        if not (self.items.item(row, 5).text().strip() if self.items.item(row, 5) else ""):
+            self.items.item(row, 5).setText(str(record.get("price") or 0))
+        self.update_totals()
+
     def _line_data(self):
         lines = []
         for row in range(self.items.rowCount()):
-            value = lambda col: (self.items.item(row, col).text().strip() if self.items.item(row, col) else "")
+            def value(col):
+                widget = self.items.cellWidget(row, col)
+                if widget and hasattr(widget, "currentText"):
+                    return widget.currentText().strip()
+                return self.items.item(row, col).text().strip() if self.items.item(row, col) else ""
             if not value(1):
                 continue
-            item_type = value(0).casefold() or "manual"
+            type_box = self.items.cellWidget(row, 0)
+            item_type = str(type_box.currentData() if type_box else value(0)).casefold() or "manual"
             line = {"item_type": item_type, "designation": value(1), "information": value(2), "unit": value(3), "sort_order": row + 1}
             if item_type != "section":
                 line.update({"quantity": value(4), "unit_price": value(5), "discount_percentage": value(6) or 0})
@@ -147,8 +221,10 @@ class FactureEditor(QDialog):
             result = self.database.save_facture_with_items({
                 "client_id": self.client.currentData(), "date": self.date.date().toString("yyyy-MM-dd"),
                 "facture_type": self.type.currentData(), "tva_rate": str(self.tva.value()),
-                "client_city": self.city.text(), "notes": self.notes.toPlainText(),
+                "client_address": self.address.text(), "client_city": self.city.text(), "client_ice": self.ice.text(),
+                "notes": self.notes.toPlainText(),
                 "operation_token": self.operation_token,
+                **({key: self.draft[key] for key in ("source_sale_id", "source_devis") if key in self.draft} if self.draft else {}),
             }, self._line_data(), self.facture["id"] if self.facture else None)
             self.saved_id = result["facture_id"]; self.accept()
         except Exception as exc:
@@ -180,6 +256,38 @@ class FacturePaymentsDialog(QDialog):
             self.refresh()
         except Exception as exc:
             QMessageBox.warning(self, "Paiement", str(exc))
+
+
+class DevisSelectorDialog(QDialog):
+    """Search and select a Devis by its visible business data, never its PK."""
+    def __init__(self, database, parent=None):
+        super().__init__(parent); self.database = database; self.sale_id = None
+        self.setWindowTitle("Sélectionner un Devis"); self.resize(900, 500)
+        layout = QVBoxLayout(self); self.search = QLineEdit(); self.search.setPlaceholderText("N° Devis, client ou date")
+        self.search.textChanged.connect(self.refresh); layout.addWidget(self.search)
+        self.table = QTableWidget(0, 6); self.table.setHorizontalHeaderLabels(("Devis N°", "Client", "Date", "Total HT", "Total TTC", "Statut"))
+        self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); self.table.cellDoubleClicked.connect(lambda *_: self.select())
+        layout.addWidget(self.table)
+        buttons = QDialogButtonBox(QDialogButtonBox.Ok | QDialogButtonBox.Cancel); buttons.accepted.connect(self.select); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
+        self.refresh()
+
+    def refresh(self):
+        rows = self.database.get_operation_summary_items(
+            "Sales", search_text=self.search.text().strip() or None,
+            search_columns=["devis", "client_name", "client_username", "date"], order_by="date", order_dir="desc"
+        )
+        self.table.setRowCount(len(rows))
+        for row, sale in enumerate(rows):
+            values = (sale.get("devis"), sale.get("client_name") or sale.get("client_username"), sale.get("date"),
+                      _money(sale.get("total_ht") or 0), _money(sale.get("total_ttc") or 0), sale.get("state"))
+            for col, value in enumerate(values):
+                item = QTableWidgetItem(str(value or "")); item.setData(Qt.UserRole, sale.get("ID") or sale.get("id")); self.table.setItem(row, col, item)
+
+    def select(self):
+        row = self.table.currentRow()
+        if row < 0:
+            return QMessageBox.information(self, "Devis", "Sélectionnez un devis.")
+        self.sale_id = int(self.table.item(row, 0).data(Qt.UserRole)); self.accept()
 
 
 class FacturesTab(QWidget):
@@ -231,10 +339,12 @@ class FacturesTab(QWidget):
         if dialog.exec(): self.refresh()
 
     def from_devis(self):
-        sale_id, accepted = QInputDialog.getInt(self, "Créer depuis Devis", "ID de la vente / devis:", 1, 1)
-        if not accepted: return
+        selector = DevisSelectorDialog(self.database, self)
+        if not selector.exec(): return
         try:
-            self.database.create_facture_from_sale(sale_id); self.refresh()
+            dialog = FactureEditor(self.database, parent=self)
+            dialog.load_draft(self.database.get_facture_draft_from_sale(selector.sale_id))
+            if dialog.exec(): self.refresh()
         except Exception as exc: QMessageBox.warning(self, "Facture", str(exc))
 
     def edit_facture(self):
@@ -263,36 +373,8 @@ class FacturesTab(QWidget):
         facture_id = self.selected_id()
         if not facture_id: return
         facture = self.database.get_facture(facture_id)
-        rows = []
-        for item in facture["items"]:
-            if item["item_type"] == "section":
-                rows.append(f"<tr class='section'><td colspan='4'>{escape(str(item['designation']))}</td></tr>")
-                continue
-            rows.append("<tr><td>{}</td><td>{}</td><td>{}</td><td>{}</td></tr>".format(
-                escape(str(item["designation"])), escape(str(item.get("quantity") or "")),
-                _money(item.get("unit_price") or 0), _money(calculate_line_subtotal(
-                    item.get("quantity") or 0, item.get("unit_price") or 0,
-                    item.get("discount_percentage") or 0,
-                )),
-            ))
         profile = getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
-        company = profile.get_value("company name") if profile else ""
-        company_address = profile.get_value("address") if profile else ""
-        source = f"Devis source: {facture.get('source_devis') or facture['source_sale_id']}" if facture.get("source_sale_id") else ""
-        html = f"""<style>
-            body {{ font-family: Arial, sans-serif; color: #222; margin: 22px; }}
-            .header {{ border-bottom: 2px solid #183b63; padding-bottom: 12px; display: block; }}
-            h1 {{ color: #183b63; text-align: right; margin: 0; }}
-            table {{ border-collapse: collapse; margin-top: 24px; }} th {{ background: #183b63; color: white; }}
-            th, td {{ border: 1px solid #555; padding: 7px; }} td:nth-child(n+2) {{ text-align: right; }}
-            .section td {{ background: #eee; text-align: left !important; font-weight: bold; }}
-            .totals {{ margin-left: auto; width: 48%; margin-top: 18px; }} .words {{ margin-top: 25px; font-style: italic; }}
-            </style><div class='header'><b>{escape(str(company or ''))}</b><br>{escape(str(company_address or ''))}
-            <h1>FACTURE</h1><div style='text-align:right'>N° {escape(facture['facture_number'])}<br>Date: {escape(str(facture['date']))}</div></div>
-            <p><b>Client: {escape(facture['client_name'])}</b><br>{escape(facture.get('client_address') or '')}<br>{escape(facture.get('client_city') or '')}<br>ICE: {escape(facture.get('client_ice') or '')}<br>{escape(source)}</p>
-            <table width='100%'><tr><th>Désignation</th><th>Qté</th><th>Prix HT</th><th>Total HT</th></tr>{''.join(rows)}</table>
-            <table class='totals'><tr><td>Total HT</td><td>{_money(facture['total_ht'])} MAD</td></tr><tr><td>TVA</td><td>{_money(facture['vat_amount'])} MAD</td></tr><tr><td><b>Total TTC</b></td><td><b>{_money(facture['total_ttc'])} MAD</b></td></tr><tr><td>Payé</td><td>{_money(facture['paid'])} MAD</td></tr><tr><td>Reste à payer</td><td>{_money(facture['remaining'])} MAD</td></tr></table>
-            <p class='words'>Arrêtée la présente Facture à la somme de : <b>{facture['amount_in_words']}</b></p>"""
+        html = build_facture_html(facture, self.database.get_facture_payments(facture_id), profile)
         dialog = QDialog(self); dialog.setWindowTitle("Aperçu facture"); dialog.resize(850, 700); layout = QVBoxLayout(dialog); browser = QTextBrowser(); browser.setHtml(html); layout.addWidget(browser)
         actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(html, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_html(html, dialog)); actions.addWidget(pdf); actions.addWidget(print_button); layout.addLayout(actions); dialog.exec()
 

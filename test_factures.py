@@ -12,7 +12,8 @@ from core.moroccan_dirham_words import amount_to_words
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
-from ui.tabs.factures_tab import FactureEditor, FacturesTab
+from ui.facture_document import build_facture_html
+from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturesTab
 
 
 class _FactureDatabase:
@@ -75,9 +76,9 @@ class _CopyCursor:
     def __init__(self):
         self._fetchone_rows = [(18, 7, "client.test", "Client Test", "2026-09-23", Decimal("20"), "Note", "DE-2026-18")]
         self._fetchall_rows = [[
-            (41, "product", "Produit", "Info", Decimal("2"), Decimal("500"), Decimal("0"), 1),
-            (42, "section", "Pose", "", None, None, None, 2),
-            (43, "service", "Installation", "", Decimal("1"), Decimal("100"), Decimal("10"), 3),
+            (41, "product", "Produit", "Info", "U", Decimal("2"), Decimal("500"), Decimal("0"), 1),
+            (42, "section", "Pose", "", "", None, None, None, 2),
+            (43, "service", "Installation", "", "ENS", Decimal("1"), Decimal("100"), Decimal("10"), 3),
         ]]
 
     def execute(self, _sql, _params=None):
@@ -131,8 +132,8 @@ class FactureEditorTests(unittest.TestCase):
         database = _FactureDatabase()
         dialog = FactureEditor(database)
         try:
-            dialog.items.item(0, 0).setText("service")
-            dialog.items.item(0, 1).setText("Pose")
+            dialog.items.cellWidget(0, 0).setCurrentIndex(dialog.items.cellWidget(0, 0).findData("service"))
+            dialog.items.cellWidget(0, 1).setCurrentText("Pose")
             dialog.items.item(0, 4).setText("12")
             dialog.items.item(0, 5).setText("15")
             dialog.items.item(0, 6).setText("5")
@@ -190,13 +191,13 @@ class FactureEditorTests(unittest.TestCase):
 
     def test_client_catalog_normalizes_the_canonical_primary_key(self):
         database = Database()
-        cursor = _CatalogCursor([(7, "client.test", "Client Test")])
+        cursor = _CatalogCursor([(7, "client.test", "Client Test", "Rue Test", "ICE7")])
         database.cursor = cursor
         catalog = database.get_sale_catalog(False, False, include_clients=True)
         self.assertEqual(catalog["clients"], [
-            {"id": 7, "username": "client.test", "name": "Client Test"}
+            {"id": 7, "username": "client.test", "name": "Client Test", "address": "Rue Test", "ice": "ICE7"}
         ])
-        self.assertIn("SELECT id, username, name FROM clients", cursor.sql)
+        self.assertIn("SELECT id, username, name, address, ice FROM clients", cursor.sql)
 
     def test_client_combo_handles_empty_and_nullable_display_fields(self):
         empty = FactureEditor(_FactureDatabase([]))
@@ -218,6 +219,45 @@ class FactureEditorTests(unittest.TestCase):
         finally:
             dialog.reject()
 
+    def test_existing_invoice_keeps_a_missing_client_snapshot_identity(self):
+        database = _FactureDatabase([])
+        facture = {"id": 8, "facture_number": "FA001/2026", "date": "2026-09-23", "facture_type": "normal",
+                   "tva_rate": "20", "client_id": 91, "client_name": "Aptiv", "client_address": "Zone industrielle",
+                   "client_city": "Tanger", "client_ice": "001", "notes": "", "items": []}
+        dialog = FactureEditor(database, facture)
+        try:
+            self.assertEqual(dialog.client.currentData(), 91)
+            self.assertIn("historique", dialog.client.currentText())
+        finally:
+            dialog.reject()
+
+    def test_devis_selector_uses_visible_rows_not_an_id_prompt(self):
+        database = _FactureDatabase()
+        database.get_operation_summary_items = lambda *_args, **_kwargs: [{
+            "ID": 18, "devis": "DE-2026-18", "client_name": "Aptiv", "date": "2026-09-23",
+            "total_ht": Decimal("22725"), "total_ttc": Decimal("27270"), "state": "confirmed",
+        }]
+        dialog = DevisSelectorDialog(database)
+        try:
+            self.assertEqual(dialog.table.item(0, 0).text(), "DE-2026-18")
+            dialog.table.selectRow(0); dialog.select()
+            self.assertEqual(dialog.sale_id, 18)
+        finally:
+            dialog.reject()
+
+    def test_printable_document_is_white_and_contains_unit_and_payment_reference(self):
+        facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",
+                   "client_address": "Adresse", "client_city": "Tanger", "client_ice": "ICE", "source_devis": "DE-1",
+                   "items": [{"item_type": "manual", "designation": "Avance", "unit": "ENS", "quantity": 1,
+                              "unit_price": Decimal("166666.67"), "discount_percentage": 0}],
+                   "total_ht": Decimal("166666.67"), "vat_amount": Decimal("33333.33"), "total_ttc": Decimal("200000"),
+                   "paid": Decimal("100000"), "remaining": Decimal("100000"), "amount_in_words": "DEUX CENT MILLE DIRHAMS"}
+        html = build_facture_html(facture, [{"method": "Chèque", "amount": Decimal("100000"), "reference": "1300019"}])
+        self.assertIn("background:#fff", html)
+        self.assertIn("Unite", html)
+        self.assertIn("RESTE A PAYER", html)
+        self.assertIn("1300019", html)
+
     def test_create_from_devis_copies_an_independent_snapshot_payload(self):
         database = _CopyDatabase()
         result = database.create_facture_from_sale(18, "advance", user={"id": 3})
@@ -230,6 +270,7 @@ class FactureEditorTests(unittest.TestCase):
         self.assertEqual(header["source_devis"], "DE-2026-18")
         self.assertEqual(header["facture_type"], "advance")
         self.assertEqual(items[0]["source_sale_item_id"], 41)
+        self.assertEqual(items[0]["unit"], "U")
         self.assertEqual(items[1]["item_type"], "section")
         self.assertEqual(items[2]["discount_percentage"], Decimal("10"))
 

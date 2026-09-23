@@ -1033,10 +1033,25 @@ class Database:
             raise ValueError("A facture requires at least one item")
 
         try:
+            existing_snapshot = None
+            if facture_id:
+                self.cursor.execute(
+                    "SELECT client_id, client_username, client_name, client_address, client_city, client_ice "
+                    "FROM factures WHERE id=%s FOR UPDATE", (int(facture_id),)
+                )
+                existing_snapshot = self.cursor.fetchone()
+                if not existing_snapshot:
+                    raise ValueError(f"Facture {facture_id} does not exist")
             self.cursor.execute(
                 "SELECT id, username, name, address, ice FROM clients WHERE id=%s", (client_id,)
             )
             client = self.cursor.fetchone()
+            # An issued invoice remains a legal document even if the original
+            # client record was later removed. Only retain that exact stored
+            # identity; a newly selected client must always exist live.
+            if not client and existing_snapshot and client_id == existing_snapshot[0]:
+                client = (existing_snapshot[0], existing_snapshot[1], existing_snapshot[2],
+                          existing_snapshot[3], existing_snapshot[5])
             if not client:
                 raise ValueError("Selected client does not exist")
             actor = self._actor_fields(user)
@@ -1044,18 +1059,18 @@ class Database:
             source_sale_id = int(source_sale_id) if source_sale_id else None
             source_devis = str(facture_data.get("source_devis") or "")
             notes = str(facture_data.get("notes") or "")
-            city = str(facture_data.get("client_city") or "")
+            address = str(facture_data.get("client_address") if "client_address" in facture_data else client[3] or "")
+            city = str(facture_data.get("client_city") if "client_city" in facture_data else (
+                existing_snapshot[4] if existing_snapshot else "") or "")
+            ice = str(facture_data.get("client_ice") if "client_ice" in facture_data else client[4] or "")
 
             if facture_id:
                 facture_id = int(facture_id)
-                self.cursor.execute("SELECT id FROM factures WHERE id=%s FOR UPDATE", (facture_id,))
-                if not self.cursor.fetchone():
-                    raise ValueError(f"Facture {facture_id} does not exist")
                 self.cursor.execute(
                     "UPDATE factures SET client_id=%s, client_username=%s, client_name=%s, "
                     "client_address=%s, client_city=%s, client_ice=%s, date=%s, facture_type=%s, "
                     "source_sale_id=%s, source_devis=%s, tva_rate=%s, notes=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
-                    (client[0], client[1], client[2], client[3], city, client[4], date_value,
+                    (client[0], client[1], client[2], address, city, ice, date_value,
                      facture_type, source_sale_id, source_devis, tva_rate, notes, facture_id),
                 )
                 self.cursor.execute("DELETE FROM facture_items WHERE facture_id=%s", (facture_id,))
@@ -1072,8 +1087,8 @@ class Database:
                     "client_username, client_name, client_address, client_city, client_ice, date, "
                     "facture_type, tva_rate, notes, operation_token, created_by, created_by_username, created_at) "
                     "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
-                    (number, year, source_sale_id, source_devis, client[0], client[1], client[2], client[3], city,
-                     client[4], date_value, facture_type, tva_rate, notes, token,
+                    (number, year, source_sale_id, source_devis, client[0], client[1], client[2], address, city,
+                     ice, date_value, facture_type, tva_rate, notes, token,
                      actor["created_by"], actor["created_by_username"], actor["created_at"]),
                 )
                 facture_id = int(self.cursor.fetchone()[0])
@@ -1089,8 +1104,8 @@ class Database:
             self.conn.rollback()
             raise
 
-    def create_facture_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
-        """Copy a Devis/Sale into an independent invoice snapshot exactly once per call."""
+    def get_facture_draft_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
+        """Return an editable, unsaved independent Facture draft from a Devis."""
         sale_id = int(sale_id)
         self.cursor.execute(
             "SELECT s.id, s.client_id, s.client_username, s.client_name, s.date, s.tva, s.notes, s.devis "
@@ -1100,20 +1115,27 @@ class Database:
         if not sale or not sale[1]:
             raise ValueError("Sale must have a persisted client before invoicing")
         self.cursor.execute(
-            "SELECT id, item_type, product_name, information, quantity, unit_price, "
+            "SELECT id, item_type, product_name, information, '' AS unit, quantity, unit_price, "
             "discount_percentage, sort_order FROM sales_items WHERE sales_id=%s ORDER BY sort_order, id",
             (sale_id,),
         )
         items = [
             {"source_sale_item_id": row[0], "item_type": row[1], "designation": row[2],
-             "information": row[3], "quantity": row[4], "unit_price": row[5],
-             "discount_percentage": row[6], "sort_order": row[7]}
+             "information": row[3], "unit": row[4], "quantity": row[5], "unit_price": row[6],
+             "discount_percentage": row[7], "sort_order": row[8]}
             for row in self.cursor.fetchall()
         ]
-        return self.save_facture_with_items({
+        return {
             "client_id": sale[1], "source_sale_id": sale[0], "date": date or sale[4],
             "tva_rate": sale[5] or 0, "notes": sale[6] or "", "source_devis": sale[7] or "", "facture_type": facture_type,
-        }, items, user=user)
+            "items": items,
+        }
+
+    def create_facture_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
+        """Persist a Devis snapshot for non-interactive callers."""
+        draft = self.get_facture_draft_from_sale(sale_id, facture_type, date, user)
+        items = draft.pop("items")
+        return self.save_facture_with_items(draft, items, user=user)
 
     def get_facture(self, facture_id, user=None):
         """Load an invoice snapshot with derived totals, payment history, and status."""
@@ -3599,12 +3621,13 @@ class Database:
             ]
         if include_clients:
             self.cursor.execute(
-                "SELECT id, username, name FROM clients "
+                "SELECT id, username, name, address, ice FROM clients "
                 "WHERE username IS NOT NULL OR name IS NOT NULL "
                 "ORDER BY LOWER(COALESCE(name, username)), id"
             )
             catalog["clients"] = [
-                {"id": int(row[0]), "username": row[1] or "", "name": row[2] or ""}
+                {"id": int(row[0]), "username": row[1] or "", "name": row[2] or "",
+                 "address": row[3] or "", "ice": row[4] or ""}
                 for row in self.cursor.fetchall()
             ]
         if include_suppliers:

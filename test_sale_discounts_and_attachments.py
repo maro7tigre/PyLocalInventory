@@ -245,5 +245,101 @@ class TestDecimalEditorDelegate(unittest.TestCase):
         self.assertEqual(delegate.minimum, 0.0)
         self.assertEqual(delegate.maximum, 100.0)
 
+
+class TestLiveSaleRemiseDialog(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        import os
+        os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
+        from PySide6.QtWidgets import QApplication
+        cls.app = QApplication.instance() or QApplication([])
+
+    def _dialog(self):
+        from PySide6.QtCore import QEventLoop, QTimer
+        from ui.tabs.sales_tab import SalesEditDialog
+
+        RemoteDatabase = type("RemoteDatabase", (), {
+            "has_permission": lambda _self, *_args: True,
+            "get_sale_catalog": lambda _self, **_kwargs: {
+                "clients": [], "products": [], "services": [],
+            },
+            "get_next_devis_preview": lambda _self: "DE-TEST-1",
+        })
+        dialog = SalesEditDialog(database=RemoteDatabase())
+        loop = QEventLoop()
+        QTimer.singleShot(500, loop.quit)
+        loop.exec()
+        self.assertTrue(dialog.isEnabled())
+        return dialog
+
+    @staticmethod
+    def _edit_row(dialog, row, quantity, price, discount):
+        table = dialog.items_table.table
+        columns = dialog.items_table.data_manager.table_columns
+        table.cellWidget(row, columns.index("product_name")).setText(f"Manual {row}")
+        for key, value in (("quantity", quantity), ("unit_price", price)):
+            column = columns.index(key)
+            index = table.model().index(row, column)
+            delegate = table.itemDelegateForColumn(column)
+            editor = delegate.createEditor(table, None, index)
+            delegate.setEditorData(editor, index)
+            editor.setText(str(value))
+        column = columns.index("discount_percentage")
+        index = table.model().index(row, column)
+        delegate = table.itemDelegateForColumn(column)
+        editor = delegate.createEditor(table, None, index)
+        delegate.setEditorData(editor, index)
+        editor.setValue(float(discount))
+
+    @staticmethod
+    def _totals(dialog):
+        from ui.widgets.parameters_widgets import ParameterWidgetFactory
+        return tuple(float(ParameterWidgetFactory.get_widget_value(widget)) for widget in (
+            dialog.subtotal_widget, dialog.total_ht_widget, dialog.vat_widget, dialog.total_ttc_widget,
+        ))
+
+    def test_live_row_edits_update_visible_sale_totals_before_save(self):
+        dialog = self._dialog()
+        try:
+            self._edit_row(dialog, 0, 12, 15, 5)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (180.0, 171.0, 34.2, 205.2))
+            self.assertEqual(dialog.remise_spinbox.value(), 9.0)
+
+            dialog.remise_spinbox.setValue(12.0)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (180.0, 168.0, 33.6, 201.6))
+            dialog.remise_spinbox.setValue(9.0)
+
+            # The same active discount editor updates the bottom widgets live.
+            self._edit_row(dialog, 0, 12, 15, 10)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (180.0, 162.0, 32.4, 194.4))
+            self.assertEqual(dialog.remise_spinbox.value(), 18.0)
+
+            self._edit_row(dialog, 0, 20, 15, 10)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (300.0, 270.0, 54.0, 324.0))
+            self.assertEqual(dialog.remise_spinbox.value(), 30.0)
+
+            self._edit_row(dialog, 0, 12, 20, 5)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (240.0, 228.0, 45.6, 273.6))
+            self.assertEqual(dialog.remise_spinbox.value(), 12.0)
+
+            # The trailing row is created by the regular item-change flow.
+            self.assertGreaterEqual(dialog.items_table.table.rowCount(), 2)
+            self._edit_row(dialog, 1, 1, 100, 10)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (340.0, 318.0, 63.6, 381.6))
+            self.assertEqual(dialog.remise_spinbox.value(), 22.0)
+
+            dialog.items_table._delete_row(1)
+            self.app.processEvents()
+            self.assertEqual(self._totals(dialog), (240.0, 228.0, 45.6, 273.6))
+
+        finally:
+            dialog.reject()
+
 if __name__ == "__main__":
     unittest.main()

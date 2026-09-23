@@ -5,7 +5,7 @@ from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstrac
                              QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
                               QStyledItemDelegate, QComboBox, QInputDialog, QDoubleSpinBox)
 from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
-from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer, QSignalBlocker
+from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer, QSignalBlocker, QPersistentModelIndex
 from ui.widgets.preview_widget import PreviewWidget
 from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
@@ -1124,10 +1124,25 @@ class QuantityDelegate(QStyledItemDelegate):
         ))
         row = index.row()
         self.active_editors[row] = editor  # Store reference
+        # Store model index for live updates
+        editor.setProperty("model_index", index)
         self._apply_style(editor, row)
-        # Connect textChanged for real-time styling only
-        editor.textChanged.connect(lambda _t, r=row, e=editor: self._apply_style(e, r))
+        # Connect textChanged for real-time styling AND live subtotal updates
+        editor.textChanged.connect(lambda _t, r=row, e=editor: self._on_editor_text_changed(r, e))
         return editor
+
+    def _on_editor_text_changed(self, row: int, editor: QLineEdit):
+        """Live update model and trigger subtotal recalculation while typing."""
+        index = editor.property("model_index")
+        if index is None:
+            return
+        # Update model data immediately (triggers itemChanged -> _on_item_changed -> _update_row_subtotal)
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "1"
+        index.model().setData(index, value, Qt.EditRole)
+        # Also update style
+        self._apply_style(editor, row)
 
     def destroyEditor(self, editor, index):
         row = index.row()
@@ -1165,6 +1180,50 @@ class QuantityDelegate(QStyledItemDelegate):
             editor.setToolTip("")
 
 
+class UnitPriceDelegate(QStyledItemDelegate):
+    """Delegate for unit_price with live subtotal updates via QLineEdit."""
+    def __init__(self, event_handler: TableEventHandler, parent=None):
+        super().__init__(parent)
+        self.event_handler = event_handler
+        self.active_editors = {}
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        editor.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r"^(?:|\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
+        ))
+        row = index.row()
+        self.active_editors[row] = editor
+        editor.setProperty("model_index", index)
+        editor.textChanged.connect(lambda _t, r=row, e=editor: self._on_editor_text_changed(r, e))
+        return editor
+
+    def _on_editor_text_changed(self, row: int, editor: QLineEdit):
+        index = editor.property("model_index")
+        if index is None:
+            return
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "0"
+        index.model().setData(index, value, Qt.EditRole)
+
+    def destroyEditor(self, editor, index):
+        row = index.row()
+        if row in self.active_editors:
+            del self.active_editors[row]
+        super().destroyEditor(editor, index)
+
+    def setEditorData(self, editor, index):
+        value = index.model().data(index, Qt.EditRole)
+        editor.setText(str(value) if value is not None else "")
+
+    def setModelData(self, editor, model, index):
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "0"
+        model.setData(index, value, Qt.EditRole)
+
+
 class DecimalSpinBoxDelegate(QStyledItemDelegate):
     """Bounded decimal editor used for per-line sale discounts."""
     def __init__(self, decimals=2, minimum=0.0, maximum=100.0, parent=None):
@@ -1177,7 +1236,18 @@ class DecimalSpinBoxDelegate(QStyledItemDelegate):
         editor.setRange(self.minimum, self.maximum)
         editor.setSingleStep(0.25)
         editor.setSuffix(' %')
+        # Live update while spinning/typing
+        model_index = QPersistentModelIndex(index)
+        editor.valueChanged.connect(
+            lambda _v, e=editor, idx=model_index: self._on_spinbox_value_changed(e, idx)
+        )
         return editor
+
+    def _on_spinbox_value_changed(self, editor, model_index):
+        if not model_index.isValid():
+            return
+        value = format(editor.value(), f'.{self.decimals}f').rstrip('0').rstrip('.')
+        model_index.model().setData(model_index, value, Qt.EditRole)
 
     def setEditorData(self, editor, index):
         try:
@@ -1302,13 +1372,19 @@ class OperationsTableWidget(QWidget):
             self.event_handler.validate_all_rows()
 
     def _install_delegates(self):
-        """Install custom delegates (quantity styling)."""
+        """Install custom delegates (quantity and unit_price styling + live updates)."""
         try:
             qty_col = self.data_manager.table_columns.index('quantity')
         except ValueError:
             return
         delegate = QuantityDelegate(self.event_handler, self.table)
         self.table.setItemDelegateForColumn(qty_col, delegate)
+        try:
+            price_col = self.data_manager.table_columns.index('unit_price')
+        except ValueError:
+            return
+        price_delegate = UnitPriceDelegate(self.event_handler, self.table)
+        self.table.setItemDelegateForColumn(price_col, price_delegate)
 
     def _install_discount_delegate(self):
         try:

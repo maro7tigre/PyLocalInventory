@@ -3599,10 +3599,12 @@ class Database:
             ]
         if include_clients:
             self.cursor.execute(
-                "SELECT username, name FROM clients WHERE username IS NOT NULL OR name IS NOT NULL"
+                "SELECT id, username, name FROM clients "
+                "WHERE username IS NOT NULL OR name IS NOT NULL "
+                "ORDER BY LOWER(COALESCE(name, username)), id"
             )
             catalog["clients"] = [
-                {"username": row[0] or "", "name": row[1] or ""}
+                {"id": int(row[0]), "username": row[1] or "", "name": row[2] or ""}
                 for row in self.cursor.fetchall()
             ]
         if include_suppliers:

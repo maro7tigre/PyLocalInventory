@@ -83,7 +83,15 @@ class FactureEditor(QDialog):
     def _load_clients(self):
         catalog = self.database.get_sale_catalog(False, False, include_clients=True)
         for client in catalog.get("clients", []):
-            self.client.addItem(f"{client['name']} ({client['username']})", client["id"])
+            client_id = client.get("id")
+            if client_id is None:
+                raise RuntimeError("Client catalog is missing the canonical client ID")
+            name = str(client.get("name") or "").strip()
+            username = str(client.get("username") or "").strip()
+            label = name or username or f"Client {client_id}"
+            if username and username != label:
+                label = f"{label} ({username})"
+            self.client.addItem(label, int(client_id))
 
     def _load_facture(self, facture):
         self.date.setDate(QDate.fromString(str(facture["date"]), "yyyy-MM-dd"))

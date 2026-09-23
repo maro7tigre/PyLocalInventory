@@ -16,11 +16,14 @@ from ui.tabs.factures_tab import FactureEditor, FacturesTab
 
 
 class _FactureDatabase:
-    def __init__(self):
+    def __init__(self, clients=None):
         self.saved = None
+        self.clients = clients if clients is not None else [
+            {"id": 7, "name": "Client Test", "username": "client.test"}
+        ]
 
     def get_sale_catalog(self, *_args, **_kwargs):
-        return {"clients": [{"id": 7, "name": "Client Test", "username": "client.test"}]}
+        return {"clients": self.clients}
 
     def save_facture_with_items(self, header, items, facture_id=None):
         self.saved = (header, items, facture_id)
@@ -39,6 +42,21 @@ class _Cursor:
 
     def execute(self, sql, params=None):
         self.statements.append((sql, params))
+
+    def fetchall(self):
+        return []
+
+
+class _CatalogCursor:
+    def __init__(self, rows):
+        self.rows = rows
+        self.sql = ""
+
+    def execute(self, sql, _params=None):
+        self.sql = sql
+
+    def fetchall(self):
+        return self.rows
 
 
 class _Connection:
@@ -169,6 +187,36 @@ class FactureEditorTests(unittest.TestCase):
     def test_invoice_rpc_payloads_are_json_safe(self):
         payload = RemoteDatabase._json_safe({"total": Decimal("1200.00"), "none": None})
         self.assertEqual(payload, {"total": "1200.00", "none": None})
+
+    def test_client_catalog_normalizes_the_canonical_primary_key(self):
+        database = Database()
+        cursor = _CatalogCursor([(7, "client.test", "Client Test")])
+        database.cursor = cursor
+        catalog = database.get_sale_catalog(False, False, include_clients=True)
+        self.assertEqual(catalog["clients"], [
+            {"id": 7, "username": "client.test", "name": "Client Test"}
+        ])
+        self.assertIn("SELECT id, username, name FROM clients", cursor.sql)
+
+    def test_client_combo_handles_empty_and_nullable_display_fields(self):
+        empty = FactureEditor(_FactureDatabase([]))
+        self.assertEqual(empty.client.count(), 0)
+        empty.reject()
+        dialog = FactureEditor(_FactureDatabase([
+            {"id": 1, "name": None, "username": "alpha"},
+            {"id": 2, "name": "Beta SARL", "username": None},
+            {"id": 3, "name": None, "username": None},
+        ]))
+        try:
+            self.assertEqual(dialog.client.count(), 3)
+            self.assertEqual(dialog.client.itemData(0), 1)
+            self.assertEqual(dialog.client.itemData(1), 2)
+            self.assertEqual(dialog.client.itemData(2), 3)
+            self.assertEqual(dialog.client.itemText(0), "alpha")
+            self.assertEqual(dialog.client.itemText(1), "Beta SARL")
+            self.assertEqual(dialog.client.itemText(2), "Client 3")
+        finally:
+            dialog.reject()
 
     def test_create_from_devis_copies_an_independent_snapshot_payload(self):
         database = _CopyDatabase()

@@ -12,7 +12,7 @@ from core.moroccan_dirham_words import amount_to_words
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
-from ui.facture_document import build_facture_html
+from ui.facture_document import render_facture_preview_pages
 from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturesTab
 
 
@@ -245,20 +245,19 @@ class FactureEditorTests(unittest.TestCase):
         finally:
             dialog.reject()
 
-    def test_printable_document_is_white_and_contains_unit_and_payment_reference(self):
+    def test_printable_document_uses_a4_width_and_contains_payment_reference(self):
         facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",
                    "client_address": "Adresse", "client_city": "Tanger", "client_ice": "ICE", "source_devis": "DE-1",
                    "items": [{"item_type": "manual", "designation": "Avance", "unit": "ENS", "quantity": 1,
                               "unit_price": Decimal("166666.67"), "discount_percentage": 0}],
                    "total_ht": Decimal("166666.67"), "vat_amount": Decimal("33333.33"), "total_ttc": Decimal("200000"),
                    "paid": Decimal("100000"), "remaining": Decimal("100000"), "amount_in_words": "DEUX CENT MILLE DIRHAMS"}
-        html = build_facture_html(facture, [{"method": "Chèque", "amount": Decimal("100000"), "reference": "1300019"}])
-        self.assertIn("background:#fff", html)
-        self.assertIn("Unité", html)
-        self.assertIn("RESTE À PAYER", html)
-        self.assertIn("1300019", html)
-        self.assertIn("23/09/2026", html)
-        self.assertIn("166 666,67", html)
+        pages, geometry = render_facture_preview_pages(
+            facture, [{"method": "Chèque", "amount": Decimal("100000"), "reference": "1300019"}]
+        )
+        self.assertEqual(len(pages), 1)
+        self.assertAlmostEqual(geometry["printable_mm"].width(), 182, places=1)
+        self.assertAlmostEqual(geometry["printable_px"].width() / geometry["page_px"].width(), 182 / 210, places=2)
 
     def test_create_from_devis_copies_an_independent_snapshot_payload(self):
         database = _CopyDatabase()

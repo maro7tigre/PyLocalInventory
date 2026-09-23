@@ -4,17 +4,17 @@ from decimal import Decimal
 from uuid import uuid4
 
 from PySide6.QtCore import QDate, Qt
-from PySide6.QtGui import QTextDocument
+from PySide6.QtGui import QPixmap
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
-    QTextBrowser, QTextEdit, QVBoxLayout, QWidget,
+    QMessageBox, QPushButton, QScrollArea, QSpinBox, QTableWidget, QTableWidgetItem,
+    QTextEdit, QVBoxLayout, QWidget,
 )
 
 from core.calculations import calculate_line_subtotal, calculate_operation_totals, round_money, to_decimal
-from ui.facture_document import build_facture_html
+from ui.facture_document import render_facture_preview_pages, render_facture_to_printer
 from ui.widgets.themed_widgets import BlueButton, GreenButton, OrangeButton, RedButton
 
 
@@ -374,11 +374,15 @@ class FacturesTab(QWidget):
         if not facture_id: return
         facture = self.database.get_facture(facture_id)
         profile = getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
-        html = build_facture_html(facture, self.database.get_facture_payments(facture_id), profile)
-        dialog = QDialog(self); dialog.setWindowTitle("Aperçu facture"); dialog.resize(850, 700); layout = QVBoxLayout(dialog); browser = QTextBrowser(); browser.setHtml(html); layout.addWidget(browser)
-        actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(html, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_html(html, dialog)); actions.addWidget(pdf); actions.addWidget(print_button); layout.addLayout(actions); dialog.exec()
+        payments = self.database.get_facture_payments(facture_id)
+        dialog = QDialog(self); dialog.setWindowTitle("Aperçu facture"); dialog.resize(1050, 800); layout = QVBoxLayout(dialog)
+        scroll = QScrollArea(); scroll.setWidgetResizable(True); pages = QWidget(); page_layout = QVBoxLayout(pages)
+        for image in render_facture_preview_pages(facture, payments, profile)[0]:
+            page = QLabel(); page.setPixmap(QPixmap.fromImage(image)); page.setAlignment(Qt.AlignHCenter); page_layout.addWidget(page)
+        scroll.setWidget(pages); layout.addWidget(scroll)
+        actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog)); actions.addWidget(pdf); actions.addWidget(print_button); layout.addLayout(actions); dialog.exec()
 
-    def _save_pdf(self, html, parent):
+    def _save_pdf(self, facture, payments, profile, parent):
         path, _ = QFileDialog.getSaveFileName(parent, "Enregistrer la facture", "", "PDF (*.pdf)")
         if not path:
             return
@@ -387,9 +391,9 @@ class FacturesTab(QWidget):
         printer = QPrinter(QPrinter.HighResolution)
         printer.setOutputFormat(QPrinter.PdfFormat)
         printer.setOutputFileName(path)
-        document = QTextDocument(); document.setHtml(html); document.print_(printer)
+        render_facture_to_printer(printer, facture, payments, profile)
 
-    def _print_html(self, html, parent):
+    def _print_facture(self, facture, payments, profile, parent):
         printer = QPrinter(QPrinter.HighResolution); dialog = QPrintDialog(printer, parent)
         if dialog.exec() == QDialog.Accepted:
-            document = QTextDocument(); document.setHtml(html); document.print_(printer)
+            render_facture_to_printer(printer, facture, payments, profile)

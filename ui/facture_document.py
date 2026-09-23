@@ -1,13 +1,19 @@
-"""Single printable Facture document source used by preview, PDF, and print."""
+"""Deterministic Facture drawing shared by preview, PDF export, and printing."""
 
-import base64
 import os
 from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
-from html import escape
+
+from PySide6.QtCore import QMarginsF, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPageLayout, QPageSize, QPen
 
 from core.calculations import calculate_line_subtotal, round_money
 from core.runtime_paths import resource_path
+
+
+PAGE_MARGINS_MM = QMarginsF(14, 12, 14, 14)
+PRINTABLE_WIDTH_MM = 182
+PREVIEW_DPI = 144
 
 
 def money(value):
@@ -15,11 +21,10 @@ def money(value):
 
 
 def quantity(value):
-    """Keep invoice quantities precise without using money formatting."""
     try:
         number = Decimal(str(value or 0))
     except (InvalidOperation, ValueError):
-        return escape(str(value or ""))
+        return str(value or "")
     return f"{number:,.3f}".replace(",", " ").replace(".", ",")
 
 
@@ -27,90 +32,70 @@ def _profile_value(profile, key):
     return str(profile.get_value(key) or "") if profile else ""
 
 
-def _html_lines(value):
-    return escape(str(value or "")).replace("\n", "<br>")
-
-
 def _display_date(value):
     if isinstance(value, (date, datetime)):
         return value.strftime("%d/%m/%Y")
-    value = str(value or "")
     try:
-        return datetime.strptime(value[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+        return datetime.strptime(str(value or "")[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
     except ValueError:
-        return escape(value)
+        return str(value or "")
 
 
-def _logo_html():
-    path = resource_path("report", "lamidap_logo.png")
-    if not os.path.isfile(path):
-        return ""
-    with open(path, "rb") as stream:
-        data = base64.b64encode(stream.read()).decode("ascii")
-    # QTextDocument honors HTML pixel dimensions for images more reliably than CSS mm units.
-    return f'<img class="logo" width="180" src="data:image/png;base64,{data}">'
+def configure_facture_page(printer):
+    """Apply the physical A4 geometry used by every Facture output target."""
+    layout = QPageLayout(
+        QPageSize(QPageSize.A4), QPageLayout.Portrait, PAGE_MARGINS_MM, QPageLayout.Millimeter
+    )
+    printer.setPageLayout(layout)
+    return printer.pageLayout()
 
 
-def _item_rows(items):
-    rows = []
-    for item in items:
-        if item["item_type"] == "section":
-            rows.append(f'<tr class="section"><td colspan="5">{escape(str(item["designation"]))}</td></tr>')
-            continue
-        total = calculate_line_subtotal(
-            item.get("quantity") or 0, item.get("unit_price") or 0, item.get("discount_percentage") or 0
-        )
-        description = escape(str(item["designation"]))
-        if item.get("information"):
-            description += f'<br><span class="detail">{escape(str(item["information"]))}</span>'
-        rows.append(
-            "<tr class='item-row'><td>{}</td><td class='center'>{}</td><td class='number'>{}</td>"
-            "<td class='number'>{}</td><td class='number'>{}</td></tr>".format(
-                description,
-                escape(str(item.get("unit") or "")),
-                quantity(item.get("quantity")),
-                money(item.get("unit_price") or 0),
-                money(total),
-            )
-        )
-
-    # A sparse invoice still needs the same ruled writing area as a paper invoice.
-    for _ in range(max(0, 14 - len(rows))):
-        rows.append("<tr class='filler'><td>&nbsp;</td><td></td><td></td><td></td><td></td></tr>")
-    return "".join(rows)
+def facture_page_geometry(layout, dpi):
+    """Return page and printable rectangles in device pixels and physical millimetres."""
+    return {
+        "dpi": dpi,
+        "page_mm": layout.fullRect(QPageLayout.Millimeter),
+        "printable_mm": layout.paintRect(QPageLayout.Millimeter),
+        "page_points": layout.fullRect(QPageLayout.Point),
+        "printable_points": layout.paintRect(QPageLayout.Point),
+        "page_px": layout.fullRectPixels(dpi),
+        "printable_px": layout.paintRectPixels(dpi),
+    }
 
 
-def build_facture_html(facture, payments, profile=None):
-    """Build the shared white A4 business document from the persisted invoice snapshot."""
+def _print_layout_debug(target, geometry):
+    print("[FACTURE LAYOUT DEBUG]")
+    print(f"target = {target}")
+    print(f"page size mm = {geometry['page_mm']}")
+    print(f"printable rect mm = {geometry['printable_mm']}")
+    print(f"page rect points = {geometry['page_points']}")
+    print(f"printable rect points = {geometry['printable_points']}")
+    print(f"page rect px = {geometry['page_px']}")
+    print(f"printable rect px = {geometry['printable_px']}")
+    print(f"renderer table width mm = {PRINTABLE_WIDTH_MM:.2f}")
+
+
+def _document_data(facture, payments, profile):
     company = _profile_value(profile, "company name")
     address = _profile_value(profile, "address")
     phone = _profile_value(profile, "phone")
     email = _profile_value(profile, "email")
-    footer = _profile_value(profile, "report footer")
     currency = _profile_value(profile, "currency") or "MAD"
-    contact = "<br>".join(part for part in (
-        _html_lines(address),
-        f"Tél. : {escape(phone)}" if phone else "",
-        f"Email : {escape(email)}" if email else "",
-    ) if part)
-    source = facture.get("source_devis")
+    footer = _profile_value(profile, "report footer")
+    contact = [address]
+    if phone:
+        contact.append(f"Tél. : {phone}")
+    if email:
+        contact.append(f"Email : {email}")
     client_rows = [
-        ("Mr / Société :", facture.get("client_name")),
-        ("Adresse / Ville :", " ".join(filter(None, (str(facture.get("client_address") or ""), str(facture.get("client_city") or ""))))),
-        ("ICE :", facture.get("client_ice")),
+        ("Mr / Société :", str(facture.get("client_name") or "")),
+        ("Adresse / Ville :", " ".join(filter(None, (
+            str(facture.get("client_address") or ""), str(facture.get("client_city") or ""),
+        )))),
+        ("ICE :", str(facture.get("client_ice") or "")),
     ]
-    if source:
-        client_rows.append(("Devis N° :", source))
-    client_html = "".join(
-        f"<tr><th>{label}</th><td>{_html_lines(value)}</td></tr>" for label, value in client_rows
-    )
-    if facture["paid"]:
-        payment_rows = (
-            f"<tr><th>AVANCE / PAYÉ</th><td>{money(facture['paid'])} {escape(currency)}</td></tr>"
-            f"<tr class='grand'><th>RESTE À PAYER</th><td>{money(facture['remaining'])} {escape(currency)}</td></tr>"
-        )
-    else:
-        payment_rows = f"<tr class='grand'><th>NET À PAYER</th><td>{money(facture['total_ttc'])} {escape(currency)}</td></tr>"
+    if facture.get("source_devis"):
+        client_rows.append(("Devis N° :", str(facture["source_devis"])))
     references = []
     for payment in payments:
         if not (payment.get("reference") or payment.get("method") == "Chèque"):
@@ -118,33 +103,221 @@ def build_facture_html(facture, payments, profile=None):
         label = "CHQ" if payment.get("method") == "Chèque" else str(payment.get("method") or "Règlement").upper()
         reference = f" {payment['reference']}" if payment.get("reference") else ""
         payment_date = f" DU {_display_date(payment['date'])}" if payment.get("date") else ""
-        references.append(f"{label}{reference} : {money(payment.get('amount') or 0)} {escape(currency)}{payment_date}")
-    footer_company = " - ".join(part for part in (company, f"Email : {email}" if email else "") if part)
+        references.append(f"{label}{reference} : {money(payment.get('amount') or 0)} {currency}{payment_date}")
+    items = []
+    for item in facture["items"]:
+        if item["item_type"] == "section":
+            items.append({"section": True, "designation": str(item["designation"])})
+            continue
+        total = calculate_line_subtotal(
+            item.get("quantity") or 0, item.get("unit_price") or 0, item.get("discount_percentage") or 0
+        )
+        items.append({
+            "section": False,
+            "designation": str(item["designation"]),
+            "information": str(item.get("information") or ""),
+            "unit": str(item.get("unit") or ""),
+            "quantity": quantity(item.get("quantity")),
+            "price": money(item.get("unit_price") or 0),
+            "total": money(total),
+        })
+    total_rows = [
+        ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
+        ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
+        ("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True),
+    ]
+    if facture["paid"]:
+        total_rows.extend((
+            ("AVANCE / PAYÉ", f"{money(facture['paid'])} {currency}", False),
+            ("RESTE À PAYER", f"{money(facture['remaining'])} {currency}", True),
+        ))
+    else:
+        total_rows.append(("NET À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
+    return {
+        "company": company,
+        "contact": "\n".join(part for part in contact if part),
+        "client_rows": client_rows,
+        "number": str(facture["facture_number"]),
+        "date": _display_date(facture.get("date")),
+        "items": items,
+        "total_rows": total_rows,
+        "words": str(facture.get("amount_in_words") or ""),
+        "references": references,
+        "footer_company": " - ".join(part for part in (company, f"Email : {email}" if email else "") if part),
+        "footer": footer,
+        "logo": QImage(resource_path("report", "lamidap_logo.png")),
+    }
 
-    return f"""<!doctype html><html><head><meta charset='utf-8'><style>
-        @page {{ size: A4 portrait; margin: 12mm 14mm 14mm 14mm; }}
-        * {{ box-sizing: border-box; }}
-        body {{ margin:0; background:#fff; color:#111; font-family:Arial, Helvetica, sans-serif; font-size:10pt; line-height:1.25; }}
-        table {{ border-collapse:collapse; width:100%; }}
-        .header {{ margin-bottom:7mm; }} .company {{ width:55%; vertical-align:top; padding-right:9mm; }} .invoice {{ width:45%; vertical-align:top; }}
-        .logo {{ display:block; margin:0 0 3mm; }}
-        .company-name {{ font-size:13pt; font-weight:bold; letter-spacing:.3pt; }} .contact {{ margin-top:1mm; font-size:9pt; line-height:1.35; }}
-        .title {{ margin:0 0 3mm; text-align:center; font-size:27pt; line-height:1; letter-spacing:1.5pt; font-weight:bold; }}
-        .document-info th,.document-info td {{ border:1px solid #222; padding:2.5mm 3mm; }} .document-info th {{ width:50%; background:#303030; color:#fff; text-align:left; font-size:9pt; }}
-        .document-info td {{ font-size:11pt; font-weight:bold; }}
-        .client {{ width:45%; margin:0 0 6mm auto; border:1px solid #222; }} .client th,.client td {{ padding:2.1mm 3mm; vertical-align:top; }} .client th {{ width:37%; text-align:left; font-size:8.5pt; white-space:nowrap; }} .client td {{ font-weight:bold; }}
-        .items {{ table-layout:fixed; margin-top:0; }} .items col.designation {{ width:54%; }} .items col.unit {{ width:9%; }} .items col.quantity {{ width:9%; }} .items col.price {{ width:14%; }} .items col.total {{ width:14%; }}
-        .items thead {{ display:table-header-group; }} .items th {{ border:1px solid #222; background:#303030; color:#fff; padding:3mm 2.5mm; text-align:left; font-size:9pt; }} .items th.number {{ text-align:right; }}
-        .items td {{ border-left:1px solid #333; border-right:1px solid #333; padding:2.4mm 2.5mm; vertical-align:top; }} .items tbody tr:last-child td {{ border-bottom:1px solid #333; }} .items .item-row {{ break-inside:avoid; page-break-inside:avoid; min-height:10mm; }}
-        .items .filler td {{ height:10mm; }} .items .section td {{ height:auto; border-top:1px solid #333; border-bottom:1px solid #333; background:#e6e6e6; font-weight:bold; padding:2.5mm; }}
-        .number {{ text-align:right; white-space:nowrap; }} .center {{ text-align:center; }} .detail {{ color:#444; font-size:8.5pt; }}
-        .settlement {{ width:100%; margin-top:6mm; break-inside:avoid; page-break-inside:avoid; }} .words {{ width:55%; vertical-align:bottom; padding:0 10mm 0 1mm; }} .words-label {{ font-size:9pt; }} .words-value {{ margin-top:2.5mm; font-size:10pt; font-weight:bold; line-height:1.4; }} .references {{ margin-top:4mm; font-size:8.5pt; line-height:1.45; }}
-        .totals-cell {{ width:45%; vertical-align:bottom; }} .totals th,.totals td {{ border:1px solid #222; padding:2.5mm 3mm; }} .totals th {{ background:#eee; text-align:left; }} .totals td {{ text-align:right; white-space:nowrap; }} .totals .grand th,.totals .grand td {{ background:#303030; color:#fff; font-weight:bold; }}
-        .footer {{ margin-top:7mm; border-top:1px solid #333; padding-top:2.5mm; text-align:center; font-size:8pt; line-height:1.35; white-space:normal; }} .footer-company {{ font-weight:bold; margin-bottom:1mm; }} .footer-details {{ white-space:pre-wrap; }}
-    </style></head><body>
-    <table class='header'><tr><td class='company'>{_logo_html()}<div class='company-name'>{escape(company)}</div><div class='contact'>{contact}</div></td><td class='invoice'><h1 class='title'>FACTURE</h1><table class='document-info'><tr><th>Numéro</th><th>Date</th></tr><tr><td>{escape(str(facture['facture_number']))}</td><td>{_display_date(facture.get('date'))}</td></tr></table></td></tr></table>
-    <table class='client'>{client_html}</table>
-    <table class='items'><colgroup><col class='designation'><col class='unit'><col class='quantity'><col class='price'><col class='total'></colgroup><thead><tr><th>Désignation</th><th class='center'>Unité</th><th class='number'>Qté</th><th class='number'>Prix HT</th><th class='number'>Total HT</th></tr></thead><tbody>{_item_rows(facture['items'])}</tbody></table>
-    <table class='settlement'><tr><td class='words'><div class='words-label'>Arrêtée la présente Facture à la somme de :</div><div class='words-value'>{_html_lines(facture.get('amount_in_words'))}</div><div class='references'>{'<br>'.join(escape(value) for value in references)}</div></td><td class='totals-cell'><table class='totals'><tr><th>Total HT</th><td>{money(facture['total_ht'])} {escape(currency)}</td></tr><tr><th>Total TVA</th><td>{money(facture['vat_amount'])} {escape(currency)}</td></tr><tr class='grand'><th>MONTANT GLOBAL</th><td>{money(facture['total_ttc'])} {escape(currency)}</td></tr>{payment_rows}</table></td></tr></table>
-    <div class='footer'><div class='footer-company'>{escape(footer_company)}</div><div class='footer-details'>{_html_lines(footer)}</div></div>
-    </body></html>"""
+
+def _page_items(items):
+    """Reserve the lower final-page area for settlement and legal footer."""
+    if len(items) <= 14:
+        return [(items, True)]
+    pages = []
+    remaining = list(items)
+    while len(remaining) > 20:
+        count = min(18, len(remaining) - 20)
+        pages.append((remaining[:count], False))
+        remaining = remaining[count:]
+    pages.append((remaining, True))
+    return pages
+
+
+def _font(size, bold=False):
+    font = QFont("Arial")
+    font.setPointSizeF(size)
+    font.setBold(bold)
+    return font
+
+
+def _draw_text(painter, rect, text, size, flags=Qt.AlignLeft | Qt.AlignVCenter, bold=False, color=Qt.black):
+    painter.save()
+    painter.setFont(_font(size, bold))
+    painter.setPen(color)
+    painter.drawText(rect, flags | Qt.TextWordWrap, text)
+    painter.restore()
+
+
+def _draw_box(painter, rect, fill=None, width=0.35):
+    painter.save()
+    painter.setPen(QPen(QColor("#222222"), width))
+    painter.setBrush(QColor(fill) if fill else Qt.NoBrush)
+    painter.drawRect(rect)
+    painter.restore()
+
+
+def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_final):
+    scale = printable_rect.width() / PRINTABLE_WIDTH_MM
+
+    def rect(x, y, width, height):
+        return QRectF(printable_rect.x() + x * scale, printable_rect.y() + y * scale, width * scale, height * scale)
+
+    def line(x1, y1, x2, y2, width=0.35):
+        painter.save(); painter.setPen(QPen(QColor("#222222"), width)); painter.drawLine(
+            printable_rect.x() + x1 * scale, printable_rect.y() + y1 * scale,
+            printable_rect.x() + x2 * scale, printable_rect.y() + y2 * scale,
+        ); painter.restore()
+
+    if is_first:
+        logo_rect = rect(0, 0, 52, 28)
+        if not data["logo"].isNull():
+            image = data["logo"].scaled(logo_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawImage(QRectF(logo_rect.x(), logo_rect.y(), image.width(), image.height()), image)
+        _draw_text(painter, rect(0, 30, 88, 6), data["company"], 12, bold=True)
+        _draw_text(painter, rect(0, 37, 88, 27), data["contact"], 8.5, Qt.AlignLeft | Qt.AlignTop)
+        _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 24, Qt.AlignCenter, bold=True)
+        info = rect(100, 16, 82, 19)
+        _draw_box(painter, info)
+        line(141, 16, 141, 35)
+        line(100, 24, 182, 24)
+        _draw_text(painter, rect(102, 17, 37, 6), "Numéro", 8.5, bold=True)
+        _draw_text(painter, rect(143, 17, 37, 6), "Date", 8.5, bold=True)
+        _draw_text(painter, rect(102, 25, 37, 8), data["number"], 10, bold=True)
+        _draw_text(painter, rect(143, 25, 37, 8), data["date"], 10, bold=True)
+        client = rect(100, 40, 82, 33)
+        _draw_box(painter, client)
+        row_height = 33 / len(data["client_rows"])
+        for index, (label, value) in enumerate(data["client_rows"]):
+            y = 40 + index * row_height
+            if index:
+                line(100, y, 182, y, 0.25)
+            _draw_text(painter, rect(102, y + 0.5, 27, row_height - 1), label, 7.5, bold=True)
+            _draw_text(painter, rect(130, y + 0.5, 50, row_height - 1), value, 8.5, bold=True)
+        table_y = 78
+    else:
+        table_y = 0
+
+    header_height = 9
+    row_height = 9
+    table_width = 182
+    columns = (0, 98.28, 114.66, 131.04, 156.52, 182)
+    _draw_box(painter, rect(0, table_y, table_width, header_height), "#303030")
+    headers = ("Désignation", "Unité", "Qté", "Prix HT", "Total HT")
+    for index, label in enumerate(headers):
+        x = columns[index]
+        width = columns[index + 1] - x
+        if index:
+            line(x, table_y, x, table_y + header_height)
+        align = Qt.AlignLeft if index == 0 else Qt.AlignCenter
+        _draw_text(painter, rect(x + 1.5, table_y, width - 3, header_height), label, 8.5, align, bold=True, color=Qt.white)
+
+    rows_to_draw = list(page_items)
+    if is_final and is_first:
+        rows_to_draw.extend([None] * max(0, 14 - len(rows_to_draw)))
+    for row_index, item in enumerate(rows_to_draw):
+        y = table_y + header_height + row_index * row_height
+        row_rect = rect(0, y, table_width, row_height)
+        _draw_box(painter, row_rect, "#e8e8e8" if item and item.get("section") else None, 0.25)
+        for boundary in columns[1:-1]:
+            line(boundary, y, boundary, y + row_height, 0.25)
+        if not item:
+            continue
+        if item["section"]:
+            _draw_text(painter, rect(2, y, 178, row_height), item["designation"], 8.5, bold=True)
+            continue
+        description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
+        _draw_text(painter, rect(2, y + .5, columns[1] - 4, row_height - 1), description, 8.5, Qt.AlignLeft | Qt.AlignVCenter)
+        values = (item["unit"], item["quantity"], item["price"], item["total"])
+        for value_index, value in enumerate(values, 1):
+            x = columns[value_index]
+            width = columns[value_index + 1] - x
+            alignment = Qt.AlignCenter if value_index == 1 else Qt.AlignRight
+            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 8.5, alignment)
+
+    if not is_final:
+        return
+    settlement_y = table_y + header_height + len(rows_to_draw) * row_height + 5
+    totals_x = 105
+    total_row_height = 6
+    total_height = len(data["total_rows"]) * total_row_height
+    _draw_text(painter, rect(0, settlement_y, 98, 5), "Arrêtée la présente Facture à la somme de :", 8)
+    _draw_text(painter, rect(0, settlement_y + 6, 98, 11), data["words"], 9, Qt.AlignLeft | Qt.AlignTop, bold=True)
+    _draw_text(painter, rect(0, settlement_y + 18, 98, max(4, total_height - 18)), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
+    for index, (label, value, emphasized) in enumerate(data["total_rows"]):
+        y = settlement_y + index * total_row_height
+        fill = "#303030" if emphasized else "#eeeeee"
+        _draw_box(painter, rect(totals_x, y, 77, total_row_height), fill, 0.25)
+        line(totals_x + 46, y, totals_x + 46, y + total_row_height, 0.25)
+        color = Qt.white if emphasized else Qt.black
+        _draw_text(painter, rect(totals_x + 2, y, 42, total_row_height), label, 8, bold=emphasized, color=color)
+        _draw_text(painter, rect(totals_x + 48, y, 27, total_row_height), value, 8, Qt.AlignRight, emphasized, color)
+    footer_y = 252
+    line(0, footer_y, 182, footer_y)
+    _draw_text(painter, rect(0, footer_y + 2, 182, 5), data["footer_company"], 7.5, Qt.AlignCenter, bold=True)
+    _draw_text(painter, rect(0, footer_y + 8, 182, 10), data["footer"], 7, Qt.AlignCenter | Qt.AlignTop)
+
+
+def render_facture_to_printer(printer, facture, payments, profile=None):
+    """Render a Facture to a QPrinter using only physical QPageLayout coordinates."""
+    layout = configure_facture_page(printer)
+    geometry = facture_page_geometry(layout, printer.resolution())
+    _print_layout_debug("printer", geometry)
+    painter = QPainter(printer)
+    printer_rect = geometry["printable_px"].translated(-geometry["printable_px"].topLeft())
+    print(f"printer painter viewport px = {painter.viewport()}")
+    data = _document_data(facture, payments, profile)
+    pages = _page_items(data["items"])
+    for index, (items, final) in enumerate(pages):
+        if index:
+            printer.newPage()
+        painter.fillRect(printer_rect, Qt.white)
+        _draw_facture_page(painter, printer_rect, data, items, index == 0, final)
+    painter.end()
+    return geometry
+
+
+def render_facture_preview_pages(facture, payments, profile=None, dpi=PREVIEW_DPI):
+    """Render the same physical pages to preview images without QTextDocument."""
+    layout = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, PAGE_MARGINS_MM, QPageLayout.Millimeter)
+    geometry = facture_page_geometry(layout, dpi)
+    _print_layout_debug("preview", geometry)
+    data = _document_data(facture, payments, profile)
+    pages = []
+    for index, (items, final) in enumerate(_page_items(data["items"])):
+        image = QImage(geometry["page_px"].size(), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.white)
+        painter = QPainter(image)
+        _draw_facture_page(painter, geometry["printable_px"], data, items, index == 0, final)
+        painter.end()
+        pages.append(image)
+    return pages, geometry

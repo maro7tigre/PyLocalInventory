@@ -43,7 +43,6 @@ from classes.sales_class import SalesClass
 from classes.sales_item_class import SalesItemClass
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
-from classes.facture_class import FactureClass
 from classes.reports_class import ReportsClass
 
 from core.profiles import ProfileManager
@@ -145,7 +144,6 @@ class MainWindow(ThemedMainWindow):
         self.database.register_class(SalesItemClass)
         self.database.register_class(ImportClass)
         self.database.register_class(ImportItemClass)
-        self.database.register_class(FactureClass)
         self.database.register_class(ReportsClass)
 
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")

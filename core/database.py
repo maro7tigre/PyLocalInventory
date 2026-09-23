@@ -887,9 +887,8 @@ class Database:
                     sort_order INTEGER NOT NULL DEFAULT 0
                 )
             """)
-            # FactureClass is registered with the application's generic schema
-            # builder. If that builder ran first, supplement its minimal header
-            # table here instead of assuming CREATE TABLE above took effect.
+            # Supplement a table created by an earlier pre-release build,
+            # without dropping, recreating, or rewriting existing data.
             for column, sql_type in (
                 ("invoice_year", "INTEGER"), ("source_sale_id", "INTEGER"), ("source_devis", "TEXT"),
                 ("client_id", "INTEGER"), ("client_username", "TEXT"),
@@ -904,7 +903,13 @@ class Database:
                 )
             self.cursor.execute(
                 "CREATE UNIQUE INDEX IF NOT EXISTS factures_number_uidx "
-                "ON factures(LOWER(BTRIM(facture_number)))"
+                "ON factures(LOWER(BTRIM(facture_number))) "
+                "WHERE BTRIM(COALESCE(facture_number, '')) <> ''"
+            )
+            self.cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS factures_operation_token_uidx "
+                "ON factures(operation_token) WHERE operation_token IS NOT NULL "
+                "AND BTRIM(operation_token) <> ''"
             )
             self.cursor.execute(
                 "CREATE INDEX IF NOT EXISTS facture_items_facture_id_idx ON facture_items(facture_id)"

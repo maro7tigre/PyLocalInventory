@@ -180,10 +180,20 @@ class FacturesTab(QWidget):
         super().__init__(parent); self.database = database
         layout = QVBoxLayout(self); buttons = QHBoxLayout()
         actions = (("+ Nouvelle Facture", GreenButton, self.new_facture), ("Créer depuis Devis", BlueButton, self.from_devis), ("Modifier", OrangeButton, self.edit_facture), ("Paiements", BlueButton, self.payments), ("Aperçu / PDF / Imprimer", OrangeButton, self.preview), ("Supprimer", RedButton, self.delete_facture), ("Actualiser", BlueButton, self.refresh))
+        self._action_buttons = {}
         for text, cls, slot in actions:
             button = cls(text); button.clicked.connect(slot); buttons.addWidget(button)
+            self._action_buttons[text] = button
         buttons.addStretch(1); layout.addLayout(buttons)
         self.table = QTableWidget(0, 10); self.table.setHorizontalHeaderLabels(("ID", "Facture N°", "Client", "Date", "Total HT", "TVA", "Total TTC", "Payé", "Reste à payer", "Statut")); self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); layout.addWidget(self.table)
+        can_write = self.database.has_permission("Factures", "write")
+        self._action_buttons["+ Nouvelle Facture"].setEnabled(can_write)
+        self._action_buttons["Créer depuis Devis"].setEnabled(can_write)
+        self._action_buttons["Modifier"].setEnabled(can_write)
+        self._action_buttons["Paiements"].setEnabled(can_write)
+        self._action_buttons["Supprimer"].setEnabled(
+            self.database.has_permission("Factures", "delete")
+        )
         self.refresh()
 
     def refresh(self):
@@ -194,6 +204,15 @@ class FacturesTab(QWidget):
                 for col, key in enumerate(keys): self.table.setItem(row, col, QTableWidgetItem(_money(facture[key]) if key in keys[4:9] else str(facture[key] or "")))
         except Exception as exc:
             QMessageBox.warning(self, "Factures", str(exc))
+
+    # MainWindow uses these names for tab activation, backup restore, and its
+    # staggered startup preload. Keeping the custom tab in that lifecycle
+    # prevents an open Factures page from showing stale payment/status data.
+    def refresh_table(self, force=False):
+        self.refresh()
+
+    def refresh_on_tab_switch(self):
+        self.refresh()
 
     def selected_id(self):
         row = self.table.currentRow()

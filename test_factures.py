@@ -254,9 +254,11 @@ class FactureEditorTests(unittest.TestCase):
                    "paid": Decimal("100000"), "remaining": Decimal("100000"), "amount_in_words": "DEUX CENT MILLE DIRHAMS"}
         html = build_facture_html(facture, [{"method": "Chèque", "amount": Decimal("100000"), "reference": "1300019"}])
         self.assertIn("background:#fff", html)
-        self.assertIn("Unite", html)
-        self.assertIn("RESTE A PAYER", html)
+        self.assertIn("Unité", html)
+        self.assertIn("RESTE À PAYER", html)
         self.assertIn("1300019", html)
+        self.assertIn("23/09/2026", html)
+        self.assertIn("166 666,67", html)
 
     def test_create_from_devis_copies_an_independent_snapshot_payload(self):
         database = _CopyDatabase()

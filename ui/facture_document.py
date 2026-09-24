@@ -79,12 +79,16 @@ def _document_data(facture, payments, profile):
     company = _profile_value(profile, "company name")
     address = _profile_value(profile, "address")
     phone = _profile_value(profile, "phone")
+    fax = _profile_value(profile, "fax")
     email = _profile_value(profile, "email")
+    website = _profile_value(profile, "website")
     currency = _profile_value(profile, "currency") or "MAD"
     footer = _profile_value(profile, "report footer")
     contact = [address]
     if phone:
         contact.append(f"Tél. : {phone}")
+    if fax:
+        contact.append(f"Fax : {fax}")
     if email:
         contact.append(f"Email : {email}")
     client_rows = [
@@ -124,14 +128,21 @@ def _document_data(facture, payments, profile):
     total_rows = [
         ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
         ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
-        ("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True),
     ]
-    if facture["paid"]:
+    if facture.get("facture_type") == "balance":
+        total_rows.extend((
+            ("MONTANT GLOBAL", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False),
+            ("AVANCES / ACOMPTES", f"{money(facture.get('previous_advance_ttc') or 0)} {currency}", False),
+            ("RESTE À PAYER", f"{money(facture['total_ttc'])} {currency}", True),
+        ))
+    elif facture["paid"]:
+        total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
         total_rows.extend((
             ("AVANCE / PAYÉ", f"{money(facture['paid'])} {currency}", False),
             ("RESTE À PAYER", f"{money(facture['remaining'])} {currency}", True),
         ))
     else:
+        total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
         total_rows.append(("NET À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
     return {
         "company": company,
@@ -143,8 +154,15 @@ def _document_data(facture, payments, profile):
         "total_rows": total_rows,
         "words": str(facture.get("amount_in_words") or ""),
         "references": references,
-        "footer_company": " - ".join(part for part in (company, f"Email : {email}" if email else "") if part),
-        "footer": footer,
+        "footer_company": " - ".join(part for part in (website, company, f"Email : {email}" if email else "") if part),
+        "footer": " | ".join(part for part in (
+            footer, *(f"{label}: {value}" for label, value in (
+                ("ICE", _profile_value(profile, "ice")), ("PATENTE", _profile_value(profile, "patente")),
+                ("I.F", _profile_value(profile, "if number")), ("R.C", _profile_value(profile, "rc")),
+                ("CNSS", _profile_value(profile, "cnss")), ("BANQUE", _profile_value(profile, "bank name")),
+                ("AGENCE", _profile_value(profile, "bank agency")), ("RIB", _profile_value(profile, "bank account")),
+            ) if value)
+        ) if part),
         "logo": QImage(resource_path("report", "lamidap_logo.png")),
     }
 

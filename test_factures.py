@@ -7,13 +7,14 @@ from decimal import Decimal
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
 from PySide6.QtWidgets import QApplication
+from PySide6.QtCore import Qt
 
 from core.moroccan_dirham_words import amount_to_words
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
 from ui.facture_document import render_facture_preview_pages
-from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturesTab
+from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturePreviewDialog, FacturesTab
 
 
 class _FactureDatabase:
@@ -123,6 +124,20 @@ class _PaymentDatabase(Database):
         return {"client_id": 7, "remaining": Decimal("100000.00")}
 
 
+class _MultiDraftDatabase(Database):
+    def __init__(self, client_ids):
+        super().__init__(); self.client_ids = client_ids
+
+    def get_facture_draft_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
+        return {
+            "client_id": self.client_ids[sale_id], "source_sale_id": sale_id, "date": "2026-09-23",
+            "tva_rate": Decimal("20"), "notes": "", "source_devis": f"DE-{sale_id}",
+            "facture_type": facture_type,
+            "items": [{"item_type": "manual", "designation": f"Ligne {sale_id}", "quantity": 1,
+                       "unit_price": Decimal("100"), "discount_percentage": 0}],
+        }
+
+
 class FactureEditorTests(unittest.TestCase):
     @classmethod
     def setUpClass(cls):
@@ -134,6 +149,7 @@ class FactureEditorTests(unittest.TestCase):
         try:
             dialog.items.cellWidget(0, 0).setCurrentIndex(dialog.items.cellWidget(0, 0).findData("service"))
             dialog.items.cellWidget(0, 1).setCurrentText("Pose")
+            dialog._set_client(7)
             dialog.items.item(0, 4).setText("12")
             dialog.items.item(0, 5).setText("15")
             dialog.items.item(0, 6).setText("5")
@@ -173,6 +189,7 @@ class FactureEditorTests(unittest.TestCase):
         statements = "\n".join(sql for sql, _params in database.cursor.statements).upper()
         self.assertIn("CREATE TABLE IF NOT EXISTS FACTURES", statements)
         self.assertIn("CREATE TABLE IF NOT EXISTS FACTURE_ITEMS", statements)
+        self.assertIn("CREATE TABLE IF NOT EXISTS FACTURE_SOURCES", statements)
         self.assertIn("ALTER TABLE PAYMENTS ADD COLUMN IF NOT EXISTS FACTURE_ID", statements)
         self.assertIn("FACTURES_NUMBER_UIDX", statements)
         self.assertNotIn("DROP TABLE", statements)
@@ -199,9 +216,10 @@ class FactureEditorTests(unittest.TestCase):
         ])
         self.assertIn("SELECT id, username, name, address, ice FROM clients", cursor.sql)
 
-    def test_client_combo_handles_empty_and_nullable_display_fields(self):
+    def test_client_picker_keeps_the_catalog_outside_the_editor(self):
         empty = FactureEditor(_FactureDatabase([]))
-        self.assertEqual(empty.client.count(), 0)
+        self.assertTrue(empty.client.isReadOnly())
+        self.assertEqual(empty.client.text(), "")
         empty.reject()
         dialog = FactureEditor(_FactureDatabase([
             {"id": 1, "name": None, "username": "alpha"},
@@ -209,13 +227,9 @@ class FactureEditorTests(unittest.TestCase):
             {"id": 3, "name": None, "username": None},
         ]))
         try:
-            self.assertEqual(dialog.client.count(), 3)
-            self.assertEqual(dialog.client.itemData(0), 1)
-            self.assertEqual(dialog.client.itemData(1), 2)
-            self.assertEqual(dialog.client.itemData(2), 3)
-            self.assertEqual(dialog.client.itemText(0), "alpha")
-            self.assertEqual(dialog.client.itemText(1), "Beta SARL")
-            self.assertEqual(dialog.client.itemText(2), "Client 3")
+            self.assertEqual(set(dialog.client_records), {1, 2, 3})
+            dialog._set_client(2)
+            self.assertEqual(dialog.client.text(), "Beta SARL")
         finally:
             dialog.reject()
 
@@ -226,8 +240,8 @@ class FactureEditorTests(unittest.TestCase):
                    "client_city": "Tanger", "client_ice": "001", "notes": "", "items": []}
         dialog = FactureEditor(database, facture)
         try:
-            self.assertEqual(dialog.client.currentData(), 91)
-            self.assertIn("historique", dialog.client.currentText())
+            self.assertEqual(dialog.client_id, 91)
+            self.assertIn("historique", dialog.client.text())
         finally:
             dialog.reject()
 
@@ -239,11 +253,62 @@ class FactureEditorTests(unittest.TestCase):
         }]
         dialog = DevisSelectorDialog(database)
         try:
-            self.assertEqual(dialog.table.item(0, 0).text(), "DE-2026-18")
-            dialog.table.selectRow(0); dialog.select()
-            self.assertEqual(dialog.sale_id, 18)
+            self.assertEqual(dialog.table.item(0, 1).text(), "DE-2026-18")
+            dialog.table.item(0, 0).setCheckState(Qt.Checked); dialog.select()
+            self.assertEqual(dialog.sale_ids, [18])
         finally:
             dialog.reject()
+
+    def test_advance_and_balance_editors_generate_distinct_financial_lines(self):
+        draft = {
+            "client_id": 7, "date": "2026-09-23", "tva_rate": Decimal("20"),
+            "source_sale_ids": [18, 19], "source_devis": "DE-2026-18 / DE-2026-19",
+            "selected_total_ttc": Decimal("500000"), "previous_advance_ttc": Decimal("600000"),
+            "remaining_ttc": Decimal("100000"), "items": [],
+        }
+        advance_db = _FactureDatabase(); advance = FactureEditor(advance_db)
+        try:
+            draft["facture_type"] = "advance"; advance.load_draft(draft); advance.advance_amount.setValue(200000); advance.save()
+            header, lines, _facture_id = advance_db.saved
+            self.assertEqual(header["source_sale_ids"], [18, 19])
+            self.assertEqual(lines[0]["unit_price"], "166666.67")
+            self.assertIn("SUIVANT DEVIS N° DE-2026-18 / DE-2026-19", lines[0]["designation"])
+        finally:
+            advance.reject()
+        balance_db = _FactureDatabase(); balance = FactureEditor(balance_db)
+        try:
+            draft["facture_type"] = "balance"; balance.load_draft(draft); balance.save()
+            _header, lines, _facture_id = balance_db.saved
+            self.assertEqual(lines[0]["unit_price"], "83333.33")
+            self.assertIn("SOLDE", lines[0]["designation"])
+        finally:
+            balance.reject()
+
+    def test_multi_devis_rejects_different_clients_before_invoice_creation(self):
+        database = _MultiDraftDatabase({18: 7, 19: 8})
+        with self.assertRaisesRegex(ValueError, "même client"):
+            database.get_facture_draft_from_sales([18, 19])
+
+    def test_main_list_keeps_payment_amounts_in_the_payment_screen(self):
+        tab = FacturesTab(_FactureDatabase())
+        self.assertEqual([tab.table.horizontalHeaderItem(i).text() for i in range(tab.table.columnCount())], [
+            "ID", "Facture N°", "Type", "Client", "Date", "Devis source", "Total TTC", "Statut",
+        ])
+
+    def test_preview_defaults_to_fit_page_without_a_scroll_area(self):
+        facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",
+                   "client_address": "Adresse", "client_city": "Tanger", "client_ice": "ICE", "items": [],
+                   "total_ht": Decimal("0"), "vat_amount": Decimal("0"), "total_ttc": Decimal("0"),
+                   "paid": Decimal("0"), "remaining": Decimal("0"), "amount_in_words": "ZÉRO DIRHAM"}
+        pages, _geometry = render_facture_preview_pages(facture, [])
+        dialog = FacturePreviewDialog(pages)
+        try:
+            dialog.show(); self.app.processEvents()
+            self.assertEqual(dialog.zoom, 0)
+            self.assertLessEqual(dialog.page.pixmap().height(), dialog.page.height())
+            self.assertLessEqual(dialog.page.pixmap().width(), dialog.page.width())
+        finally:
+            dialog.close()
 
     def test_printable_document_uses_a4_width_and_contains_payment_reference(self):
         facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",

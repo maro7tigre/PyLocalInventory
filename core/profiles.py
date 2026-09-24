@@ -344,13 +344,23 @@ class ProfileClass:
             "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": False, "default": "", "options": [], "type": "string"},
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
             "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"},
+            "fax": {"value": None, "display name": {"en": "fax", "fr": "fax", "es": "fax"}, "required": False, "default": "", "options": [], "type": "string"},
+            "website": {"value": None, "display name": {"en": "website", "fr": "site web", "es": "sitio web"}, "required": False, "default": "", "options": [], "type": "string"},
+            "ice": {"value": None, "display name": {"en": "ICE", "fr": "ICE", "es": "ICE"}, "required": False, "default": "", "options": [], "type": "string"},
+            "patente": {"value": None, "display name": {"en": "patente", "fr": "patente", "es": "patente"}, "required": False, "default": "", "options": [], "type": "string"},
+            "if number": {"value": None, "display name": {"en": "tax number", "fr": "I.F", "es": "NIF"}, "required": False, "default": "", "options": [], "type": "string"},
+            "rc": {"value": None, "display name": {"en": "RC", "fr": "R.C", "es": "R.C"}, "required": False, "default": "", "options": [], "type": "string"},
+            "cnss": {"value": None, "display name": {"en": "CNSS", "fr": "CNSS", "es": "CNSS"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank name": {"value": None, "display name": {"en": "bank", "fr": "banque", "es": "banco"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank account": {"value": None, "display name": {"en": "bank account", "fr": "compte / RIB", "es": "cuenta / RIB"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank agency": {"value": None, "display name": {"en": "bank agency", "fr": "agence bancaire", "es": "agencia bancaria"}, "required": False, "default": "", "options": [], "type": "string"},
             # Multiline footer text that will appear centered at the bottom of the last report page
             "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"},
             "currency": {"value": None, "display name": {"en" : "currency","fr": "devise", "es": "moneda"}, "required": False, "default": "DA", "options": [], "type": "string"}
         }
         self.available_parameters = {
             # Order determines display order in dialog
-            "dialog" : ["company name", "address", "email", "phone", "report footer"],
+            "dialog" : ["company name", "address", "email", "phone", "fax", "website", "ice", "patente", "if number", "rc", "cnss", "bank name", "bank account", "bank agency", "report footer"],
             "table" : ["company name"]
         }
         

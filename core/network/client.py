@@ -155,6 +155,17 @@ class RemoteDatabase:
             {'include_clients': include_clients, 'include_suppliers': include_suppliers},
         )
 
+    # Dedicated Facture API mirrors the local Database surface. Keeping these
+    # explicit avoids raw SQL fallbacks in the LAN client.
+    def get_next_facture_preview(self, date=None): return self._call('get_next_facture_preview', [date])
+    def get_facture(self, facture_id): return self._call('get_facture', [facture_id])
+    def list_factures(self): return self._call('list_factures', [])
+    def get_facture_payments(self, facture_id): return self._call('get_facture_payments', [facture_id])
+    def get_facture_draft_from_sales(self, sale_ids, facture_type='normal', date=None): return self._call('get_facture_draft_from_sales', [sale_ids, facture_type, date])
+    def save_facture_with_items(self, data, items, facture_id=None): return self._call('save_facture_with_items', [data, items, facture_id])
+    def add_facture_payment(self, *args): return self._call('add_facture_payment', list(args))
+    def delete_facture(self, facture_id): return self._call('delete_facture', [facture_id])
+
     def register_class(self, cls):
         """Mirrors Database.register_class - only needs the section name
         locally, the real table already exists on the host."""

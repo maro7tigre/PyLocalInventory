@@ -87,7 +87,7 @@ _REPORT_METHODS = {'get_reports', 'list_report_users', 'save_report', 'delete_re
 _PRODUCT_READ_METHODS = {'get_product_stock_levels', 'get_product_stock_levels_for_product_ids'}
 _FACTURE_METHODS = {
     'get_next_facture_preview', 'get_facture', 'list_factures',
-    'get_facture_payments', 'get_facture_draft_from_sale', 'save_facture_with_items', 'create_facture_from_sale',
+    'get_facture_payments', 'get_facture_draft_from_sale', 'get_facture_draft_from_sales', 'save_facture_with_items', 'create_facture_from_sale',
     'add_facture_payment', 'delete_facture',
 }
 _FACTURE_WRITE_METHODS = {
@@ -189,7 +189,7 @@ def _check_permission(user, method, args, kwargs):
         if not user['permissions'].get('Factures', {}).get(needed):
             return False, f"You don't have {needed} access to Factures"
         # Copying a Devis reads Sales data but never changes it.
-        if method in ('create_facture_from_sale', 'get_facture_draft_from_sale') and not user['permissions'].get('Sales', {}).get('read'):
+        if method in ('create_facture_from_sale', 'get_facture_draft_from_sale', 'get_facture_draft_from_sales') and not user['permissions'].get('Sales', {}).get('read'):
             return False, "You don't have read access to Sales"
         return True, None
 

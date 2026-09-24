@@ -9,6 +9,7 @@ from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
 from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont
 from ui.widgets.themed_widgets import GreenButton, RedButton
+from ui.widgets.workspace_dialog import maximize_workspace_dialog
 from ui.widgets.operations_table import OperationsTableWidget
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
 from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
@@ -228,6 +229,7 @@ class BaseOperationDialog(QDialog):
         
         # Auto-size dialog
         self.resize(900, 700)
+        maximize_workspace_dialog(self)
 
         self.setMinimumSize(600, 500)
     def _on_load_finished(self, loaded=None):

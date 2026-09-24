@@ -13,7 +13,8 @@ from core.moroccan_dirham_words import amount_to_words
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
-from ui.facture_document import render_facture_preview_pages
+from core.profiles import ProfileClass
+from ui.facture_document import _document_data, render_facture_preview_pages
 from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturePreviewDialog, FacturesTab
 
 
@@ -304,11 +305,35 @@ class FactureEditorTests(unittest.TestCase):
         dialog = FacturePreviewDialog(pages)
         try:
             dialog.show(); self.app.processEvents()
+            self.assertTrue(dialog.isMaximized())
             self.assertEqual(dialog.zoom, 0)
             self.assertLessEqual(dialog.page.pixmap().height(), dialog.page.height())
             self.assertLessEqual(dialog.page.pixmap().width(), dialog.page.width())
         finally:
             dialog.close()
+
+    def test_company_profile_data_renders_without_empty_legal_labels(self):
+        profile = ProfileClass("test")
+        profile.set_values({
+            "company name": "LAMIDAP - S.A.R.L", "address": "288, Zone Industrielle Gzenaya\n90000 Tanger",
+            "phone": "00 212 539 39 45 60", "fax": "00 212 539 39 45 59",
+            "email": "lamidap@lamidap.com", "website": "www.lamidap.com",
+            "ice": "000066710000023", "patente": "52981388", "if number": "04909316",
+            "rc": "31073", "cnss": "7412042", "bank name": "ATTIJARI WAFA BANQUE - CENTRE D'AFFAIRE",
+            "bank account": "1370A000000023", "bank agency": "GZENAYA Z-F",
+        })
+        facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",
+                   "items": [], "total_ht": Decimal("0"), "vat_amount": Decimal("0"), "total_ttc": Decimal("0"),
+                   "paid": Decimal("0"), "remaining": Decimal("0"), "amount_in_words": "ZÉRO DIRHAM"}
+        data = _document_data(facture, [], profile)
+        self.assertIn("Fax : 00 212 539 39 45 59", data["contact"])
+        self.assertEqual(data["website"], "www.lamidap.com")
+        self.assertIn("ICE: 000066710000023", "\n".join(data["legal_lines"]))
+        self.assertIn("COMPTE N°: 1370A000000023", data["bank_line"])
+        empty = ProfileClass("empty")
+        empty_data = _document_data(facture, [], empty)
+        self.assertEqual(empty_data["legal_lines"], [])
+        self.assertEqual(empty_data["bank_line"], "")
 
     def test_printable_document_uses_a4_width_and_contains_payment_reference(self):
         facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",

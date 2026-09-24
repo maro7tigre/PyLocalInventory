@@ -43,10 +43,12 @@ class ClientsTab(BaseTab):
             QMessageBox.information(self, "Attachments", "Select a client first.")
             return
         from ui.widgets.attachments_widget import AttachmentPanel
+        from ui.widgets.workspace_dialog import maximize_workspace_dialog
         dialog = QDialog(self)
         dialog.setWindowTitle("Client Sales")
         dialog.setMinimumSize(1100, 720)
         dialog.resize(1180, 780)
+        maximize_workspace_dialog(dialog)
         layout = QVBoxLayout(dialog)
         panel = AttachmentPanel(self.database, 'client', client_id, dialog)
         layout.addWidget(panel)

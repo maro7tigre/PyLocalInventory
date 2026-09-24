@@ -83,14 +83,29 @@ def _document_data(facture, payments, profile):
     email = _profile_value(profile, "email")
     website = _profile_value(profile, "website")
     currency = _profile_value(profile, "currency") or "MAD"
-    footer = _profile_value(profile, "report footer")
+    report_footer = _profile_value(profile, "report footer")
     contact = [address]
     if phone:
         contact.append(f"Tél. : {phone}")
     if fax:
         contact.append(f"Fax : {fax}")
-    if email:
-        contact.append(f"Email : {email}")
+    legal_values = [
+        ("ICE", _profile_value(profile, "ice")),
+        ("PATENTE", _profile_value(profile, "patente")),
+        ("I.F", _profile_value(profile, "if number")),
+        ("R.C", _profile_value(profile, "rc")),
+        ("CNSS", _profile_value(profile, "cnss")),
+    ]
+    legal_lines = []
+    for values in (legal_values[:3], legal_values[3:]):
+        line = "   ".join(f"{label}: {value}" for label, value in values if value)
+        if line:
+            legal_lines.append(line)
+    bank_parts = [
+        ("BANQUE", _profile_value(profile, "bank name")),
+        ("COMPTE N°", _profile_value(profile, "bank account")),
+        ("AGENCE", _profile_value(profile, "bank agency")),
+    ]
     client_rows = [
         ("Mr / Société :", str(facture.get("client_name") or "")),
         ("Adresse / Ville :", " ".join(filter(None, (
@@ -145,7 +160,6 @@ def _document_data(facture, payments, profile):
         total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
         total_rows.append(("NET À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
     return {
-        "company": company,
         "contact": "\n".join(part for part in contact if part),
         "client_rows": client_rows,
         "number": str(facture["facture_number"]),
@@ -154,15 +168,11 @@ def _document_data(facture, payments, profile):
         "total_rows": total_rows,
         "words": str(facture.get("amount_in_words") or ""),
         "references": references,
-        "footer_company": " - ".join(part for part in (website, company, f"Email : {email}" if email else "") if part),
-        "footer": " | ".join(part for part in (
-            footer, *(f"{label}: {value}" for label, value in (
-                ("ICE", _profile_value(profile, "ice")), ("PATENTE", _profile_value(profile, "patente")),
-                ("I.F", _profile_value(profile, "if number")), ("R.C", _profile_value(profile, "rc")),
-                ("CNSS", _profile_value(profile, "cnss")), ("BANQUE", _profile_value(profile, "bank name")),
-                ("AGENCE", _profile_value(profile, "bank agency")), ("RIB", _profile_value(profile, "bank account")),
-            ) if value)
-        ) if part),
+        "website": website,
+        "company_contact": " - ".join(part for part in (company, f"Email : {email}" if email else "") if part),
+        "legal_lines": legal_lines,
+        "bank_line": " - ".join(f"{label}: {value}" for label, value in bank_parts if value),
+        "report_footer": report_footer,
         "logo": QImage(resource_path("report", "lamidap_logo.png")),
     }
 
@@ -221,8 +231,7 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
         if not data["logo"].isNull():
             image = data["logo"].scaled(logo_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawImage(QRectF(logo_rect.x(), logo_rect.y(), image.width(), image.height()), image)
-        _draw_text(painter, rect(0, 30, 88, 6), data["company"], 12, bold=True)
-        _draw_text(painter, rect(0, 37, 88, 27), data["contact"], 8.5, Qt.AlignLeft | Qt.AlignTop)
+        _draw_text(painter, rect(0, 30, 88, 35), data["contact"], 8.5, Qt.AlignLeft | Qt.AlignTop)
         _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 24, Qt.AlignCenter, bold=True)
         info = rect(100, 16, 82, 19)
         _draw_box(painter, info)
@@ -299,10 +308,13 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
         color = Qt.white if emphasized else Qt.black
         _draw_text(painter, rect(totals_x + 2, y, 42, total_row_height), label, 8, bold=emphasized, color=color)
         _draw_text(painter, rect(totals_x + 48, y, 27, total_row_height), value, 8, Qt.AlignRight, emphasized, color)
-    footer_y = 252
+    footer_y = 244
     line(0, footer_y, 182, footer_y)
-    _draw_text(painter, rect(0, footer_y + 2, 182, 5), data["footer_company"], 7.5, Qt.AlignCenter, bold=True)
-    _draw_text(painter, rect(0, footer_y + 8, 182, 10), data["footer"], 7, Qt.AlignCenter | Qt.AlignTop)
+    _draw_text(painter, rect(0, footer_y + 1, 182, 4), data["website"], 8, Qt.AlignCenter, bold=True)
+    _draw_text(painter, rect(0, footer_y + 5, 182, 4), data["company_contact"], 6.5, Qt.AlignCenter, bold=True)
+    _draw_text(painter, rect(0, footer_y + 9, 182, 7), "\n".join(data["legal_lines"]), 6.2, Qt.AlignCenter | Qt.AlignTop)
+    _draw_text(painter, rect(0, footer_y + 16, 182, 4), data["bank_line"], 6.2, Qt.AlignCenter, bold=True)
+    _draw_text(painter, rect(0, footer_y + 20, 182, 5), data["report_footer"], 5.8, Qt.AlignCenter | Qt.AlignTop)
 
 
 def render_facture_to_printer(printer, facture, payments, profile=None):

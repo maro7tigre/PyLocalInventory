@@ -9,7 +9,7 @@ from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
     QComboBox, QDateEdit, QDialog, QDialogButtonBox, QDoubleSpinBox,
     QFormLayout, QFileDialog, QHBoxLayout, QHeaderView, QLabel, QLineEdit,
-    QMessageBox, QPushButton, QSpinBox, QTableWidget, QTableWidgetItem,
+    QMessageBox, QPushButton, QScrollArea, QSizePolicy, QSpinBox, QTableWidget, QTableWidgetItem,
     QTextEdit, QVBoxLayout, QWidget,
 )
 
@@ -412,7 +412,12 @@ class FacturePreviewDialog(QDialog):
         super().__init__(parent); self.images = images; self.page_index = 0; self.zoom = 0
         self.setWindowTitle("Aperçu facture"); self.resize(1050, 800)
         maximize_workspace_dialog(self)
-        layout = QVBoxLayout(self); self.page = QLabel(); self.page.setAlignment(Qt.AlignCenter); layout.addWidget(self.page, 1)
+        layout = QVBoxLayout(self)
+        self.preview = QScrollArea(); self.preview.setWidgetResizable(False)
+        self.preview.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.preview.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.page = QLabel(); self.page.setAlignment(Qt.AlignCenter); self.page.setSizePolicy(QSizePolicy.Ignored, QSizePolicy.Ignored)
+        self.preview.setWidget(self.page); layout.addWidget(self.preview, 1)
         controls = QHBoxLayout(); fit = BlueButton("Ajuster à la page"); fit.clicked.connect(self.fit_page)
         full = BlueButton("100 %"); full.clicked.connect(lambda: self.set_zoom(1.0))
         minus = BlueButton("Zoom -"); minus.clicked.connect(lambda: self.set_zoom((self.zoom or self._fit_scale()) / 1.2))
@@ -423,11 +428,15 @@ class FacturePreviewDialog(QDialog):
 
     def _fit_scale(self):
         image = self.images[self.page_index]
-        return min(max(0.05, self.page.width() / image.width()), max(0.05, self.page.height() / image.height()))
+        viewport = self.preview.viewport().size()
+        return min(max(0.05, viewport.width() / image.width()), max(0.05, viewport.height() / image.height()))
 
     def update_page(self):
         image = self.images[self.page_index]; scale = self.zoom or self._fit_scale()
-        self.page.setPixmap(QPixmap.fromImage(image).scaled(max(1, int(image.width() * scale)), max(1, int(image.height() * scale)), Qt.KeepAspectRatio, Qt.SmoothTransformation))
+        pixmap = QPixmap.fromImage(image).scaled(max(1, int(image.width() * scale)), max(1, int(image.height() * scale)), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        viewport = self.preview.viewport().size()
+        self.page.setPixmap(pixmap)
+        self.page.resize(max(viewport.width(), pixmap.width()), max(viewport.height(), pixmap.height()))
 
     def fit_page(self):
         self.zoom = 0; self.update_page()

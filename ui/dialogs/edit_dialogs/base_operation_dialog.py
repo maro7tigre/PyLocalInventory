@@ -309,10 +309,20 @@ class BaseOperationDialog(QDialog):
 
         
     def setup_ui(self):
-        """Setup clean auto-sizing UI"""
+        """Keep the financial/action footer visible while the workspace scrolls."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(15)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.workspace_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(15)
+        self.workspace_scroll.setWidget(workspace)
+        layout.addWidget(self.workspace_scroll, 1)
         
         # ID display (if existing)
         if self.operation_id:
@@ -322,13 +332,13 @@ class BaseOperationDialog(QDialog):
             id_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
             id_layout.addWidget(id_label)
             id_layout.addStretch()
-            layout.addLayout(id_layout)
+            workspace_layout.addLayout(id_layout)
         
         # Operation parameters (auto-sized form)
-        self.setup_parameters_section(layout)
+        self.setup_parameters_section(workspace_layout)
         
         # Items section
-        self.setup_items_section(layout)
+        self.setup_items_section(workspace_layout)
         
         # Totals section
         self.setup_totals_section(layout)

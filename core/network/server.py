@@ -806,8 +806,9 @@ class DatabaseServer:
                 profile_values = {}
                 if selected_profile:
                     for key in (
-                        "company name", "address", "email", "phone",
-                        "report footer", "currency",
+                        "company name", "address", "email", "phone", "fax", "website",
+                        "ice", "patente", "if number", "rc", "cnss", "bank name",
+                        "bank account", "bank agency", "report footer", "currency",
                     ):
                         profile_values[key] = selected_profile.get_value(key)
                 logger.info(

@@ -18,7 +18,6 @@ from ui.facture_document import render_facture_preview_pages, render_facture_to_
 from ui.widgets.themed_widgets import BlueButton, GreenButton, OrangeButton, RedButton
 from ui.widgets.workspace_dialog import maximize_workspace_dialog
 
-
 def _money(value):
     return f"{round_money(value):,.2f}".replace(",", " ")
 
@@ -541,6 +540,7 @@ class FacturesTab(QWidget):
         if not facture_id: return
         facture = self.database.get_facture(facture_id)
         profile = getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
+        profile = profile or getattr(self.database, "remote_profile", None)
         payments = self.database.get_facture_payments(facture_id)
         dialog = FacturePreviewDialog(render_facture_preview_pages(facture, payments, profile)[0], self)
         layout = dialog.layout(); actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog)); actions.addWidget(pdf); actions.addWidget(print_button); layout.addLayout(actions); dialog.exec()

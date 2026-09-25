@@ -83,3 +83,5 @@ tests/
 .idea/
 .DS_Store
 Thumbs.db
+#////////////////
+PyLocalinventory

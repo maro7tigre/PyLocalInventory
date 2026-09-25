@@ -64,16 +64,18 @@ class FactureEditor(QDialog):
         form.addRow("Notes", self.notes)
         layout.addLayout(form)
         self.source_summary = QLabel("Aucun Devis sélectionné")
-        self.type_details = QWidget(); type_layout = QFormLayout(self.type_details)
-        type_layout.addRow("Devis sélectionnés", self.source_summary)
-        self.selected_total = QLabel("0,00 MAD"); type_layout.addRow("Total Devis sélectionnés", self.selected_total)
+        self.type_details = QWidget(); self.type_layout = QFormLayout(self.type_details)
+        self.select_devis = BlueButton("Sélectionner les devis"); self.select_devis.clicked.connect(self.choose_devis)
+        self.type_layout.addRow(self.select_devis)
+        self.type_layout.addRow("Devis sélectionnés", self.source_summary)
+        self.selected_total = QLabel("0,00 MAD"); self.type_layout.addRow("Total Devis sélectionnés", self.selected_total)
         self.advance_amount = QDoubleSpinBox(); self.advance_amount.setRange(0.01, 999999999); self.advance_amount.setDecimals(2)
         self.advance_designation = QLineEdit("AVANCE SUR TRAVAUX DE MENUISERIE EN BOIS")
-        type_layout.addRow("Montant de l'avance TTC", self.advance_amount)
-        type_layout.addRow("Désignation", self.advance_designation)
+        self.type_layout.addRow("Montant de l'avance TTC", self.advance_amount)
+        self.type_layout.addRow("Désignation", self.advance_designation)
         self.previous_advance = QLabel("0,00 MAD"); self.remaining_balance = QLabel("0,00 MAD")
-        type_layout.addRow("Avances / acomptes déjà facturés", self.previous_advance)
-        type_layout.addRow("Reste à facturer", self.remaining_balance)
+        self.type_layout.addRow("Avances / acomptes déjà facturés", self.previous_advance)
+        self.type_layout.addRow("Reste à facturer", self.remaining_balance)
         layout.addWidget(self.type_details)
         self.items = QTableWidget(0, len(self.columns)); self.items.setHorizontalHeaderLabels(self.columns)
         self.items.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
@@ -86,8 +88,9 @@ class FactureEditor(QDialog):
         controls.addWidget(self.total_ht); controls.addWidget(self.total_tva); controls.addWidget(self.total_ttc)
         layout.addLayout(controls)
         buttons = QDialogButtonBox(QDialogButtonBox.Save | QDialogButtonBox.Cancel)
+        self.save_button = buttons.button(QDialogButtonBox.Save)
         buttons.accepted.connect(self.save); buttons.rejected.connect(self.reject); layout.addWidget(buttons)
-        self.items.itemChanged.connect(self.update_totals)
+        self.items.itemChanged.connect(lambda: (self.update_totals(), self._update_save_state()))
         self._load_clients()
         self.type.currentIndexChanged.connect(self._update_type_ui)
         self.advance_amount.valueChanged.connect(self.update_totals)
@@ -105,7 +108,9 @@ class FactureEditor(QDialog):
         """Populate a new editor from a selected Devis without issuing it yet."""
         self.draft = draft
         self.date.setDate(QDate.fromString(str(draft.get("date") or ""), "yyyy-MM-dd"))
+        self.type.blockSignals(True)
         self.type.setCurrentIndex(max(0, self.type.findData(draft.get("facture_type") or "normal")))
+        self.type.blockSignals(False)
         self.tva.setValue(float(draft.get("tva_rate") or 0)); self.notes.setPlainText(str(draft.get("notes") or ""))
         self.draft = draft
         self._set_client(draft["client_id"])
@@ -113,11 +118,29 @@ class FactureEditor(QDialog):
         self.selected_total.setText(f"{_money(draft.get('selected_total_ttc') or 0)} MAD")
         self.previous_advance.setText(f"{_money(draft.get('previous_advance_ttc') or 0)} MAD")
         self.remaining_balance.setText(f"{_money(draft.get('remaining_ttc') or 0)} MAD")
-        if draft.get("facture_type") == "balance":
-            self.advance_designation.setText("SOLDE SUR TRAVAUX DE MENUISERIE EN BOIS")
         self.items.setRowCount(0)
         for item in draft.get("items", []): self.add_line(item)
-        self.update_totals()
+        self._update_type_ui()
+
+    def choose_devis(self):
+        dialog = DevisSelectorDialog(self.database, self)
+        if not dialog.exec():
+            return
+        try:
+            self.load_draft(self.database.get_facture_draft_from_sales(
+                dialog.sale_ids, self.type.currentData(), self.date.date().toString("yyyy-MM-dd")
+            ))
+        except Exception as exc:
+            QMessageBox.warning(self, "Facture", str(exc))
+
+    def _refresh_special_draft(self, invoice_type):
+        draft = self.draft or {}
+        source_ids = draft.get("source_sale_ids") or ([draft["source_sale_id"]] if draft.get("source_sale_id") else [])
+        if not source_ids or (self.draft or {}).get("facture_type") == invoice_type:
+            return
+        self.load_draft(self.database.get_facture_draft_from_sales(
+            source_ids, invoice_type, self.date.date().toString("yyyy-MM-dd")
+        ))
 
     def _load_clients(self):
         catalog = self.database.get_sale_catalog(True, True, include_clients=True)
@@ -144,9 +167,11 @@ class FactureEditor(QDialog):
             name = str(client.get("name") or client.get("username") or f"Client {self.client_id}")
             self.client.setText(name)
             if not populate_snapshot:
+                self._update_save_state()
                 return
             self.address.setText(str(client.get("address") or ""))
             self.ice.setText(str(client.get("ice") or ""))
+        self._update_save_state()
 
     def choose_client_dialog(self):
         dialog = ClientSelectorDialog(self.client_records, self)
@@ -188,6 +213,7 @@ class FactureEditor(QDialog):
         type_box.currentIndexChanged.connect(lambda _index, current=row: self._set_line_type(current))
         self.items.setCellWidget(row, 0, type_box)
         designation = QComboBox(); designation.setEditable(True)
+        designation.currentTextChanged.connect(lambda _text: self._update_save_state())
         designation.setCurrentText(str(values.get("designation") or ""))
         designation.activated.connect(lambda _index, current=row: self._catalog_line_selected(current))
         self.items.setCellWidget(row, 1, designation)
@@ -249,6 +275,7 @@ class FactureEditor(QDialog):
                 self.total_ht.setText(f"Total HT: {_money(totals['total_ht'])} MAD")
                 self.total_tva.setText(f"TVA: {_money(totals['vat_amount'])} MAD")
                 self.total_ttc.setText(f"Total TTC: {_money(totals['total_ttc'])} MAD")
+                self._update_save_state()
                 return
             gross = Decimal("0")
             for row, line in enumerate(self._line_data()):
@@ -260,6 +287,7 @@ class FactureEditor(QDialog):
             self.total_ht.setText(f"Total HT: {_money(totals['total_ht'])} MAD")
             self.total_tva.setText(f"TVA: {_money(totals['vat_amount'])} MAD")
             self.total_ttc.setText(f"Total TTC: {_money(totals['total_ttc'])} MAD")
+            self._update_save_state()
         except Exception:
             # Inputs can be temporarily incomplete while a cell is edited.
             return
@@ -267,16 +295,34 @@ class FactureEditor(QDialog):
     def _update_type_ui(self):
         invoice_type = self.type.currentData()
         special = invoice_type in ("advance", "balance")
+        if special:
+            self._refresh_special_draft(invoice_type)
         self.type_details.setVisible(special)
         self.items.setVisible(not special)
         for child in self.findChildren(QPushButton):
             if child.text() in ("+ Ligne", "Supprimer ligne"):
                 child.setVisible(not special)
-        self.advance_amount.setVisible(invoice_type == "advance")
-        self.advance_designation.setVisible(special)
-        self.previous_advance.setVisible(invoice_type == "balance")
-        self.remaining_balance.setVisible(invoice_type == "balance")
+        self.type_layout.setRowVisible(self.advance_amount, invoice_type == "advance")
+        self.type_layout.setRowVisible(self.advance_designation, invoice_type == "advance")
+        self.type_layout.setRowVisible(self.previous_advance, invoice_type == "balance")
+        self.type_layout.setRowVisible(self.remaining_balance, invoice_type == "balance")
         self.update_totals()
+
+    def _update_save_state(self):
+        if not hasattr(self, "save_button"):
+            return
+        invoice_type = self.type.currentData()
+        if invoice_type == "normal":
+            enabled = self.client_id is not None and bool(self._line_data())
+        else:
+            draft = self.draft or {}
+            source_ids = draft.get("source_sale_ids") or ([draft["source_sale_id"]] if draft.get("source_sale_id") else [])
+            remaining = to_decimal(draft.get("remaining_ttc") or 0)
+            if invoice_type == "advance":
+                enabled = self.client_id is not None and bool(source_ids) and 0 < to_decimal(self.advance_amount.value()) <= remaining
+            else:
+                enabled = self.client_id is not None and bool(source_ids) and remaining > 0
+        self.save_button.setEnabled(enabled)
 
     def save(self):
         if self.client_id is None:
@@ -290,7 +336,9 @@ class FactureEditor(QDialog):
                 total_ttc = (to_decimal(self.advance_amount.value()) if invoice_type == "advance"
                              else to_decimal(self.draft.get("remaining_ttc") or 0))
                 if total_ttc <= 0:
-                    raise ValueError("Le montant à facturer doit être supérieur à zéro.")
+                    raise ValueError("Ces devis sont déjà entièrement facturés.")
+                if invoice_type == "advance" and total_ttc > to_decimal(self.draft.get("remaining_ttc") or 0):
+                    raise ValueError("Le montant de l'avance dépasse le reste à facturer.")
                 total_ht = round_money(total_ttc / (Decimal("1") + to_decimal(self.tva.value()) / Decimal("100")))
                 devis = self.draft.get("source_devis") or ""
                 designation = self.advance_designation.text().strip() or "AVANCE"
@@ -539,11 +587,10 @@ class FacturesTab(QWidget):
         facture_id = self.selected_id()
         if not facture_id: return
         facture = self.database.get_facture(facture_id)
-        profile = getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
-        profile = profile or getattr(self.database, "remote_profile", None)
+        profile = self._get_report_profile()
         payments = self.database.get_facture_payments(facture_id)
         dialog = FacturePreviewDialog(render_facture_preview_pages(facture, payments, profile)[0], self)
-        layout = dialog.layout(); actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog)); actions.addWidget(pdf); actions.addWidget(print_button); layout.addLayout(actions); dialog.exec()
+        layout = dialog.layout(); actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog)); close = RedButton("Fermer"); close.clicked.connect(dialog.reject); actions.addWidget(pdf); actions.addWidget(print_button); actions.addStretch(1); actions.addWidget(close); layout.addLayout(actions); dialog.exec()
 
     def _save_pdf(self, facture, payments, profile, parent):
         path, _ = QFileDialog.getSaveFileName(parent, "Enregistrer la facture", "", "PDF (*.pdf)")
@@ -560,3 +607,12 @@ class FacturesTab(QWidget):
         printer = QPrinter(QPrinter.HighResolution); dialog = QPrintDialog(printer, parent)
         if dialog.exec() == QDialog.Accepted:
             render_facture_to_printer(printer, facture, payments, profile)
+
+    def _get_report_profile(self):
+        """Match the profile source order used by the existing report dialogs."""
+        profile_manager = getattr(self.database, "profile_manager", None)
+        return (
+            getattr(profile_manager, "selected_profile", None)
+            or getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
+            or getattr(self.database, "remote_profile", None)
+        )

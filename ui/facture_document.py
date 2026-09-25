@@ -140,26 +140,28 @@ def _document_data(facture, payments, profile):
             "price": money(item.get("unit_price") or 0),
             "total": money(total),
         })
+    paid = Decimal(str(facture.get("paid") or 0))
+    remaining = Decimal(str(facture.get("remaining") or 0))
+    previous_advance = Decimal(str(facture.get("previous_advance_ttc") or 0))
     total_rows = [
         ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
         ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
     ]
     if facture.get("facture_type") == "balance":
-        total_rows.extend((
-            ("MONTANT GLOBAL", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False),
-            ("AVANCES / ACOMPTES", f"{money(facture.get('previous_advance_ttc') or 0)} {currency}", False),
-            ("RESTE À PAYER", f"{money(facture['total_ttc'])} {currency}", True),
-        ))
-    elif facture["paid"]:
-        total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
-        total_rows.extend((
-            ("AVANCE / PAYÉ", f"{money(facture['paid'])} {currency}", False),
-            ("RESTE À PAYER", f"{money(facture['remaining'])} {currency}", True),
-        ))
+        total_rows.append(("MONTANT GLOBAL", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False))
+        if previous_advance > 0:
+            total_rows.append(("AVANCES / ACOMPTES", f"{money(previous_advance)} {currency}", False))
+        total_rows.append(("RESTE À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
     else:
         total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
-        total_rows.append(("NET À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
-    return {
+        if paid > 0:
+            total_rows.append(("AVANCE / PAYÉ", f"{money(paid)} {currency}", False))
+            if remaining > 0:
+                total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
+        else:
+            label = "AVANCE À PAYER" if facture.get("facture_type") == "advance" else "NET À PAYER"
+            total_rows.append((label, f"{money(facture['total_ttc'])} {currency}", True))
+    data = {
         "contact": "\n".join(part for part in contact if part),
         "client_rows": client_rows,
         "number": str(facture["facture_number"]),
@@ -168,6 +170,7 @@ def _document_data(facture, payments, profile):
         "total_rows": total_rows,
         "words": str(facture.get("amount_in_words") or ""),
         "references": references,
+        "notes": str(facture.get("notes") or "").strip(),
         "website": website,
         "company_contact": " - ".join(part for part in (company, f"Email : {email}" if email else "") if part),
         "legal_lines": legal_lines,
@@ -175,6 +178,7 @@ def _document_data(facture, payments, profile):
         "report_footer": report_footer,
         "logo": QImage(resource_path("report", "lamidap_logo.png")),
     }
+    return data
 
 
 def _page_items(items):
@@ -232,15 +236,15 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
             image = data["logo"].scaled(logo_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawImage(QRectF(logo_rect.x(), logo_rect.y(), image.width(), image.height()), image)
         _draw_text(painter, rect(0, 30, 88, 35), data["contact"], 8.5, Qt.AlignLeft | Qt.AlignTop)
-        _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 24, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 26, Qt.AlignCenter, bold=True)
         info = rect(100, 16, 82, 19)
         _draw_box(painter, info)
         line(141, 16, 141, 35)
         line(100, 24, 182, 24)
-        _draw_text(painter, rect(102, 17, 37, 6), "Numéro", 8.5, bold=True)
-        _draw_text(painter, rect(143, 17, 37, 6), "Date", 8.5, bold=True)
-        _draw_text(painter, rect(102, 25, 37, 8), data["number"], 10, bold=True)
-        _draw_text(painter, rect(143, 25, 37, 8), data["date"], 10, bold=True)
+        _draw_text(painter, rect(102, 17, 37, 6), "Numéro", 9, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(143, 17, 37, 6), "Date", 9, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(102, 25, 37, 8), data["number"], 12, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(143, 25, 37, 8), data["date"], 12, Qt.AlignCenter, bold=True)
         client = rect(100, 40, 82, 33)
         _draw_box(painter, client)
         row_height = 33 / len(data["client_rows"])
@@ -248,8 +252,8 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
             y = 40 + index * row_height
             if index:
                 line(100, y, 182, y, 0.25)
-            _draw_text(painter, rect(102, y + 0.5, 27, row_height - 1), label, 7.5, bold=True)
-            _draw_text(painter, rect(130, y + 0.5, 50, row_height - 1), value, 8.5, bold=True)
+            _draw_text(painter, rect(102, y + 0.5, 27, row_height - 1), label, 8, bold=True)
+            _draw_text(painter, rect(130, y + 0.5, 50, row_height - 1), value, 9.5, Qt.AlignCenter, bold=True)
         table_y = 78
     else:
         table_y = 0
@@ -270,7 +274,7 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
 
     rows_to_draw = list(page_items)
     if is_final and is_first:
-        rows_to_draw.extend([None] * max(0, 14 - len(rows_to_draw)))
+        rows_to_draw.extend([None] * max(0, 13 - len(rows_to_draw)))
     for row_index, item in enumerate(rows_to_draw):
         y = table_y + header_height + row_index * row_height
         row_rect = rect(0, y, table_width, row_height)
@@ -288,18 +292,27 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
         for value_index, value in enumerate(values, 1):
             x = columns[value_index]
             width = columns[value_index + 1] - x
-            alignment = Qt.AlignCenter if value_index == 1 else Qt.AlignRight
-            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 8.5, alignment)
+            numeric = value_index in (2, 3, 4)
+            alignment = Qt.AlignCenter if numeric or value_index == 1 else Qt.AlignRight
+            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 9.5 if numeric else 8.5, alignment)
 
     if not is_final:
         return
     settlement_y = table_y + header_height + len(rows_to_draw) * row_height + 5
     totals_x = 105
     total_row_height = 6
-    total_height = len(data["total_rows"]) * total_row_height
     _draw_text(painter, rect(0, settlement_y, 98, 5), "Arrêtée la présente Facture à la somme de :", 8)
     _draw_text(painter, rect(0, settlement_y + 6, 98, 11), data["words"], 9, Qt.AlignLeft | Qt.AlignTop, bold=True)
-    _draw_text(painter, rect(0, settlement_y + 18, 98, max(4, total_height - 18)), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
+    footer_y = 244
+    lower_left_y = settlement_y + 18
+    lower_left_height = max(0, footer_y - lower_left_y - 1)
+    if data["notes"]:
+        note_height = min(10, lower_left_height)
+        _draw_text(painter, rect(0, lower_left_y, 98, note_height), data["notes"], 9.5, Qt.AlignLeft | Qt.AlignTop, bold=True)
+        lower_left_y += note_height + 1
+        lower_left_height = max(0, footer_y - lower_left_y - 1)
+    if data["references"]:
+        _draw_text(painter, rect(0, lower_left_y, 98, lower_left_height), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
     for index, (label, value, emphasized) in enumerate(data["total_rows"]):
         y = settlement_y + index * total_row_height
         fill = "#303030" if emphasized else "#eeeeee"
@@ -308,7 +321,6 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
         color = Qt.white if emphasized else Qt.black
         _draw_text(painter, rect(totals_x + 2, y, 42, total_row_height), label, 8, bold=emphasized, color=color)
         _draw_text(painter, rect(totals_x + 48, y, 27, total_row_height), value, 8, Qt.AlignRight, emphasized, color)
-    footer_y = 244
     line(0, footer_y, 182, footer_y)
     _draw_text(painter, rect(0, footer_y + 1, 182, 4), data["website"], 8, Qt.AlignCenter, bold=True)
     _draw_text(painter, rect(0, footer_y + 5, 182, 4), data["company_contact"], 6.5, Qt.AlignCenter, bold=True)

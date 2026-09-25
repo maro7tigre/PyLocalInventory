@@ -64,7 +64,7 @@ class _PdfRenderWorker(QObject):
                     worker_db = Database(sales_db.profile_manager)
                     worker_db.language = getattr(sales_db, 'language', 'en')
                     worker_db.registered_classes = sales_db.registered_classes
-                    if not worker_db.connect():
+                    if not worker_db.connect(initialize_schema=False):
                         worker_db = None
                 except Exception:
                     worker_db = None

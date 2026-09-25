@@ -219,8 +219,18 @@ class MainWindow(ThemedMainWindow):
         if saved_profile_name:
             if self.profile_manager.load_profile(saved_profile_name):
                 print(f"✓ Loaded saved profile: {saved_profile_name}")
+                return
             else:
                 print(f"⚠️  Could not load saved profile: {saved_profile_name}")
+
+        # A renamed profile can leave both persisted selections stale. Selecting
+        # the sole installed profile preserves the existing local report source
+        # without guessing when the user has more than one profile.
+        available_profiles = self.profile_manager.list_profiles()
+        if len(available_profiles) == 1:
+            recovered_profile = available_profiles[0]
+            self.profile_manager.load_profile(recovered_profile)
+            print(f"✓ Recovered sole available profile: {recovered_profile}")
     
     def save_app_config(self):
         """Save application configuration to QSettings"""

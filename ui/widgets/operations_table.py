@@ -117,6 +117,11 @@ class TableDataManager:
     def _get_cell_value(self, table, row, col):
         """Get value from table cell (widget or item)"""
         widget = table.cellWidget(row, col)
+        # Active QDoubleSpinBox editors expose formatted text such as
+        # "14.00 %". Use their numeric value so totals see the same value as
+        # the row subtotal before the editor has been committed/closed.
+        if widget and hasattr(widget, 'value'):
+            return str(widget.value())
         if widget and hasattr(widget, 'text'):
             return widget.text().strip()
         if widget and hasattr(widget, 'currentData'):

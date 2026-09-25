@@ -280,15 +280,17 @@ class TestLiveSaleRemiseDialog(unittest.TestCase):
         for key, value in (("quantity", quantity), ("unit_price", price)):
             column = columns.index(key)
             index = table.model().index(row, column)
-            delegate = table.itemDelegateForColumn(column)
-            editor = delegate.createEditor(table, None, index)
-            delegate.setEditorData(editor, index)
+            table.setCurrentIndex(index)
+            table.edit(index)
+            editor = table.cellWidget(row, column)
+            assert editor is not None
             editor.setText(str(value))
         column = columns.index("discount_percentage")
         index = table.model().index(row, column)
-        delegate = table.itemDelegateForColumn(column)
-        editor = delegate.createEditor(table, None, index)
-        delegate.setEditorData(editor, index)
+        table.setCurrentIndex(index)
+        table.edit(index)
+        editor = table.cellWidget(row, column)
+        assert editor is not None
         editor.setValue(float(discount))
 
     @staticmethod

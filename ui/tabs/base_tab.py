@@ -1135,7 +1135,7 @@ class BaseTab(QWidget):
         def fetch():
             # Establish connection inside the worker thread if not connected
             if getattr(database, 'profile_manager', None) and not getattr(database, 'conn', None):
-                if not database.connect():
+                if not database.connect(initialize_schema=False):
                     raise RuntimeError("Failed to connect worker database on background thread")
             
             if hasattr(database, 'get_operation_summary_items') and section in ('Sales', 'Imports'):

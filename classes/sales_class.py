@@ -138,6 +138,8 @@ class SalesClass(BaseClass):
                 "display_name": {"en": "Final Remise"},
                 "required": False,
                 "default": True,
+                "true_value": True,
+                "false_value": False,
                 "type": "bool"
             },
             "notes": {

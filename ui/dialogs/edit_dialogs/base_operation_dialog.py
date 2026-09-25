@@ -58,7 +58,7 @@ class SaveWorker(QObject):
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                if not worker_db.connect(initialize_schema=False):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
 
             if self.is_import:
@@ -110,7 +110,7 @@ class LoadWorker(QObject):
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                if not worker_db.connect(initialize_schema=False):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
 
             if self.operation_obj:
@@ -149,6 +149,7 @@ class LoadWorker(QObject):
             })
             self.finished.emit()
         except Exception as e:
+            logger.exception("Operation load worker failed")
             self.error.emit(str(e))
         finally:
             if self.operation_obj:
@@ -207,7 +208,8 @@ class BaseOperationDialog(QDialog):
             self.operation_obj if operation_id else None,
             database,
             fetch_catalog=True,
-            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters)
+            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters),
+            fetch_bl_preview=(not operation_id and 'bl_number' in self.operation_obj.parameters),
         )
         self.load_worker.moveToThread(self.load_thread)
         self.load_thread.started.connect(self.load_worker.process)
@@ -340,11 +342,16 @@ class BaseOperationDialog(QDialog):
         # Items section
         self.setup_items_section(workspace_layout)
         
-        # Totals section
-        self.setup_totals_section(layout)
-        
-        # Buttons
-        self.setup_buttons(layout)
+        # The footer stays outside the scroll area and therefore remains in
+        # the dialog's available work area when Windows maximizes it.
+        footer = QWidget()
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(6)
+        self.setup_totals_section(footer_layout)
+        self.setup_buttons(footer_layout)
+        layout.addWidget(footer, 0)
     
     def setup_parameters_section(self, parent_layout):
         """Setup operation parameters with auto-sizing form"""

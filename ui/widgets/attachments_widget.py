@@ -69,7 +69,7 @@ class _AttachmentFetchWorker(QObject):
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                if not worker_db.connect(initialize_schema=False):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
             records = worker_db.list_attachments(self.entity_type, self.entity_id)
             needle, kind = self.needle, self.kind
@@ -132,7 +132,7 @@ class _ClientSalesFetchWorker(QObject):
                 worker_db = Database(self.database.profile_manager)
                 worker_db.language = getattr(self.database, 'language', 'en')
                 worker_db.registered_classes = self.database.registered_classes
-                if not worker_db.connect():
+                if not worker_db.connect(initialize_schema=False):
                     raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
             sales = worker_db.get_client_sales(self.client_id)
             logger.debug(

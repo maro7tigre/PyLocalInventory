@@ -276,8 +276,13 @@ class Database:
         finally:
             admin_conn.close()
 
-    def connect(self):
-        """Establish database connection for the selected profile."""
+    def connect(self, initialize_schema=True):
+        """Establish a database connection for the selected profile.
+
+        Only the application's startup connection initializes tables and
+        migrations. Background readers use an already-initialized production
+        database and must not contend on DDL before serving a query.
+        """
         self.last_error = None
         if not self.profile_manager or not self.profile_manager.selected_profile:
             self.last_error = "No profile selected, cannot connect to database"
@@ -299,7 +304,8 @@ class Database:
 
             if profile.database_name or not profile.schema_name:
                 profile.database_name = database_name
-                self._ensure_profile_database(pg_config, database_name)
+                if initialize_schema:
+                    self._ensure_profile_database(pg_config, database_name)
                 self.conn = psycopg2.connect(
                     host=pg_config.get('host'),
                     port=pg_config.get('port'),
@@ -313,17 +319,8 @@ class Database:
                 self.database_name = database_name
                 self.schema_name = None
 
-                # Create tables for all registered classes
-                self._create_all_tables()
-
-                # Ensure meta/migrations and run one-time tasks
-                self._ensure_meta_table()
-                self._ensure_user_tables()
-                self._ensure_attachment_tables()
-                self._ensure_payments_table()
-                self._ensure_facture_tables()
-                self._ensure_change_log_table()
-                self._run_one_time_migrations()
+                if initialize_schema:
+                    self._initialize_schema()
 
                 print(f"✓ Connected to database: {database_name}")
                 diagnostics.db_connection_opened(kind="local")
@@ -345,23 +342,15 @@ class Database:
             )
             self.cursor = diagnostics.track_cursor(self.conn.cursor())
 
-            self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
-            self.conn.commit()
+            if initialize_schema:
+                self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                self.conn.commit()
             self.cursor.execute(f"SET search_path TO {schema_name}")
             self.database_name = None
             self.schema_name = schema_name
 
-            # Create tables for all registered classes
-            self._create_all_tables()
-
-            # Ensure meta/migrations and run one-time tasks
-            self._ensure_meta_table()
-            self._ensure_user_tables()
-            self._ensure_attachment_tables()
-            self._ensure_payments_table()
-            self._ensure_facture_tables()
-            self._ensure_change_log_table()
-            self._run_one_time_migrations()
+            if initialize_schema:
+                self._initialize_schema()
 
             print(f"✓ Connected to database schema: {schema_name}")
             diagnostics.db_connection_opened(kind="local")
@@ -377,6 +366,17 @@ class Database:
             logger.exception("Database initialization failed")
             print(f"✗ Failed to connect to database: {e}")
             return False
+
+    def _initialize_schema(self):
+        """Run controlled schema initialization on the startup connection only."""
+        self._create_all_tables()
+        self._ensure_meta_table()
+        self._ensure_user_tables()
+        self._ensure_attachment_tables()
+        self._ensure_payments_table()
+        self._ensure_facture_tables()
+        self._ensure_change_log_table()
+        self._run_one_time_migrations()
 
     @staticmethod
     def _sql_type_for(param_type):
@@ -1205,7 +1205,7 @@ class Database:
             "selected_total_ttc": round_money(source_total_ttc),
             "items": [item for draft in drafts for item in draft["items"]],
         }
-        if facture_type == "balance":
+        if facture_type in ("advance", "balance"):
             result["previous_advance_ttc"] = self.get_previous_advance_total(source_ids)
             result["remaining_ttc"] = max(Decimal("0"), result["selected_total_ttc"] - result["previous_advance_ttc"])
         return result
@@ -1223,7 +1223,7 @@ class Database:
         )
         params = list(source_ids) + list(source_ids)
         if exclude_facture_id:
-            query += " AND fs.facture_id <> %s"
+            query += " AND f.id <> %s"
             params.append(int(exclude_facture_id))
         self.cursor.execute(query, params)
         return round_money(sum((self._facture_totals(row[0])["total_ttc"] for row in self.cursor.fetchall()), Decimal("0")))
@@ -2566,6 +2566,12 @@ class Database:
             # creates and edits persist (and can switch) the flag.
             if "is_historical" in sale_data:
                 header["is_historical"] = self._parse_bool_flag(sale_data["is_historical"])
+            # PostgreSQL requires a real bool for this BOOLEAN column. Older
+            # parameter mappings could supply numeric 0/1 values here.
+            if "remise_includes_line_discounts" in header:
+                header["remise_includes_line_discounts"] = self._parse_bool_flag(
+                    header["remise_includes_line_discounts"]
+                )
             if sale_id:
                 for protected in (
                     "created_by", "created_by_username", "created_at", "operation_token"

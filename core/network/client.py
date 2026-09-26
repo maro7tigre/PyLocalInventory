@@ -162,7 +162,7 @@ class RemoteDatabase:
     def list_factures(self): return self._call('list_factures', [])
     def get_facture_payments(self, facture_id): return self._call('get_facture_payments', [facture_id])
     def get_facture_draft_from_sales(self, sale_ids, facture_type='normal', date=None, exclude_facture_id=None): return self._call('get_facture_draft_from_sales', [sale_ids, facture_type, date, exclude_facture_id])
-    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None): return self._call('get_invoiced_total_for_sources', [sale_ids, exclude_facture_id])
+    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, strict=True): return self._call('get_invoiced_total_for_sources', [sale_ids, exclude_facture_id], {'strict': strict})
     def save_facture_with_items(self, data, items, facture_id=None): return self._call('save_facture_with_items', [data, items, facture_id])
     def add_facture_payment(self, *args): return self._call('add_facture_payment', list(args))
     def update_facture_payment(self, *args): return self._call('update_facture_payment', list(args))

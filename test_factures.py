@@ -1,5 +1,6 @@
 """Focused no-database regression tests for the Factures presentation contract."""
 
+import json
 import os
 import unittest
 from decimal import Decimal
@@ -11,6 +12,7 @@ from PySide6.QtCore import Qt
 
 from core.moroccan_dirham_words import amount_to_words
 from core.database import Database
+from core.calculations import to_decimal
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
 from core.profiles import ProfileClass
@@ -162,6 +164,114 @@ class _MultiDraftDatabase(Database):
             "items": [{"item_type": "manual", "designation": f"Ligne {sale_id}", "quantity": 1,
                        "unit_price": Decimal("100"), "discount_percentage": 0}],
         }
+
+
+class _CountingConnection:
+    """Connection double that records commits so a read path can be proven read-only."""
+
+    def __init__(self):
+        self.commits = 0
+        self.rollbacks = 0
+
+    def commit(self):
+        self.commits += 1
+
+    def rollback(self):
+        self.rollbacks += 1
+
+
+class _AllocationCursor:
+    """Answers the exact queries the allocation guard and backfill issue."""
+
+    def __init__(self, database):
+        self.db = database
+        self.updates = []
+        self.rowcount = 0
+
+    def execute(self, sql, params=None):
+        normalized = " ".join(sql.split()).upper()
+        if normalized.startswith("SELECT FACTURE_ID, SALE_ID FROM FACTURE_SOURCES"):
+            self.rows = [(fid, sid) for fid, sids in self.db.pending_sources.items()
+                         for sid in sids]
+        elif normalized.startswith("SELECT SALE_ID FROM FACTURE_SOURCES"):
+            self.rows = [(sid,) for sid in self.db.invoice_sources[int(params[0])]]
+        elif normalized.startswith("UPDATE FACTURE_SOURCES"):
+            self.updates.append((sql, params))
+            self.rowcount = 1
+            self.rows = []
+        else:
+            self.rows = []
+
+    def fetchall(self):
+        return self.rows
+
+
+class _AmbiguousAllocationDatabase(Database):
+    """Database double reproducing legacy invoices that have no stored split."""
+
+    def __init__(self, allocations, invoice_sources=None):
+        super().__init__()
+        self.allocations = allocations
+        self.invoice_sources = invoice_sources or {}
+        self.pending_sources = {}
+        self.facture_totals = {}
+        self.cursor = _AllocationCursor(self)
+        self.conn = _CountingConnection()
+
+    def _source_allocation_rows(self, source_ids, exclude_facture_id=None):
+        requested = set(source_ids)
+        return [(sid, alloc, fid) for sid, rows in self.allocations.items()
+                for alloc, fid in rows if sid in requested]
+
+    def _facture_totals(self, facture_id):
+        return {"total_ttc": self.facture_totals[facture_id]}
+
+
+class _ListResilientDatabase(Database):
+    """One invoice raises while loading; the other must still be listed."""
+
+    class _Cursor:
+        def __init__(self, rows):
+            self.rows = rows
+            self._rows = None
+
+        def execute(self, sql, params=None):
+            self._rows = self.rows
+
+        def fetchall(self):
+            return self._rows
+
+        def fetchone(self):
+            return self._rows[0] if self._rows else None
+
+    class _Conn:
+        def rollback(self):
+            pass
+
+    def __init__(self):
+        super().__init__()
+        header = (2, "FA-LEGACY/2026", None, "DE-1", 7, "c", "C", "", "", None,
+                  "2026-09-23", "normal", Decimal("20"), Decimal("0"), True,
+                  Decimal("1000.00"), Decimal("0"), "", None, None)
+        self.cursor = self._Cursor([(1,), (2,)])
+        self.conn = self._Conn()
+        self._headers = {2: header}
+
+    def get_facture(self, facture_id, user=None):
+        if int(facture_id) == 1:
+            return {"id": 1, "facture_number": "FA-OK/2026"}
+        raise ValueError("legacy row cannot be rebuilt")
+
+    def _facture_header_fallback(self, facture_id):
+        row = self._headers.get(int(facture_id))
+        if not row:
+            return None
+        fields = ("id", "facture_number", "source_sale_id", "source_devis", "client_id",
+                  "client_username", "client_name", "client_address", "client_city", "client_ice",
+                  "date", "facture_type", "tva_rate", "remise", "remise_includes_line_discounts",
+                  "selected_total_ttc", "previous_advance_ttc", "notes", "created_at", "updated_at")
+        return dict(zip(fields, row), read_error=True,
+                    already_invoiced_ttc=to_decimal(row[16] or 0))
 
 
 class FactureEditorTests(unittest.TestCase):
@@ -336,6 +446,79 @@ class FactureEditorTests(unittest.TestCase):
         self.assertEqual(Database._proportional_allocations({18: Decimal("40000"), 19: Decimal("60000")}, Decimal("30000")), {
             18: Decimal("12000.00"), 19: Decimal("18000.00"),
         })
+
+    # ---- Legacy invoices with no stored per-Devis allocation ---------------
+    # A pre-existing invoice spanning several Devis without a stored split must
+    # never make invoices unreadable, and must only block a NEW balance calc.
+
+    def test_ambiguous_legacy_allocation_never_raises_on_the_read_path(self):
+        database = _AmbiguousAllocationDatabase(
+            {18: [(None, 4)], 19: [(None, 4)], 20: [(None, 4)]}, {4: [18, 19, 20]})
+        read = database.get_invoiced_total_for_sources([18, 19, 20], strict=False)
+        self.assertTrue(read["ambiguous_facture_ids"])
+        self.assertEqual(read["group_level"], True)
+
+    def test_strict_calculation_refuses_to_guess_an_ambiguous_legacy_allocation(self):
+        database = _AmbiguousAllocationDatabase(
+            {18: [(None, 4)], 19: [(None, 4)], 20: [(None, 4)]}, {4: [18, 19, 20]})
+        # A single Devis out of a multi-Devis legacy invoice cannot be resolved.
+        with self.assertRaisesRegex(ValueError, "ancienne facture"):
+            database.get_invoiced_total_for_sources([18], strict=True)
+
+    def test_strict_calculation_accepts_the_exact_same_devis_group(self):
+        database = _AmbiguousAllocationDatabase(
+            {18: [(None, 4)], 19: [(None, 4)], 20: [(None, 4)]}, {4: [18, 19, 20]})
+        database.facture_totals = {4: Decimal("50000")}
+        result = database.get_invoiced_total_for_sources([18, 19, 20], strict=True)
+        self.assertEqual(result["total_ttc"], Decimal("50000.00"))
+        self.assertEqual(result["group_level"], True)
+
+    def test_group_total_adds_every_ambiguous_legacy_invoice(self):
+        database = _AmbiguousAllocationDatabase(
+            {18: [(None, 4), (None, 5)], 19: [(None, 4), (None, 5)], 20: [(None, 4), (None, 5)]},
+            {4: [18, 19, 20], 5: [18, 19, 20]})
+        database.facture_totals = {4: Decimal("50000"), 5: Decimal("8000")}
+        result = database.get_invoiced_total_for_sources([18, 19, 20], strict=True)
+        self.assertEqual(result["total_ttc"], Decimal("58000.00"))
+        self.assertEqual(result["ambiguous_facture_ids"], [4, 5])
+
+    def test_allocation_result_stays_json_safe_for_remote_clients(self):
+        database = _AmbiguousAllocationDatabase(
+            {18: [(None, 4)], 19: [(None, 4)], 20: [(None, 4)]}, {4: [18, 19, 20]})
+        database.facture_totals = {4: Decimal("50000")}
+        result = database.get_invoiced_total_for_sources([18, 19, 20], strict=True)
+        # A set would be serialized as a string by the RPC encoder's default=str.
+        encoded = json.loads(json.dumps(result, default=str))
+        self.assertEqual(encoded["ambiguous_facture_ids"], [4])
+
+    def test_ambiguity_message_never_says_historique(self):
+        # The user-facing wording must describe an old invoice, not call it
+        # "facture historique".
+        self.assertIn("ancienne facture", Database.AMBIGUOUS_ALLOCATION_MESSAGE)
+        self.assertNotIn("historique", Database.AMBIGUOUS_ALLOCATION_MESSAGE)
+
+    def test_reading_an_invoice_does_not_backfill_or_commit(self):
+        database = _AmbiguousAllocationDatabase({18: [(None, 4)]}, {4: [18, 19, 20]})
+        database.get_invoiced_total_for_sources([18], strict=False)
+        self.assertEqual(database.conn.commits, 0)
+        self.assertEqual(database.cursor.updates, [])
+
+    def test_backfill_only_resolves_single_devis_legacy_invoices(self):
+        database = _AmbiguousAllocationDatabase({18: [(None, 4), (None, 6)]}, {4: [18, 19, 20]})
+        database.facture_totals = {4: Decimal("50000"), 6: Decimal("4000")}
+        database.pending_sources = {4: [18, 19, 20], 6: [18]}
+        database._backfill_unambiguous_source_allocations()
+        # Only the unambiguous single-Devis invoice 6 got a stored split.
+        self.assertEqual([call[1] for call in database.cursor.updates],
+                         [(Decimal("4000.00"), 6, 18)])
+        self.assertEqual(database.conn.commits, 1)
+
+    def test_list_factures_keeps_a_row_whose_derived_data_cannot_be_rebuilt(self):
+        database = _ListResilientDatabase()
+        listed = database.list_factures()
+        self.assertEqual([f["id"] for f in listed], [1, 2])
+        self.assertEqual(listed[1]["read_error"], True)
+        self.assertEqual(listed[1]["facture_number"], "FA-LEGACY/2026")
 
     def test_paid_balance_document_keeps_payment_balance_separate(self):
         facture = {

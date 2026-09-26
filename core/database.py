@@ -1266,32 +1266,129 @@ class Database:
             allocations[source_ids[-1]] = round_money(amount - assigned)
         return allocations
 
-    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, user=None):
-        """Return issued TTC allocated to each requested Devis, never payments."""
-        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
-        if not source_ids:
-            return {"total_ttc": Decimal("0"), "by_source": {}}
+    # Message for a NEW billing calculation that cannot be done safely. Reads
+    # never raise this - an old invoice must stay viewable no matter what.
+    AMBIGUOUS_ALLOCATION_MESSAGE = (
+        "Impossible de calculer automatiquement le reste à facturer pour ce devis : "
+        "une ancienne facture liée à plusieurs devis ne contient pas de répartition "
+        "détaillée. Créez la nouvelle facture depuis les devis complets concernés, "
+        "ou saisissez le montant manuellement."
+    )
+
+    def _backfill_unambiguous_source_allocations(self):
+        """Give legacy invoices an allocation when it is mathematically certain.
+
+        An invoice linked to exactly ONE Devis cannot be ambiguous: its whole
+        accounting amount belongs to that Devis. The amount comes from the
+        authoritative _facture_totals(), so the Remise/TVA rules are never
+        re-implemented here. Idempotent (guarded on allocated_ttc IS NULL) and
+        non-destructive: a multi-Devis invoice keeps an unknown split and is
+        never given invented numbers.
+
+        Called from the one-time migration, not from a read path, so reading
+        invoices never performs a write.
+        """
+        self.cursor.execute(
+            "SELECT facture_id, sale_id FROM facture_sources "
+            "WHERE allocated_ttc IS NULL ORDER BY facture_id, sale_id"
+        )
+        pending = {}
+        for facture_id, sale_id in self.cursor.fetchall():
+            pending.setdefault(int(facture_id), []).append(int(sale_id))
+        filled = 0
+        for facture_id, sale_ids in pending.items():
+            if len(sale_ids) != 1:
+                continue
+            try:
+                total = self._facture_totals(facture_id)["total_ttc"]
+            except Exception:
+                continue
+            self.cursor.execute(
+                "UPDATE facture_sources SET allocated_ttc=%s "
+                "WHERE facture_id=%s AND sale_id=%s AND allocated_ttc IS NULL",
+                (total, facture_id, sale_ids[0]),
+            )
+            filled += self.cursor.rowcount or 0
+        self.conn.commit()
+        if filled:
+            print(
+                f"Migrated facture_sources.allocated_ttc: {filled} unambiguous "
+                "single-Devis link(s) resolved; multi-Devis invoices left unknown"
+            )
+        return filled
+
+    def _source_allocation_rows(self, source_ids, exclude_facture_id=None):
         placeholders = ",".join(["%s"] * len(source_ids))
         params = list(source_ids)
         query = (
-            "SELECT fs.sale_id, fs.allocated_ttc, f.id FROM facture_sources fs "
-            "JOIN factures f ON f.id=fs.facture_id "
+            "SELECT fs.sale_id, fs.allocated_ttc, fs.facture_id FROM facture_sources fs "
             f"WHERE fs.sale_id IN ({placeholders})"
         )
         if exclude_facture_id:
-            query += " AND f.id <> %s"
+            query += " AND fs.facture_id <> %s"
             params.append(int(exclude_facture_id))
-        self.cursor.execute(query, params)
+        self.cursor.execute(query + " ORDER BY fs.facture_id, fs.sale_id", params)
+        return [(int(row[0]), row[1], int(row[2])) for row in self.cursor.fetchall()]
+
+    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, user=None,
+                                        strict=True):
+        """Issued TTC allocated to each requested Devis, never payments.
+
+        ``strict=True`` (new billing calculation only) refuses to guess when an
+        older invoice spanning several Devis has no stored per-Devis split.
+        ``strict=False`` is the READ path: it reports what is known and flags
+        the ambiguity instead of raising, so listing, previewing, printing and
+        payment history of an existing invoice can never fail.
+
+        ``ambiguous_facture_ids`` is a sorted list of ids, not a set, so the
+        result stays JSON-safe over the RPC layer.
+        """
+        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
+        if not source_ids:
+            return {"total_ttc": Decimal("0"), "by_source": {},
+                    "ambiguous_facture_ids": [], "group_level": False}
+        rows = self._source_allocation_rows(source_ids, exclude_facture_id)
         by_source = {source_id: Decimal("0") for source_id in source_ids}
-        for source_id, allocated_ttc, facture_id in self.cursor.fetchall():
+        ambiguous = {}
+        for source_id, allocated_ttc, facture_id in rows:
             if allocated_ttc is None:
-                raise ValueError(
-                    "La répartition d'une facture historique liée à ce devis est inconnue; "
-                    "un nouveau calcul de reste à facturer serait ambigu."
-                )
-            by_source[int(source_id)] += to_decimal(allocated_ttc)
+                ambiguous.setdefault(facture_id, set()).add(source_id)
+                continue
+            by_source[source_id] += to_decimal(allocated_ttc)
         by_source = {source_id: round_money(value) for source_id, value in by_source.items()}
-        return {"total_ttc": round_money(sum(by_source.values(), Decimal("0"))), "by_source": by_source}
+
+        if ambiguous and strict:
+            # A group that covers the ambiguous invoice's Devis exactly is safe:
+            # the group total is known even though its internal split is not.
+            requested = set(source_ids)
+            grouped_total = sum(by_source.values(), Decimal("0"))
+            sources_of = {}
+            for facture_id in ambiguous:
+                self.cursor.execute(
+                    "SELECT sale_id FROM facture_sources WHERE facture_id=%s", (facture_id,)
+                )
+                sources_of[facture_id] = {int(r[0]) for r in self.cursor.fetchall()}
+            unresolved = [fid for fid, srcs in sources_of.items() if srcs != requested]
+            if unresolved:
+                raise ValueError(self.AMBIGUOUS_ALLOCATION_MESSAGE)
+            # Exact same Devis group: each ambiguous invoice's group total is
+            # known even though its internal split is not, so every one of them
+            # is added. The new invoice's own split is computed fresh from the
+            # remaining amounts by the caller.
+            for facture_id in ambiguous:
+                grouped_total = grouped_total + self._facture_totals(facture_id)["total_ttc"]
+            return {
+                "total_ttc": round_money(grouped_total), "by_source": by_source,
+                "ambiguous_facture_ids": sorted(ambiguous),
+                "group_level": True,
+            }
+
+        return {
+            "total_ttc": round_money(sum(by_source.values(), Decimal("0"))),
+            "by_source": by_source,
+            "ambiguous_facture_ids": sorted(ambiguous),
+            "group_level": bool(ambiguous),
+        }
 
     def _facture_payment_total(self, facture_id):
         self.cursor.execute(
@@ -1600,22 +1697,72 @@ class Database:
             Decimal("0"),
             project["selected_total_ttc"] - scope["previous_paid_ttc"] - scope["current_paid_ttc"],
         )
-        # Amount already invoiced on OTHER invoices for the same Devis scope.
-        # This is invoicing, not payment: it is what makes a balance invoice
-        # worth (project TTC - already invoiced).
-        result["already_invoiced_ttc"] = self.get_invoiced_total_for_sources(
-            [source["sale_id"] for source in result["sources"]], facture_id
-        )["total_ttc"] if result["sources"] else Decimal("0")
+        # Informational only, and deliberately tolerant: reading an existing
+        # invoice must never compute (or refuse) a new billing balance. The
+        # strict per-Devis allocation check belongs to the new-invoice path
+        # only (get_facture_draft_from_sales / save_facture_with_items).
+        source_sale_ids = [source["sale_id"] for source in result["sources"]]
+        result["already_invoiced_ttc"] = (
+            self.get_invoiced_total_for_sources(
+                source_sale_ids, facture_id, strict=False
+            )["total_ttc"] if source_sale_ids else Decimal("0")
+        )
         result["source_items"] = (
             self._facture_source_items(facture_id)
             if str(result.get("facture_type")) == "balance" else []
         )
         return result
 
+    def _facture_header_fallback(self, facture_id):
+        """Minimal invoice row built only from persisted header values.
+
+        Used by list_factures() so an invoice whose optional derived data
+        cannot be rebuilt is still listed (and can still be opened) instead of
+        disappearing from the table. No cross-invoice money is computed here.
+        """
+        self.cursor.execute(
+            "SELECT id, facture_number, source_sale_id, source_devis, client_id, client_username, "
+            "client_name, client_address, client_city, client_ice, date, facture_type, tva_rate, "
+            "remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, "
+            "created_at, updated_at FROM factures WHERE id=%s", (int(facture_id),)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        fields = ("id", "facture_number", "source_sale_id", "source_devis", "client_id",
+                  "client_username", "client_name", "client_address", "client_city", "client_ice",
+                  "date", "facture_type", "tva_rate", "remise", "remise_includes_line_discounts",
+                  "selected_total_ttc", "previous_advance_ttc", "notes", "created_at", "updated_at")
+        result = dict(zip(fields, row))
+        result["read_error"] = True
+        result["already_invoiced_ttc"] = to_decimal(result.get("previous_advance_ttc") or 0)
+        return result
+
     def list_factures(self, user=None):
-        """List invoice headers with status derived from items and ledger rows."""
+        """List invoice headers with status derived from items and ledger rows.
+
+        Each invoice is read independently. If one invoice's optional derived
+        data cannot be rebuilt, it is still listed from its persisted header
+        values rather than aborting the whole query, so the Factures tab always
+        shows every invoice.
+        """
         self.cursor.execute("SELECT id FROM factures ORDER BY date DESC, id DESC")
-        return [self.get_facture(row[0]) for row in self.cursor.fetchall()]
+        factures = []
+        for row in self.cursor.fetchall():
+            facture_id = int(row[0])
+            try:
+                factures.append(self.get_facture(facture_id))
+            except Exception as exc:
+                logger.exception("Facture id=%s listed from persisted header: %s", facture_id, exc)
+                try:
+                    fallback = self._facture_header_fallback(facture_id)
+                except Exception:
+                    self.conn.rollback()
+                    logger.exception("Facture id=%s header fallback failed", facture_id)
+                    fallback = None
+                if fallback:
+                    factures.append(fallback)
+        return factures
 
     def add_facture_payment(self, facture_id, amount, date, method="Autre", reference="", notes="", user=None):
         """Add a ledger payment allocation without creating a second transaction."""
@@ -2249,7 +2396,8 @@ class Database:
         # Fast path: if all flags are already set, nothing to do (no lock needed)
         if (self._get_meta('fk_relaxed', '0') == '1' and
                 self._get_meta('backfill_product_name_done', '0') == '1' and
-                self._get_meta('sales_affect_stock_backfill_done', '0') == '1'):
+                self._get_meta('sales_affect_stock_backfill_done', '0') == '1' and
+                self._get_meta('facture_allocation_backfill_done', '0') == '1'):
             return
 
         lock_target = self.database_name or self.schema_name
@@ -2265,7 +2413,7 @@ class Database:
             try:
                 self.cursor.execute(
                     "SELECT key, value FROM meta WHERE key IN "
-                    "('fk_relaxed','backfill_product_name_done','sales_affect_stock_backfill_done')"
+                    "('fk_relaxed','backfill_product_name_done','sales_affect_stock_backfill_done','facture_allocation_backfill_done')"
                 )
                 flags = {row[0]: row[1] for row in self.cursor.fetchall()}
             except Exception as e:
@@ -2276,6 +2424,7 @@ class Database:
             fk_done = flags.get('fk_relaxed', '0') == '1'
             backfill_done = flags.get('backfill_product_name_done', '0') == '1'
             affect_stock_done = flags.get('sales_affect_stock_backfill_done', '0') == '1'
+            facture_allocation_done = flags.get('facture_allocation_backfill_done', '0') == '1'
 
             # 1) Legacy product_id FK relaxation: fresh Postgres schemas are
             # created without that FK to begin with (see _create_table_for_class),
@@ -2351,6 +2500,19 @@ class Database:
             except Exception as e:
                 self.conn.rollback()
                 print(f"Warning: could not finalize sales.affect_stock: {e}")
+
+            # Legacy invoices that predate per-Devis allocations. Only an
+            # invoice linked to exactly ONE Devis is mathematically certain, so
+            # only those get a stored split; multi-Devis invoices keep an
+            # unknown split instead of invented numbers. Runs here (not in the
+            # read path) so simply listing invoices never writes.
+            if not facture_allocation_done:
+                try:
+                    self._backfill_unambiguous_source_allocations()
+                    self._set_meta('facture_allocation_backfill_done', '1')
+                except Exception as e:
+                    self.conn.rollback()
+                    print(f"facture allocation backfill migration failed: {e}")
         finally:
             try:
                 self.cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))

@@ -3,7 +3,7 @@ Sales tab - Updated to use unified BaseTab approach
 Now consistent with Products/Clients/Suppliers experience
 """
 from ui.tabs.base_tab import BaseTab
-from PySide6.QtCore import Qt, QPoint, QDate
+from PySide6.QtCore import Qt, QPoint, QRect, QDate
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QSpinBox, QLineEdit,
     QWidget, QFrame, QPushButton, QMessageBox)
@@ -430,10 +430,58 @@ class SalesTab(BaseTab):
 
         popup.setStyleSheet("#statePopup { background:#2f2f2f; border:2px solid #444; border-radius:10px; }")
         self._state_popup = popup
-        # Position near anchor
-        global_pos = anchor.mapToGlobal(anchor.rect().bottomLeft())
-        popup.move(global_pos + QPoint(0, 6))
+        # Build the real size before measuring, so the placement below uses the
+        # popup's actual height/width rather than a guess.
+        popup.adjustSize()
+        self._position_state_popup(popup, anchor)
         popup.show()
+
+    def _position_state_popup(self, popup, anchor):
+        """Place the popup inside the anchor's screen working area.
+
+        ``availableGeometry()`` is used on purpose: on Windows it already
+        excludes the taskbar (and any other reserved strip), so the popup can
+        never be pushed behind it. Preference is below the State button; when
+        the bottom of the screen is too close, the popup flips above the
+        button instead of being clipped.
+        """
+        from PySide6.QtGui import QGuiApplication
+
+        screen = anchor.screen() if hasattr(anchor, 'screen') else None
+        if screen is None:
+            screen = QGuiApplication.screenAt(anchor.mapToGlobal(QPoint(0, 0)))
+        if screen is None:
+            screen = popup.screen() or QGuiApplication.primaryScreen()
+        if screen is None:
+            return
+        available = screen.availableGeometry()
+
+        # mapToGlobal() takes a point, so rebuild the button's global rect from
+        # its top-left corner and size.
+        anchor_rect = QRect(anchor.mapToGlobal(QPoint(0, 0)), anchor.size())
+        popup_width = popup.width() or popup.sizeHint().width()
+        popup_height = popup.height() or popup.sizeHint().height()
+
+        gap = 6
+        space_below = available.bottom() - anchor_rect.bottom() - gap
+        space_above = anchor_rect.top() - available.top() - gap
+        if popup_height <= space_below:
+            y = anchor_rect.bottom() + gap
+        elif popup_height <= space_above:
+            y = anchor_rect.top() - gap - popup_height
+        else:
+            # Neither side fits: keep the top of the popup on screen, which is
+            # where the most room is on every desktop layout.
+            y = available.top()
+
+        x = anchor_rect.left()
+        # Never let the popup run past either screen edge.
+        x = max(x, available.left())
+        if popup_width < available.width():
+            x = min(x, available.right() - popup_width + 1)
+        if popup_height >= available.height():
+            y = available.top()
+        popup.move(x, y)
 
     def _cancel_sale_from_popup(self, popup, obj):
         """Permanently remove a sale after explicit confirmation."""

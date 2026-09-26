@@ -6,6 +6,8 @@ from decimal import Decimal
 
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
+from PySide6.QtCore import QPoint
+from PySide6.QtGui import QGuiApplication
 from PySide6.QtWidgets import QApplication, QPushButton
 
 from core.sales_states import is_financially_active, sale_state_label
@@ -101,6 +103,100 @@ class SalesStateRefreshTests(unittest.TestCase):
         self.app.processEvents()
         self.assertIsNotNone(getattr(self.tab, "_state_popup", None))
         self.tab._state_popup.close()
+
+
+class StatePopupPlacementTests(unittest.TestCase):
+    """The State popup must stay inside the screen working area (taskbar-free)."""
+
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+        cls.screen = QGuiApplication.primaryScreen()
+        cls.available = cls.screen.availableGeometry()
+
+    def setUp(self):
+        self.tab = SalesTab(type("DB", (), {"has_permission": lambda self, *a: True})())
+
+    def tearDown(self):
+        popup = getattr(self.tab, "_state_popup", None)
+        if popup is not None:
+            popup.close()
+        self.tab.deleteLater()
+
+    def _anchor_at(self, y):
+        """A real top-level button placed at an exact global y position."""
+        button = QPushButton("State")
+        button.resize(90, 24)
+        button.move(self.available.left() + 40, y)
+        button.show()
+        self.app.processEvents()
+        return button
+
+    def _open_popup_for(self, anchor):
+        self.tab._open_state_popup(_Sale(1, "pending"), anchor)
+        self.app.processEvents()
+        return self.tab._state_popup
+
+    def test_popup_opens_below_for_a_row_near_the_top(self):
+        popup = self._open_popup_for(self._anchor_at(self.available.top() + 20))
+        anchor_bottom = self.available.top() + 20 + 24
+        self.assertGreaterEqual(popup.y(), anchor_bottom)
+        self.assertTrue(self.available.contains(popup.geometry()))
+
+    def test_popup_opens_below_for_a_row_in_the_middle(self):
+        middle = self.available.center().y()
+        popup = self._open_popup_for(self._anchor_at(middle - 12))
+        self.assertGreaterEqual(popup.y(), middle + 12)
+        self.assertTrue(self.available.contains(popup.geometry()))
+
+    def test_popup_flips_above_for_the_last_row_near_the_taskbar(self):
+        # Anchor hugging the bottom of the working area: no room below.
+        anchor = self._anchor_at(self.available.bottom() - 24)
+        popup = self._open_popup_for(anchor)
+        self.assertLessEqual(popup.geometry().bottom(), anchor.mapToGlobal(QPoint(0, 0)).y())
+        self.assertTrue(self.available.contains(popup.geometry()))
+        # Every option must still be reachable, not clipped.
+        self.assertLessEqual(popup.height(), self.available.height())
+
+    def test_popup_never_crosses_either_screen_edge(self):
+        for x in (self.available.left() - 30, self.available.right() - 20):
+            anchor = self._anchor_at(self.available.center().y() - 12)
+            anchor.move(x, anchor.y())
+            self.app.processEvents()
+            popup = self._open_popup_for(anchor)
+            self.assertGreaterEqual(popup.x(), self.available.left())
+            self.assertLessEqual(popup.geometry().right(), self.available.right())
+            popup.close()
+
+    def test_popup_fits_after_resizing_to_a_small_window(self):
+        for width, height in ((420, 320), (900, 600), (1600, 1000)):
+            self.tab.resize(width, height)
+            self.app.processEvents()
+            anchor = self._anchor_at(self.available.bottom() - 24)
+            popup = self._open_popup_for(anchor)
+            self.assertTrue(
+                self.available.contains(popup.geometry()),
+                f"popup escaped the working area at {width}x{height}",
+            )
+            popup.close()
+
+    def test_all_state_options_and_cancel_remain_present_and_clickable(self):
+        popup = self._open_popup_for(self._anchor_at(self.available.top() + 20))
+        labels = [button.text() for button in popup.findChildren(QPushButton)]
+        self.assertEqual(
+            labels, ["On Hold", "Pending", "Confirmed", "Finished", "Cancel"]
+        )
+        for button in popup.findChildren(QPushButton):
+            self.assertTrue(button.isVisible())
+            self.assertTrue(button.isEnabled())
+        # Cancel must still be wired to the cancel handler. The real handler
+        # shows a blocking confirmation, so it is replaced here.
+        calls = []
+        self.tab._cancel_sale_from_popup = lambda pop, _obj: (calls.append(pop), pop.close())
+        popup.findChildren(QPushButton)[-1].click()
+        self.app.processEvents()
+        self.assertEqual(len(calls), 1, "Cancel is not wired to the cancel handler")
+        self.assertFalse(popup.isVisible())
 
 
 class ClientActiveDebtTests(unittest.TestCase):

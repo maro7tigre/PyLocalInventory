@@ -5,7 +5,7 @@ from datetime import date, datetime
 from decimal import Decimal, InvalidOperation
 
 from PySide6.QtCore import QMarginsF, QRectF, Qt
-from PySide6.QtGui import QColor, QFont, QImage, QPainter, QPageLayout, QPageSize, QPen
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPageLayout, QPageSize, QPen
 
 from core.calculations import calculate_line_subtotal, round_money
 from core.runtime_paths import resource_path
@@ -14,6 +14,11 @@ from core.runtime_paths import resource_path
 PAGE_MARGINS_MM = QMarginsF(14, 12, 14, 14)
 PRINTABLE_WIDTH_MM = 182
 PREVIEW_DPI = 144
+TABLE_HEADER_HEIGHT = 9
+MIN_ITEM_ROW_HEIGHT = 9
+TOTAL_ROW_HEIGHT = 6
+FINAL_SAFE_GAP = 5
+MIN_TABLE_ROWS = 13
 
 
 def money(value):
@@ -181,25 +186,113 @@ def _document_data(facture, payments, profile):
     return data
 
 
-def _page_items(items):
-    """Reserve the lower final-page area for settlement and legal footer."""
-    if len(items) <= 14:
-        return [(items, True)]
-    pages = []
-    remaining = list(items)
-    while len(remaining) > 20:
-        count = min(18, len(remaining) - 20)
-        pages.append((remaining[:count], False))
-        remaining = remaining[count:]
-    pages.append((remaining, True))
-    return pages
-
-
 def _font(size, bold=False):
     font = QFont("Arial")
     font.setPointSizeF(size)
     font.setBold(bold)
     return font
+
+
+def _text_height(text, width_mm, size, bold=False, minimum=0):
+    """Measure wrapped painter text in physical millimetres for page planning."""
+    if not text:
+        return minimum
+    pixels_per_mm = 96 / 25.4
+    bounds = QFontMetricsF(_font(size, bold)).boundingRect(
+        QRectF(0, 0, width_mm * pixels_per_mm, 100000), Qt.TextWordWrap, text
+    )
+    return max(minimum, bounds.height() / pixels_per_mm)
+
+
+def _item_height(item):
+    if item.get("section"):
+        return MIN_ITEM_ROW_HEIGHT
+    description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
+    return max(MIN_ITEM_ROW_HEIGHT, _text_height(description, 94.28, 8.5, minimum=8) + 1)
+
+
+def _footer_height(data):
+    """Keep all legal content inside a fixed, bottom-anchored reserved area."""
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 6.2, minimum=4)
+    return max(
+        27,
+        1 + 4 + 4 + legal_height + 4 + _text_height(data["report_footer"], 182, 5.8, minimum=4) + 1,
+    )
+
+
+def _settlement_height(data):
+    """Measure the unsplittable final settlement block, including all left-side text."""
+    left_height = 5 + 1 + _text_height(data["words"], 98, 9, bold=True, minimum=11)
+    if data["notes"]:
+        left_height += 2 + _text_height(data["notes"], 98, 9.5, bold=True, minimum=5)
+    if data["references"]:
+        left_height += 2 + _text_height("\n".join(data["references"]), 98, 7.5, minimum=4)
+    return max(left_height, len(data["total_rows"]) * TOTAL_ROW_HEIGHT)
+
+
+def _table_y(is_first):
+    return 78 if is_first else 12
+
+
+def _final_page_plan(items, data, printable_height, is_first):
+    """Return a safe final-page plan, or None when its content cannot fit."""
+    footer_height = _footer_height(data)
+    footer_y = printable_height - footer_height
+    settlement_height = _settlement_height(data)
+    settlement_limit = footer_y - FINAL_SAFE_GAP - settlement_height
+    table_y = _table_y(is_first)
+    row_heights = [_item_height(item) for item in items]
+    table_bottom = table_y + TABLE_HEADER_HEIGHT + sum(row_heights)
+    if table_bottom + 5 > settlement_limit:
+        return None
+
+    # Preserve the familiar short-invoice table while never consuming reserved final space.
+    padding_capacity = int((settlement_limit - (table_bottom + 5)) // MIN_ITEM_ROW_HEIGHT)
+    padding = min(max(0, MIN_TABLE_ROWS - len(row_heights)), max(0, padding_capacity))
+    row_heights.extend([MIN_ITEM_ROW_HEIGHT] * padding)
+    return {
+        "items": list(items), "row_heights": row_heights, "is_first": is_first,
+        "is_final": True, "table_y": table_y, "footer_y": footer_y,
+        "footer_height": footer_height, "settlement_y": table_y + TABLE_HEADER_HEIGHT + sum(row_heights) + 5,
+    }
+
+
+def plan_facture_pages(data, printable_height=271):
+    """Plan all pages from measured content; used unchanged by preview, PDF, and print."""
+    remaining = list(data["items"])
+    first_final = _final_page_plan(remaining, data, printable_height, True)
+    if first_final is not None:
+        return [first_final]
+
+    pages = []
+    is_first = True
+    while True:
+        final = _final_page_plan(remaining, data, printable_height, False)
+        if final is not None:
+            pages.append(final)
+            return pages
+
+        table_y = _table_y(is_first)
+        capacity = printable_height - table_y - TABLE_HEADER_HEIGHT - 2
+        used = 0
+        count = 0
+        for item in remaining:
+            height = _item_height(item)
+            # A non-final page must leave at least one item with the final settlement.
+            if count and (used + height > capacity or count == len(remaining) - 1):
+                break
+            if height > capacity:
+                raise ValueError("Une ligne de facture dépasse la zone imprimable A4.")
+            used += height
+            count += 1
+        if not count:
+            raise ValueError("La section finale de la facture dépasse la zone imprimable A4.")
+        pages.append({
+            "items": remaining[:count], "row_heights": [_item_height(item) for item in remaining[:count]],
+            "is_first": is_first, "is_final": False, "table_y": table_y,
+        })
+        remaining = remaining[count:]
+        is_first = False
 
 
 def _draw_text(painter, rect, text, size, flags=Qt.AlignLeft | Qt.AlignVCenter, bold=False, color=Qt.black):
@@ -218,7 +311,7 @@ def _draw_box(painter, rect, fill=None, width=0.35):
     painter.restore()
 
 
-def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_final):
+def _draw_facture_page(painter, printable_rect, data, page, page_number, page_count):
     scale = printable_rect.width() / PRINTABLE_WIDTH_MM
 
     def rect(x, y, width, height):
@@ -230,6 +323,8 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
             printable_rect.x() + x2 * scale, printable_rect.y() + y2 * scale,
         ); painter.restore()
 
+    is_first = page["is_first"]
+    is_final = page["is_final"]
     if is_first:
         logo_rect = rect(0, 0, 52, 28)
         if not data["logo"].isNull():
@@ -254,12 +349,13 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
                 line(100, y, 182, y, 0.25)
             _draw_text(painter, rect(102, y + 0.5, 27, row_height - 1), label, 8, bold=True)
             _draw_text(painter, rect(130, y + 0.5, 50, row_height - 1), value, 9.5, Qt.AlignCenter, bold=True)
-        table_y = 78
+        if page_count > 1:
+            _draw_text(painter, rect(100, 36, 82, 3), f"Page {page_number} / {page_count}", 7, Qt.AlignRight)
     else:
-        table_y = 0
+        _draw_text(painter, rect(0, 0, 182, 8), f"FACTURE {data['number']}    Page {page_number} / {page_count}", 9, Qt.AlignRight, bold=True)
 
-    header_height = 9
-    row_height = 9
+    table_y = page["table_y"]
+    header_height = TABLE_HEADER_HEIGHT
     table_width = 182
     columns = (0, 98.28, 114.66, 131.04, 156.52, 182)
     _draw_box(painter, rect(0, table_y, table_width, header_height), "#303030")
@@ -272,19 +368,19 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
         align = Qt.AlignLeft if index == 0 else Qt.AlignCenter
         _draw_text(painter, rect(x + 1.5, table_y, width - 3, header_height), label, 8.5, align, bold=True, color=Qt.white)
 
-    rows_to_draw = list(page_items)
-    if is_final and is_first:
-        rows_to_draw.extend([None] * max(0, 13 - len(rows_to_draw)))
-    for row_index, item in enumerate(rows_to_draw):
-        y = table_y + header_height + row_index * row_height
+    rows_to_draw = list(page["items"]) + [None] * (len(page["row_heights"]) - len(page["items"]))
+    y = table_y + header_height
+    for item, row_height in zip(rows_to_draw, page["row_heights"]):
         row_rect = rect(0, y, table_width, row_height)
         _draw_box(painter, row_rect, "#e8e8e8" if item and item.get("section") else None, 0.25)
         for boundary in columns[1:-1]:
             line(boundary, y, boundary, y + row_height, 0.25)
         if not item:
+            y += row_height
             continue
         if item["section"]:
             _draw_text(painter, rect(2, y, 178, row_height), item["designation"], 8.5, bold=True)
+            y += row_height
             continue
         description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
         _draw_text(painter, rect(2, y + .5, columns[1] - 4, row_height - 1), description, 8.5, Qt.AlignLeft | Qt.AlignVCenter)
@@ -295,38 +391,47 @@ def _draw_facture_page(painter, printable_rect, data, page_items, is_first, is_f
             numeric = value_index in (2, 3, 4)
             alignment = Qt.AlignCenter if numeric or value_index == 1 else Qt.AlignRight
             _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 9.5 if numeric else 8.5, alignment)
+        y += row_height
 
     if not is_final:
         return
-    settlement_y = table_y + header_height + len(rows_to_draw) * row_height + 5
+    settlement_y = page["settlement_y"]
     totals_x = 105
-    total_row_height = 6
     _draw_text(painter, rect(0, settlement_y, 98, 5), "Arrêtée la présente Facture à la somme de :", 8)
-    _draw_text(painter, rect(0, settlement_y + 6, 98, 11), data["words"], 9, Qt.AlignLeft | Qt.AlignTop, bold=True)
-    footer_y = 244
-    lower_left_y = settlement_y + 18
-    lower_left_height = max(0, footer_y - lower_left_y - 1)
+    words_height = _text_height(data["words"], 98, 9, bold=True, minimum=11)
+    _draw_text(painter, rect(0, settlement_y + 6, 98, words_height), data["words"], 9, Qt.AlignLeft | Qt.AlignTop, bold=True)
+    footer_y = page["footer_y"]
+    lower_left_y = settlement_y + 6 + words_height
     if data["notes"]:
-        note_height = min(10, lower_left_height)
+        note_height = _text_height(data["notes"], 98, 9.5, bold=True, minimum=5)
+        lower_left_y += 2
         _draw_text(painter, rect(0, lower_left_y, 98, note_height), data["notes"], 9.5, Qt.AlignLeft | Qt.AlignTop, bold=True)
-        lower_left_y += note_height + 1
-        lower_left_height = max(0, footer_y - lower_left_y - 1)
+        lower_left_y += note_height
     if data["references"]:
-        _draw_text(painter, rect(0, lower_left_y, 98, lower_left_height), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
+        reference_height = _text_height("\n".join(data["references"]), 98, 7.5, minimum=4)
+        lower_left_y += 2
+        _draw_text(painter, rect(0, lower_left_y, 98, reference_height), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
     for index, (label, value, emphasized) in enumerate(data["total_rows"]):
-        y = settlement_y + index * total_row_height
+        y = settlement_y + index * TOTAL_ROW_HEIGHT
         fill = "#303030" if emphasized else "#eeeeee"
-        _draw_box(painter, rect(totals_x, y, 77, total_row_height), fill, 0.25)
-        line(totals_x + 46, y, totals_x + 46, y + total_row_height, 0.25)
+        _draw_box(painter, rect(totals_x, y, 77, TOTAL_ROW_HEIGHT), fill, 0.25)
+        line(totals_x + 46, y, totals_x + 46, y + TOTAL_ROW_HEIGHT, 0.25)
         color = Qt.white if emphasized else Qt.black
-        _draw_text(painter, rect(totals_x + 2, y, 42, total_row_height), label, 8, bold=emphasized, color=color)
-        _draw_text(painter, rect(totals_x + 48, y, 27, total_row_height), value, 8, Qt.AlignRight, emphasized, color)
+        _draw_text(painter, rect(totals_x + 2, y, 42, TOTAL_ROW_HEIGHT), label, 8, bold=emphasized, color=color)
+        _draw_text(painter, rect(totals_x + 48, y, 27, TOTAL_ROW_HEIGHT), value, 8, Qt.AlignRight, emphasized, color)
     line(0, footer_y, 182, footer_y)
-    _draw_text(painter, rect(0, footer_y + 1, 182, 4), data["website"], 8, Qt.AlignCenter, bold=True)
-    _draw_text(painter, rect(0, footer_y + 5, 182, 4), data["company_contact"], 6.5, Qt.AlignCenter, bold=True)
-    _draw_text(painter, rect(0, footer_y + 9, 182, 7), "\n".join(data["legal_lines"]), 6.2, Qt.AlignCenter | Qt.AlignTop)
-    _draw_text(painter, rect(0, footer_y + 16, 182, 4), data["bank_line"], 6.2, Qt.AlignCenter, bold=True)
-    _draw_text(painter, rect(0, footer_y + 20, 182, 5), data["report_footer"], 5.8, Qt.AlignCenter | Qt.AlignTop)
+    footer_text_y = footer_y + 1
+    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["website"], 8, Qt.AlignCenter, bold=True)
+    footer_text_y += 4
+    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["company_contact"], 6.5, Qt.AlignCenter, bold=True)
+    footer_text_y += 4
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 6.2, minimum=4)
+    _draw_text(painter, rect(0, footer_text_y, 182, legal_height), "\n".join(data["legal_lines"]), 6.2, Qt.AlignCenter | Qt.AlignTop)
+    footer_text_y += legal_height
+    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["bank_line"], 6.2, Qt.AlignCenter, bold=True)
+    footer_text_y += 4
+    report_height = _text_height(data["report_footer"], 182, 5.8, minimum=4)
+    _draw_text(painter, rect(0, footer_text_y, 182, report_height), data["report_footer"], 5.8, Qt.AlignCenter | Qt.AlignTop)
 
 
 def render_facture_to_printer(printer, facture, payments, profile=None):
@@ -338,12 +443,13 @@ def render_facture_to_printer(printer, facture, payments, profile=None):
     printer_rect = geometry["printable_px"].translated(-geometry["printable_px"].topLeft())
     print(f"printer painter viewport px = {painter.viewport()}")
     data = _document_data(facture, payments, profile)
-    pages = _page_items(data["items"])
-    for index, (items, final) in enumerate(pages):
+    printable_height = printer_rect.height() / (printer_rect.width() / PRINTABLE_WIDTH_MM)
+    pages = plan_facture_pages(data, printable_height)
+    for index, page in enumerate(pages):
         if index:
             printer.newPage()
         painter.fillRect(printer_rect, Qt.white)
-        _draw_facture_page(painter, printer_rect, data, items, index == 0, final)
+        _draw_facture_page(painter, printer_rect, data, page, index + 1, len(pages))
     painter.end()
     return geometry
 
@@ -355,11 +461,13 @@ def render_facture_preview_pages(facture, payments, profile=None, dpi=PREVIEW_DP
     _print_layout_debug("preview", geometry)
     data = _document_data(facture, payments, profile)
     pages = []
-    for index, (items, final) in enumerate(_page_items(data["items"])):
+    printable_height = geometry["printable_px"].height() / (geometry["printable_px"].width() / PRINTABLE_WIDTH_MM)
+    plans = plan_facture_pages(data, printable_height)
+    for index, page in enumerate(plans):
         image = QImage(geometry["page_px"].size(), QImage.Format_ARGB32_Premultiplied)
         image.fill(Qt.white)
         painter = QPainter(image)
-        _draw_facture_page(painter, geometry["printable_px"], data, items, index == 0, final)
+        _draw_facture_page(painter, geometry["printable_px"], data, page, index + 1, len(plans))
         painter.end()
         pages.append(image)
     return pages, geometry

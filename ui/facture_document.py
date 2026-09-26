@@ -153,19 +153,20 @@ def _document_data(facture, payments, profile):
         ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
     ]
     if facture.get("facture_type") == "balance":
-        total_rows.append(("MONTANT GLOBAL", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False))
-        if previous_advance > 0:
-            total_rows.append(("AVANCES / ACOMPTES", f"{money(previous_advance)} {currency}", False))
-        total_rows.append(("RESTE À PAYER", f"{money(facture['total_ttc'])} {currency}", True))
+        total_rows.append(("MONTANT GLOBAL DES DEVIS", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False))
+        total_rows.append(("DÉJÀ FACTURÉ", f"{money(previous_advance)} {currency}", False))
+        total_rows.append(("SOLDE FACTURÉ", f"{money(facture['total_ttc'])} {currency}", True))
     else:
         total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
-        if paid > 0:
-            total_rows.append(("AVANCE / PAYÉ", f"{money(paid)} {currency}", False))
-            if remaining > 0:
-                total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
-        else:
-            label = "AVANCE À PAYER" if facture.get("facture_type") == "advance" else "NET À PAYER"
-            total_rows.append((label, f"{money(facture['total_ttc'])} {currency}", True))
+    if paid > 0:
+        total_rows.append(("PAYÉ", f"{money(paid)} {currency}", False))
+    if remaining > 0:
+        label = "AVANCE À PAYER" if facture.get("facture_type") == "advance" and not paid else (
+            "NET À PAYER" if facture.get("facture_type") == "normal" and not paid else "RESTE À PAYER"
+        )
+        total_rows.append((label, f"{money(remaining)} {currency}", True))
+    elif paid > 0:
+        total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
     data = {
         "contact": "\n".join(part for part in contact if part),
         "client_rows": client_rows,
@@ -193,7 +194,7 @@ def _font(size, bold=False):
     return font
 
 
-def _text_height(text, width_mm, size, bold=False, minimum=0):
+def _text_height(text, width_mm, size, bold=False, minimum=0.0):
     """Measure wrapped painter text in physical millimetres for page planning."""
     if not text:
         return minimum
@@ -208,15 +209,15 @@ def _item_height(item):
     if item.get("section"):
         return MIN_ITEM_ROW_HEIGHT
     description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
-    return max(MIN_ITEM_ROW_HEIGHT, _text_height(description, 94.28, 8.5, minimum=8) + 1)
+    return max(MIN_ITEM_ROW_HEIGHT, _text_height(description, 94.28, 9.5, minimum=8) + 1)
 
 
 def _footer_height(data):
     """Keep all legal content inside a fixed, bottom-anchored reserved area."""
-    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 6.2, minimum=4)
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 7, minimum=5)
     return max(
         27,
-        1 + 4 + 4 + legal_height + 4 + _text_height(data["report_footer"], 182, 5.8, minimum=4) + 1,
+        1 + 5 + 5 + legal_height + 5 + _text_height(data["report_footer"], 182, 6.5, minimum=4.5) + 1,
     )
 
 
@@ -330,7 +331,7 @@ def _draw_facture_page(painter, printable_rect, data, page, page_number, page_co
         if not data["logo"].isNull():
             image = data["logo"].scaled(logo_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
             painter.drawImage(QRectF(logo_rect.x(), logo_rect.y(), image.width(), image.height()), image)
-        _draw_text(painter, rect(0, 30, 88, 35), data["contact"], 8.5, Qt.AlignLeft | Qt.AlignTop)
+        _draw_text(painter, rect(0, 30, 88, 35), data["contact"], 9.5, Qt.AlignLeft | Qt.AlignTop)
         _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 26, Qt.AlignCenter, bold=True)
         info = rect(100, 16, 82, 19)
         _draw_box(painter, info)
@@ -383,14 +384,17 @@ def _draw_facture_page(painter, printable_rect, data, page, page_number, page_co
             y += row_height
             continue
         description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
-        _draw_text(painter, rect(2, y + .5, columns[1] - 4, row_height - 1), description, 8.5, Qt.AlignLeft | Qt.AlignVCenter)
+        _draw_text(
+            painter, rect(2, y + .5, columns[1] - 4, row_height - 1), description, 9.5,
+            Qt.AlignCenter, bold="\n" in item["designation"],
+        )
         values = (item["unit"], item["quantity"], item["price"], item["total"])
         for value_index, value in enumerate(values, 1):
             x = columns[value_index]
             width = columns[value_index + 1] - x
             numeric = value_index in (2, 3, 4)
             alignment = Qt.AlignCenter if numeric or value_index == 1 else Qt.AlignRight
-            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 9.5 if numeric else 8.5, alignment)
+            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 10 if numeric else 9, alignment)
         y += row_height
 
     if not is_final:
@@ -421,17 +425,17 @@ def _draw_facture_page(painter, printable_rect, data, page, page_number, page_co
         _draw_text(painter, rect(totals_x + 48, y, 27, TOTAL_ROW_HEIGHT), value, 8, Qt.AlignRight, emphasized, color)
     line(0, footer_y, 182, footer_y)
     footer_text_y = footer_y + 1
-    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["website"], 8, Qt.AlignCenter, bold=True)
-    footer_text_y += 4
-    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["company_contact"], 6.5, Qt.AlignCenter, bold=True)
-    footer_text_y += 4
-    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 6.2, minimum=4)
-    _draw_text(painter, rect(0, footer_text_y, 182, legal_height), "\n".join(data["legal_lines"]), 6.2, Qt.AlignCenter | Qt.AlignTop)
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["website"], 9, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["company_contact"], 7.5, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 7, minimum=5)
+    _draw_text(painter, rect(0, footer_text_y, 182, legal_height), "\n".join(data["legal_lines"]), 7, Qt.AlignCenter | Qt.AlignTop)
     footer_text_y += legal_height
-    _draw_text(painter, rect(0, footer_text_y, 182, 4), data["bank_line"], 6.2, Qt.AlignCenter, bold=True)
-    footer_text_y += 4
-    report_height = _text_height(data["report_footer"], 182, 5.8, minimum=4)
-    _draw_text(painter, rect(0, footer_text_y, 182, report_height), data["report_footer"], 5.8, Qt.AlignCenter | Qt.AlignTop)
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["bank_line"], 7, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    report_height = _text_height(data["report_footer"], 182, 6.5, minimum=4.5)
+    _draw_text(painter, rect(0, footer_text_y, 182, report_height), data["report_footer"], 6.5, Qt.AlignCenter | Qt.AlignTop)
 
 
 def render_facture_to_printer(printer, facture, payments, profile=None):

@@ -893,6 +893,7 @@ class Database:
                     facture_id INTEGER NOT NULL REFERENCES factures(id) ON DELETE RESTRICT,
                     sale_id INTEGER NOT NULL,
                     source_devis TEXT,
+                    allocated_ttc NUMERIC(15, 2),
                     created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
                     UNIQUE(facture_id, sale_id)
                 )
@@ -904,6 +905,7 @@ class Database:
                 ("client_id", "INTEGER"), ("client_username", "TEXT"),
                 ("client_address", "TEXT"), ("client_city", "TEXT"),
                 ("client_ice", "TEXT"), ("tva_rate", "NUMERIC(7, 3)"),
+                ("remise", "NUMERIC(15, 2)"), ("remise_includes_line_discounts", "BOOLEAN"),
                 ("selected_total_ttc", "NUMERIC(15, 2)"), ("previous_advance_ttc", "NUMERIC(15, 2)"),
                 ("operation_token", "TEXT"), ("created_by", "INTEGER"),
                 ("created_by_username", "TEXT"), ("created_at", "TEXT"),
@@ -929,6 +931,10 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS facture_sources_sale_id_idx ON facture_sources(sale_id)"
             )
             self.cursor.execute("ALTER TABLE facture_sources ADD COLUMN IF NOT EXISTS source_devis TEXT")
+            # New invoices persist an explicit source allocation.  Existing
+            # rows remain NULL: their historical split cannot be recovered
+            # safely and must never be invented for a later partial Devis use.
+            self.cursor.execute("ALTER TABLE facture_sources ADD COLUMN IF NOT EXISTS allocated_ttc NUMERIC(15, 2)")
             # Preserve every pre-existing single-Devis invoice as a source row.
             # The old header columns remain intact for backwards compatibility.
             self.cursor.execute(
@@ -986,13 +992,97 @@ class Database:
             (int(facture_id),),
         )
         gross = Decimal("0")
+        line_discounts = Decimal("0")
         for quantity, unit_price, discount in self.cursor.fetchall():
-            gross += calculate_line_subtotal(quantity or 0, unit_price or 0, discount or 0)
-        self.cursor.execute("SELECT tva_rate FROM factures WHERE id=%s", (int(facture_id),))
+            gross += to_decimal(quantity or 0) * to_decimal(unit_price or 0)
+            line_discounts += (to_decimal(quantity or 0) * to_decimal(unit_price or 0)
+                               - calculate_line_subtotal(quantity or 0, unit_price or 0, discount or 0))
+        self.cursor.execute(
+            "SELECT tva_rate, COALESCE(remise, 0), COALESCE(remise_includes_line_discounts, FALSE) "
+            "FROM factures WHERE id=%s", (int(facture_id),)
+        )
         row = self.cursor.fetchone()
         if not row:
             raise ValueError(f"Facture {facture_id} does not exist")
-        return calculate_operation_totals(gross, 0, row[0] or 0)
+        remise = to_decimal(row[1] or 0) if row[2] else to_decimal(row[1] or 0) + line_discounts
+        return calculate_operation_totals(gross, remise, row[0] or 0)
+
+    def _sale_invoice_draft(self, sale_id, date=None, user=None):
+        """Load a Devis snapshot and its Sales-authoritative final TTC."""
+        sale_id = int(sale_id)
+        self.cursor.execute(
+            "SELECT s.id, s.client_id, s.client_username, s.client_name, s.date, s.tva, s.notes, s.devis, "
+            "COALESCE(s.remise, 0), COALESCE(s.remise_includes_line_discounts, FALSE) "
+            "FROM sales s WHERE s.id=%s", (sale_id,)
+        )
+        sale = self.cursor.fetchone()
+        if not sale or not sale[1]:
+            raise ValueError("Sale must have a persisted client before invoicing")
+        self.cursor.execute(
+            "SELECT id, item_type, product_name, information, '' AS unit, quantity, unit_price, "
+            "discount_percentage, sort_order FROM sales_items WHERE sales_id=%s ORDER BY sort_order, id",
+            (sale_id,),
+        )
+        items = [{"source_sale_item_id": row[0], "item_type": row[1], "designation": row[2],
+                  "information": row[3], "unit": row[4], "quantity": row[5], "unit_price": row[6],
+                  "discount_percentage": row[7], "sort_order": row[8]} for row in self.cursor.fetchall()]
+        raw_subtotal = sum((to_decimal(item["quantity"] or 0) * to_decimal(item["unit_price"] or 0)
+                            for item in items if item["item_type"] != "section"), Decimal("0"))
+        remise = to_decimal(sale[8] or 0)
+        if not sale[9]:
+            remise += sum((calculate_line_subtotal(item["quantity"] or 0, item["unit_price"] or 0, 0)
+                           - calculate_line_subtotal(item["quantity"] or 0, item["unit_price"] or 0,
+                                                     item["discount_percentage"] or 0)
+                           for item in items if item["item_type"] != "section"), Decimal("0"))
+        totals = calculate_operation_totals(raw_subtotal, remise, sale[5] or 0)
+        return {"client_id": sale[1], "source_sale_id": sale[0], "date": date or sale[4],
+                "tva_rate": sale[5] or 0, "notes": sale[6] or "", "source_devis": sale[7] or "",
+                "items": items, "selected_total_ttc": totals["total_ttc"],
+                "sale_remise": remise, "sale_remise_includes_line_discounts": bool(sale[9])}
+
+    @staticmethod
+    def _proportional_allocations(source_totals, amount):
+        """Allocate a TTC amount deterministically, preserving cents exactly."""
+        amount = round_money(amount)
+        total = sum(source_totals.values(), Decimal("0"))
+        if amount < 0 or amount > total:
+            raise ValueError("Le montant à facturer dépasse le reste disponible des devis.")
+        allocations, assigned = {}, Decimal("0")
+        source_ids = sorted(source_totals)
+        for source_id in source_ids[:-1]:
+            allocation = round_money(amount * source_totals[source_id] / total) if total else Decimal("0")
+            allocations[source_id] = allocation
+            assigned += allocation
+        if source_ids:
+            allocations[source_ids[-1]] = round_money(amount - assigned)
+        return allocations
+
+    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, user=None):
+        """Return issued TTC allocated to each requested Devis, never payments."""
+        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
+        if not source_ids:
+            return {"total_ttc": Decimal("0"), "by_source": {}}
+        placeholders = ",".join(["%s"] * len(source_ids))
+        params = list(source_ids)
+        query = (
+            "SELECT fs.sale_id, fs.allocated_ttc, f.id FROM facture_sources fs "
+            "JOIN factures f ON f.id=fs.facture_id "
+            f"WHERE fs.sale_id IN ({placeholders})"
+        )
+        if exclude_facture_id:
+            query += " AND f.id <> %s"
+            params.append(int(exclude_facture_id))
+        self.cursor.execute(query, params)
+        by_source = {source_id: Decimal("0") for source_id in source_ids}
+        for source_id, allocated_ttc, facture_id in self.cursor.fetchall():
+            if allocated_ttc is None:
+                raise ValueError(
+                    "La répartition d'une facture historique liée à ce devis est inconnue; "
+                    "un nouveau calcul de reste à facturer serait ambigu."
+                )
+            by_source[int(source_id)] += to_decimal(allocated_ttc)
+        by_source = {source_id: round_money(value) for source_id, value in by_source.items()}
+        return {"total_ttc": round_money(sum(by_source.values(), Decimal("0"))), "by_source": by_source}
 
     def _facture_payment_total(self, facture_id):
         self.cursor.execute(
@@ -1099,19 +1189,54 @@ class Database:
             notes = str(facture_data.get("notes") or "")
             selected_total_ttc = round_money(facture_data.get("selected_total_ttc") or 0)
             previous_advance_ttc = round_money(facture_data.get("previous_advance_ttc") or 0)
+            remise = round_money(facture_data.get("remise") or 0)
+            remise_includes_line_discounts = self._parse_bool_flag(
+                facture_data.get("remise_includes_line_discounts", False)
+            )
             address = str(facture_data.get("client_address") if "client_address" in facture_data else client[3] or "")
             city = str(facture_data.get("client_city") if "client_city" in facture_data else (
                 existing_snapshot[4] if existing_snapshot else "") or "")
             ice = str(facture_data.get("client_ice") if "client_ice" in facture_data else client[4] or "")
+
+            invoice_gross = sum((quantity * unit_price for _, item_type, _, _, _, quantity, unit_price, _, _ in validated
+                                 if item_type != "section"), Decimal("0"))
+            invoice_line_discounts = sum((quantity * unit_price - calculate_line_subtotal(quantity, unit_price, discount)
+                                          for _, item_type, _, _, _, quantity, unit_price, discount, _ in validated
+                                          if item_type != "section"), Decimal("0"))
+            invoice_remise = remise if remise_includes_line_discounts else remise + invoice_line_discounts
+            invoice_total_ttc = calculate_operation_totals(invoice_gross, invoice_remise, tva_rate)["total_ttc"]
+            allocations = {}
+            if facture_id and source_ids:
+                self.cursor.execute(
+                    "SELECT sale_id, allocated_ttc FROM facture_sources WHERE facture_id=%s", (int(facture_id),)
+                )
+                existing_allocations = {int(source_id): to_decimal(amount) for source_id, amount in self.cursor.fetchall()
+                                        if amount is not None}
+                if set(existing_allocations) == set(source_ids) and round_money(sum(existing_allocations.values(), Decimal("0"))) == invoice_total_ttc:
+                    allocations = existing_allocations
+            if source_ids and not allocations:
+                source_drafts = [self._sale_invoice_draft(source_id, date_value, user) for source_id in source_ids]
+                if any(to_decimal(draft["tva_rate"] or 0) != tva_rate for draft in source_drafts):
+                    raise ValueError("Les devis sélectionnés doivent utiliser le même taux de TVA.")
+                source_totals = {draft["source_sale_id"]: draft["selected_total_ttc"] for draft in source_drafts}
+                already = self.get_invoiced_total_for_sources(source_ids, facture_id, user)["by_source"]
+                available = {source_id: max(Decimal("0"), source_totals[source_id] - already[source_id])
+                             for source_id in source_ids}
+                available_total = round_money(sum(available.values(), Decimal("0")))
+                if invoice_total_ttc > available_total:
+                    raise ValueError("Le montant à facturer dépasse le reste disponible des devis.")
+                if facture_type == "balance" and invoice_total_ttc != available_total:
+                    raise ValueError("Une facture de solde doit facturer exactement le reste disponible.")
+                allocations = self._proportional_allocations(available, invoice_total_ttc)
 
             if facture_id:
                 facture_id = int(facture_id)
                 self.cursor.execute(
                     "UPDATE factures SET client_id=%s, client_username=%s, client_name=%s, "
                     "client_address=%s, client_city=%s, client_ice=%s, date=%s, facture_type=%s, "
-                    "source_sale_id=%s, source_devis=%s, tva_rate=%s, selected_total_ttc=%s, previous_advance_ttc=%s, notes=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+                    "source_sale_id=%s, source_devis=%s, tva_rate=%s, remise=%s, remise_includes_line_discounts=%s, selected_total_ttc=%s, previous_advance_ttc=%s, notes=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
                     (client[0], client[1], client[2], address, city, ice, date_value,
-                     facture_type, source_sale_id, source_devis, tva_rate, selected_total_ttc, previous_advance_ttc, notes, facture_id),
+                      facture_type, source_sale_id, source_devis, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, facture_id),
                 )
                 self.cursor.execute("DELETE FROM facture_items WHERE facture_id=%s", (facture_id,))
                 if "source_sale_ids" in facture_data:
@@ -1127,19 +1252,19 @@ class Database:
                 self.cursor.execute(
                     "INSERT INTO factures (facture_number, invoice_year, source_sale_id, source_devis, client_id, "
                     "client_username, client_name, client_address, client_city, client_ice, date, "
-                    "facture_type, tva_rate, selected_total_ttc, previous_advance_ttc, notes, operation_token, created_by, created_by_username, created_at) "
-                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    "facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, operation_token, created_by, created_by_username, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
                     (number, year, source_sale_id, source_devis, client[0], client[1], client[2], address, city,
-                     ice, date_value, facture_type, tva_rate, selected_total_ttc, previous_advance_ttc, notes, token,
+                      ice, date_value, facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, token,
                      actor["created_by"], actor["created_by_username"], actor["created_at"]),
                 )
                 facture_id = int(self.cursor.fetchone()[0])
             if source_ids:
                 for source_id in source_ids:
                     self.cursor.execute(
-                        "INSERT INTO facture_sources (facture_id, sale_id, source_devis) VALUES (%s,%s,%s) "
-                        "ON CONFLICT (facture_id, sale_id) DO NOTHING",
-                        (facture_id, source_id, devis_by_id.get(source_id, ""))
+                        "INSERT INTO facture_sources (facture_id, sale_id, source_devis, allocated_ttc) VALUES (%s,%s,%s,%s) "
+                        "ON CONFLICT (facture_id, sale_id) DO UPDATE SET source_devis=EXCLUDED.source_devis, allocated_ttc=EXCLUDED.allocated_ttc",
+                        (facture_id, source_id, devis_by_id.get(source_id, ""), allocations[source_id])
                     )
             for line in validated:
                 self.cursor.execute(
@@ -1155,32 +1280,14 @@ class Database:
 
     def get_facture_draft_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
         """Return an editable, unsaved independent Facture draft from a Devis."""
-        sale_id = int(sale_id)
-        self.cursor.execute(
-            "SELECT s.id, s.client_id, s.client_username, s.client_name, s.date, s.tva, s.notes, s.devis "
-            "FROM sales s WHERE s.id=%s", (sale_id,)
-        )
-        sale = self.cursor.fetchone()
-        if not sale or not sale[1]:
-            raise ValueError("Sale must have a persisted client before invoicing")
-        self.cursor.execute(
-            "SELECT id, item_type, product_name, information, '' AS unit, quantity, unit_price, "
-            "discount_percentage, sort_order FROM sales_items WHERE sales_id=%s ORDER BY sort_order, id",
-            (sale_id,),
-        )
-        items = [
-            {"source_sale_item_id": row[0], "item_type": row[1], "designation": row[2],
-             "information": row[3], "unit": row[4], "quantity": row[5], "unit_price": row[6],
-             "discount_percentage": row[7], "sort_order": row[8]}
-            for row in self.cursor.fetchall()
-        ]
-        return {
-            "client_id": sale[1], "source_sale_id": sale[0], "date": date or sale[4],
-            "tva_rate": sale[5] or 0, "notes": sale[6] or "", "source_devis": sale[7] or "", "facture_type": facture_type,
-            "items": items,
-        }
+        draft = self._sale_invoice_draft(sale_id, date, user)
+        draft["facture_type"] = facture_type
+        draft["remise"] = draft["sale_remise"]
+        draft["remise_includes_line_discounts"] = True
+        return draft
 
-    def get_facture_draft_from_sales(self, sale_ids, facture_type="normal", date=None, user=None):
+    def get_facture_draft_from_sales(self, sale_ids, facture_type="normal", date=None,
+                                     exclude_facture_id=None, user=None):
         """Build one immutable invoice draft from one or more same-client Devis."""
         source_ids = sorted({int(value) for value in (sale_ids or []) if value})
         if not source_ids:
@@ -1189,13 +1296,11 @@ class Database:
         client_ids = {draft["client_id"] for draft in drafts}
         if len(client_ids) != 1:
             raise ValueError("Les devis sélectionnés doivent appartenir au même client.")
-        source_total_ttc = Decimal("0")
-        for draft in drafts:
-            gross = sum((calculate_line_subtotal(
-                item.get("quantity") or 0, item.get("unit_price") or 0,
-                item.get("discount_percentage") or 0
-            ) for item in draft["items"] if item.get("item_type") != "section"), Decimal("0"))
-            source_total_ttc += calculate_operation_totals(gross, 0, draft["tva_rate"])["total_ttc"]
+        tva_rates = {to_decimal(draft["tva_rate"] or 0) for draft in drafts}
+        if len(tva_rates) != 1:
+            raise ValueError("Les devis sélectionnés doivent utiliser le même taux de TVA.")
+        source_totals = {draft["source_sale_id"]: round_money(draft["selected_total_ttc"]) for draft in drafts}
+        source_total_ttc = sum(source_totals.values(), Decimal("0"))
         source_devis = [draft.get("source_devis") for draft in drafts if draft.get("source_devis")]
         tva_rate = drafts[0]["tva_rate"]
         result = {
@@ -1203,30 +1308,24 @@ class Database:
             "tva_rate": tva_rate, "notes": "", "facture_type": facture_type,
             "source_sale_ids": source_ids, "source_devis": " / ".join(source_devis),
             "selected_total_ttc": round_money(source_total_ttc),
+            "source_totals_ttc": source_totals,
+            # Store the final Sales remise as one invoice-level value. This
+            # exactly preserves each source's displayed Sales total without
+            # applying line discounts a second time.
+            "remise": sum((to_decimal(draft["sale_remise"]) for draft in drafts), Decimal("0")),
+            "remise_includes_line_discounts": True,
             "items": [item for draft in drafts for item in draft["items"]],
         }
         if facture_type in ("advance", "balance"):
-            result["previous_advance_ttc"] = self.get_previous_advance_total(source_ids)
-            result["remaining_ttc"] = max(Decimal("0"), result["selected_total_ttc"] - result["previous_advance_ttc"])
+            invoiced = self.get_invoiced_total_for_sources(source_ids, exclude_facture_id, user)
+            result["previous_advance_ttc"] = invoiced["total_ttc"]
+            result["invoiced_by_source"] = invoiced["by_source"]
+            result["remaining_ttc"] = max(Decimal("0"), result["selected_total_ttc"] - invoiced["total_ttc"])
         return result
 
     def get_previous_advance_total(self, sale_ids, exclude_facture_id=None):
-        """Count issued advance invoices once, even when they cover several sources."""
-        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
-        if not source_ids:
-            return Decimal("0")
-        placeholders = ",".join(["%s"] * len(source_ids))
-        query = (
-            "SELECT f.id FROM factures f WHERE f.facture_type='advance' "
-            f"AND EXISTS (SELECT 1 FROM facture_sources fs WHERE fs.facture_id=f.id AND fs.sale_id IN ({placeholders})) "
-            f"AND NOT EXISTS (SELECT 1 FROM facture_sources fs WHERE fs.facture_id=f.id AND fs.sale_id NOT IN ({placeholders}))"
-        )
-        params = list(source_ids) + list(source_ids)
-        if exclude_facture_id:
-            query += " AND f.id <> %s"
-            params.append(int(exclude_facture_id))
-        self.cursor.execute(query, params)
-        return round_money(sum((self._facture_totals(row[0])["total_ttc"] for row in self.cursor.fetchall()), Decimal("0")))
+        """Compatibility name retained for callers; includes every invoice type."""
+        return self.get_invoiced_total_for_sources(sale_ids, exclude_facture_id)["total_ttc"]
 
     def create_facture_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
         """Persist a Devis snapshot for non-interactive callers."""
@@ -1239,14 +1338,14 @@ class Database:
         facture_id = int(facture_id)
         self.cursor.execute(
             "SELECT id, facture_number, source_sale_id, source_devis, client_id, client_username, client_name, "
-            "client_address, client_city, client_ice, date, facture_type, tva_rate, selected_total_ttc, previous_advance_ttc, notes, "
+            "client_address, client_city, client_ice, date, facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, "
             "created_at, updated_at FROM factures WHERE id=%s", (facture_id,)
         )
         row = self.cursor.fetchone()
         if not row:
             raise ValueError(f"Facture {facture_id} does not exist")
         fields = ("id", "facture_number", "source_sale_id", "source_devis", "client_id", "client_username", "client_name",
-                  "client_address", "client_city", "client_ice", "date", "facture_type", "tva_rate", "selected_total_ttc", "previous_advance_ttc", "notes",
+                  "client_address", "client_city", "client_ice", "date", "facture_type", "tva_rate", "remise", "remise_includes_line_discounts", "selected_total_ttc", "previous_advance_ttc", "notes",
                   "created_at", "updated_at")
         result = dict(zip(fields, row))
         self.cursor.execute(
@@ -1258,10 +1357,10 @@ class Database:
                        "quantity", "unit_price", "discount_percentage", "sort_order")
         result["items"] = [dict(zip(item_fields, item)) for item in self.cursor.fetchall()]
         self.cursor.execute(
-            "SELECT fs.sale_id, COALESCE(NULLIF(fs.source_devis, ''), s.devis) FROM facture_sources fs LEFT JOIN sales s ON s.id=fs.sale_id "
+            "SELECT fs.sale_id, COALESCE(NULLIF(fs.source_devis, ''), s.devis), fs.allocated_ttc FROM facture_sources fs LEFT JOIN sales s ON s.id=fs.sale_id "
             "WHERE fs.facture_id=%s ORDER BY fs.id", (facture_id,)
         )
-        result["sources"] = [{"sale_id": row[0], "devis": row[1]} for row in self.cursor.fetchall()]
+        result["sources"] = [{"sale_id": row[0], "devis": row[1], "allocated_ttc": row[2]} for row in self.cursor.fetchall()]
         if result["sources"]:
             result["source_devis"] = " / ".join(str(row["devis"] or "") for row in result["sources"] if row["devis"])
         totals = self._facture_totals(facture_id)
@@ -1316,6 +1415,57 @@ class Database:
         fields = ("id", "date", "amount", "method", "reference", "notes", "created_by_username")
         return [dict(zip(fields, row)) for row in self.cursor.fetchall()]
 
+    def update_facture_payment(self, facture_id, payment_id, amount, date, method="Autre", reference="", notes="", user=None):
+        """Edit one invoice payment without allowing the invoice to be overpaid."""
+        facture_id = int(facture_id)
+        payment_id = int(payment_id)
+        amount = round_money(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        allowed_methods = {"Espèces", "Chèque", "Virement", "Carte", "Autre"}
+        if method not in allowed_methods:
+            raise ValueError("Unsupported payment method")
+        try:
+            self.cursor.execute(
+                "SELECT amount FROM payments WHERE id=%s AND facture_id=%s", (payment_id, facture_id)
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            facture = self.get_facture(facture_id)
+            adjusted_paid = to_decimal(facture["paid"]) - to_decimal(row[0]) + amount
+            if adjusted_paid > to_decimal(facture["total_ttc"]):
+                raise ValueError("Payment exceeds the remaining invoice balance")
+            self.cursor.execute(
+                "UPDATE payments SET amount=%s, date=%s, method=%s, reference=%s, notes=%s "
+                "WHERE id=%s AND facture_id=%s RETURNING id",
+                (amount, str(date), method, str(reference or ""), str(notes or ""), payment_id, facture_id),
+            )
+            updated = self.cursor.fetchone()
+            if not updated:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            self.conn.commit()
+            return int(updated[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_facture_payment(self, facture_id, payment_id, user=None):
+        """Delete one payment allocation; Facture totals remain derived from the ledger."""
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id=%s AND facture_id=%s RETURNING id",
+                (int(payment_id), int(facture_id)),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            self.conn.commit()
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def delete_facture(self, facture_id, user=None):
         """Delete only an unpaid invoice; financial history is never deleted."""
         facture_id = int(facture_id)
@@ -1323,6 +1473,7 @@ class Database:
             if self._facture_payment_total(facture_id):
                 raise ValueError("An invoice with payments cannot be deleted")
             self.cursor.execute("DELETE FROM facture_items WHERE facture_id=%s", (facture_id,))
+            self.cursor.execute("DELETE FROM facture_sources WHERE facture_id=%s", (facture_id,))
             self.cursor.execute("DELETE FROM factures WHERE id=%s RETURNING id", (facture_id,))
             row = self.cursor.fetchone()
             if not row:

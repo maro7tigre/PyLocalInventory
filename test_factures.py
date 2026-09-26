@@ -76,7 +76,7 @@ class _Connection:
 
 class _CopyCursor:
     def __init__(self):
-        self._fetchone_rows = [(18, 7, "client.test", "Client Test", "2026-09-23", Decimal("20"), "Note", "DE-2026-18")]
+        self._fetchone_rows = [(18, 7, "client.test", "Client Test", "2026-09-23", Decimal("20"), "Note", "DE-2026-18", Decimal("0"), False)]
         self._fetchall_rows = [[
             (41, "product", "Produit", "Info", "U", Decimal("2"), Decimal("500"), Decimal("0"), 1),
             (42, "section", "Pose", "", "", None, None, None, 2),
@@ -123,6 +123,30 @@ class _PaymentDatabase(Database):
 
     def get_facture(self, _facture_id, user=None):
         return {"client_id": 7, "remaining": Decimal("100000.00")}
+
+
+class _FacturePaymentMutationCursor:
+    def __init__(self):
+        self.calls = []
+        self.result = None
+
+    def execute(self, sql, params=None):
+        self.calls.append((sql, params))
+        normalized = " ".join(sql.split()).upper()
+        self.result = (Decimal("20.00"),) if normalized.startswith("SELECT AMOUNT") else (9,)
+
+    def fetchone(self):
+        return self.result
+
+
+class _FacturePaymentMutationDatabase(Database):
+    def __init__(self):
+        super().__init__()
+        self.cursor = _FacturePaymentMutationCursor()
+        self.conn = _Connection()
+
+    def get_facture(self, _facture_id, user=None):
+        return {"paid": Decimal("80.00"), "total_ttc": Decimal("100.00")}
 
 
 class _MultiDraftDatabase(Database):
@@ -261,15 +285,15 @@ class FactureEditorTests(unittest.TestCase):
             dialog.reject()
 
     def test_advance_and_balance_editors_generate_distinct_financial_lines(self):
-        draft = {
+        advance_draft = {
             "client_id": 7, "date": "2026-09-23", "tva_rate": Decimal("20"),
             "source_sale_ids": [18, 19], "source_devis": "DE-2026-18 / DE-2026-19",
-            "selected_total_ttc": Decimal("500000"), "previous_advance_ttc": Decimal("600000"),
-            "remaining_ttc": Decimal("100000"), "items": [],
+            "selected_total_ttc": Decimal("500000"), "previous_advance_ttc": Decimal("0"),
+            "remaining_ttc": Decimal("500000"), "items": [],
         }
         advance_db = _FactureDatabase(); advance = FactureEditor(advance_db)
         try:
-            draft["facture_type"] = "advance"; advance.load_draft(draft); advance.advance_amount.setValue(200000); advance.save()
+            advance_draft["facture_type"] = "advance"; advance.load_draft(advance_draft); advance.advance_amount.setValue(200000); advance.save()
             header, lines, _facture_id = advance_db.saved
             self.assertEqual(header["source_sale_ids"], [18, 19])
             self.assertEqual(lines[0]["unit_price"], "166666.67")
@@ -278,7 +302,9 @@ class FactureEditorTests(unittest.TestCase):
             advance.reject()
         balance_db = _FactureDatabase(); balance = FactureEditor(balance_db)
         try:
-            draft["facture_type"] = "balance"; balance.load_draft(draft); balance.save()
+            balance_draft = {**advance_draft, "facture_type": "balance", "selected_total_ttc": Decimal("700000"),
+                             "previous_advance_ttc": Decimal("600000"), "remaining_ttc": Decimal("100000")}
+            balance.load_draft(balance_draft); balance.save()
             _header, lines, _facture_id = balance_db.saved
             self.assertEqual(lines[0]["unit_price"], "83333.33")
             self.assertIn("SOLDE", lines[0]["designation"])
@@ -289,6 +315,33 @@ class FactureEditorTests(unittest.TestCase):
         database = _MultiDraftDatabase({18: 7, 19: 8})
         with self.assertRaisesRegex(ValueError, "même client"):
             database.get_facture_draft_from_sales([18, 19])
+
+    def test_multi_devis_rejects_different_tva_before_invoice_creation(self):
+        database = _MultiDraftDatabase({18: 7, 19: 7})
+        original = database.get_facture_draft_from_sale
+        database.get_facture_draft_from_sale = lambda sale_id, *args: {
+            **original(sale_id, *args), "tva_rate": Decimal("20") if sale_id == 18 else Decimal("0"),
+        }
+        with self.assertRaisesRegex(ValueError, "même taux de TVA"):
+            database.get_facture_draft_from_sales([18, 19])
+
+    def test_proportional_source_allocation_is_deterministic_and_exact(self):
+        self.assertEqual(Database._proportional_allocations({18: Decimal("40000"), 19: Decimal("60000")}, Decimal("30000")), {
+            18: Decimal("12000.00"), 19: Decimal("18000.00"),
+        })
+
+    def test_paid_balance_document_keeps_payment_balance_separate(self):
+        facture = {
+            "facture_number": "FA009/2026", "date": "2026-09-23", "facture_type": "balance",
+            "client_name": "Aptiv", "items": [], "total_ht": Decimal("18612.00"),
+            "vat_amount": Decimal("3722.40"), "total_ttc": Decimal("22334.40"),
+            "selected_total_ttc": Decimal("100000"), "previous_advance_ttc": Decimal("77665.60"),
+            "paid": Decimal("22334.40"), "remaining": Decimal("0"), "amount_in_words": "TEST",
+        }
+        rows = _document_data(facture, [], None)["total_rows"]
+        self.assertIn(("SOLDE FACTURÉ", "22 334,40 MAD", True), rows)
+        self.assertIn(("PAYÉ", "22 334,40 MAD", False), rows)
+        self.assertIn(("RESTE À PAYER", "0,00 MAD", True), rows)
 
     def test_main_list_keeps_payment_amounts_in_the_payment_screen(self):
         tab = FacturesTab(_FactureDatabase())
@@ -373,6 +426,19 @@ class FactureEditorTests(unittest.TestCase):
         self.assertEqual(payment_id, 9)
         self.assertTrue(database.conn.committed)
         self.assertIn("INSERT INTO payments", database.cursor.calls[-1][0])
+
+    def test_facture_payment_edit_and_delete_are_invoice_scoped_and_safe(self):
+        database = _FacturePaymentMutationDatabase()
+        self.assertEqual(database.update_facture_payment(5, 9, "20.00", "2026-09-26", "Chèque", "CHQ-1", "Note"), 9)
+        update_sql, update_params = database.cursor.calls[-1]
+        self.assertIn("UPDATE payments SET amount", update_sql)
+        self.assertEqual(update_params[-2:], (9, 5))
+        with self.assertRaisesRegex(ValueError, "remaining invoice balance"):
+            database.update_facture_payment(5, 9, "50.01", "2026-09-26")
+        self.assertEqual(database.delete_facture_payment(5, 9), 9)
+        delete_sql, delete_params = database.cursor.calls[-1]
+        self.assertIn("DELETE FROM payments WHERE id", delete_sql)
+        self.assertEqual(delete_params, (9, 5))
 
 
 if __name__ == "__main__":

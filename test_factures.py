@@ -14,6 +14,7 @@ from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.server import _check_permission
 from core.profiles import ProfileClass
+from core.sales_states import is_financially_active
 from ui.facture_document import _document_data, render_facture_preview_pages
 from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturePreviewDialog, FacturesTab
 
@@ -196,6 +197,12 @@ class FactureEditorTests(unittest.TestCase):
             amount_to_words(Decimal("1250.50")),
             "MILLE DEUX CENT CINQUANTE DIRHAMS ET CINQUANTE CENTIMES",
         )
+
+    def test_only_confirmed_sales_are_financially_active(self):
+        self.assertFalse(is_financially_active("on_hold"))
+        self.assertFalse(is_financially_active("pending"))
+        self.assertTrue(is_financially_active("confirmed"))
+        self.assertTrue(is_financially_active("finished"))
 
     def test_facture_rpc_permissions_are_explicit(self):
         user = {"is_superadmin": False, "permissions": {

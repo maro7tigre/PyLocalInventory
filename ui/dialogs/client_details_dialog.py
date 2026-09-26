@@ -36,6 +36,7 @@ from PySide6.QtWidgets import (
 )
 from core.calculations import calculate_operation_totals, to_decimal
 from core.runtime_paths import resource_path
+from core.sales_states import is_financially_active, sale_state_label
 from ui.widgets.preview_widget import PreviewWidget
 
 logger = logging.getLogger(__name__)
@@ -184,6 +185,7 @@ class _ClientReportWorker(QObject):
         self.purchases = []
         self.payments = []
         self.devis_by_sale = {}
+        self.sale_state_by_id = {}
 
     @Slot()
     def run(self):
@@ -235,6 +237,9 @@ class _ClientReportWorker(QObject):
             self.devis_by_sale = {
                 s["sale_id"]: s.get("devis") for s in (data.get("sales") or [])
             }
+            self.sale_state_by_id = {
+                s["sale_id"]: s.get("state") or "pending" for s in (data.get("sales") or [])
+            }
         else:
             account = self.database.get_client_account(self.client_id)
             self.purchases = account.get("purchases") or []
@@ -242,6 +247,9 @@ class _ClientReportWorker(QObject):
             summaries = self.database.get_client_sale_summaries(self.client_id)
             self.devis_by_sale = {
                 s["sale_id"]: s.get("devis") for s in (summaries.get("sales") or [])
+            }
+            self.sale_state_by_id = {
+                s["sale_id"]: s.get("state") or "pending" for s in (summaries.get("sales") or [])
             }
 
     def _html_to_pdf(self, html_content, output_path):
@@ -526,7 +534,8 @@ class _ClientReportWorker(QObject):
         vat_rate = to_decimal(first.get("vat") or 0)
         totals = calculate_operation_totals(raw, remise, vat_rate)
         total_ttc = totals["total_ttc"]
-        paid = min(self._sale_paid(rows), total_ttc)
+        financially_active = is_financially_active(self.sale_state_by_id.get(sale_id))
+        paid = min(self._sale_paid(rows), total_ttc) if financially_active else Decimal("0")
         remaining = max(total_ttc - paid, Decimal("0"))
 
         sale_date = self._format_french_date(first.get("date") or "")
@@ -581,6 +590,11 @@ class _ClientReportWorker(QObject):
             f'<tr class="due"><th>Reste à payer</th><td>{self._fmt_money(remaining)} {currency}</td></tr>'
             "</table>"
         )
+        if not financially_active and self.report_type == "full_statement":
+            totals_html = (
+                '<div class="no-payments">DEVIS NON CONFIRMÉ - '
+                'montant exclu du solde client.</div>'
+            )
 
         # Payment history of this Sale only, in real chronology, with the
         # running balance after each payment.
@@ -634,7 +648,7 @@ class _ClientReportWorker(QObject):
             "</section></div>"
         )
 
-        self.sale_ttc_by_id[sale_id] = total_ttc
+        self.sale_ttc_by_id[sale_id] = total_ttc if financially_active else Decimal("0")
         self.sale_paid_by_id[sale_id] = paid
         return header + items_html + items_footer + bottom + "</div>"
 
@@ -969,7 +983,7 @@ class ClientDetailsDialog(QDialog):
 
         self.sales_stack = QStackedWidget()
         self.purchases_table = self._create_table(
-            ["Sale #", "Date", "Devis"]
+            ["Sale #", "Date", "Devis", "State", "Amount"]
         )
         self.sales_empty = self._empty_state("No sales found for this client.")
         self.sales_stack.addWidget(self.purchases_table)
@@ -979,7 +993,7 @@ class ClientDetailsDialog(QDialog):
         p_header.setStretchLastSection(False)
         p_header.setMinimumSectionSize(42)
         p_header.setSectionResizeMode(2, QHeaderView.Stretch)
-        for col in (0, 1):
+        for col in (0, 1, 3, 4):
             p_header.setSectionResizeMode(col, QHeaderView.ResizeToContents)
         p_header.setMaximumSectionSize(110)
 
@@ -1331,14 +1345,13 @@ class ClientDetailsDialog(QDialog):
         self._populate_purchases()
         self._populate_payments()
 
-        total_bought = sum(
-            (sale["total"] for sale in self.sales), Decimal("0")
-        )
+        active_sales = [sale for sale in self.sales if is_financially_active(sale["state"])]
+        total_bought = sum((sale["total"] for sale in active_sales), Decimal("0"))
         # Total Paid counts both Sale-linked payments (sale["paid"], already
         # capped per-sale by the backend) and general/unallocated client
         # payments (payments with no sale_id) - Remaining is Total Bought
         # minus that combined figure.
-        sale_paid = sum((sale["paid"] for sale in self.sales), Decimal("0"))
+        sale_paid = sum((sale["paid"] for sale in active_sales), Decimal("0"))
         general_paid = sum(
             (to_decimal(pay.get("amount") or 0) for pay in self.payments
              if pay.get("sale_id") is None),
@@ -1471,17 +1484,24 @@ class ClientDetailsDialog(QDialog):
                 f"#{sale['sale_id']}",
                 self._format_date(sale["date"]),
                 f"Devis N° {devis}" if devis != "-" else "-",
+                sale_state_label(sale["state"]),
+                f"{_format_money(sale['total'])} {self.currency}" if is_financially_active(sale["state"]) else "—",
             ]
             for col, value in enumerate(values):
                 item = QTableWidgetItem(str(value))
                 item.setData(Qt.UserRole, sale["sale_id"])
                 item.setData(Qt.UserRole + 1, sale["sale_id"])
 
-                if col in (0, 1):
+                if col in (0, 1, 3, 4):
                     item.setTextAlignment(Qt.AlignCenter)
                 elif col == 2:
                     item.setTextAlignment(Qt.AlignLeft | Qt.AlignVCenter)
                     item.setForeground(QColor("#8fc8d8"))
+                elif col == 3:
+                    colors = {"on_hold": "#9e9e9e", "pending": "#e8a33d", "confirmed": "#7fce95", "finished": "#79aee8"}
+                    item.setForeground(QColor(colors.get(sale["state"], "#e8a33d")))
+                elif col == 4 and not is_financially_active(sale["state"]):
+                    item.setForeground(QColor("#9e9e9e"))
 
                 self.purchases_table.setItem(row, col, item)
 
@@ -1572,6 +1592,17 @@ class ClientDetailsDialog(QDialog):
             return
 
         sale = self.sales[current_row]
+        if not is_financially_active(sale["state"]):
+            devis = sale["devis"] or "-"
+            self.selected_sale_label.setText(f"Selected Sale #{sale['sale_id']}")
+            self.selected_devis_label.setText(f"Devis N°: {devis}")
+            self.selected_remaining_label.setText("Ce devis n'est pas encore confirmé.")
+            self._apply_selected_bar_style(Decimal("0"), has_selection=False)
+            self.amount_input.clear()
+            self.amount_input.setPlaceholderText("Payment unavailable until this Devis is confirmed")
+            self.amount_input.setEnabled(False)
+            self.add_payment_button.setEnabled(False)
+            return
         remaining = sale["remaining"]
         devis = sale["devis"] or "-"
         self.selected_sale_label.setText(f"Selected Sale #{sale['sale_id']}")
@@ -1732,6 +1763,12 @@ class ClientDetailsDialog(QDialog):
         selected_row = self.purchases_table.currentRow()
         has_sale = 0 <= selected_row < len(self.sales)
         sale = self.sales[selected_row] if has_sale else None
+
+        if sale and not is_financially_active(sale["state"]):
+            QMessageBox.information(
+                self, "Devis non confirmé", "Ce devis n'est pas encore confirmé."
+            )
+            return
 
         amount_text = self.amount_input.text()
         from core.calculations import parse_decimal_input, InputState

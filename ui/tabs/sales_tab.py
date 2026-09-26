@@ -308,6 +308,19 @@ class SalesTab(BaseTab):
             self.table.setUpdatesEnabled(True)
             self.table.viewport().update()
 
+    def _rewrite_row(self, row, obj):
+        """Keep Sales-specific button cells during BaseTab's in-place refresh."""
+        for col in range(self.table.columnCount()):
+            self.table.setCellWidget(row, col, None)
+        for col, column_key in enumerate(self.table_columns):
+            if column_key == "state":
+                self._set_state_cell(row, col, obj)
+            elif column_key == "is_historical":
+                self._set_historical_cell(row, col, obj)
+            else:
+                self.set_table_cell(row, col, column_key, obj)
+        self.table.resizeRowToContents(row)
+
     def _open_progress_for_sale(self, obj):
         try:
             dialog = OrderProgressDialog(obj, self.database, self)

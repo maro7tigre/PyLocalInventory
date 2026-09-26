@@ -186,6 +186,9 @@ class _ClientReportWorker(QObject):
         self.payments = []
         self.devis_by_sale = {}
         self.sale_state_by_id = {}
+        # Per-Sale financial accumulators, filled by _render_sale_section().
+        self.sale_ttc_by_id = {}
+        self.sale_paid_by_id = {}
 
     @Slot()
     def run(self):
@@ -608,10 +611,16 @@ class _ClientReportWorker(QObject):
         for pay in sale_payments:
             amount = to_decimal(pay.get("amount") or 0)
             balance = max(balance - amount, Decimal("0"))
+            # A non-confirmed Devis is listed with its payment history for
+            # transparency, but no running balance is presented: nothing is owed
+            # until the Devis is confirmed.
+            balance_cell = (
+                f"{self._fmt_money(balance)} {currency}" if financially_active else "—"
+            )
             payment_rows_html.append(
                 f"<tr><td>{html_lib.escape(self._format_french_date(pay.get('date')))}</td>"
                 f"<td>{self._fmt_money(amount)} {currency}</td>"
-                f"<td>{self._fmt_money(balance)} {currency}</td></tr>"
+                f"<td>{balance_cell}</td></tr>"
             )
         payments_paid = sum(
             (to_decimal(pay.get("amount") or 0) for pay in sale_payments),
@@ -633,11 +642,18 @@ class _ClientReportWorker(QObject):
                 '<div class="no-payments">Aucun paiement enregistré pour cette vente.</div>'
             )
 
-        payments_summary = (
-            f'<div class="payments-summary">Total payé : <strong>{self._fmt_money(payments_paid)} {currency}</strong>'
-            f"&nbsp;&nbsp;&nbsp;"
-            f"Reste à payer : <strong>{self._fmt_money(payments_remaining)} {currency}</strong></div>"
-        )
+        if financially_active:
+            payments_summary = (
+                f'<div class="payments-summary">Total payé : <strong>{self._fmt_money(payments_paid)} {currency}</strong>'
+                f"&nbsp;&nbsp;&nbsp;"
+                f"Reste à payer : <strong>{self._fmt_money(payments_remaining)} {currency}</strong></div>"
+            )
+        else:
+            payments_summary = (
+                f'<div class="payments-summary">Total enregistré : <strong>{self._fmt_money(payments_paid)} {currency}</strong>'
+                f"&nbsp;&nbsp;&nbsp;"
+                "Reste à payer : <strong>— (devis non confirmé)</strong></div>"
+            )
 
         bottom = (
             '<div class="sale-bottom">'

@@ -173,13 +173,16 @@ class ProductClass(BaseClass):
             imports_result = self.database.cursor.fetchone()
             total_imports = imports_result[0] if imports_result and imports_result[0] else 0
             
-            # Get total sales for this product from Sales_Items joined to Sales excluding on_hold
-            self.database.cursor.execute("""
+            # Get total sales for this product from Sales_Items joined to Sales.
+            # Current stock is derived from stored operations, so only sales the
+            # user explicitly marked as affecting stock are subtracted - the
+            # Sale's workflow state plays no part in it.
+            from core.database import SALE_STOCK_ELIGIBILITY_SQL
+            self.database.cursor.execute(f"""
                 SELECT SUM(si.quantity)
                 FROM Sales_Items si
                 JOIN Sales s ON si.sales_id = s.ID
-                WHERE si.product_id = %s AND (s.state IS NULL OR s.state != 'on_hold')
-                  AND (s.is_historical IS NULL OR NOT s.is_historical)
+                WHERE si.product_id = %s AND {SALE_STOCK_ELIGIBILITY_SQL}
             """, (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0

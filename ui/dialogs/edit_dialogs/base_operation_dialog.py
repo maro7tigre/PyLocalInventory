@@ -397,6 +397,38 @@ class BaseOperationDialog(QDialog):
                         checkbox.setText(
                             "Historical Sale \u2014 Do not affect current stock"
                         )
+                    try:
+                        checkbox.stateChanged.connect(
+                            lambda _state: self._sync_stock_checkbox_state()
+                        )
+                    except Exception:
+                        pass
+                form_layout.addRow(widget)
+                continue
+
+            # Explicit stock decision for a Sale. A historical Sale is
+            # books-only, so this is forced off and disabled while Historical
+            # is on; unchecking Historical re-enables it WITHOUT checking it,
+            # so the user always makes the stock decision explicitly.
+            if param_key == 'affect_stock':
+                checkbox = getattr(widget, 'checkbox', None)
+                if checkbox is not None:
+                    if getattr(self.operation_obj, 'section', 'Sales') == 'Sales':
+                        checkbox.setText(
+                            "Affect current stock \u2014 Deduct product quantities "
+                            "from inventory"
+                        )
+                        try:
+                            checkbox.stateChanged.connect(
+                                lambda _state: self._sync_stock_checkbox_state()
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        # Imports keep their own historical/stock behaviour and
+                        # never gain this Sale-only control.
+                        self.parameter_widgets.pop(param_key, None)
+                        continue
                 form_layout.addRow(widget)
                 continue
 
@@ -427,6 +459,11 @@ class BaseOperationDialog(QDialog):
             
             form_layout.addRow(QLabel(display_name + ":"), widget)
         
+        # Apply the Historical -> Affect current stock rule once the widgets
+        # exist, so the control is never left in a wrong initial state even if
+        # the data load is slow or fails (load_data() re-applies it).
+        self._sync_stock_checkbox_state()
+
         parent_layout.addWidget(form_widget)
     
     def setup_items_section(self, parent_layout):
@@ -576,6 +613,11 @@ class BaseOperationDialog(QDialog):
         for param_key, widget in self.parameter_widgets.items():
             current_value = self.operation_obj.get_value(param_key)
             ParameterWidgetFactory.set_widget_value(widget, current_value)
+
+        # Apply the Historical -> Affect current stock rule to the loaded
+        # values, so editing an existing historical Sale shows the stock
+        # checkbox unchecked and disabled.
+        self._sync_stock_checkbox_state()
         
         # sales.remise is the final value for new records. Legacy records used
         # it as an extra amount beyond their line discounts.
@@ -788,9 +830,10 @@ class BaseOperationDialog(QDialog):
                 
                 if not is_import:
                     items_objects = self.items_table.get_items_data()
-                    is_historical = bool(self.operation_obj.get_value('is_historical'))
-                    sale_state = self.operation_obj.get_value('state') or 'pending'
-                    if not is_historical and sale_state != 'on_hold':
+                    # Only a Sale that explicitly affects current stock is
+                    # validated against available inventory. Sale state and the
+                    # Historical flag no longer decide this.
+                    if self._affects_stock():
                         stock_errors = self._validate_stock(items_objects)
                         mw = self._get_main_window()
                         warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
@@ -850,6 +893,10 @@ class BaseOperationDialog(QDialog):
                     }
                 else:
                     header["is_historical"] = bool(self.operation_obj.get_value("is_historical"))
+                    # Send a real Python bool: the column is BOOLEAN and the
+                    # host normalizes/forces it again. A historical Sale can
+                    # never claim stock impact.
+                    header["affect_stock"] = self._affects_stock()
                     save_kwargs = {
                         'sale_data': header,
                         'items': prepared,
@@ -935,25 +982,23 @@ class BaseOperationDialog(QDialog):
                 except Exception:
                     pass
 
-                # Stock validation for sales (skip on_hold — those don't deduct stock)
-                if self.operation_obj.section == 'Sales':
-                    sale_state = self.operation_obj.get_value('state') or 'pending'
-                    is_historical = bool(self.operation_obj.get_value('is_historical'))
-                    if not is_historical and sale_state != 'on_hold':
-                        stock_errors = self._validate_stock(items_objects)
-                        mw = self._get_main_window()
-                        warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
-                        if stock_errors and warn_stock:
-                            reply = QMessageBox.warning(
-                                self, "Insufficient Stock",
-                                "Not enough stock for:\n\n" +
-                                "\n".join(f"  \u2022 {e}" for e in stock_errors) +
-                                "\n\nSave anyway?",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                QMessageBox.StandardButton.No
-                            )
-                            if reply != QMessageBox.StandardButton.Yes:
-                                return
+                # Stock validation for sales - only when this Sale actually
+                # consumes inventory (explicit affect_stock, never historical).
+                if self.operation_obj.section == 'Sales' and self._affects_stock():
+                    stock_errors = self._validate_stock(items_objects)
+                    mw = self._get_main_window()
+                    warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                    if stock_errors and warn_stock:
+                        reply = QMessageBox.warning(
+                            self, "Insufficient Stock",
+                            "Not enough stock for:\n\n" +
+                            "\n".join(f"  • {e}" for e in stock_errors) +
+                            "\n\nSave anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.No
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
 
                 items_saved = 0
                 for item in items_objects:
@@ -1059,10 +1104,57 @@ class BaseOperationDialog(QDialog):
         self.save_worker = None
         self.save_thread = None
 
+    def _sync_stock_checkbox_state(self):
+        """Keep "Affect current stock" consistent with "Historical Sale".
+
+        Historical is a hard exclusion: while it is on, the stock checkbox is
+        unchecked and disabled. Turning Historical off only re-enables the
+        checkbox - it is never auto-checked, because opting into inventory is
+        an explicit decision the user must make.
+        """
+        if getattr(self.operation_obj, 'section', '') != 'Sales':
+            return
+        historical = self._checkbox_is_checked('is_historical')
+        stock = self._checkbox_for('affect_stock')
+        if stock is None:
+            return
+        if historical:
+            if stock.isChecked():
+                stock.setChecked(False)
+            stock.setEnabled(False)
+            stock.setToolTip(
+                "A historical Sale is recorded for the books only and never "
+                "affects current stock."
+            )
+        else:
+            stock.setEnabled(True)
+            stock.setToolTip(
+                "Check to deduct this Sale's product quantities from current "
+                "stock. Leave unchecked to create the Sale without touching "
+                "inventory."
+            )
+
+    def _checkbox_for(self, param_key):
+        widget = self.parameter_widgets.get(param_key)
+        return getattr(widget, 'checkbox', None) if widget is not None else None
+
+    def _checkbox_is_checked(self, param_key):
+        checkbox = self._checkbox_for(param_key)
+        return bool(checkbox is not None and checkbox.isChecked())
+
+    def _affects_stock(self):
+        """Single source of truth for the GUI stock decision (Sales only)."""
+        if getattr(self.operation_obj, 'section', '') != 'Sales':
+            return False
+        if self._checkbox_is_checked('is_historical'):
+            return False
+        return self._checkbox_is_checked('affect_stock')
+
     def _confirm_sale_summary(self):
         """Show the required pre-save summary and ask for confirmation."""
         try:
-            is_historical = bool(self.operation_obj.get_value('is_historical'))
+            is_historical = self._checkbox_is_checked('is_historical')
+            affect_stock = self._affects_stock()
             new_products = sum(
                 1 for e in self.pending_entities
                 if str(e.get("type") or "").casefold() == "product"
@@ -1085,10 +1177,11 @@ class BaseOperationDialog(QDialog):
                 "",
                 f"  \u2022 Devis N°: {self.operation_obj.get_value('devis') or '(allocated on save)'}",
                 f"  \u2022 Historical Sale: {'Yes' if is_historical else 'No'}",
+                f"  \u2022 Affect current stock: {'Yes' if affect_stock else 'No'}",
                 (
-                    "  \u2022 Stock impact: None (no deduction, no validation)"
-                    if is_historical
-                    else "  \u2022 Stock impact: Normal (deducts stock once)"
+                    "  \u2022 Stock impact: Will deduct product quantities from current stock"
+                    if affect_stock
+                    else "  \u2022 Stock impact: No stock deduction"
                 ),
                 f"  \u2022 New Products to create: {new_products}",
                 f"  \u2022 New Services to create: {new_services}",
@@ -1300,20 +1393,22 @@ class BaseOperationDialog(QDialog):
                         "sale_price": str(price),
                     }
                     if action == "product":
-                        is_historical = bool(self.operation_obj.get_value("is_historical"))
+                        # A product created from a Sale only needs opening stock
+                        # that covers the Sale when that Sale actually consumes
+                        # inventory. Otherwise the Sale leaves stock alone, so
+                        # the opening quantity may legitimately be 0.
+                        consumes_stock = self._affects_stock()
                         from PySide6.QtWidgets import QInputDialog
-                        # Historical products start at zero real stock unless the
-                        # user enters a real opening quantity.
                         initial, ok = QInputDialog.getDouble(
                             self, "Initial Product Stock",
                             f"Initial stock for '{name}':",
-                            0.0 if is_historical else float(quantity),
-                            0.0 if is_historical else 0.001,
+                            float(quantity) if consumes_stock else 0.0,
+                            0.001 if consumes_stock else 0.0,
                             999999999.0, 3,
                         )
                         if not ok:
                             return False, False
-                        if not is_historical and Decimal(str(initial)) < quantity:
+                        if consumes_stock and Decimal(str(initial)) < quantity:
                             QMessageBox.warning(
                                 self, "Insufficient Initial Stock",
                                 "Initial stock must cover the quantity in this sale."

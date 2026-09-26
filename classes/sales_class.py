@@ -85,6 +85,28 @@ class SalesClass(BaseClass):
                     "es": "Registrar esta venta sin afectar el stock actual"
                 }
             },
+            # Explicit, user-chosen inventory decision for this Sale. Creating a
+            # sale does NOT touch current stock unless this is checked. Kept
+            # separate from is_historical (books/accounting meaning) and from
+            # state (workflow meaning): a historical sale always forces this
+            # off, and a state change never changes it.
+            "affect_stock": {
+                "value": False,
+                "display_name": {
+                    "en": "Affect current stock", "fr": "Affecter le stock actuel",
+                    "es": "Afectar el stock actual"
+                },
+                "required": False,
+                "default": False,
+                "type": "bool",
+                "true_value": True,
+                "false_value": False,
+                "hint": {
+                    "en": "Deduct product quantities from inventory",
+                    "fr": "Déduire les quantités produits du stock",
+                    "es": "Descontar las cantidades de producto del inventario"
+                }
+            },
             "client_username": {
                 "value": "",
                 "display_name": {"en": "Client", "fr": "Client", "es": "Cliente"},
@@ -251,6 +273,7 @@ class SalesClass(BaseClass):
                 "tva": "rw",
                 "notes": "rw",
                 "is_historical": "rw",
+                "affect_stock": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {

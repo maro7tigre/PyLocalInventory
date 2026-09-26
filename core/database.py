@@ -90,6 +90,22 @@ CLIENT_ACCOUNT_SALE_FIELDS = (
     "remaining",
 )
 
+# Single authoritative predicate for "this Sale participates in current stock".
+#
+# Current stock is derived from stored operations (imports minus eligible sales),
+# so no second physical deduction exists. A Sale is only subtracted when the
+# user explicitly opted in via affect_stock, and never when it is a historical
+# (books-only) record - that exclusion is a hard safety net even if legacy data
+# ever contains the impossible historical + affect_stock combination.
+#
+# Sale state is deliberately NOT part of this predicate: workflow state and the
+# inventory decision are separate concepts, so moving a Sale from pending to
+# confirmed (or to on_hold) must never move stock on its own.
+SALE_STOCK_ELIGIBILITY_SQL = (
+    "COALESCE(s.affect_stock, FALSE) = TRUE "
+    "AND COALESCE(s.is_historical, FALSE) = FALSE"
+)
+
 # Year a Devis number is scoped to: the first 4-digit group in the sale date,
 # falling back to created_at, then 0. Kept as a single SQL expression so the
 # per-year backfill and the summaries query always agree on the same year.
@@ -541,6 +557,14 @@ class Database:
                 # Historical sales are books-only: they never touch stock.
                 # Default FALSE so every existing sale stays a normal sale.
                 'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
+                # Explicit, user-chosen stock decision for a Sale. Declared
+                # BOOLEAN here (and deliberately NOT as a "bool" parameter) so
+                # the generic class-driven migration loop - which maps bool to
+                # DOUBLE PRECISION for the numeric tva toggle - can never create
+                # it with the wrong type. Added nullable first so the one-time
+                # backfill can distinguish legacy rows; _migrate_sales_affect_stock
+                # then backfills and tightens it to NOT NULL DEFAULT FALSE.
+                'affect_stock': 'BOOLEAN',
                 'remise': 'DOUBLE PRECISION',
                 'remise_includes_line_discounts': 'BOOLEAN NOT NULL DEFAULT FALSE',
                 # Persistent per-year sequential Devis reference (DE-YEAR-N).
@@ -634,6 +658,28 @@ class Database:
                     f"Warning: could not normalize {col_table}.is_historical "
                     f"to BOOLEAN: {e_type}"
                 )
+
+        # sales.affect_stock must be BOOLEAN, never DOUBLE PRECISION: the stock
+        # predicate uses COALESCE(s.affect_stock, FALSE) = TRUE, which needs a
+        # real boolean. Only relevant if some other path ever added the column
+        # through the bool->DOUBLE PRECISION mapping.
+        try:
+            self.cursor.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'sales' "
+                "AND column_name = 'affect_stock'"
+            )
+            type_row = self.cursor.fetchone()
+            if type_row and type_row[0] != "boolean":
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock "
+                    "TYPE BOOLEAN USING (COALESCE(affect_stock, 0) <> 0)"
+                )
+                self.conn.commit()
+                print("✓ Normalized sales.affect_stock to BOOLEAN")
+        except Exception as e_type:
+            self.conn.rollback()
+            print(f"Warning: could not normalize sales.affect_stock to BOOLEAN: {e_type}")
 
         try:
             self.cursor.execute(
@@ -2009,9 +2055,10 @@ class Database:
         migrations at a time. A second instance blocks on the lock, then
         re-checks - finding flags already set and skipping without doing any work.
         """
-        # Fast path: if both flags are already set, nothing to do (no lock needed)
+        # Fast path: if all flags are already set, nothing to do (no lock needed)
         if (self._get_meta('fk_relaxed', '0') == '1' and
-                self._get_meta('backfill_product_name_done', '0') == '1'):
+                self._get_meta('backfill_product_name_done', '0') == '1' and
+                self._get_meta('sales_affect_stock_backfill_done', '0') == '1'):
             return
 
         lock_target = self.database_name or self.schema_name
@@ -2026,7 +2073,8 @@ class Database:
             # Re-read flags inside the lock (another instance may have finished while we waited)
             try:
                 self.cursor.execute(
-                    "SELECT key, value FROM meta WHERE key IN ('fk_relaxed','backfill_product_name_done')"
+                    "SELECT key, value FROM meta WHERE key IN "
+                    "('fk_relaxed','backfill_product_name_done','sales_affect_stock_backfill_done')"
                 )
                 flags = {row[0]: row[1] for row in self.cursor.fetchall()}
             except Exception as e:
@@ -2036,6 +2084,7 @@ class Database:
 
             fk_done = flags.get('fk_relaxed', '0') == '1'
             backfill_done = flags.get('backfill_product_name_done', '0') == '1'
+            affect_stock_done = flags.get('sales_affect_stock_backfill_done', '0') == '1'
 
             # 1) Legacy product_id FK relaxation: fresh Postgres schemas are
             # created without that FK to begin with (see _create_table_for_class),
@@ -2066,6 +2115,51 @@ class Database:
                 except Exception as e:
                     self.conn.rollback()
                     print(f"Backfill product_name migration failed: {e}")
+
+            # 3) One-time sales.affect_stock backfill. Existing sales already
+            # influence current stock under the OLD rule (not historical AND
+            # state != on_hold); without this their displayed stock would all
+            # change the moment the column appears. Only rows still NULL are
+            # touched, and the meta flag stops it running again, so a Sale the
+            # user later saves with affect_stock = FALSE can never be re-enabled.
+            if not affect_stock_done:
+                try:
+                    self.cursor.execute("""
+                        UPDATE sales
+                        SET affect_stock = TRUE
+                        WHERE affect_stock IS NULL
+                          AND COALESCE(is_historical, FALSE) = FALSE
+                          AND (state IS NULL OR state <> 'on_hold')
+                    """)
+                    enabled = self.cursor.rowcount or 0
+                    self.cursor.execute("""
+                        UPDATE sales
+                        SET affect_stock = FALSE
+                        WHERE affect_stock IS NULL
+                    """)
+                    self.conn.commit()
+                    self._set_meta('sales_affect_stock_backfill_done', '1')
+                    print(
+                        f"Migrated sales.affect_stock: {enabled} existing sale(s) keep "
+                        "their previous stock effect, all others default to FALSE"
+                    )
+                except Exception as e:
+                    self.conn.rollback()
+                    print(f"sales.affect_stock backfill migration failed: {e}")
+
+            # The column is tightened only after the legacy rows were converted,
+            # so every future insert relies on the NOT NULL DEFAULT FALSE.
+            try:
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock SET DEFAULT FALSE"
+                )
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock SET NOT NULL"
+                )
+                self.conn.commit()
+            except Exception as e:
+                self.conn.rollback()
+                print(f"Warning: could not finalize sales.affect_stock: {e}")
         finally:
             try:
                 self.cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
@@ -2515,13 +2609,12 @@ class Database:
             )
             imported = self.cursor.fetchone()[0] or 0
             self.cursor.execute(
-                """
+                f"""
                 SELECT COALESCE(SUM(si.quantity), 0)
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
                 WHERE si.product_id=%s
-                  AND (s.state IS NULL OR s.state<>'on_hold')
-                  AND (s.is_historical IS NULL OR NOT s.is_historical)
+                  AND {SALE_STOCK_ELIGIBILITY_SQL}
                 """,
                 (product_id,),
             )
@@ -2650,6 +2743,13 @@ class Database:
                     }
 
             is_historical = self._parse_bool_flag(sale_data.get("is_historical"))
+            # affect_stock is the explicit, user-chosen inventory decision and
+            # the ONLY thing that makes a Sale consume current stock. A
+            # historical Sale is books-only, so it can never affect stock -
+            # enforced here so a remote client cannot bypass it.
+            affect_stock = self._parse_bool_flag(sale_data.get("affect_stock"))
+            if is_historical:
+                affect_stock = False
 
             resolved_pending = self._create_pending_sale_entities(pending_entities, user)
 
@@ -2717,6 +2817,10 @@ class Database:
             # creates and edits persist (and can switch) the flag.
             if "is_historical" in sale_data:
                 header["is_historical"] = self._parse_bool_flag(sale_data["is_historical"])
+            # Same treatment for affect_stock: a real BOOLEAN column that is not
+            # managed by the parameter-class schema builder, so it is injected
+            # explicitly and normalized to a Python bool for PostgreSQL.
+            header["affect_stock"] = affect_stock
             # PostgreSQL requires a real bool for this BOOLEAN column. Older
             # parameter mappings could supply numeric 0/1 values here.
             if "remise_includes_line_discounts" in header:
@@ -2835,7 +2939,9 @@ class Database:
                 )
             deleted = len(delete_ids)
 
-            if not is_historical and str(header.get("state") or "pending") != "on_hold":
+            # Stock availability is only validated when this Sale actually
+            # consumes inventory. Sale state plays no part in this decision.
+            if affect_stock:
                 requested_by_product = {}
                 for item in validated:
                     if item["item_type"] == "product":
@@ -2865,12 +2971,11 @@ class Database:
                     )
                     imported = self.cursor.fetchone()[0] or 0
                     self.cursor.execute(
-                        """
+                        f"""
                         SELECT COALESCE(SUM(si.quantity), 0)
                         FROM sales_items si JOIN sales s ON s.id=si.sales_id
                         WHERE si.product_id=%s AND si.sales_id<>%s
-                          AND (s.state IS NULL OR s.state<>'on_hold')
-                          AND (s.is_historical IS NULL OR NOT s.is_historical)
+                          AND {SALE_STOCK_ELIGIBILITY_SQL}
                         """,
                         (product_id, sale_id),
                     )
@@ -3742,7 +3847,7 @@ class Database:
 
     def get_product_stock_levels(self):
         self.cursor.execute(
-            """
+            f"""
             SELECT p.id,
                    COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
             FROM products p
@@ -3757,8 +3862,7 @@ class Database:
                 SELECT si.product_id, SUM(si.quantity) AS quantity
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
-                WHERE s.state IS NULL OR s.state<>'on_hold'
-                  AND (s.is_historical IS NULL OR NOT s.is_historical)
+                WHERE {SALE_STOCK_ELIGIBILITY_SQL}
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             """
@@ -3769,7 +3873,7 @@ class Database:
         if not product_ids:
             return {}
         self.cursor.execute(
-            """
+            f"""
             SELECT p.id,
                    COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
             FROM products p
@@ -3784,8 +3888,7 @@ class Database:
                 SELECT si.product_id, SUM(si.quantity) AS quantity
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
-                WHERE s.state IS NULL OR s.state<>'on_hold'
-                  AND (s.is_historical IS NULL OR NOT s.is_historical)
+                WHERE {SALE_STOCK_ELIGIBILITY_SQL}
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             WHERE p.id = ANY(%s)
@@ -3808,7 +3911,7 @@ class Database:
         if include_products:
             if exclude_sale_id:
                 self.cursor.execute(
-                    """
+                    f"""
                     SELECT p.id, p.name, p.sale_price, p.preview_image,
                            COALESCE(imported.quantity, 0)
                            - COALESCE(sold.quantity, 0) AS stock
@@ -3824,8 +3927,7 @@ class Database:
                         SELECT si.product_id, SUM(si.quantity) AS quantity
                         FROM sales_items si
                         JOIN sales s ON s.id=si.sales_id
-                        WHERE (s.state IS NULL OR s.state<>'on_hold')
-                          AND (s.is_historical IS NULL OR NOT s.is_historical)
+                        WHERE {SALE_STOCK_ELIGIBILITY_SQL}
                           AND s.id != %s
                         GROUP BY si.product_id
                     ) sold ON sold.product_id=p.id
@@ -3836,7 +3938,7 @@ class Database:
                 )
             else:
                 self.cursor.execute(
-                    """
+                    f"""
                     SELECT p.id, p.name, p.sale_price, p.preview_image,
                            COALESCE(imported.quantity, 0)
                            - COALESCE(sold.quantity, 0) AS stock
@@ -3852,8 +3954,7 @@ class Database:
                         SELECT si.product_id, SUM(si.quantity) AS quantity
                         FROM sales_items si
                         JOIN sales s ON s.id=si.sales_id
-                        WHERE s.state IS NULL OR s.state<>'on_hold'
-                          AND (s.is_historical IS NULL OR NOT s.is_historical)
+                        WHERE {SALE_STOCK_ELIGIBILITY_SQL}
                         GROUP BY si.product_id
                     ) sold ON sold.product_id=p.id
                     WHERE p.name IS NOT NULL AND p.name<>''
@@ -3920,7 +4021,7 @@ class Database:
         )
         totals = self.cursor.fetchone() or (0, 0, 0, 0, 0)
         self.cursor.execute(
-            """
+            f"""
             WITH imported AS (
               SELECT ii.product_id, SUM(ii.quantity) quantity
               FROM import_items ii
@@ -3930,8 +4031,7 @@ class Database:
             ), sold AS (
               SELECT si.product_id, SUM(si.quantity) quantity
               FROM sales_items si JOIN sales s ON s.id=si.sales_id
-              WHERE s.state IS NULL OR s.state<>'on_hold'
-                AND (s.is_historical IS NULL OR NOT s.is_historical)
+              WHERE {SALE_STOCK_ELIGIBILITY_SQL}
               GROUP BY si.product_id
             ), stock AS (
               SELECT p.name, p.username,

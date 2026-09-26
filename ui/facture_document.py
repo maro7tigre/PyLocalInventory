@@ -129,44 +129,108 @@ def _document_data(facture, payments, profile):
         payment_date = f" DU {_display_date(payment['date'])}" if payment.get("date") else ""
         references.append(f"{label}{reference} : {money(payment.get('amount') or 0)} {currency}{payment_date}")
     items = []
-    for item in facture["items"]:
-        if item["item_type"] == "section":
-            items.append({"section": True, "designation": str(item["designation"])})
-            continue
-        total = calculate_line_subtotal(
-            item.get("quantity") or 0, item.get("unit_price") or 0, item.get("discount_percentage") or 0
-        )
-        items.append({
-            "section": False,
-            "designation": str(item["designation"]),
-            "information": str(item.get("information") or ""),
-            "unit": str(item.get("unit") or ""),
-            "quantity": quantity(item.get("quantity")),
-            "price": money(item.get("unit_price") or 0),
-            "total": money(total),
-        })
+    # A balance invoice must show the original Devis Products/Services, not a
+    # synthetic line, while its accounting total stays the balance amount.
+    source_items = facture.get("source_items") or []
+    if source_items:
+        devis_labels = {
+            source.get("sale_id"): source.get("devis")
+            for source in (facture.get("sources") or [])
+        }
+        current_source = object()
+        for source_item in source_items:
+            sale_id = source_item.get("source_sale_id")
+            if sale_id != current_source:
+                current_source = sale_id
+                devis = devis_labels.get(sale_id) or ""
+                items.append({
+                    "section": True,
+                    "designation": f"DEVIS N° {devis}" if devis else "DEVIS",
+                })
+            if str(source_item.get("item_type") or "") == "section":
+                items.append({"section": True, "designation": str(source_item.get("designation") or "")})
+                continue
+            total = calculate_line_subtotal(
+                source_item.get("quantity") or 0,
+                source_item.get("unit_price") or 0,
+                source_item.get("discount_percentage") or 0,
+            )
+            items.append({
+                "section": False,
+                "designation": str(source_item.get("designation") or ""),
+                "information": str(source_item.get("information") or ""),
+                "unit": str(source_item.get("unit") or ""),
+                "quantity": quantity(source_item.get("quantity")),
+                "price": money(source_item.get("unit_price") or 0),
+                "total": money(total),
+            })
+    else:
+        for item in facture["items"]:
+            if item["item_type"] == "section":
+                items.append({"section": True, "designation": str(item["designation"])})
+                continue
+            total = calculate_line_subtotal(
+                item.get("quantity") or 0, item.get("unit_price") or 0, item.get("discount_percentage") or 0
+            )
+            items.append({
+                "section": False,
+                "designation": str(item["designation"]),
+                "information": str(item.get("information") or ""),
+                "unit": str(item.get("unit") or ""),
+                "quantity": quantity(item.get("quantity")),
+                "price": money(item.get("unit_price") or 0),
+                "total": money(total),
+            })
     paid = Decimal(str(facture.get("paid") or 0))
     remaining = Decimal(str(facture.get("remaining") or 0))
-    previous_advance = Decimal(str(facture.get("previous_advance_ttc") or 0))
-    total_rows = [
-        ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
-        ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
-    ]
-    if facture.get("facture_type") == "balance":
-        total_rows.append(("MONTANT GLOBAL DES DEVIS", f"{money(facture.get('selected_total_ttc') or facture['total_ttc'])} {currency}", False))
-        total_rows.append(("DÉJÀ FACTURÉ", f"{money(previous_advance)} {currency}", False))
-        total_rows.append(("SOLDE FACTURÉ", f"{money(facture['total_ttc'])} {currency}", True))
+    invoice_type = facture.get("facture_type")
+    # Project (selected Devis) figures vs. this invoice's own accounting value.
+    # The backend is authoritative for both; the renderer only formats them.
+    project_ht = Decimal(str(facture.get("selected_total_ht") or facture["total_ht"]))
+    project_vat = Decimal(str(facture.get("selected_vat_amount") or facture["vat_amount"]))
+    project_ttc = Decimal(str(facture.get("selected_total_ttc") or facture["total_ttc"]))
+    previous_paid = Decimal(str(facture.get("previous_paid_ttc") or 0))
+    current_paid = Decimal(str(facture.get("current_paid_ttc") if
+                              facture.get("current_paid_ttc") is not None else paid))
+    project_remaining = Decimal(str(
+        facture.get("project_remaining_to_pay")
+        if facture.get("project_remaining_to_pay") is not None
+        else max(Decimal("0"), project_ttc - previous_paid - current_paid)
+    ))
+
+    total_rows = []
+    if invoice_type == "balance":
+        # A balance invoice displays the FULL Devis value; the payment lines
+        # below explain what is still owed on the project.
+        total_rows = [
+            ("Total HT", f"{money(project_ht)} {currency}", False),
+            ("Total TVA", f"{money(project_vat)} {currency}", False),
+            ("Total TTC", f"{money(project_ttc)} {currency}", True),
+            ("DÉJÀ PAYÉ", f"{money(previous_paid)} {currency}", False),
+            ("PAYÉ", f"{money(current_paid)} {currency}", False),
+            ("RESTE À PAYER", f"{money(project_remaining)} {currency}", True),
+        ]
+    elif invoice_type == "advance":
+        # An advance is a PART of the project: the project value is shown as the
+        # global amount, while the advance itself stays the invoiced amount.
+        total_rows = [
+            ("TOTAL HT", f"{money(project_ht)} {currency}", False),
+            ("TOTAL TVA", f"{money(project_vat)} {currency}", False),
+            ("MONTANT GLOBAL", f"{money(project_ttc)} {currency}", False),
+            ("AVANCE À PAYER", f"{money(facture['total_ttc'])} {currency}", True),
+        ]
     else:
-        total_rows.append(("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True))
-    if paid > 0:
-        total_rows.append(("PAYÉ", f"{money(paid)} {currency}", False))
-    if remaining > 0:
-        label = "AVANCE À PAYER" if facture.get("facture_type") == "advance" and not paid else (
-            "NET À PAYER" if facture.get("facture_type") == "normal" and not paid else "RESTE À PAYER"
-        )
-        total_rows.append((label, f"{money(remaining)} {currency}", True))
-    elif paid > 0:
-        total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
+        total_rows = [
+            ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
+            ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
+            ("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True),
+        ]
+        if paid > 0:
+            total_rows.append(("PAYÉ", f"{money(paid)} {currency}", False))
+        if remaining > 0:
+            total_rows.append(("NET À PAYER", f"{money(remaining)} {currency}", True))
+        elif paid > 0:
+            total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
     data = {
         "contact": "\n".join(part for part in contact if part),
         "client_rows": client_rows,

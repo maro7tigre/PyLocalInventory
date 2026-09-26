@@ -346,9 +346,65 @@ class FactureEditorTests(unittest.TestCase):
             "paid": Decimal("22334.40"), "remaining": Decimal("0"), "amount_in_words": "TEST",
         }
         rows = _document_data(facture, [], None)["total_rows"]
-        self.assertIn(("SOLDE FACTURÉ", "22 334,40 MAD", True), rows)
+        # The balance document shows the FULL project value, not the balance
+        # amount, and its payment lines are actual-payment based.
+        self.assertIn(("Total TTC", "100 000,00 MAD", True), rows)
+        self.assertIn(("DÉJÀ PAYÉ", "0,00 MAD", False), rows)
         self.assertIn(("PAYÉ", "22 334,40 MAD", False), rows)
-        self.assertIn(("RESTE À PAYER", "0,00 MAD", True), rows)
+        self.assertIn(("RESTE À PAYER", "77 665,60 MAD", True), rows)
+        # Labels removed by the new layout.
+        self.assertNotIn("SOLDE FACTURÉ", [row[0] for row in rows])
+        self.assertNotIn("MONTANT GLOBAL DES DEVIS", [row[0] for row in rows])
+
+    def test_advance_document_shows_project_totals_but_keeps_advance_amount(self):
+        facture = {
+            "facture_number": "FA013/2026", "date": "2026-09-23", "facture_type": "advance",
+            "client_name": "Aptiv", "items": [], "total_ht": Decimal("2083.33"),
+            "vat_amount": Decimal("416.67"), "total_ttc": Decimal("2500"),
+            "selected_total_ht": Decimal("30000"), "selected_vat_amount": Decimal("6000"),
+            "selected_total_ttc": Decimal("36000"),
+            "paid": Decimal("0"), "remaining": Decimal("2500"), "amount_in_words": "TEST",
+        }
+        rows = _document_data(facture, [], None)["total_rows"]
+        self.assertEqual(rows, [
+            ("TOTAL HT", "30 000,00 MAD", False),
+            ("TOTAL TVA", "6 000,00 MAD", False),
+            ("MONTANT GLOBAL", "36 000,00 MAD", False),
+            ("AVANCE À PAYER", "2 500,00 MAD", True),
+        ])
+        # The advance block stays simple: no PAYE / RESTE lines.
+        self.assertNotIn("PAYÉ", [row[0] for row in rows])
+        self.assertNotIn("RESTE À PAYER", [row[0] for row in rows])
+
+    def test_balance_document_renders_source_devis_lines(self):
+        facture = {
+            "facture_number": "FA014/2026", "date": "2026-09-23", "facture_type": "balance",
+            "client_name": "Aptiv", "total_ht": Decimal("18612.00"),
+            "vat_amount": Decimal("3722.40"), "total_ttc": Decimal("22334.40"),
+            "selected_total_ht": Decimal("30000"), "selected_vat_amount": Decimal("6000"),
+            "selected_total_ttc": Decimal("36000"),
+            "previous_paid_ttc": Decimal("2500"), "current_paid_ttc": Decimal("0"),
+            "project_remaining_to_pay": Decimal("33500"),
+            "paid": Decimal("0"), "remaining": Decimal("22334.40"), "amount_in_words": "TEST",
+            "items": [{"item_type": "manual", "designation": "SOLDE SUR TRAVAUX", "quantity": 1,
+                       "unit_price": Decimal("100"), "discount_percentage": 0}],
+            "sources": [{"sale_id": 38, "devis": "DE-2026-38", "allocated_ttc": Decimal("33500")}],
+            "source_items": [
+                {"source_sale_id": 38, "item_type": "product", "designation": "Product A",
+                 "information": "", "unit": "U", "quantity": Decimal("2"),
+                 "unit_price": Decimal("100"), "discount_percentage": 0, "sort_order": 1},
+                {"source_sale_id": 38, "item_type": "section", "designation": "Porte",
+                 "quantity": None, "unit_price": None, "discount_percentage": 0, "sort_order": 2},
+                {"source_sale_id": 38, "item_type": "service", "designation": "Service A",
+                 "information": "sur site", "unit": "ENS", "quantity": Decimal("1"),
+                 "unit_price": Decimal("500"), "discount_percentage": 0, "sort_order": 3},
+            ],
+        }
+        data = _document_data(facture, [], None)
+        rendered = [item["designation"] for item in data["items"]]
+        self.assertEqual(rendered, ["DEVIS N° DE-2026-38", "Product A", "Porte", "Service A"])
+        self.assertNotIn("SOLDE SUR TRAVAUX", rendered)
+        self.assertIn(("RESTE À PAYER", "33 500,00 MAD", True), data["total_rows"])
 
     def test_main_list_keeps_payment_amounts_in_the_payment_screen(self):
         tab = FacturesTab(_FactureDatabase())

@@ -37,13 +37,28 @@ class _DashboardWorker(QObject):
         is_cancelled = False
         error_msg = ""
         snapshot = None
+        worker_db = self.database
+        close_worker_db = False
         try:
             if QThread.currentThread().isInterruptionRequested():
                 is_cancelled = True
                 return
+
+            # A local Database owns a psycopg cursor and cannot be used from
+            # this QThread. RemoteDatabase is safe to use for one RPC here.
+            from core.database import Database
+            if isinstance(self.database, Database):
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, "language", "en")
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect(initialize_schema=False):
+                    raise RuntimeError(
+                        f"Worker could not connect to database: {worker_db.last_error}"
+                    )
+                close_worker_db = True
                 
             with diagnostics.operation("dashboard_snapshot", mode="client"):
-                snapshot = self.database.get_dashboard_snapshot()
+                snapshot = worker_db.get_dashboard_snapshot()
                 
                 if QThread.currentThread().isInterruptionRequested():
                     is_cancelled = True
@@ -54,6 +69,8 @@ class _DashboardWorker(QObject):
             logger.exception("Remote dashboard load failed")
             error_msg = str(error) or "Unknown error"
         finally:
+            if close_worker_db:
+                worker_db.close()
             if is_cancelled:
                 self.cancelled.emit(started)
             elif is_success:

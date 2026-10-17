@@ -8,7 +8,7 @@ from PySide6.QtWidgets import (
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
     QCheckBox, QMessageBox, QInputDialog, QFileDialog
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
 from core.network.server import DatabaseServer
 from core.network.protocol import DEFAULT_PORT
@@ -73,8 +73,18 @@ class NetworkDialog(QDialog):
             self._refresh_hosting_status()
             self._refresh_users_table()
             self._refresh_roles_combo()
+            self._hosting_status_timer = QTimer(self)
+            self._hosting_status_timer.setInterval(2000)
+            self._hosting_status_timer.timeout.connect(self._refresh_hosting_status)
+            self._hosting_status_timer.start()
 
         self.tabs.setCurrentIndex(min(focus_tab, self.tabs.count() - 1))
+
+    def done(self, result):
+        timer = getattr(self, '_hosting_status_timer', None)
+        if timer is not None:
+            timer.stop()
+        super().done(result)
 
     def _apply_access_state(self):
         """Disable the management tabs until a profile has been unlocked."""
@@ -259,7 +269,10 @@ class NetworkDialog(QDialog):
     def _refresh_hosting_status(self):
         server = getattr(self.main_window, 'network_server', None)
         running = bool(server and server.is_running)
-        self.status_label.setText("Status: Hosting" if running else "Status: Not hosting")
+        self.status_label.setText(
+            "Status: Hosting" if running else
+            "Status: Server unavailable" if server else "Status: Not hosting"
+        )
         self.toggle_btn.setText("Stop Hosting" if running else "Start Hosting")
         self.ip_label.setText(f"Your LAN IP: {DatabaseServer.local_ip()}" if running else "")
         self.port_input.setEnabled(not running)
@@ -268,8 +281,13 @@ class NetworkDialog(QDialog):
         server = getattr(self.main_window, 'network_server', None)
         if server and server.is_running:
             server.stop()
+            self.main_window.network_server = None
             self._refresh_hosting_status()
             return
+        if server:
+            # A dead serving thread still owns its pool until stop() cleans it.
+            server.stop()
+            self.main_window.network_server = None
 
         if not self.user_manager.has_any_superadmin():
             username, ok = QInputDialog.getText(self, "Create Super Admin", "Choose a super-admin username:")
@@ -293,10 +311,10 @@ class NetworkDialog(QDialog):
             QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
             return
 
-        server = DatabaseServer(self.database, port=port)
         try:
+            server = DatabaseServer(self.database, port=port)
             server.start()
-        except OSError as e:
+        except Exception as e:
             QMessageBox.critical(self, "Could not start hosting", str(e))
             return
         self.main_window.network_server = server

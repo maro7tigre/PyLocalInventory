@@ -318,9 +318,10 @@ class MainWindow(ThemedMainWindow):
             
         # Stop network server
         try:
-            if getattr(self, 'network_server', None) and self.network_server.is_running:
+            server = getattr(self, 'network_server', None)
+            if server is not None:
                 _safe_log("info", "Stopping network server...")
-                self.network_server.stop()
+                server.stop()
         except Exception as e:
             _safe_log("error", f"Error stopping network server: {e}")
             

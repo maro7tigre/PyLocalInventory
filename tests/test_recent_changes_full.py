@@ -1,5 +1,7 @@
 import sys
 import os
+import threading
+import time
 import unittest
 from unittest.mock import MagicMock, patch, call
 from decimal import Decimal
@@ -10,7 +12,8 @@ sys.path.insert(0, os.path.abspath(os.path.join(os.path.dirname(__file__), '..')
 from ui.dialogs.edit_dialogs.base_operation_dialog import BaseOperationDialog, SaveWorker, LoadWorker
 from ui.widgets.operations_table import OperationsTableWidget
 from PySide6.QtWidgets import QApplication, QDialog, QMessageBox
-from PySide6.QtCore import QTimer
+from PySide6.QtCore import QEvent, QThread, QTimer
+from PySide6.QtTest import QTest
 
 app = QApplication.instance() or QApplication(sys.argv)
 
@@ -103,6 +106,49 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
         self.assertTrue(dialog.operation_obj.data.get('loaded'))
         self.assertEqual(dialog.database.sale_catalog["products"][0]["name"], "Prod A")
 
+    def test_remote_load_completion_runs_on_gui_thread(self):
+        class RemoteDatabase:
+            def has_permission(self, *_args):
+                return True
+
+            def get_sale_catalog(self, **_kwargs):
+                return {"products": [], "services": []}
+
+        RemoteDatabase.__name__ = "RemoteDatabase"
+        gui_thread = QThread.currentThread()
+        callback_threads = []
+
+        def setup_ui(dialog):
+            dialog.parameter_widgets = {}
+            dialog.remise_spinbox = None
+            dialog.items_table = None
+
+        def load_data(_dialog):
+            callback_threads.append(QThread.currentThread())
+
+        with patch.object(BaseOperationDialog, "setup_ui", setup_ui), patch.object(
+            BaseOperationDialog, "apply_theme", lambda _dialog: None,
+        ), patch.object(BaseOperationDialog, "load_data", load_data):
+            dialog = BaseOperationDialog(DummyOperation, DummyItem, database=RemoteDatabase())
+            thread = dialog.load_thread
+            try:
+                deadline = time.monotonic() + 2
+                while not callback_threads and time.monotonic() < deadline:
+                    app.processEvents()
+                    QTest.qWait(2)
+                self.assertTrue(callback_threads, "remote load callback did not run")
+                self.assertEqual(callback_threads[0], gui_thread)
+                self.assertIsNotNone(thread)
+            finally:
+                if thread is not None:
+                    try:
+                        self.assertTrue(thread.wait(2000), "load QThread did not stop")
+                    except RuntimeError:
+                        pass
+                app.sendPostedEvents(None, QEvent.DeferredDelete)
+                app.processEvents()
+                dialog.close()
+
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.QThread.start')
     @patch('core.database.Database')
     @patch('ui.dialogs.edit_dialogs.base_operation_dialog.BaseOperationDialog.setup_ui')
@@ -167,6 +213,124 @@ class TestBaseOperationDialogAsync(unittest.TestCase):
         # stops), so simulate that delivery before asserting the cleanup.
         dialog._on_save_thread_finished()
         self.assertIsNone(dialog.save_worker)
+
+class TestFactureEditorLoad(unittest.TestCase):
+    def test_remote_editor_returns_before_catalog_and_preview_rpcs_finish(self):
+        from ui.tabs.factures_tab import FactureEditor, _active_facture_editor_jobs
+
+        gui_thread_id = threading.get_ident()
+
+        class RemoteDatabase:
+            def __init__(self):
+                self.call_threads = []
+                self.sale_catalog = {
+                    "products": [{
+                        "id": 1, "name": "Product", "price": "10", "stock": "5",
+                    }],
+                    "services": [],
+                    "clients": [{"id": 7, "username": "client", "name": "Client"}],
+                }
+
+            def get_sale_catalog(self, *_args, **_kwargs):
+                self.call_threads.append(threading.get_ident())
+                time.sleep(0.03)
+                return self.sale_catalog
+
+            def get_next_facture_preview(self):
+                self.call_threads.append(threading.get_ident())
+                time.sleep(0.03)
+                return "FA-007/2026"
+
+        RemoteDatabase.__name__ = "RemoteDatabase"
+        database = RemoteDatabase()
+        started = time.perf_counter()
+        editor = FactureEditor(database)
+        constructor_ms = (time.perf_counter() - started) * 1000
+        self.assertLess(constructor_ms, 50)
+        thread = editor._catalog_thread
+        self.assertIsNotNone(thread)
+
+        editor.load_draft({
+            "date": "2026-10-10", "facture_type": "normal", "tva_rate": 20,
+            "notes": "Draft note", "client_id": 7,
+            "source_devis": "DE-007/2026", "selected_total_ttc": 24,
+            "previous_advance_ttc": 0, "remaining_ttc": 24,
+            "items": [{
+                "item_type": "product", "designation": "Product", "unit": "U",
+                "quantity": "2", "unit_price": "10", "discount_percentage": "0",
+            }],
+        })
+        self.assertTrue(thread.wait(2000), "FactureEditor load QThread did not stop")
+
+        deadline = time.monotonic() + 2
+        while not editor._catalog_ready and time.monotonic() < deadline:
+            app.processEvents()
+            QTest.qWait(2)
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        app.processEvents()
+
+        self.assertTrue(editor._catalog_ready)
+        self.assertEqual(len(database.call_threads), 2)
+        self.assertEqual(len(set(database.call_threads)), 1)
+        self.assertNotEqual(database.call_threads[0], gui_thread_id)
+        self.assertEqual(editor.number.text(), "Aperçu: FA-007/2026")
+        self.assertEqual(editor.client.text(), "Client")
+        self.assertEqual(editor.notes.toPlainText(), "Draft note")
+        self.assertEqual(editor.items.rowCount(), 1)
+        self.assertTrue(editor.save_button.isEnabled())
+        self.assertFalse(_active_facture_editor_jobs)
+        editor.close()
+
+    def test_local_editor_worker_uses_and_closes_a_dedicated_database(self):
+        from ui.tabs.factures_tab import _FactureEditorLoadWorker
+
+        class FakeDatabase:
+            instances = []
+
+            def __init__(self, profile_manager):
+                self.profile_manager = profile_manager
+                self.language = "en"
+                self.registered_classes = {"Clients": object}
+                self.connected = False
+                self.closed = False
+                self.calls = []
+                self.__class__.instances.append(self)
+
+            def connect(self, initialize_schema=False):
+                assert initialize_schema is False
+                self.connected = True
+                return True
+
+            def get_sale_catalog(self, *_args, **_kwargs):
+                self.calls.append("catalog")
+                return {"products": [], "services": [], "clients": []}
+
+            def get_next_facture_preview(self):
+                self.calls.append("preview")
+                return "FA-007/2026"
+
+            def close(self):
+                self.closed = True
+
+        FakeDatabase.instances.clear()
+        source = FakeDatabase("profile")
+        with patch("core.database.Database", FakeDatabase):
+            received = []
+            worker = _FactureEditorLoadWorker(source, fetch_preview=True)
+            worker.loaded.connect(lambda catalog, preview: received.append((catalog, preview)))
+            worker.run()
+
+        self.assertEqual(len(FakeDatabase.instances), 2)
+        background = FakeDatabase.instances[1]
+        self.assertEqual(source.calls, [])
+        self.assertTrue(background.connected and background.closed)
+        self.assertEqual(background.language, source.language)
+        self.assertIs(background.registered_classes, source.registered_classes)
+        self.assertEqual(background.calls, ["catalog", "preview"])
+        self.assertEqual(
+            received, [({"products": [], "services": [], "clients": []}, "FA-007/2026")],
+        )
+
 
 class TestOperationsTableCatalog(unittest.TestCase):
     def setUp(self):

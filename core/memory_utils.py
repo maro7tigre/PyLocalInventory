@@ -60,8 +60,19 @@ def _windows_rss_bytes():
         psapi = ctypes.windll.psapi
         counters = PROCESS_MEMORY_COUNTERS()
         counters.cb = ctypes.sizeof(PROCESS_MEMORY_COUNTERS)
-        handle = kernel32.GetCurrentProcess()
-        if psapi.GetProcessMemoryInfo(handle, ctypes.byref(counters), counters.cb):
+        # WinDLL defaults an unspecified return type to 32-bit c_int. A
+        # pseudo-HANDLE is pointer-sized on 64-bit Windows; truncating it
+        # makes GetProcessMemoryInfo fail and reports a misleading 0.0 MiB
+        # when psutil is not installed.
+        get_current_process = kernel32.GetCurrentProcess
+        get_current_process.restype = wintypes.HANDLE
+        get_process_memory_info = psapi.GetProcessMemoryInfo
+        get_process_memory_info.argtypes = (
+            wintypes.HANDLE, ctypes.POINTER(PROCESS_MEMORY_COUNTERS), wintypes.DWORD
+        )
+        get_process_memory_info.restype = wintypes.BOOL
+        handle = get_current_process()
+        if get_process_memory_info(handle, ctypes.byref(counters), counters.cb):
             return int(counters.WorkingSetSize)
     except Exception:
         return None

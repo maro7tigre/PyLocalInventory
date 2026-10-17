@@ -64,5 +64,22 @@ class TestMainWindowShutdown(unittest.TestCase):
                 # Verify event was accepted
                 event.accept.assert_called_once()
 
+    def test_closeEvent_cleans_up_pool_after_server_thread_dies(self):
+        with patch.object(MainWindow, '__init__', lambda self: super(MainWindow, self).__init__()):
+            window = MainWindow()
+            window.tab_visibility = {}
+            server = MagicMock()
+            server.is_running = False
+            setattr(window, 'network_server', server)
+            window.database = MagicMock()
+            window.tab_widget = MagicMock()
+            window.tab_widget.count.return_value = 0
+            window.save_app_config = MagicMock()
+            window._stop_sync_coordinator = MagicMock()
+            event = MagicMock()
+            window.closeEvent(event)
+            server.stop.assert_called_once()
+            event.accept.assert_called_once()
+
 if __name__ == "__main__":
     unittest.main()

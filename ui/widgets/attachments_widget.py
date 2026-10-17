@@ -11,7 +11,7 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot
+from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
@@ -148,6 +148,131 @@ class _ClientSalesFetchWorker(QObject):
             logger.debug("[ATTACH WORKER] sales run end worker=%s", id(self))
 
 
+def _worker_database(database):
+    """Return a thread-owned local connection or the existing remote client."""
+    from core.database import Database
+    if not isinstance(database, Database):
+        return database, False
+    worker_db = Database(database.profile_manager)
+    worker_db.language = getattr(database, 'language', 'en')
+    worker_db.registered_classes = database.registered_classes
+    if not worker_db.connect(initialize_schema=False):
+        raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+    return worker_db, True
+
+
+def _upload_attachment(database, entity_type, entity_id, filename, data, sale_id=None):
+    """Perform one upload, including the existing sale-to-client mirror."""
+    encoded = base64.b64encode(data).decode('ascii')
+    if entity_type == 'client':
+        database.upload_attachment(entity_type, entity_id, filename, encoded, sale_id=sale_id)
+        return
+    database.upload_attachment(entity_type, entity_id, filename, encoded)
+    if entity_type != 'sale':
+        return
+    client_id = None
+    try:
+        database.cursor.execute('SELECT client_id, client_username FROM sales WHERE id=%s', (entity_id,))
+        row = database.cursor.fetchone()
+        client_id = int(row[0]) if row and row[0] not in (None, '', 0) else None
+        username = str(row[1] or '').strip() if row else ''
+        if client_id:
+            database.upload_attachment('client', client_id, filename, encoded)
+            return
+        if username:
+            sql = "SELECT id FROM clients WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = LOWER(%s) ORDER BY id LIMIT 1"
+            database.cursor.execute(sql, (database._normalize_exact(username),))
+            client = database.cursor.fetchone()
+            if client:
+                database.upload_attachment('client', int(client[0]), filename, encoded)
+                return
+        raise ValueError('The sale has no linked client; the file was added only to this sale.')
+    except Exception as exc:
+        try:
+            database.conn.rollback()
+        except Exception:
+            pass
+        raise RuntimeError(f'Added to the sale, but could not add it to the client: {exc}') from exc
+
+
+class _AttachmentUploadWorker(QObject):
+    finished = Signal(object)
+
+    def __init__(self, database, entity_type, entity_id, uploads, sale_id):
+        super().__init__()
+        self.database = database
+        self.entity_type = entity_type
+        self.entity_id = entity_id
+        self.uploads = uploads
+        self.sale_id = sale_id
+
+    @Slot()
+    def run(self):
+        worker_db = self.database
+        close_worker_db = False
+        errors = []
+        try:
+            worker_db, close_worker_db = _worker_database(self.database)
+            for filename, data in self.uploads:
+                if QThread.currentThread().isInterruptionRequested():
+                    break
+                try:
+                    _upload_attachment(worker_db, self.entity_type, self.entity_id, filename, data, self.sale_id)
+                except Exception as exc:
+                    errors.append(f'{filename}: {exc}')
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            if close_worker_db:
+                worker_db.close()
+            self.finished.emit(errors)
+
+
+class _AttachmentDownloadWorker(QObject):
+    finished = Signal(object, object)
+
+    def __init__(self, database, jobs):
+        super().__init__()
+        self.database = database
+        self.jobs = jobs
+
+    @Slot()
+    def run(self):
+        worker_db = self.database
+        close_worker_db = False
+        results, errors = [], []
+        try:
+            worker_db, close_worker_db = _worker_database(self.database)
+            for record, target in self.jobs:
+                if QThread.currentThread().isInterruptionRequested():
+                    break
+                temporary = None
+                try:
+                    data = base64.b64decode(worker_db.download_attachment(record['id']))
+                    if target is not None:
+                        target = Path(target)
+                        target.parent.mkdir(parents=True, exist_ok=True)
+                        with tempfile.NamedTemporaryFile(dir=target.parent, delete=False) as handle:
+                            temporary = Path(handle.name)
+                            handle.write(data)
+                            handle.flush()
+                            os.fsync(handle.fileno())
+                        if temporary.stat().st_size != len(data):
+                            raise RuntimeError('Downloaded file size could not be verified.')
+                        os.replace(temporary, target)
+                    results.append((record, str(target) if target is not None else '', data if target is None else b''))
+                except Exception as exc:
+                    if temporary is not None:
+                        temporary.unlink(missing_ok=True)
+                    errors.append(f"{record.get('display_name', record.get('original_filename', 'Attachment'))}: {exc}")
+        except Exception as exc:
+            errors.append(str(exc))
+        finally:
+            if close_worker_db:
+                worker_db.close()
+            self.finished.emit(results, errors)
+
+
 def _scan_with_windows_wia(output_path):
     """Open the Windows WIA scanner UI and save one scanned page as PNG."""
     powershell = shutil.which('powershell.exe') or shutil.which('powershell')
@@ -203,6 +328,10 @@ class AttachmentPanel(QWidget):
         self._sales_worker = None
         self._refresh_after_sales = False
         self._sales_refresh_pending = False
+        self._transfer_thread = None
+        self._transfer_worker = None
+        self._download_record = None
+        self._download_completed = None
         self._closing = False
         self.client_sales_table = None
         self.client_sales_empty = None
@@ -355,8 +484,8 @@ class AttachmentPanel(QWidget):
 
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_fetch_thread_finished)
 
         worker.finished.connect(self._on_attachments_fetched)
@@ -370,6 +499,7 @@ class AttachmentPanel(QWidget):
         thread.start()
 
     def _on_fetch_thread_finished(self):
+        thread = self._fetch_thread
         self._fetch_thread = None
         self._fetch_worker = None
         if self._closing:
@@ -459,8 +589,8 @@ class AttachmentPanel(QWidget):
 
         worker.finished.connect(thread.quit)
         worker.error.connect(thread.quit)
-        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(worker.deleteLater)
         thread.finished.connect(self._on_sales_thread_finished)
 
         worker.finished.connect(self._on_client_sales_fetched)
@@ -474,6 +604,7 @@ class AttachmentPanel(QWidget):
         thread.start()
 
     def _on_sales_thread_finished(self):
+        thread = self._sales_thread
         self._sales_thread = None
         self._sales_worker = None
         if self._closing:
@@ -589,7 +720,7 @@ class AttachmentPanel(QWidget):
             "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s closing",
             id(self), self.entity_id,
         )
-        for thread in (self._fetch_thread, self._sales_thread):
+        for thread in (self._fetch_thread, self._sales_thread, self._transfer_thread):
             if thread is not None and thread.isRunning():
                 thread.requestInterruption()
 
@@ -630,73 +761,95 @@ class AttachmentPanel(QWidget):
         self._add_paths(paths)
 
     def _add_paths(self, paths):
-        errors = []
+        uploads = []
         for path in paths:
             try:
-                data = Path(path).read_bytes()
-                self._upload_bytes(Path(path).name, data)
-            except Exception as exc: errors.append(f'{Path(path).name}: {exc}')
-        self.refresh()
-        if errors: QMessageBox.warning(self, 'Some files were not added', '\n'.join(errors))
+                uploads.append((Path(path).name, Path(path).read_bytes()))
+            except Exception as exc:
+                QMessageBox.warning(self, 'Attachments', f'{Path(path).name}: {exc}')
+        self._start_upload(uploads)
 
     def paste_image(self):
         image = QGuiApplication.clipboard().image()
         if image.isNull(): QMessageBox.information(self, 'Paste image', 'The clipboard does not contain an image.'); return
         data = bytearray(); buffer = QBuffer(); buffer.open(QIODevice.WriteOnly); image.save(buffer, 'PNG')
-        try:
-            self._upload_bytes('clipboard-image.png', bytes(buffer.data()))
-            self.refresh()
-        except Exception as exc: QMessageBox.warning(self, 'Paste image', str(exc))
+        self._start_upload([('clipboard-image.png', bytes(buffer.data()))])
+
+    def _start_upload(self, uploads):
+        if not uploads:
+            return
+        if self._transfer_thread is not None:
+            QMessageBox.information(self, 'Attachments', 'An attachment transfer is already in progress.')
+            return
+        sale_id = self.sale_selector.currentData() if self.entity_type == 'client' else None
+        thread = QThread()
+        worker = _AttachmentUploadWorker(
+            self.database, self.entity_type, self.entity_id, uploads, sale_id,
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_upload_finished)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(lambda t=thread: _release_attachment_job(t))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_transfer_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._transfer_thread = thread
+        self._transfer_worker = worker
+        _active_attachment_threads.add(thread)
+        _active_attachment_jobs[thread] = worker
+        thread.start()
+
+    @Slot(object)
+    def _on_upload_finished(self, errors):
+        if self._closing:
+            return
+        self.refresh()
+        if errors:
+            QMessageBox.warning(self, 'Some files were not added', '\n'.join(errors))
+
+    @Slot()
+    def _on_transfer_finished(self):
+        logger.debug("Attachment transfer thread finished panel=%s thread=%s", id(self), id(self._transfer_thread) if self._transfer_thread else None)
+        self._transfer_thread = None
+        self._transfer_worker = None
+
+    def _start_download(self, jobs, completed):
+        if self._transfer_thread is not None:
+            QMessageBox.information(self, 'Attachments', 'An attachment transfer is already in progress.')
+            return
+        thread = QThread()
+        worker = _AttachmentDownloadWorker(self.database, jobs)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        self._download_completed = completed
+        worker.finished.connect(self._on_download_finished)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(lambda t=thread: _release_attachment_job(t))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_transfer_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._transfer_thread = thread
+        self._transfer_worker = worker
+        _active_attachment_threads.add(thread)
+        _active_attachment_jobs[thread] = worker
+        thread.start()
+
+    @Slot(object, object)
+    def _on_download_finished(self, results, errors):
+        completed = self._download_completed
+        self._download_completed = None
+        if self._closing:
+            return
+        if completed is not None:
+            completed(results)
+        if errors:
+            QMessageBox.warning(self, 'Attachments', '\n'.join(errors))
 
     def _upload_bytes(self, filename, data):
         """Upload to this scope and mirror sale uploads to the linked client."""
-        encoded = base64.b64encode(data).decode('ascii')
-        if self.entity_type == 'client':
-            self.database.upload_attachment(
-                self.entity_type, self.entity_id, filename, encoded,
-                sale_id=self.sale_selector.currentData(),
-            )
-        else:
-            self.database.upload_attachment(self.entity_type, self.entity_id, filename, encoded)
-        if self.entity_type != 'sale':
-            return
-        client_id = None
-        try:
-            # First try to mirror via explicit sales.client_id (reliable).
-            self.database.cursor.execute('SELECT client_id, client_username FROM sales WHERE id=%s', (self.entity_id,))
-            row = self.database.cursor.fetchone()
-            if row:
-                client_id = int(row[0]) if row[0] not in (None, '', 0) else None
-                username = str(row[1] or '').strip()
-            else:
-                username = ''
-            if client_id:
-                self.database.upload_attachment('client', client_id, filename, encoded)
-                return
-            # Fallback to matching by username for legacy sales without client_id
-            if username:
-                sql = "SELECT id FROM clients WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = LOWER(%s) ORDER BY id LIMIT 1"
-                self.database.cursor.execute(sql, (self.database._normalize_exact(username),))
-                crow = self.database.cursor.fetchone()
-                if crow:
-                    self.database.upload_attachment('client', int(crow[0]), filename, encoded)
-                    return
-            raise ValueError('The sale has no linked client; the file was added only to this sale.')
-        except Exception as exc:
-            # Preserve the successful sale upload while giving a useful action
-            # message if old/imported sales are not linked to a client.
-            logger.exception(
-                "Sale-to-client attachment mirror failed: user_id=%s mode=%s "
-                "operation=mirror_sale_attachment_to_client sale_id=%s client_id=%s",
-                getattr(self.database, 'current_user_id', None),
-                'remote' if hasattr(self.database, 'host') else 'local',
-                self.entity_id, client_id,
-            )
-            try:
-                self.database.conn.rollback()
-            except Exception:
-                pass
-            raise RuntimeError(f'Added to the sale, but could not add it to the client: {exc}') from exc
+        sale_id = self.sale_selector.currentData() if self.entity_type == 'client' else None
+        _upload_attachment(self.database, self.entity_type, self.entity_id, filename, data, sale_id)
 
     def _setup_client_attachments(self, layout):
         # Attachment tab removed; keep placeholder for backward compatibility.
@@ -728,9 +881,7 @@ class AttachmentPanel(QWidget):
                     raise RuntimeError('The scanner completed without producing an image.')
 
                 filename = f"scan-{datetime.now().strftime('%Y%m%d-%H%M%S')}.png"
-                self._upload_bytes(filename, _scanned_image_as_png(scan_path))
-            self.refresh()
-            QMessageBox.information(self, 'Scan document', 'The scanned page was added successfully.')
+                self._start_upload([(filename, _scanned_image_as_png(scan_path))])
         except subprocess.TimeoutExpired:
             QMessageBox.warning(self, 'Scan document', 'The scanner did not finish within 10 minutes.')
         except Exception as exc:
@@ -806,10 +957,13 @@ class AttachmentPanel(QWidget):
         if not selected: return
         record = selected[0]
         if record['mime_type'] == 'application/pdf': return self.open_selected()
+        self._start_download([(record, None)], lambda results: self._show_image_preview(record, results[0][2]) if results else None)
+
+    def _show_image_preview(self, record, data):
         try:
-            image = QImage.fromData(self._bytes(record))
+            image = QImage.fromData(data)
         except Exception as exc:
-            logger.exception("Preview download failed for attachment %s", record.get('id'))
+            logger.exception("Preview decode failed for attachment %s", record.get('id'))
             QMessageBox.warning(self, 'Preview', f"Could not download '{record['display_name']}':\n{exc}")
             return
         if image.isNull(): return QMessageBox.warning(self, 'Preview', 'This image cannot be previewed.')
@@ -829,35 +983,38 @@ class AttachmentPanel(QWidget):
         target.write_bytes(self._bytes(record)); return target
 
     def open_selected(self):
-        for record in self._selected():
-            try:
-                path = self._export(record, os.getenv('TEMP') or '.')
-            except Exception as exc:
-                logger.exception("Open failed for attachment %s", record.get('id'))
-                QMessageBox.warning(self, 'Open', f"Could not open '{record['display_name']}':\n{exc}")
-                continue
-            if path: QDesktopServices.openUrl(path.as_uri())
+        records = self._selected()
+        if not records:
+            return
+        directory = Path(os.getenv('TEMP') or '.')
+        self._start_download(
+            [(record, directory / record['original_filename']) for record in records],
+            lambda results: [QDesktopServices.openUrl(QUrl.fromLocalFile(path)) for _record, path, _data in results],
+        )
 
     def export_selected(self):
+        jobs = []
         for record in self._selected():
-            try:
-                self._export(record)
-            except Exception as exc:
-                logger.exception("Export failed for attachment %s", record.get('id'))
-                QMessageBox.warning(self, 'Export', f"Could not save '{record['display_name']}':\n{exc}")
+            filename, _ = QFileDialog.getSaveFileName(self, 'Save attachment', record['original_filename'])
+            if filename:
+                jobs.append((record, Path(filename)))
+        self._start_download(jobs, lambda _results: None)
 
     def print_selected(self):
-        for record in self._selected():
-            try:
-                path = self._export(record, os.getenv('TEMP') or '.')
-            except Exception as exc:
-                logger.exception("Print download failed for attachment %s", record.get('id'))
-                QMessageBox.warning(self, 'Print', f"Could not download '{record['display_name']}':\n{exc}")
-                continue
-            try: os.startfile(str(path), 'print')
-            except Exception as exc:
-                logger.exception("Print failed for attachment %s", record.get('id'))
-                QMessageBox.warning(self, 'Print', f'Could not print {record["display_name"]}: {exc}')
+        records = self._selected()
+        if not records:
+            return
+        directory = Path(os.getenv('TEMP') or '.')
+        def print_results(results):
+            for record, path, _data in results:
+                try:
+                    os.startfile(path, 'print')
+                except Exception as exc:
+                    logger.exception("Print failed for attachment %s", record.get('id'))
+                    QMessageBox.warning(self, 'Print', f'Could not print {record["display_name"]}: {exc}')
+        self._start_download(
+            [(record, directory / record['original_filename']) for record in records], print_results,
+        )
 
     def rename_selected(self):
         selected = self._selected()

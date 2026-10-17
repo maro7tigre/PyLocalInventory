@@ -7,6 +7,7 @@ from unittest.mock import patch
 
 os.environ.setdefault('QT_QPA_PLATFORM', 'offscreen')
 
+from PySide6.QtCore import QEvent
 from PySide6.QtGui import QImage
 from PySide6.QtWidgets import QApplication
 from core.attachments import display_filename, validate_bytes
@@ -84,12 +85,13 @@ class AttachmentSafetyTests(unittest.TestCase):
         self.assertEqual(headers[1], 'Devis N°')
         self.assertEqual(panel.client_sales_table.item(0, 1).text(), 'DE N°-2026-3')
         panel.deleteLater()
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        app.processEvents()
 
     @patch('ui.widgets.attachments_widget.QMessageBox.information')
     @patch('ui.widgets.attachments_widget._scan_with_windows_wia')
     def test_successful_windows_scan_uploads_png(self, scan, information):
         uploads = []
-        refreshes = []
 
         def create_scan(path):
             # Some WIA drivers return BMP data even when PNG was requested and
@@ -102,8 +104,7 @@ class AttachmentSafetyTests(unittest.TestCase):
 
         scan.side_effect = create_scan
         panel = SimpleNamespace(
-            _upload_bytes=lambda filename, data: uploads.append((filename, data)),
-            refresh=lambda: refreshes.append(True),
+            _start_upload=lambda files: uploads.extend(files),
         )
         with patch('ui.widgets.attachments_widget.sys.platform', 'win32'):
             AttachmentPanel.scan_document(panel)
@@ -112,16 +113,14 @@ class AttachmentSafetyTests(unittest.TestCase):
         self.assertTrue(uploads[0][0].startswith('scan-'))
         self.assertTrue(uploads[0][0].endswith('.png'))
         self.assertTrue(uploads[0][1].startswith(b'\x89PNG'))
-        self.assertEqual(refreshes, [True])
-        information.assert_called_once()
+        information.assert_not_called()
 
     @patch('ui.widgets.attachments_widget.QMessageBox.information')
     @patch('ui.widgets.attachments_widget._scan_with_windows_wia')
     def test_cancelled_windows_scan_does_not_upload(self, scan, information):
         scan.return_value = SimpleNamespace(returncode=2, stdout='', stderr='')
         panel = SimpleNamespace(
-            _upload_bytes=lambda *_args: self.fail('Cancelled scan must not upload a file'),
-            refresh=lambda: self.fail('Cancelled scan must not refresh attachments'),
+            _start_upload=lambda *_args: self.fail('Cancelled scan must not upload a file'),
         )
         with patch('ui.widgets.attachments_widget.sys.platform', 'win32'):
             AttachmentPanel.scan_document(panel)

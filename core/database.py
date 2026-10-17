@@ -10,6 +10,7 @@ unquoted, so they keep working unchanged against the folded lowercase names.
 import re
 import json
 import logging
+import traceback
 from datetime import datetime
 from decimal import Decimal
 # haitam
@@ -4059,19 +4060,19 @@ class Database:
             if columns and columns[0].lower() == 'id':
                 columns[0] = 'ID'
             result = [dict(zip(columns, row)) for row in rows]
-        except Exception:
+        except Exception as error:
             self.conn.rollback()
-            logger.exception(
-                "get_operation_summary_items failed: mode=%s section=%s user_id=%s "
-                "sql_params=%s",
-                mode, section, user.get('id') if user else None, params,
+            logger.error(
+                "get_operation_summary_items failed: mode=%s section=%s "
+                "parameter_count=%s category=%s stack=\n%s",
+                mode, section, len(params), type(error).__name__,
+                ''.join(traceback.format_tb(error.__traceback__)),
             )
             return []
         logger.info(
-            "get_operation_summary_items: mode=%s section=%s user_id=%s role_id=%s "
-            "sql_params=%s row_count=%s",
-            mode, section, user.get('id') if user else None,
-            user.get('role_id') if user else None, params, len(result),
+            "get_operation_summary_items: mode=%s section=%s "
+            "parameter_count=%s row_count=%s",
+            mode, section, len(params), len(result),
         )
         return result
 

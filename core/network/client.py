@@ -17,8 +17,6 @@ import os
 import zipfile
 import logging
 from decimal import Decimal
-from datetime import datetime
-from core.runtime_paths import user_data_root
 
 from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
@@ -29,11 +27,6 @@ from core.cache_policies import ENABLE_SQLITE_CACHE
 from core import diagnostics
 
 logger = logging.getLogger(__name__)
-
-_ATTACHMENT_RPC_METHODS = {
-    'list_attachments', 'upload_attachment', 'download_attachment',
-    'get_attachment_thumbnail', 'update_attachment', 'delete_attachment',
-}
 
 class RemoteProfile:
     """Read-only report branding supplied by the connected host."""
@@ -232,20 +225,20 @@ class RemoteDatabase:
         self._open_cache()
         diagnostics.set_mode('client')
         logger.info(
-            "client_connected host=%s port=%s user=%s host_build_id=%s",
-            self.host, self.port, self.username, self.host_build_id,
+            "client_connected host=%s port=%s host_build_id=%s",
+            self.host, self.port, self.host_build_id,
         )
         if self.host_build_id != APP_BUILD_ID:
             logger.warning(
                 "Build mismatch: this client build_id=%s host=%s port=%s reports "
-                "host_build_id=%s user=%s - if a fix isn't taking effect, redeploy "
+                "host_build_id=%s - if a fix isn't taking effect, redeploy "
                 "the host and/or this client to matching builds.",
-                APP_BUILD_ID, self.host, self.port, self.host_build_id, self.username,
+                APP_BUILD_ID, self.host, self.port, self.host_build_id,
             )
         else:
             logger.info(
-                "Build match: client and host=%s:%s both on build_id=%s user=%s",
-                self.host, self.port, APP_BUILD_ID, self.username,
+                "Build match: client and host=%s:%s both on build_id=%s",
+                self.host, self.port, APP_BUILD_ID,
             )
         return True
 
@@ -258,15 +251,6 @@ class RemoteDatabase:
         safe_args = self._json_safe(args or [])
         safe_kwargs = self._json_safe(kwargs or {})
         payload = json.dumps({'method': method, 'args': safe_args, 'kwargs': safe_kwargs}).encode('utf-8')
-        if method == 'save_sale_with_items':
-            sale_data = safe_args[0] if safe_args else {}
-            items = safe_args[1] if len(safe_args) > 1 else []
-            self._write_network_log(
-                f"request_url={url} method={method} sale_id={safe_args[2] if len(safe_args) > 2 else None} "
-                f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
-                f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
-                f"items_sent={len(items)} items={items}"
-            )
         req = urllib.request.Request(
             url, data=payload,
             headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self._token}'},
@@ -275,33 +259,24 @@ class RemoteDatabase:
         started = time.perf_counter()
         try:
             with urllib.request.urlopen(req, timeout=timeout) as resp:
-                http_status = resp.status
                 data = json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             try:
                 message = json.loads(e.read().decode('utf-8')).get('error', str(e))
             except Exception:
                 message = str(e)
-            if method == 'save_sale_with_items':
-                self._write_network_log(
-                    f"response_url={url} http_status={e.code} validation=failed error={message}"
-                )
             if e.code == 401:
                 raise AuthError(message)
             if e.code == 403:
                 raise PermissionDeniedError(message)
             raise RemoteError(message)
-        except (AuthError, PermissionDeniedError, RemoteError) as e:
+        except (AuthError, PermissionDeniedError, RemoteError):
             raise
         except Exception as e:
             logger.warning(
-                "LAN RPC connection failure method=%s host=%s port=%s error=%s",
-                method, self.host, self.port, e,
+                "LAN RPC connection failure method=%s host=%s port=%s category=%s",
+                method, self.host, self.port, type(e).__name__,
             )
-            if method == 'save_sale_with_items':
-                self._write_network_log(
-                    f"response_url={url} http_status=unavailable connection_error={e}"
-                )
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
         elapsed_ms = (time.perf_counter() - started) * 1000
@@ -310,26 +285,7 @@ class RemoteDatabase:
             "LAN RPC method=%s host=%s port=%s duration_ms=%.1f build_id=%s host_build_id=%s",
             method, self.host, self.port, elapsed_ms, APP_BUILD_ID, self.host_build_id,
         )
-        if method in _ATTACHMENT_RPC_METHODS or method == 'cursor.execute':
-            # Extra trace for the exact operation family the sale->client
-            # attachment mirror error comes from - entity/table context
-            # without ever logging the base64 file payload itself.
-            if method == 'cursor.execute':
-                sql_preview = (str(safe_args[0]) if safe_args else '')[:160]
-                detail = f"sql={sql_preview!r}"
-            else:
-                entity_type = safe_args[0] if len(safe_args) > 0 else None
-                entity_id = safe_args[1] if len(safe_args) > 1 else None
-                detail = f"entity_type={entity_type} entity_id={entity_id}"
-            logger.info(
-                "Attachment-path RPC detail: method=%s user=%s user_id=%s build_id=%s host_build_id=%s %s",
-                method, self.username, self.current_user_id, APP_BUILD_ID, self.host_build_id, detail,
-            )
         result = data.get('result')
-        if method == 'save_sale_with_items':
-            self._write_network_log(
-                f"response_url={url} http_status={http_status} validation=ok result={self._json_safe(result)}"
-            )
         return result
 
     def download_backup(self, destination):
@@ -409,16 +365,6 @@ class RemoteDatabase:
         if isinstance(value, (str, int, float, bool)) or value is None:
             return value
         return str(value)
-
-    @staticmethod
-    def _write_network_log(message):
-        try:
-            log_dir = os.path.join(user_data_root(), 'logs')
-            os.makedirs(log_dir, exist_ok=True)
-            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
-                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] client {message}\n")
-        except OSError:
-            logger.exception("Could not write network sale diagnostic log")
 
     def __getattr__(self, name):
         # Reached only for attributes not set in __init__: add_item, update_item,
@@ -539,12 +485,12 @@ class RemoteDatabase:
         from core.cache_manager import CacheManager
         try:
             self.cache = CacheManager(
-                host=self.host, port=self.port, username=self.username
+                host=self.host, port=str(self.port), username=self.username
             )
         except Exception:
             logger.exception(
-                "Failed to open local cache host=%s port=%s user=%s",
-                self.host, self.port, self.username,
+                "Failed to open local cache host=%s port=%s",
+                self.host, self.port,
             )
             self.cache = None
 
@@ -555,5 +501,5 @@ class RemoteDatabase:
             except Exception:
                 logger.exception("Failed to close local cache")
             self.cache = None
-        logger.info("client_disconnected host=%s port=%s user=%s", self.host, self.port, self.username)
+        logger.info("client_disconnected host=%s port=%s", self.host, self.port)
         self._token = None

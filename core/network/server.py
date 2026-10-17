@@ -27,22 +27,95 @@ import os
 import shutil
 import tempfile
 import logging
+import sys
 import time
+import traceback
+import uuid
 from datetime import datetime
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
-from psycopg2.pool import ThreadedConnectionPool
+from psycopg2.pool import PoolError, ThreadedConnectionPool
 
 from core.database import Database
 from core import pg_backup
-from core.attachments import attachment_backup_root
+from core.attachments import DEFAULT_MAX_BYTES, attachment_backup_root
 from core.pg_config import load_server_config
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
-from core.runtime_paths import user_data_root
 from core.build_info import APP_BUILD_ID
 
 logger = logging.getLogger(__name__)
+# The application root logger normally remains at WARNING; lifecycle and
+# request INFO records must still reach the existing rotating handlers.
+logger.setLevel(logging.INFO)
+
+_DEFAULT_BODY_BYTES = max(64 * 1024 * 1024, (DEFAULT_MAX_BYTES * 4 + 2) // 3 + 2 * 1024 * 1024)
+
+
+def _positive_int_env(name, default):
+    try:
+        value = int(os.getenv(name, str(default)))
+        if value > 0:
+            return value
+    except ValueError:
+        pass
+    logger.warning("Invalid server limit configuration name=%s; using default", name)
+    return default
+
+
+class _RequestBodyError(Exception):
+    def __init__(self, status, category, message):
+        super().__init__(message)
+        self.status = status
+        self.category = category
+
+
+class _BoundedHTTPServer(ThreadingHTTPServer):
+    """Bound active request threads, including clients still sending headers."""
+
+    request_queue_size = 16
+
+    def __init__(self, address, handler, max_threads):
+        self._slots = threading.BoundedSemaphore(max_threads)
+        self._active_lock = threading.Lock()
+        self.active_requests = 0
+        self.max_threads = max_threads
+        super().__init__(address, handler)
+
+    def process_request(self, request, client_address):
+        if not self._slots.acquire(blocking=False):
+            logger.warning("http_capacity_exhausted active=%d limit=%d", self.active_requests, self.max_threads)
+            try:
+                self.shutdown_request(request)
+            except OSError:
+                logger.warning('http_capacity_close_failed')
+            return
+        with self._active_lock:
+            self.active_requests += 1
+        try:
+            super().process_request(request, client_address)
+        except Exception:
+            with self._active_lock:
+                self.active_requests -= 1
+            self._slots.release()
+            self.shutdown_request(request)
+            raise
+
+    def process_request_thread(self, request, client_address):
+        try:
+            super().process_request_thread(request, client_address)
+        finally:
+            with self._active_lock:
+                self.active_requests -= 1
+            self._slots.release()
+
+    def handle_error(self, request, client_address):
+        # socketserver's default prints the exception (which can include
+        # request data) to stderr. Keep only a stack and the exception class.
+        error = sys.exc_info()[1]
+        if error is not None:
+            logger.error('http_worker_unhandled category=%s stack=\n%s',
+                         type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
 
 # method name -> (kind, index into `args` holding the section name)
 _SECTION_METHODS = {
@@ -98,6 +171,20 @@ _ALWAYS_ALLOWED = {
     'get_dashboard_snapshot',
 }
 _ACTION_FOR_KIND = {'read': 'read', 'write': 'write', 'delete': 'delete'}
+_LOGGABLE_METHODS = (
+    set(_SECTION_METHODS) | set(_ATTACHMENT_METHODS) | _CLIENT_ACCOUNT_METHODS |
+    _SUPPLIER_ACCOUNT_METHODS | _REPORT_METHODS | _PRODUCT_READ_METHODS |
+    _FACTURE_METHODS | _ALWAYS_ALLOWED | {
+        'cursor.execute', 'conn.commit', 'conn.rollback', 'get_sale_catalog',
+        'save_sale_with_items', 'save_import_with_items',
+        'save_product_with_opening_stock', 'update_product_with_stock',
+        'get_next_devis_preview', 'get_import_bl_number', 'get_next_bl_preview',
+    }
+)
+
+
+def _method_label(method):
+    return method if isinstance(method, str) and method in _LOGGABLE_METHODS else 'unrecognized'
 
 
 class _SessionStore:
@@ -220,10 +307,7 @@ def _check_permission(user, method, args, kwargs):
         section = UserManager.section_for_table(table) if table else None
         if not section:
             logger.warning(
-                "Permission denied (no section mapping): build_id=%s user_id=%s role_id=%s "
-                "is_superadmin=%s method=%s table=%r normalized_section=%s mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), user.get('is_superadmin'),
-                method, table, section,
+                'permission_denied reason=unknown_table method=cursor.execute',
             )
             return False, f"No permission mapping for table '{table}' - contact your admin"
         if section == "Reports" and kind == "read":
@@ -231,17 +315,14 @@ def _check_permission(user, method, args, kwargs):
         needed = _ACTION_FOR_KIND[kind]
         if not user['permissions'].get(section, {}).get(needed):
             logger.warning(
-                "Permission denied (insufficient access): build_id=%s user_id=%s role_id=%s "
-                "is_superadmin=%s method=%s table=%r normalized_section=%s needed=%s mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), user.get('is_superadmin'),
-                method, table, section, needed,
+                'permission_denied method=cursor.execute section=%s needed=%s',
+                section, needed,
             )
             return False, f"You don't have {needed} access to {section}"
         if table and table.rsplit('.', 1)[-1].casefold() in ('sales', 'clients'):
             logger.info(
-                "Permission granted: build_id=%s user_id=%s method=%s table=%r "
-                "normalized_section=%s needed=%s mode=remote",
-                APP_BUILD_ID, user.get('id'), method, table, section, needed,
+                'permission_granted method=cursor.execute section=%s needed=%s',
+                section, needed,
             )
         return True, None
 
@@ -286,52 +367,36 @@ def _check_permission(user, method, args, kwargs):
         return True, None
 
     if method in _CLIENT_ACCOUNT_METHODS:
-        client_id = args[0] if args else None
         if not user['permissions'].get('Clients', {}).get('read'):
             logger.warning(
-                "Permission denied (client account): build_id=%s user_id=%s role_id=%s "
-                "method=%s client_id=%s needed=Clients:read mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+                'permission_denied method=%s needed=Clients:read', method,
             )
             return False, "You don't have read access to Clients"
         if (method in _CLIENT_PAYMENT_WRITE_METHODS
                 and not user['permissions'].get('Sales', {}).get('write')):
             logger.warning(
-                "Permission denied (client account): build_id=%s user_id=%s role_id=%s "
-                "method=%s client_id=%s needed=Sales:write mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+                'permission_denied method=%s needed=Sales:write', method,
             )
             return False, "You don't have write access to Sales"
         logger.info(
-            "Permission granted (client account): build_id=%s user_id=%s role_id=%s "
-            "method=%s client_id=%s permission_filter=Clients:read-only "
-            "(no created_by ownership filter applied) mode=remote",
-            APP_BUILD_ID, user.get('id'), user.get('role_id'), method, client_id,
+            'permission_granted method=%s permission_filter=Clients:read-only', method,
         )
         return True, None
 
     if method in _SUPPLIER_ACCOUNT_METHODS:
-        supplier_id = args[0] if args else None
         if not user['permissions'].get('Suppliers', {}).get('read'):
             logger.warning(
-                "Permission denied (supplier account): build_id=%s user_id=%s role_id=%s "
-                "method=%s supplier_id=%s needed=Suppliers:read mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
+                'permission_denied method=%s needed=Suppliers:read', method,
             )
             return False, "You don't have read access to Suppliers"
         if (method in _SUPPLIER_PAYMENT_WRITE_METHODS
                 and not user['permissions'].get('Imports', {}).get('write')):
             logger.warning(
-                "Permission denied (supplier account): build_id=%s user_id=%s role_id=%s "
-                "method=%s supplier_id=%s needed=Imports:write mode=remote",
-                APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
+                'permission_denied method=%s needed=Imports:write', method,
             )
             return False, "You don't have write access to Imports"
         logger.info(
-            "Permission granted (supplier account): build_id=%s user_id=%s role_id=%s "
-            "method=%s supplier_id=%s permission_filter=Suppliers:read-only "
-            "(no created_by ownership filter applied) mode=remote",
-            APP_BUILD_ID, user.get('id'), user.get('role_id'), method, supplier_id,
+            'permission_granted method=%s permission_filter=Suppliers:read-only', method,
         )
         return True, None
 
@@ -360,76 +425,235 @@ class DatabaseServer:
     directly, only its own connection pool to the same Postgres schema.
     """
 
-    def __init__(self, database, port=DEFAULT_PORT):
+    def __init__(self, database, port=DEFAULT_PORT, *, max_request_bytes=None,
+                 request_timeout=None, max_request_threads=None, max_inflight_body_bytes=None,
+                 database_statement_timeout_ms=None):
         self.database = database
         self.port = port
+        self.max_request_bytes = (max_request_bytes if max_request_bytes is not None else
+                                  _positive_int_env('PYLOCALINVENTORY_MAX_REQUEST_MB',
+                                                    (_DEFAULT_BODY_BYTES + 1024 * 1024 - 1) // (1024 * 1024)) * 1024 * 1024)
+        self.request_timeout = (request_timeout if request_timeout is not None else
+                                _positive_int_env('PYLOCALINVENTORY_HTTP_TIMEOUT_SECONDS', 30))
+        self.max_request_threads = (max_request_threads if max_request_threads is not None else
+                                    _positive_int_env('PYLOCALINVENTORY_MAX_HTTP_THREADS', 32))
+        self.database_statement_timeout_ms = (
+            database_statement_timeout_ms if database_statement_timeout_ms is not None else
+            _positive_int_env('PYLOCALINVENTORY_DB_STATEMENT_TIMEOUT_MS', 8000)
+        )
+        self.max_inflight_body_bytes = (
+            max_inflight_body_bytes if max_inflight_body_bytes is not None else
+            _positive_int_env('PYLOCALINVENTORY_MAX_INFLIGHT_BODY_MB',
+                              max(128, (2 * self.max_request_bytes + 1024 * 1024 - 1) // (1024 * 1024)))
+            * 1024 * 1024
+        )
+        if min(
+            self.max_request_bytes, self.request_timeout, self.max_request_threads,
+            self.database_statement_timeout_ms,
+        ) <= 0:
+            raise ValueError("Server request limits must be positive")
+        if self.max_inflight_body_bytes < self.max_request_bytes:
+            raise ValueError('In-flight body budget must accommodate one maximum-size request')
+        if self.max_request_bytes < (DEFAULT_MAX_BYTES * 4 + 2) // 3 + 1024 * 1024:
+            logger.warning('http_body_limit_below_supported_attachment_size limit=%d',
+                           self.max_request_bytes)
         self.sessions = _SessionStore()
         self.database_name = None
         self.schema_name = None
         self._pool = None
         self._httpd = None
         self._thread = None
+        self._stopping = False
+        self._pool_lock = threading.Lock()
+        self._checked_out = 0
+        self._pool_counts = {}
+        self._checkout_times = {}
+        self._body_lock = threading.Lock()
+        self._body_inflight = 0
+
+    def _reserve_body(self, size):
+        with self._body_lock:
+            if self._body_inflight + size > self.max_inflight_body_bytes:
+                logger.warning('http_body_capacity_exhausted in_flight=%d limit=%d',
+                               self._body_inflight, self.max_inflight_body_bytes)
+                raise _RequestBodyError(503, 'body_capacity', 'Server is busy')
+            self._body_inflight += size
+
+    def _release_body(self, size):
+        with self._body_lock:
+            self._body_inflight -= size
 
     @property
     def is_running(self):
-        return self._httpd is not None
+        return bool(self._httpd and self._thread and self._thread.is_alive()
+                    and self._listener_available())
+
+    def _listener_available(self):
+        try:
+            httpd = self._httpd
+            if httpd is None:
+                return False
+            sock = httpd.socket
+            return (sock.fileno() >= 0 and
+                    bool(sock.getsockopt(socket.SOL_SOCKET, socket.SO_ACCEPTCONN)) and
+                    sock.getsockname()[1] == self.port)
+        except (AttributeError, OSError):
+            return False
+
+    def health_status(self, check_database=False):
+        """In-process health; called without DB I/O by the hosting status UI.
+
+        Authenticated /health calls this with check_database=True; an HTTP
+        response itself proves that the handler is responsive.
+        """
+        status = {
+            'gui_process_alive': True,
+            'server_thread_alive': bool(self._thread and self._thread.is_alive()),
+            'listener_available': self._listener_available(),
+        }
+        if check_database:
+            try:
+                request_db = self._borrow_database()
+                try:
+                    if request_db.cursor is None:
+                        raise RuntimeError('Health probe has no database cursor')
+                    # Transaction-local: this deadline cannot alter business SQL.
+                    request_db.cursor.execute('SET LOCAL statement_timeout = 2000')
+                    request_db.cursor.execute('SELECT 1')
+                    status['database_accessible'] = request_db.cursor.fetchone() == (1,)
+                finally:
+                    self._return_database(request_db)
+            except Exception as error:
+                status['database_accessible'] = False
+                logger.warning('health_database_unavailable category=%s', type(error).__name__)
+        return status
+
+    def _serve(self):
+        logger.info('server_thread_started port=%d', self.port)
+        httpd = self._httpd
+        if httpd is None:
+            logger.error('server_thread_started_without_listener port=%d', self.port)
+            return
+        try:
+            httpd.serve_forever()
+        except Exception:
+            # This thread only runs socketserver's accept loop; no request
+            # payloads or SQL values can appear in this traceback.
+            logger.exception('server_thread_failed port=%d', self.port)
+        finally:
+            if not self._stopping:
+                logger.error('server_thread_terminated_unexpectedly port=%d', self.port)
+                try:
+                    httpd.server_close()
+                except Exception:
+                    logger.exception('server_listener_close_failed')
+            else:
+                logger.info('server_thread_stopped port=%d', self.port)
 
     def start(self):
-        if self._httpd:
+        if self.is_running:
             return
+        if self._httpd or self._pool:
+            self.stop()
 
-        pg_config = load_server_config()
-        selected_profile = self.database.profile_manager.selected_profile
-        if getattr(selected_profile, 'database_name', None):
-            database_name = selected_profile.database_name
-            self.database_name = database_name
-            self.schema_name = None
-            self._pool = ThreadedConnectionPool(
-                2, 10,
-                host=pg_config.get('host'),
-                port=pg_config.get('port'),
-                dbname=database_name,
-                user=pg_config.get('user'),
-                password=pg_config.get('password'),
-                connect_timeout=5,
-                application_name="PyLocalInventory-LAN",
+        logger.info('server_starting port=%d body_limit=%d inflight_limit=%d read_timeout=%ss thread_limit=%d db_statement_timeout_ms=%d',
+                    self.port, self.max_request_bytes, self.max_inflight_body_bytes,
+                self.request_timeout, self.max_request_threads,
+                self.database_statement_timeout_ms)
+        try:
+            pg_config = load_server_config()
+            selected_profile = self.database.profile_manager.selected_profile
+            pool_args = dict(
+                host=pg_config.get('host'), port=pg_config.get('port'),
+                user=pg_config.get('user'), password=pg_config.get('password'),
+                connect_timeout=5, application_name='PyLocalInventory-LAN',
             )
+            if getattr(selected_profile, 'database_name', None):
+                self.database_name = selected_profile.database_name
+                self.schema_name = None
+                pool_args['dbname'] = self.database_name
+                pool_args['options'] = (
+                    f'-c statement_timeout={self.database_statement_timeout_ms}'
+                )
+            else:
+                self.schema_name = selected_profile.schema_name or Database._profile_schema_name(
+                    selected_profile.get_value('company name') or selected_profile.name
+                )
+                self.database_name = None
+                pool_args['dbname'] = pg_config.get('database')
+                pool_args['options'] = (
+                    f'-c search_path={self.schema_name} '
+                    f'-c statement_timeout={self.database_statement_timeout_ms}'
+                )
+            self._pool = ThreadedConnectionPool(2, 10, **pool_args)
+            with self._pool_lock:
+                self._checked_out = 0
+            self._httpd = _BoundedHTTPServer(('0.0.0.0', self.port), self._make_handler(),
+                                             self.max_request_threads)
+            self.port = self._httpd.server_port
+            self._stopping = False
+            self._thread = threading.Thread(target=self._serve, name='LANServer', daemon=True)
+            self._thread.start()
+        except Exception as error:
+            logger.error('server_start_failed port=%d category=%s stack=\n%s',
+                         self.port, type(error).__name__,
+                         ''.join(traceback.format_tb(error.__traceback__)))
+            if self._httpd:
+                try:
+                    self._httpd.server_close()
+                except Exception as cleanup_error:
+                    logger.error('server_start_listener_cleanup_failed category=%s',
+                                 type(cleanup_error).__name__)
+            if self._pool:
+                try:
+                    self._pool.closeall()
+                except Exception as cleanup_error:
+                    logger.error('server_start_pool_cleanup_failed category=%s',
+                                 type(cleanup_error).__name__)
+            self._httpd = self._pool = self._thread = None
+            raise
+        if self.is_running:
+            logger.info('server_listening build_id=%s bind=0.0.0.0 port=%s',
+                        APP_BUILD_ID, self.port)
         else:
-            schema_name = selected_profile.schema_name or Database._profile_schema_name(
-                selected_profile.get_value('company name') or selected_profile.name
-            )
-            self.database_name = None
-            self.schema_name = schema_name
-
-            self._pool = ThreadedConnectionPool(
-                2, 10,
-                host=pg_config.get('host'),
-                port=pg_config.get('port'),
-                dbname=pg_config.get('database'),
-                user=pg_config.get('user'),
-                password=pg_config.get('password'),
-                options=f'-c search_path={schema_name}',
-                connect_timeout=5,
-                application_name="PyLocalInventory-LAN",
-            )
-
-        self._httpd = ThreadingHTTPServer(('0.0.0.0', self.port), self._make_handler())
-        self._thread = threading.Thread(target=self._httpd.serve_forever, daemon=True)
-        self._thread.start()
-        logger.info(
-            "LAN server started: build_id=%s port=%s database_name=%s schema_name=%s",
-            APP_BUILD_ID, self.port, self.database_name, self.schema_name,
-        )
+            logger.warning('server_not_healthy_after_start port=%s', self.port)
 
     def stop(self):
-        if self._httpd:
-            self._httpd.shutdown()
-            self._httpd.server_close()
+        self._stopping = True
+        logger.info('server_stopping port=%d', self.port)
+        httpd = self._httpd
+        if httpd:
+            if self._thread and self._thread.is_alive():
+                httpd.shutdown()
+            httpd.server_close()
+        if self._thread and self._thread.is_alive():
+            self._thread.join(timeout=2)
         self._httpd = None
         self._thread = None
-        if self._pool:
-            self._pool.closeall()
+        pool = self._pool
+        if pool:
+            if httpd is not None and httpd.active_requests:
+                logger.warning('server_stop_waiting_for_requests active=%d', httpd.active_requests)
+                # Never close connections while an accepted request is still
+                # using them. Do not block the Qt event loop on long requests.
+                active_httpd = httpd
+                active_pool = pool
+                def close_when_drained():
+                    while active_httpd.active_requests:
+                        time.sleep(0.1)
+                    try:
+                        active_pool.closeall()
+                    except Exception as error:
+                        logger.error('server_pool_drain_close_failed category=%s stack=\n%s',
+                                     type(error).__name__,
+                                     ''.join(traceback.format_tb(error.__traceback__)))
+                    else:
+                        logger.info('server_pool_closed_after_drain')
+                threading.Thread(target=close_when_drained, name='LANPoolDrain', daemon=True).start()
+            else:
+                pool.closeall()
         self._pool = None
+        logger.info('server_stopped port=%d', self.port)
 
     @staticmethod
     def local_ip():
@@ -451,7 +675,30 @@ class DatabaseServer:
         instance, so each request/login gets its own connection/cursor pair -
         never shared across threads - while reusing Database's/UserManager's
         existing SQL logic unchanged."""
-        conn = self._pool.getconn()
+        self._ensure_pool_metrics()
+        started = time.monotonic()
+        pool = self._pool
+        if pool is None:
+            raise RuntimeError('LAN database pool is not running')
+        try:
+            conn = pool.getconn()
+        except Exception as error:
+            with self._pool_lock:
+                in_use = self._pool_counts.get(pool, 0)
+            logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=\n%s',
+                           type(error).__name__, in_use,
+                           ''.join(traceback.format_tb(error.__traceback__)))
+            raise
+        with self._pool_lock:
+            in_use = self._pool_counts.get(pool, 0) + 1
+            self._pool_counts[pool] = in_use
+            if self._pool is pool:
+                self._checked_out = in_use
+            self._checkout_times[id(conn)] = (started, pool)
+        logger.info('db_checkout in_use=%d capacity=10 wait_ms=%.1f',
+                    in_use, (time.monotonic() - started) * 1000)
+        if in_use >= 8:
+            logger.warning('db_pool_near_capacity in_use=%d capacity=10', in_use)
         try:
             request_db = Database(profile_manager=None)
             request_db.registered_classes = self.database.registered_classes
@@ -460,42 +707,82 @@ class DatabaseServer:
             request_db.conn = conn
             request_db.cursor = conn.cursor()
             return request_db
-        except Exception:
-            logger.exception("Failed to initialize pooled request database")
-            try:
-                self._pool.putconn(conn, close=True)
-            except Exception:
-                logger.exception("Failed to discard unusable pooled connection")
+        except Exception as error:
+            logger.error('db_request_init_failed category=%s stack=\n%s',
+                         type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
+            self._release_connection(conn, discard=True, pool=pool)
             raise
+
+    def _ensure_pool_metrics(self):
+        # A few existing tests construct a server with __new__ and inject a
+        # stand-in pool directly, without running the production constructor.
+        if not hasattr(self, '_pool_lock'):
+            self._pool_lock = threading.Lock()
+            self._checked_out = 0
+            self._pool_counts = {}
+            self._checkout_times = {}
+
+    def _release_connection(self, connection, discard=False, pool=None):
+        self._ensure_pool_metrics()
+        with self._pool_lock:
+            checkout = self._checkout_times.get(id(connection))
+        pool = pool or (checkout[1] if checkout else self._pool)
+        if pool is None:
+            raise RuntimeError('No pool owns this database connection')
+        returned = False
+        try:
+            try:
+                pool.putconn(connection, close=discard)
+            except TypeError:
+                # Preserve compatibility with pool stand-ins used by callers.
+                pool.putconn(connection)
+            returned = True
+        except Exception as error:
+            logger.error('db_return_failed category=%s stack=\n%s', type(error).__name__,
+                         ''.join(traceback.format_tb(error.__traceback__)))
+            raise
+        finally:
+            with self._pool_lock:
+                checkout = self._checkout_times.get(id(connection))
+                in_use = self._pool_counts.get(pool, 0)
+                if returned:
+                    self._checkout_times.pop(id(connection), None)
+                    in_use = max(0, in_use - 1)
+                    self._pool_counts[pool] = in_use
+                    if self._pool is pool:
+                        self._checked_out = in_use
+            age_ms = (time.monotonic() - checkout[0]) * 1000 if checkout else 0
+            logger.log(logging.WARNING if not returned or age_ms >= 10000 else logging.INFO,
+                       'db_%s in_use=%d capacity=10 held_ms=%.1f',
+                       'return_failed' if not returned else 'discard' if discard else 'return',
+                       in_use, age_ms)
 
     def _return_database(self, request_db):
         connection = request_db.conn
+        discard = bool(getattr(connection, 'closed', False))
         try:
             request_db.cursor.close()
-        except Exception:
-            logger.exception("Failed to close pooled request cursor")
+        except Exception as error:
+            logger.warning('db_cursor_close_failed category=%s', type(error).__name__)
+            discard = True
         try:
             # PostgreSQL starts a transaction even for SELECT. Reset it before
             # returning the connection so it cannot remain idle in transaction.
-            if connection and not getattr(connection, "closed", False):
+            if connection and not discard:
                 rollback = getattr(connection, "rollback", None)
                 if callable(rollback):
                     rollback()
-                self._pool.putconn(connection)
-            else:
-                try:
-                    self._pool.putconn(connection, close=True)
-                except TypeError:
-                    self._pool.putconn(connection)
+        except Exception as error:
+            logger.warning('db_reset_failed category=%s stack=\n%s',
+                           type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
+            discard = True
+        try:
+            self._release_connection(connection, discard=discard)
         except Exception:
-            logger.exception("Failed to reset pooled database connection")
             try:
-                try:
-                    self._pool.putconn(connection, close=True)
-                except TypeError:
-                    self._pool.putconn(connection)
+                connection.close()
             except Exception:
-                logger.exception("Failed to discard broken pooled connection")
+                logger.exception('db_connection_close_failed')
 
     def _create_client_backup_archive(self, work_dir):
         """Create a verified host-side archive for an authenticated client."""
@@ -543,10 +830,13 @@ class DatabaseServer:
     def _dispatch(self, method, args, kwargs, user=None):
         request_db = self._borrow_database()
         try:
+            cur = request_db.cursor
+            conn = request_db.conn
+            if cur is None or conn is None:
+                raise RuntimeError('Pooled database has no cursor or connection')
             if method == 'cursor.execute':
                 sql = args[0]
                 params = args[1] if len(args) > 1 and args[1] else []
-                cur = request_db.cursor
                 cur.execute(sql, params)
                 kind, _table = classify_sql(sql)
                 # Each RPC borrows a different pooled connection, so leaving
@@ -554,7 +844,7 @@ class DatabaseServer:
                 # commit the original transaction. Commit all mutating SQL in
                 # the request that executed it.
                 if kind in ('schema', 'write', 'delete'):
-                    request_db.conn.commit()
+                    conn.commit()
                 result = {'rowcount': cur.rowcount}
                 if cur.description:
                     result['rows'] = cur.fetchall()
@@ -562,10 +852,10 @@ class DatabaseServer:
                 return result
 
             if method == 'conn.commit':
-                request_db.conn.commit()
+                conn.commit()
                 return None
             if method == 'conn.rollback':
-                request_db.conn.rollback()
+                conn.rollback()
                 return None
 
             if method == 'save_sale_with_items':
@@ -607,8 +897,8 @@ class DatabaseServer:
                 return request_db.get_product_stock_levels()
             if method == 'get_dashboard_snapshot':
                 snapshot = request_db.get_dashboard_snapshot()
-                if not user.get("is_superadmin"):
-                    permissions = user.get("permissions", {})
+                if not (user or {}).get("is_superadmin"):
+                    permissions = (user or {}).get("permissions", {})
                     readable = lambda section: bool(
                         permissions.get(section, {}).get("read")
                     )
@@ -683,62 +973,208 @@ class DatabaseServer:
         finally:
             self._return_database(request_db)
 
-    @staticmethod
-    def _write_sales_log(message):
-        try:
-            log_dir = os.path.join(user_data_root(), 'logs')
-            os.makedirs(log_dir, exist_ok=True)
-            with open(os.path.join(log_dir, 'network_sales.log'), 'a', encoding='utf-8') as stream:
-                stream.write(f"[{datetime.now().isoformat(timespec='seconds')}] server {message}\n")
-        except OSError:
-            logger.exception("Could not write server sale diagnostic log")
-
     def _make_handler(self):
         server_obj = self
 
         class Handler(BaseHTTPRequestHandler):
-            def log_message(self, fmt, *log_args):
+            def setup(self):
+                self.request.settimeout(server_obj.request_timeout)
+                super().setup()
+
+            def handle(self):
+                try:
+                    super().handle()
+                except (TimeoutError, socket.timeout):
+                    logger.warning('http_header_timeout')
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    logger.info('http_peer_disconnected')
+
+            def handle_one_request(self):
+                # Socket timeouts alone are per read: a peer sending a byte
+                # every few seconds could otherwise occupy a slot forever.
+                self._headers_done = threading.Event()
+                self._header_expired = False
+                def expire_headers():
+                    if not self._headers_done.is_set():
+                        self._header_expired = True
+                        logger.warning('http_header_deadline_exceeded')
+                        try:
+                            self.connection.shutdown(socket.SHUT_RD)
+                        except OSError as error:
+                            logger.info('http_header_shutdown_failed category=%s', type(error).__name__)
+                self._header_timer = threading.Timer(server_obj.request_timeout, expire_headers)
+                self._header_timer.daemon = True
+                self._header_timer.start()
+                try:
+                    super().handle_one_request()
+                finally:
+                    self._headers_done.set()
+                    self._header_timer.cancel()
+
+            def parse_request(self):
+                try:
+                    parsed = super().parse_request()
+                    if self._header_expired:
+                        self.close_connection = True
+                        return False
+                    return parsed
+                finally:
+                    self._headers_done.set()
+                    self._header_timer.cancel()
+
+            def log_message(self, format, *log_args):
                 pass  # keep the console output of the app clean
+
+            def send_response(self, code, message=None):
+                self._response_status = code
+                super().send_response(code, message)
 
             def _send_json(self, status, payload):
                 body = json.dumps(payload, default=str).encode('utf-8')
                 self.send_response(status)
                 self.send_header('Content-Type', 'application/json')
                 self.send_header('Content-Length', str(len(body)))
+                if hasattr(self, '_request_id'):
+                    self.send_header('X-Request-ID', self._request_id)
                 self.end_headers()
                 self.wfile.write(body)
 
+            def _send_error(self, status, message):
+                try:
+                    self._send_json(status, {'error': message})
+                except OSError as error:
+                    self._error_category = 'peer_disconnected'
+                    self.close_connection = True
+                    logger.info('http_error_response_disconnected category=%s',
+                                type(error).__name__)
+
             def _read_json(self):
-                length = int(self.headers.get('Content-Length', 0) or 0)
-                raw = self.rfile.read(length) if length else b''
-                return json.loads(raw.decode('utf-8')) if raw else {}
+                lengths = self.headers.get_all('Content-Length', [])
+                if len(lengths) > 1:
+                    raise _RequestBodyError(400, 'invalid_length', 'Invalid Content-Length')
+                try:
+                    length = int(lengths[0]) if lengths else 0
+                except ValueError:
+                    raise _RequestBodyError(400, 'invalid_length', 'Invalid Content-Length') from None
+                if length < 0:
+                    raise _RequestBodyError(400, 'invalid_length', 'Invalid Content-Length')
+                if length > server_obj.max_request_bytes:
+                    raise _RequestBodyError(413, 'body_too_large', 'Request body too large')
+                server_obj._reserve_body(length)
+                try:
+                    chunks = []
+                    remaining = length
+                    # Allow slow but legitimate attachments, while bounding
+                    # total upload time even when the sender trickles bytes.
+                    deadline = time.monotonic() + max(server_obj.request_timeout,
+                                                       length / (256 * 1024))
+                    while remaining:
+                        time_left = deadline - time.monotonic()
+                        if time_left <= 0:
+                            raise _RequestBodyError(408, 'read_timeout', 'Request body timed out')
+                        self.connection.settimeout(min(server_obj.request_timeout, time_left))
+                        try:
+                            chunk = self.rfile.read(min(64 * 1024, remaining))
+                        except (TimeoutError, socket.timeout):
+                            raise _RequestBodyError(408, 'read_timeout', 'Request body timed out') from None
+                        if not chunk:
+                            raise _RequestBodyError(400, 'incomplete_body', 'Incomplete request body')
+                        chunks.append(chunk)
+                        remaining -= len(chunk)
+                    raw = b''.join(chunks)
+                finally:
+                    server_obj._release_body(length)
+                    # The last chunk may have used a short deadline-specific
+                    # timeout. Do not carry that into writing the response.
+                    try:
+                        self.connection.settimeout(server_obj.request_timeout)
+                    except OSError as error:
+                        logger.info('http_socket_reset_failed category=%s', type(error).__name__)
+                try:
+                    result = json.loads(raw.decode('utf-8')) if raw else {}
+                except (ValueError, UnicodeDecodeError):
+                    raise _RequestBodyError(400, 'invalid_json', 'Invalid JSON body') from None
+                if not isinstance(result, dict):
+                    raise _RequestBodyError(400, 'invalid_json', 'Invalid JSON body')
+                return result
+
+            def _handle_request(self, endpoint, action):
+                self._request_id = uuid.uuid4().hex[:16]
+                self._response_status = 500
+                self._error_category = 'none'
+                started = time.perf_counter()
+                httpd = server_obj._httpd
+                logger.info('http_request_start id=%s endpoint=%s active=%d',
+                            self._request_id, endpoint, httpd.active_requests if httpd else 0)
+                try:
+                    action()
+                except _RequestBodyError as error:
+                    self._error_category = error.category
+                    self.close_connection = True
+                    self._send_error(error.status, str(error))
+                except PoolError:
+                    self._error_category = 'database_pool'
+                    self._send_error(503, 'Host database temporarily unavailable')
+                except (TimeoutError, socket.timeout):
+                    self._error_category = 'socket_timeout'
+                    self.close_connection = True
+                    self._send_error(408, 'Request timed out')
+                except (BrokenPipeError, ConnectionResetError, ConnectionAbortedError):
+                    self._error_category = 'peer_disconnected'
+                except Exception as error:
+                    self._error_category = type(error).__name__
+                    logger.error('http_request_failed id=%s endpoint=%s category=%s stack=\n%s',
+                                 self._request_id, endpoint, type(error).__name__,
+                                 ''.join(traceback.format_tb(error.__traceback__)))
+                    self._send_error(500, 'Host request failed')
+                finally:
+                    logger.log(logging.WARNING if self._response_status >= 500 else logging.INFO,
+                               'http_request_end id=%s endpoint=%s status=%d category=%s duration_ms=%.1f',
+                               self._request_id, endpoint, self._response_status,
+                               self._error_category, (time.perf_counter() - started) * 1000)
 
             def do_POST(self):
-                try:
-                    if self.path == '/login':
+                endpoint = self.path if self.path in ('/login', '/rpc') else 'unknown'
+                def action():
+                    if endpoint == '/login':
                         return self._handle_login()
-                    if self.path == '/rpc':
+                    if endpoint == '/rpc':
                         return self._handle_rpc()
                     self._send_json(404, {'error': 'not found'})
-                except Exception as e:
-                    self._send_json(500, {'error': str(e)})
+                self._handle_request(endpoint, action)
 
             def do_GET(self):
-                if self.path != "/backup":
-                    return self._send_json(404, {"error": "not found"})
+                endpoint = self.path if self.path in ('/backup', '/health') else 'unknown'
+                self._handle_request(endpoint, lambda: self._handle_get(endpoint))
+
+            def _handle_get(self, endpoint):
+                if endpoint not in ('/backup', '/health'):
+                    return self._send_json(404, {'error': 'not found'})
                 auth_header = self.headers.get("Authorization") or ""
                 token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
                 user = server_obj.sessions.get(token) if token else None
                 if not user:
+                    self._error_category = 'authentication'
                     return self._send_json(401, {"error": "Authentication required"})
+                if endpoint == '/health':
+                    health = server_obj.health_status(check_database=True)
+                    health['http_responsive'] = True
+                    status = 200 if all(health.values()) else 503
+                    if status != 200:
+                        self._error_category = 'health_unavailable'
+                    return self._send_json(status, health)
                 # A database backup contains every section plus account data.
                 # Restrict it to the role that already administers the host.
                 if not user.get("is_superadmin"):
+                    self._error_category = 'permission'
                     return self._send_json(
                         403, {"error": "Only a Super Admin can create a full backup"}
                     )
                 response_started = False
                 try:
+                    # A backup is streamed rather than buffered. Match the
+                    # client's longer download timeout without weakening POSTs.
+                    self.connection.settimeout(300)
                     with tempfile.TemporaryDirectory() as work_dir:
                         archive_path = server_obj._create_client_backup_archive(work_dir)
                         size = os.path.getsize(archive_path)
@@ -754,8 +1190,12 @@ class DatabaseServer:
                         with open(archive_path, "rb") as stream:
                             shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
                 except Exception as error:
+                    self._error_category = type(error).__name__
+                    logger.error('backup_failed id=%s category=%s stack=\n%s',
+                                 self._request_id, type(error).__name__,
+                                 ''.join(traceback.format_tb(error.__traceback__)))
                     if not response_started:
-                        self._send_json(500, {"error": str(error)})
+                        self._send_error(500, str(error))
 
             def _handle_login(self):
                 body = self._read_json()
@@ -797,6 +1237,7 @@ class DatabaseServer:
                     server_obj._return_database(request_db)
 
                 if not user:
+                    self._error_category = 'authentication'
                     return self._send_json(401, {'error': 'Invalid username or password'})
                 token = server_obj.sessions.create(user)
                 selected_profile = getattr(
@@ -812,10 +1253,8 @@ class DatabaseServer:
                     ):
                         profile_values[key] = selected_profile.get_value(key)
                 logger.info(
-                    "Login accepted: user_id=%s username=%s role_id=%s is_superadmin=%s "
-                    "build_id=%s remote_addr=%s",
-                    user['id'], user['username'], user.get('role_id'), user['is_superadmin'],
-                    APP_BUILD_ID, self.client_address[0] if self.client_address else None,
+                    'login_accepted id=%s role_id=%s build_id=%s',
+                    self._request_id, user.get('role_id'), APP_BUILD_ID,
                 )
                 self._send_json(200, {
                     'token': token,
@@ -833,6 +1272,7 @@ class DatabaseServer:
                 token = auth_header[7:] if auth_header.startswith('Bearer ') else ''
                 user = server_obj.sessions.get(token) if token else None
                 if not user:
+                    self._error_category = 'authentication'
                     return self._send_json(401, {'error': 'Authentication required'})
 
                 body = self._read_json()
@@ -840,44 +1280,32 @@ class DatabaseServer:
                 args = body.get('args', [])
                 kwargs = body.get('kwargs', {})
 
-                if method == 'save_sale_with_items':
-                    sale_data = args[0] if args else {}
-                    items = args[1] if len(args) > 1 else []
-                    server_obj._write_sales_log(
-                        f"received user={user.get('username')} sale_id={args[2] if len(args) > 2 else None} "
-                        f"client_id={sale_data.get('client_id')} client_identifier={sale_data.get('client_username')} date={sale_data.get('date')} "
-                        f"vat={sale_data.get('tva')} notes_present={bool(sale_data.get('notes'))} "
-                        f"items_array={isinstance(items, list)} items_received={len(items) if isinstance(items, list) else 'invalid'} "
-                        f"items={items}"
-                    )
-
                 allowed, reason = _check_permission(user, method, args, kwargs)
                 if not allowed:
+                    self._error_category = 'permission'
                     return self._send_json(403, {'error': reason})
 
                 try:
                     started = time.perf_counter()
                     result = server_obj._dispatch(method, args, kwargs, user=user)
+                except PoolError:
+                    self._error_category = 'database_pool'
+                    return self._send_json(503, {'error': 'Host database temporarily unavailable'})
                 except ValueError as e:
-                    if method == 'save_sale_with_items':
-                        server_obj._write_sales_log(f"validation=failed transaction=rollback error={e}")
+                    self._error_category = 'validation'
                     return self._send_json(400, {'error': str(e)})
                 except Exception as e:
-                    if method == 'save_sale_with_items':
-                        server_obj._write_sales_log(f"validation_or_transaction=rollback error={e}")
-                    logger.exception(
-                        "LAN RPC failed method=%s user=%s",
-                        method, user.get("username"),
-                    )
+                    self._error_category = type(e).__name__
+                    logger.error('rpc_failed id=%s method=%s category=%s stack=\n%s',
+                                 self._request_id, _method_label(method), type(e).__name__,
+                                 ''.join(traceback.format_tb(e.__traceback__)))
                     return self._send_json(500, {'error': str(e)})
                 elapsed = time.perf_counter() - started
                 logger.log(
                     logging.WARNING if elapsed >= 0.5 else logging.INFO,
-                    "LAN RPC method=%s user=%s duration=%.3fs",
-                    method, user.get("username"), elapsed,
+                    'rpc_completed id=%s method=%s duration=%.3fs',
+                    self._request_id, _method_label(method), elapsed,
                 )
-                if method == 'save_sale_with_items':
-                    server_obj._write_sales_log(f"validation=ok transaction=commit result={result}")
                 self._send_json(200, {'result': result})
 
         return Handler

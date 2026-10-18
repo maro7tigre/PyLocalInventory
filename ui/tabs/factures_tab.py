@@ -3,7 +3,7 @@
 from decimal import Decimal
 from uuid import uuid4
 
-from PySide6.QtCore import QDate, QObject, QThread, Qt, Signal, Slot
+from PySide6.QtCore import QDate, QObject, QThread, QTimer, Qt, Signal, Slot
 from PySide6.QtGui import QPixmap
 from PySide6.QtPrintSupport import QPrintDialog, QPrinter
 from PySide6.QtWidgets import (
@@ -20,6 +20,98 @@ from ui.widgets.workspace_dialog import maximize_workspace_dialog
 
 def _money(value):
     return f"{round_money(value):,.2f}".replace(",", " ")
+
+
+_active_facture_request_jobs = {}
+
+
+class _FactureRequestWorker(QObject):
+    finished = Signal(object, object)
+    failed = Signal(str, object)
+
+    def __init__(self, database, requests, context):
+        super().__init__()
+        self.database = database
+        self.requests = requests
+        self.context = context
+
+    @Slot()
+    def run(self):
+        worker_db = self.database
+        close_worker_db = False
+        try:
+            from core.database import Database
+            if isinstance(self.database, Database):
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, "language", "en")
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect(initialize_schema=False):
+                    raise RuntimeError(
+                        f"Worker could not connect to database: {worker_db.last_error}"
+                    )
+                close_worker_db = True
+
+            results = []
+            for method, args, kwargs in self.requests:
+                if QThread.currentThread().isInterruptionRequested():
+                    return
+                results.append(getattr(worker_db, method)(*args, **kwargs))
+            self.finished.emit(self.context, results)
+        except Exception as exc:
+            self.failed.emit(str(exc) or "Unknown error", self.context)
+        finally:
+            if close_worker_db:
+                worker_db.close()
+
+
+class _FactureAsyncRequests:
+    def _init_facture_requests(self):
+        self._facture_request_thread = None
+        self._facture_request_worker = None
+        self._facture_request_pending = None
+
+    def _start_facture_request(self, database, requests, context=None):
+        request = (database, requests, context)
+        if self._facture_request_thread is not None:
+            self._facture_request_pending = request
+            return
+
+        thread = QThread()
+        worker = _FactureRequestWorker(database, requests, context)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.finished.connect(self._on_facture_request_loaded)
+        worker.failed.connect(self._on_facture_request_failed)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.failed.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_facture_request_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        thread_id = id(thread)
+        _active_facture_request_jobs[thread_id] = (thread, worker)
+        thread.destroyed.connect(
+            lambda _obj=None, key=thread_id: _active_facture_request_jobs.pop(key, None)
+        )
+        self._facture_request_thread = thread
+        self._facture_request_worker = worker
+        thread.start()
+
+    @Slot(object, object)
+    def _on_facture_request_loaded(self, context, results):
+        self._apply_facture_request(context, results)
+
+    @Slot(str, object)
+    def _on_facture_request_failed(self, error, context):
+        self._show_facture_request_error(error, context)
+
+    @Slot()
+    def _on_facture_request_thread_finished(self):
+        self._facture_request_thread = None
+        self._facture_request_worker = None
+        pending = self._facture_request_pending
+        self._facture_request_pending = None
+        if pending is not None:
+            self._start_facture_request(*pending)
 
 
 class _FacturesFetchWorker(QObject):
@@ -65,10 +157,12 @@ class _FactureEditorLoadWorker(QObject):
     error = Signal(str)
     finished = Signal()
 
-    def __init__(self, database, fetch_preview):
+    def __init__(self, database, fetch_preview, facture_id=None, draft_request=None):
         super().__init__()
         self.database = database
         self.fetch_preview = fetch_preview
+        self.facture_id = facture_id
+        self.draft_request = draft_request
 
     @Slot()
     def run(self):
@@ -88,6 +182,10 @@ class _FactureEditorLoadWorker(QObject):
 
             if QThread.currentThread().isInterruptionRequested():
                 return
+            facture = (
+                worker_db.get_facture(self.facture_id)
+                if self.facture_id is not None else None
+            )
             catalog = worker_db.get_sale_catalog(
                 True, True, include_clients=True,
             )
@@ -97,7 +195,15 @@ class _FactureEditorLoadWorker(QObject):
                     preview = worker_db.get_next_facture_preview()
                 except Exception:
                     pass
-            self.loaded.emit(catalog, preview)
+            draft = None
+            if self.draft_request and not QThread.currentThread().isInterruptionRequested():
+                sale_ids, facture_type, date = self.draft_request
+                draft = worker_db.get_facture_draft_from_sales(
+                    sale_ids, facture_type, date,
+                )
+            self.loaded.emit(catalog, {
+                "preview": preview, "facture": facture, "draft": draft,
+            })
         except Exception as exc:
             self.error.emit(str(exc) or "Unknown error")
         finally:
@@ -109,17 +215,23 @@ class _FactureEditorLoadWorker(QObject):
             self.finished.emit()
 
 
-class FactureEditor(QDialog):
+class FactureEditor(_FactureAsyncRequests, QDialog):
     """Small editor for a persisted invoice snapshot, not a Sales editor clone."""
 
     columns = ("Type", "Désignation", "Information", "Unité", "Qté", "Prix HT", "Remise %", "Total HT")
 
-    def __init__(self, database, facture=None, parent=None):
+    def __init__(self, database, facture=None, parent=None, *, facture_id=None,
+                 draft_request=None):
         super().__init__(parent)
         self.database = database
         self.facture = facture
+        self._facture_id_to_load = facture_id
+        self._draft_request_to_load = draft_request
         self.draft = None
         self.client_id = None
+        self._init_facture_requests()
+        self._saving = False
+        self._draft_loading = False
         self._catalog_ready = False
         self._pending_draft = None
         self._catalog_thread = None
@@ -221,12 +333,16 @@ class FactureEditor(QDialog):
         dialog = DevisSelectorDialog(self.database, self)
         if not dialog.exec():
             return
-        try:
-            self.load_draft(self.database.get_facture_draft_from_sales(
-                dialog.sale_ids, self.type.currentData(), self.date.date().toString("yyyy-MM-dd")
-            ))
-        except Exception as exc:
-            QMessageBox.warning(self, "Facture", str(exc))
+        self._draft_loading = True
+        self._update_save_state()
+        self.catalog_status.setText("Chargement du brouillon depuis les devis…")
+        self.catalog_status.show()
+        self._start_facture_request(self.database, [(
+            "get_facture_draft_from_sales",
+            (dialog.sale_ids, self.type.currentData(),
+             self.date.date().toString("yyyy-MM-dd")),
+            {},
+        )], context=("choose_devis_draft", self.type.currentData()))
 
     def _refresh_special_draft(self, invoice_type):
         if self.facture:
@@ -235,9 +351,40 @@ class FactureEditor(QDialog):
         source_ids = draft.get("source_sale_ids") or ([draft["source_sale_id"]] if draft.get("source_sale_id") else [])
         if not source_ids or (self.draft or {}).get("facture_type") == invoice_type:
             return
-        self.load_draft(self.database.get_facture_draft_from_sales(
-            source_ids, invoice_type, self.date.date().toString("yyyy-MM-dd")
-        ))
+        self._draft_loading = True
+        self._update_save_state()
+        self.catalog_status.setText("Mise à jour des devis sélectionnés…")
+        self.catalog_status.show()
+        self._start_facture_request(self.database, [(
+            "get_facture_draft_from_sales",
+            (source_ids, invoice_type, self.date.date().toString("yyyy-MM-dd")),
+            {},
+        )], context=("special_draft", invoice_type))
+
+    def _apply_facture_request(self, context, results):
+        if context and context[0] in ("special_draft", "choose_devis_draft"):
+            self._draft_loading = False
+            self.catalog_status.hide()
+            self._apply_draft(results[0])
+            self._update_save_state()
+            return
+        if context == "save":
+            self._saving = False
+            self.setEnabled(True)
+            self.saved_id = results[0]["facture_id"]
+            self.accept()
+
+    def _show_facture_request_error(self, error, context):
+        if context == "save":
+            self._saving = False
+            self.setEnabled(True)
+            QMessageBox.critical(self, "Facture", error)
+            self._update_save_state()
+        elif context and context[0] in ("special_draft", "choose_devis_draft"):
+            self._draft_loading = False
+            self.catalog_status.setText(f"Impossible de charger les devis : {error}")
+            self.catalog_status.show()
+            self._update_save_state()
 
     def _apply_catalog(self, catalog):
         self.line_catalog = {
@@ -269,7 +416,10 @@ class FactureEditor(QDialog):
     def _start_catalog_load(self):
         thread = QThread()
         worker = _FactureEditorLoadWorker(
-            self.database, fetch_preview=self.facture is None,
+            self.database,
+            fetch_preview=self.facture is None and self._facture_id_to_load is None,
+            facture_id=self._facture_id_to_load,
+            draft_request=self._draft_request_to_load,
         )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
@@ -289,17 +439,26 @@ class FactureEditor(QDialog):
         thread.start()
 
     @Slot(object, object)
-    def _on_catalog_loaded(self, catalog, preview):
+    def _on_catalog_loaded(self, catalog, load_data):
         try:
+            load_data = load_data or {}
             self._apply_catalog(catalog or {})
             self._catalog_ready = True
             self._set_catalog_controls_enabled(True)
             self.catalog_status.hide()
+            loaded_facture = load_data.get("facture")
+            if loaded_facture is not None:
+                self.facture = loaded_facture
+                self._active_facture = loaded_facture
+                self.setWindowTitle("Modifier la facture")
+            preview = load_data.get("preview")
             if preview is not None and self.facture is None:
                 self.number.setText(f"Aperçu: {preview}")
 
             if self._active_facture is not None:
                 self._load_facture(self._active_facture)
+            elif load_data.get("draft") is not None:
+                self._apply_draft(load_data["draft"])
             elif self._pending_draft is not None:
                 draft = self._pending_draft
                 self._pending_draft = None
@@ -340,6 +499,8 @@ class FactureEditor(QDialog):
             self._set_client(dialog.client_id)
 
     def _load_facture(self, facture):
+        self.number.setText(str(facture.get("facture_number") or ""))
+        self.operation_token = ""
         self.date.setDate(QDate.fromString(str(facture["date"]), "yyyy-MM-dd"))
         self.type.setCurrentIndex(max(0, self.type.findData(facture["facture_type"])))
         self.tva.setValue(float(facture["tva_rate"])); self.address.setText(facture.get("client_address") or "")
@@ -486,7 +647,7 @@ class FactureEditor(QDialog):
     def _update_save_state(self):
         if not hasattr(self, "save_button"):
             return
-        if not self._catalog_ready:
+        if not self._catalog_ready or self._draft_loading or self._saving:
             self.save_button.setEnabled(False)
             return
         invoice_type = self.type.currentData()
@@ -523,7 +684,7 @@ class FactureEditor(QDialog):
                                if invoice_type == "advance" else "SOLDE SUR TRAVAUX DE MENUISERIE EN BOIS")
                 lines = [{"item_type": "manual", "designation": f"{designation}\nSUIVANT DEVIS N° {devis}",
                           "unit": "ENS", "quantity": "1", "unit_price": str(total_ht), "discount_percentage": "0"}]
-            result = self.database.save_facture_with_items({
+            data = {
                 "client_id": self.client_id, "date": self.date.date().toString("yyyy-MM-dd"),
                 "facture_type": self.type.currentData(), "tva_rate": str(self.tva.value()),
                 "client_address": self.address.text(), "client_city": self.city.text(), "client_ice": self.ice.text(),
@@ -534,10 +695,39 @@ class FactureEditor(QDialog):
                 "remise_includes_line_discounts": self.draft.get("remise_includes_line_discounts", False) if self.draft and self.type.currentData() == "normal" else False,
                 "operation_token": self.operation_token,
                 **({key: self.draft[key] for key in ("source_sale_ids", "source_sale_id", "source_devis") if key in self.draft} if self.draft else {}),
-            }, lines, self.facture["id"] if self.facture else None)
-            self.saved_id = result["facture_id"]; self.accept()
+            }
+            self._saving = True
+            self.setEnabled(False)
+            self._start_facture_request(self.database, [(
+                "save_facture_with_items",
+                (data, lines, self.facture["id"] if self.facture else None),
+                {},
+            )], context="save")
         except Exception as exc:
+            self._saving = False
+            self.setEnabled(True)
             QMessageBox.critical(self, "Facture", str(exc))
+
+    def reject(self):
+        if self._saving:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._saving:
+            event.ignore()
+            return
+        thread = self._catalog_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+            thread.quit()
+            thread.wait(2000)
+        req_thread = getattr(self, "_facture_request_thread", None)
+        if req_thread is not None and req_thread.isRunning():
+            req_thread.requestInterruption()
+            req_thread.quit()
+            req_thread.wait(2000)
+        super().closeEvent(event)
 
 
 class FacturePaymentFormDialog(QDialog):
@@ -569,11 +759,16 @@ class FacturePaymentFormDialog(QDialog):
         }
 
 
-class FacturePaymentsDialog(QDialog):
+class FacturePaymentsDialog(_FactureAsyncRequests, QDialog):
     def __init__(self, database, facture_id, parent=None):
         super().__init__(parent); self.database = database; self.facture_id = facture_id
+        self._init_facture_requests()
+        self._loaded = False
+        self._busy = False
         self.setWindowTitle("Paiements de la facture"); self.resize(820, 480)
-        layout = QVBoxLayout(self); self.summary = QLabel(); layout.addWidget(self.summary)
+        layout = QVBoxLayout(self); self.load_status = QLabel("Chargement des paiements…"); layout.addWidget(self.load_status)
+        self.retry_button = BlueButton("Réessayer"); self.retry_button.clicked.connect(self.refresh); self.retry_button.hide(); layout.addWidget(self.retry_button)
+        self.summary = QLabel(); layout.addWidget(self.summary)
         self.table = QTableWidget(0, 5); self.table.setHorizontalHeaderLabels(("Date", "Montant", "Méthode", "Référence", "Notes"))
         self.table.setSelectionBehavior(QTableWidget.SelectRows); self.table.setSelectionMode(QTableWidget.SingleSelection)
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch); self.table.itemSelectionChanged.connect(self._update_actions)
@@ -581,8 +776,8 @@ class FacturePaymentsDialog(QDialog):
         form = QHBoxLayout(); self.date = QDateEdit(QDate.currentDate()); self.amount = QDoubleSpinBox(); self.amount.setRange(0.01, 999999999); self.amount.setDecimals(2)
         self.method = QComboBox(); self.method.addItems(("Espèces", "Chèque", "Virement", "Carte", "Autre")); self.reference = QLineEdit(); self.reference.setPlaceholderText("Référence")
         self.notes = QLineEdit(); self.notes.setPlaceholderText("Notes")
-        add = GreenButton("Ajouter paiement"); add.clicked.connect(self.add_payment)
-        for widget in (self.date, self.amount, self.method, self.reference, self.notes, add): form.addWidget(widget)
+        self.add_button = GreenButton("Ajouter paiement"); self.add_button.clicked.connect(self.add_payment)
+        for widget in (self.date, self.amount, self.method, self.reference, self.notes, self.add_button): form.addWidget(widget)
         layout.addLayout(form)
         actions = QHBoxLayout(); self.edit_button = BlueButton("Modifier paiement"); self.edit_button.clicked.connect(self.edit_payment)
         self.delete_button = RedButton("Supprimer paiement"); self.delete_button.clicked.connect(self.delete_payment)
@@ -590,29 +785,68 @@ class FacturePaymentsDialog(QDialog):
         self.payments = []; self.refresh()
 
     def refresh(self):
-        facture = self.database.get_facture(self.facture_id); self.summary.setText(f"TTC: {_money(facture['total_ttc'])} | Payé: {_money(facture['paid'])} | Reste: {_money(facture['remaining'])} | {facture['status']}")
-        self.payments = self.database.get_facture_payments(self.facture_id); self.table.setRowCount(len(self.payments))
+        self.load_status.setText("Chargement des paiements…")
+        self.load_status.show(); self.retry_button.hide()
+        self._set_busy(True)
+        self._start_facture_request(self.database, [
+            ("get_facture", (self.facture_id,), {}),
+            ("get_facture_payments", (self.facture_id,), {}),
+        ], context="load")
+
+    def _set_busy(self, busy):
+        self._busy = busy
+        enabled = self._loaded and not busy
+        for widget in (self.table, self.date, self.amount, self.method,
+                       self.reference, self.notes, self.add_button):
+            widget.setEnabled(enabled)
+        self._update_actions()
+
+    def _apply_facture_request(self, context, results):
+        if context != "load":
+            if context == "add":
+                self.reference.clear(); self.notes.clear()
+            self.refresh()
+            return
+
+        facture, self.payments = results
+        self.summary.setText(
+            f"TTC: {_money(facture['total_ttc'])} | Payé: {_money(facture['paid'])} | "
+            f"Reste: {_money(facture['remaining'])} | {facture['status']}"
+        )
+        self.table.setRowCount(len(self.payments))
         for row, payment in enumerate(self.payments):
             for col, key in enumerate(("date", "amount", "method", "reference", "notes")):
                 item = QTableWidgetItem(_money(payment[key]) if key == "amount" else str(payment[key] or ""))
                 item.setData(Qt.UserRole, int(payment["id"])); self.table.setItem(row, col, item)
+        self._loaded = True
+        self.load_status.hide()
+        self._set_busy(False)
         self._update_actions()
+
+    def _show_facture_request_error(self, error, context):
+        self._set_busy(False)
+        self.load_status.setText("Impossible de charger les paiements.")
+        self.load_status.show(); self.retry_button.show()
+        QMessageBox.warning(self, "Paiement", error)
 
     def _selected_payment(self):
         row = self.table.currentRow()
         return self.payments[row] if 0 <= row < len(self.payments) else None
 
     def _update_actions(self):
-        selected = self._selected_payment() is not None
+        selected = self._loaded and not self._busy and self._selected_payment() is not None
         self.edit_button.setEnabled(selected); self.delete_button.setEnabled(selected)
 
     def add_payment(self):
-        try:
-            self.database.add_facture_payment(self.facture_id, str(self.amount.value()), self.date.date().toString("yyyy-MM-dd"), self.method.currentText(), self.reference.text(), self.notes.text())
-            self.reference.clear(); self.notes.clear()
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.warning(self, "Paiement", str(exc))
+        if not self._loaded or self._busy:
+            return
+        self._set_busy(True)
+        self._start_facture_request(self.database, [(
+            "add_facture_payment",
+            (self.facture_id, str(self.amount.value()), self.date.date().toString("yyyy-MM-dd"),
+             self.method.currentText(), self.reference.text(), self.notes.text()),
+            {},
+        )], context="add")
 
     def edit_payment(self):
         payment = self._selected_payment()
@@ -621,12 +855,14 @@ class FacturePaymentsDialog(QDialog):
         dialog = FacturePaymentFormDialog(payment, self)
         if not dialog.exec():
             return
-        try:
-            values = dialog.values()
-            self.database.update_facture_payment(self.facture_id, payment["id"], values["amount"], values["date"], values["method"], values["reference"], values["notes"])
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.warning(self, "Paiement", str(exc))
+        values = dialog.values()
+        self._set_busy(True)
+        self._start_facture_request(self.database, [(
+            "update_facture_payment",
+            (self.facture_id, payment["id"], values["amount"], values["date"],
+             values["method"], values["reference"], values["notes"]),
+            {},
+        )], context="update")
 
     def delete_payment(self):
         payment = self._selected_payment()
@@ -634,11 +870,26 @@ class FacturePaymentsDialog(QDialog):
             return
         if QMessageBox.question(self, "Supprimer paiement", "Supprimer ce paiement ?") != QMessageBox.Yes:
             return
-        try:
-            self.database.delete_facture_payment(self.facture_id, payment["id"])
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.warning(self, "Paiement", str(exc))
+        self._set_busy(True)
+        self._start_facture_request(self.database, [(
+            "delete_facture_payment", (self.facture_id, payment["id"]), {},
+        )], context="delete")
+
+    def reject(self):
+        if self._busy:
+            return
+        super().reject()
+
+    def closeEvent(self, event):
+        if self._busy:
+            event.ignore()
+            return
+        req_thread = getattr(self, "_facture_request_thread", None)
+        if req_thread is not None and req_thread.isRunning():
+            req_thread.requestInterruption()
+            req_thread.quit()
+            req_thread.wait(2000)
+        super().closeEvent(event)
 
 
 class ClientSelectorDialog(QDialog):
@@ -670,13 +921,17 @@ class ClientSelectorDialog(QDialog):
         self.client_id = int(self.table.item(row, 0).data(Qt.UserRole)); self.accept()
 
 
-class DevisSelectorDialog(QDialog):
+class DevisSelectorDialog(_FactureAsyncRequests, QDialog):
     """Professional visible-data multi-selection; no database IDs are exposed."""
     def __init__(self, database, parent=None):
         super().__init__(parent); self.database = database; self.sale_ids = []
+        self._init_facture_requests()
+        self._query_generation = 0
         self.setWindowTitle("Sélectionner des Devis"); self.resize(950, 500)
         layout = QVBoxLayout(self); self.search = QLineEdit(); self.search.setPlaceholderText("N° Devis, client ou date")
-        self.search.textChanged.connect(self.refresh); layout.addWidget(self.search)
+        self._search_timer = QTimer(self); self._search_timer.setSingleShot(True); self._search_timer.setInterval(150); self._search_timer.timeout.connect(self.refresh)
+        self.search.textChanged.connect(self._schedule_refresh); layout.addWidget(self.search)
+        self.load_status = QLabel("Chargement des devis…"); layout.addWidget(self.load_status)
         self.table = QTableWidget(0, 7); self.table.setHorizontalHeaderLabels(("", "Devis N°", "Client", "Date", "Total HT", "Total TTC", "Statut"))
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         layout.addWidget(self.table)
@@ -685,10 +940,26 @@ class DevisSelectorDialog(QDialog):
         self.refresh()
 
     def refresh(self):
-        rows = self.database.get_operation_summary_items(
-            "Sales", search_text=self.search.text().strip() or None,
-            search_columns=["devis", "client_name", "client_username", "date"], order_by="date", order_dir="desc"
-        )
+        self._query_generation += 1
+        generation = self._query_generation
+        self.load_status.setText("Recherche des devis…")
+        self.load_status.show()
+        self._start_facture_request(self.database, [(
+            "get_operation_summary_items", ("Sales",), {
+                "search_text": self.search.text().strip() or None,
+                "search_columns": ["devis", "client_name", "client_username", "date"],
+                "order_by": "date", "order_dir": "desc",
+            },
+        )], context=generation)
+
+    def _schedule_refresh(self):
+        self._query_generation += 1
+        self._search_timer.start()
+
+    def _apply_facture_request(self, context, results):
+        if context != self._query_generation:
+            return
+        rows = results[0]
         self.table.setRowCount(len(rows))
         for row, sale in enumerate(rows):
             values = (sale.get("devis"), sale.get("client_name") or sale.get("client_username"), sale.get("date"),
@@ -696,6 +967,13 @@ class DevisSelectorDialog(QDialog):
             check = QTableWidgetItem(); check.setFlags(check.flags() | Qt.ItemIsUserCheckable); check.setCheckState(Qt.Unchecked); check.setData(Qt.UserRole, sale.get("ID") or sale.get("id")); self.table.setItem(row, 0, check)
             for col, value in enumerate(values, 1):
                 item = QTableWidgetItem(str(value or "")); item.setData(Qt.UserRole, sale.get("ID") or sale.get("id")); self.table.setItem(row, col, item)
+        self.load_status.setText(f"{len(rows)} devis trouvé(s)")
+        self.load_status.setVisible(not bool(rows))
+
+    def _show_facture_request_error(self, error, context):
+        if context == self._query_generation:
+            self.load_status.setText(f"Impossible de charger les devis : {error}")
+            self.load_status.show()
 
     def select_all(self):
         for row in range(self.table.rowCount()):
@@ -706,6 +984,14 @@ class DevisSelectorDialog(QDialog):
         if not self.sale_ids:
             return QMessageBox.information(self, "Devis", "Sélectionnez au moins un devis.")
         self.accept()
+
+    def closeEvent(self, event):
+        req_thread = getattr(self, "_facture_request_thread", None)
+        if req_thread is not None and req_thread.isRunning():
+            req_thread.requestInterruption()
+            req_thread.quit()
+            req_thread.wait(2000)
+        super().closeEvent(event)
 
 
 class FacturePreviewDialog(QDialog):
@@ -781,10 +1067,11 @@ class FactureTypeDialog(QDialog):
         self.accept()
 
 
-class FacturesTab(QWidget):
+class FacturesTab(_FactureAsyncRequests, QWidget):
     """Invoice list and actions; all data flows through Database/RPC APIs."""
     def __init__(self, database, parent=None):
         super().__init__(parent); self.database = database
+        self._init_facture_requests()
         self._refresh_thread = None
         self._refresh_worker = None
         self._refresh_pending = False
@@ -859,6 +1146,11 @@ class FacturesTab(QWidget):
             thread.requestInterruption()
             thread.quit()
             thread.wait(5000)
+        req_thread = getattr(self, "_facture_request_thread", None)
+        if req_thread is not None and req_thread.isRunning():
+            req_thread.requestInterruption()
+            req_thread.quit()
+            req_thread.wait(2000)
         super().closeEvent(event)
 
     # MainWindow uses these names for tab activation, backup restore, and its
@@ -888,16 +1180,17 @@ class FacturesTab(QWidget):
         chooser = FactureTypeDialog(self)
         if not chooser.exec():
             return
-        try:
-            dialog = FactureEditor(self.database, parent=self)
-            dialog.load_draft(self.database.get_facture_draft_from_sales(selector.sale_ids, chooser.facture_type))
-            if dialog.exec(): self.refresh()
-        except Exception as exc: QMessageBox.warning(self, "Facture", str(exc))
+        dialog = FactureEditor(
+            self.database, parent=self,
+            draft_request=(selector.sale_ids, chooser.facture_type,
+                           QDate.currentDate().toString("yyyy-MM-dd")),
+        )
+        if dialog.exec(): self.refresh()
 
     def edit_facture(self):
         facture_id = self.selected_id()
         if not facture_id: return QMessageBox.information(self, "Facture", "Sélectionnez une facture.")
-        dialog = FactureEditor(self.database, self.database.get_facture(facture_id), self)
+        dialog = FactureEditor(self.database, parent=self, facture_id=facture_id)
         if dialog.exec(): self.refresh()
 
     def payments(self):
@@ -910,20 +1203,56 @@ class FacturesTab(QWidget):
             return
         if QMessageBox.question(self, "Supprimer", "Supprimer cette facture non payée ?") != QMessageBox.Yes:
             return
-        try:
-            self.database.delete_facture(facture_id)
-            self.refresh()
-        except Exception as exc:
-            QMessageBox.warning(self, "Facture", str(exc))
+        self._action_buttons["Supprimer"].setEnabled(False)
+        self._start_facture_request(self.database, [
+            ("delete_facture", (facture_id,), {}),
+        ], context=("delete", facture_id))
 
     def preview(self):
         facture_id = self.selected_id()
         if not facture_id: return
-        facture = self.database.get_facture(facture_id)
+        self._action_buttons["Aperçu / PDF / Imprimer"].setEnabled(False)
         profile = self._get_report_profile()
-        payments = self.database.get_facture_payments(facture_id)
-        dialog = FacturePreviewDialog(render_facture_preview_pages(facture, payments, profile)[0], self)
-        layout = dialog.layout(); actions = QHBoxLayout(); pdf = BlueButton("Enregistrer PDF"); pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog)); print_button = OrangeButton("Imprimer"); print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog)); close = RedButton("Fermer"); close.clicked.connect(dialog.reject); actions.addWidget(pdf); actions.addWidget(print_button); actions.addStretch(1); actions.addWidget(close); layout.addLayout(actions); dialog.exec()
+        self._start_facture_request(self.database, [
+            ("get_facture", (facture_id,), {}),
+            ("get_facture_payments", (facture_id,), {}),
+        ], context=("preview", facture_id, profile))
+
+    def _apply_facture_request(self, context, results):
+        if isinstance(context, tuple) and context[0] == "preview":
+            self._action_buttons["Aperçu / PDF / Imprimer"].setEnabled(True)
+            _tag, _facture_id, profile = context
+            facture, payments = results
+            dialog = FacturePreviewDialog(render_facture_preview_pages(facture, payments, profile)[0], self)
+            layout = dialog.layout()
+            actions = QHBoxLayout()
+            pdf = BlueButton("Enregistrer PDF")
+            pdf.clicked.connect(lambda: self._save_pdf(facture, payments, profile, dialog))
+            print_button = OrangeButton("Imprimer")
+            print_button.clicked.connect(lambda: self._print_facture(facture, payments, profile, dialog))
+            close = RedButton("Fermer")
+            close.clicked.connect(dialog.reject)
+            actions.addWidget(pdf)
+            actions.addWidget(print_button)
+            actions.addStretch(1)
+            actions.addWidget(close)
+            layout.addLayout(actions)
+            dialog.exec()
+        elif isinstance(context, tuple) and context[0] == "delete":
+            self._action_buttons["Supprimer"].setEnabled(
+                self.database.has_permission("Factures", "delete")
+            )
+            self.refresh()
+
+    def _show_facture_request_error(self, error, context):
+        if isinstance(context, tuple) and context[0] == "preview":
+            self._action_buttons["Aperçu / PDF / Imprimer"].setEnabled(True)
+            QMessageBox.warning(self, "Aperçu facture", error)
+        elif isinstance(context, tuple) and context[0] == "delete":
+            self._action_buttons["Supprimer"].setEnabled(
+                self.database.has_permission("Factures", "delete")
+            )
+            QMessageBox.warning(self, "Facture", error)
 
     def _save_pdf(self, facture, payments, profile, parent):
         path, _ = QFileDialog.getSaveFileName(parent, "Enregistrer la facture", "", "PDF (*.pdf)")

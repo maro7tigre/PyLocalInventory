@@ -219,6 +219,8 @@ class TestFactureEditorLoad(unittest.TestCase):
         from ui.tabs.factures_tab import FactureEditor, _active_facture_editor_jobs
 
         gui_thread_id = threading.get_ident()
+        catalog_started = threading.Event()
+        release_catalog = threading.Event()
 
         class RemoteDatabase:
             def __init__(self):
@@ -233,7 +235,9 @@ class TestFactureEditorLoad(unittest.TestCase):
 
             def get_sale_catalog(self, *_args, **_kwargs):
                 self.call_threads.append(threading.get_ident())
-                time.sleep(0.03)
+                catalog_started.set()
+                if not release_catalog.wait(2):
+                    raise TimeoutError("test did not release the catalog request")
                 return self.sale_catalog
 
             def get_next_facture_preview(self):
@@ -243,10 +247,9 @@ class TestFactureEditorLoad(unittest.TestCase):
 
         RemoteDatabase.__name__ = "RemoteDatabase"
         database = RemoteDatabase()
-        started = time.perf_counter()
         editor = FactureEditor(database)
-        constructor_ms = (time.perf_counter() - started) * 1000
-        self.assertLess(constructor_ms, 50)
+        self.assertTrue(catalog_started.wait(2), "catalog request did not start")
+        self.assertFalse(release_catalog.is_set(), "editor blocked until catalog RPC returned")
         thread = editor._catalog_thread
         self.assertIsNotNone(thread)
 
@@ -260,6 +263,7 @@ class TestFactureEditorLoad(unittest.TestCase):
                 "quantity": "2", "unit_price": "10", "discount_percentage": "0",
             }],
         })
+        release_catalog.set()
         self.assertTrue(thread.wait(2000), "FactureEditor load QThread did not stop")
 
         deadline = time.monotonic() + 2
@@ -328,8 +332,134 @@ class TestFactureEditorLoad(unittest.TestCase):
         self.assertIs(background.registered_classes, source.registered_classes)
         self.assertEqual(background.calls, ["catalog", "preview"])
         self.assertEqual(
-            received, [({"products": [], "services": [], "clients": []}, "FA-007/2026")],
+            received, [({"products": [], "services": [], "clients": []}, {
+                "preview": "FA-007/2026", "facture": None, "draft": None,
+            })],
         )
+
+
+class TestFactureAsyncDialogs(unittest.TestCase):
+    @staticmethod
+    def _pump_until(predicate, timeout=2000, desc=""):
+        deadline = time.monotonic() + timeout / 1000
+        while time.monotonic() < deadline:
+            app.processEvents()
+            app.sendPostedEvents(None, QEvent.DeferredDelete)
+            if predicate():
+                return True
+            time.sleep(0.005)
+        app.processEvents()
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        result = predicate()
+        if not result and desc:
+            print(f"[_pump_until timeout for: {desc}]", flush=True)
+        return result
+
+    def test_devis_selector_fetches_and_searches_off_gui_thread(self):
+        from ui.tabs.factures_tab import DevisSelectorDialog, _active_facture_request_jobs
+
+        started = threading.Event()
+        release = threading.Event()
+        gui_thread = threading.get_ident()
+
+        class RemoteDatabase:
+            def __init__(self):
+                self.call_threads = []
+
+            def get_operation_summary_items(self, *_args, **kwargs):
+                self.call_threads.append(threading.get_ident())
+                if kwargs.get("search_text") == "DE-2":
+                    started.set()
+                    if not release.wait(2):
+                        raise TimeoutError("test did not release the Devis search")
+                return [{
+                    "id": 2, "devis": "DE-2", "client_name": "Client",
+                    "date": "2026-10-01", "total_ht": 10,
+                    "total_ttc": 12, "state": "pending",
+                }]
+
+        database = RemoteDatabase()
+        dialog = DevisSelectorDialog(database)
+        self.assertTrue(self._pump_until(lambda: dialog.table.rowCount() == 1, desc="initial rowCount"))
+        dialog.search.setText("DE-2")
+        self.assertTrue(
+            self._pump_until(started.is_set, desc=f"started.is_set, text={dialog.search.text()}"), "Devis search did not start in the worker",
+        )
+        release.set()
+        self.assertTrue(self._pump_until(
+            lambda: dialog._facture_request_thread is None and
+            dialog.table.item(0, 1) is not None and
+            dialog.table.item(0, 1).text() == "DE-2",
+            desc=f"search finished: thread={dialog._facture_request_thread}, item={(dialog.table.item(0, 1).text() if dialog.table.item(0, 1) else None)}"
+        ))
+        self.assertTrue(database.call_threads)
+        self.assertTrue(all(thread_id != gui_thread for thread_id in database.call_threads))
+        app.sendPostedEvents(None, QEvent.DeferredDelete)
+        app.processEvents()
+        self.assertFalse(_active_facture_request_jobs)
+        dialog.close()
+
+    def test_payment_dialog_load_and_write_are_async_and_single_attempt(self):
+        from ui.tabs.factures_tab import FacturePaymentsDialog, _active_facture_request_jobs
+
+        load_started = threading.Event()
+        release_load = threading.Event()
+        write_started = threading.Event()
+        release_write = threading.Event()
+        gui_thread = threading.get_ident()
+
+        class RemoteDatabase:
+            def __init__(self):
+                self.call_threads = []
+                self.write_calls = 0
+
+            def get_facture(self, _facture_id):
+                self.call_threads.append(threading.get_ident())
+                load_started.set()
+                if not release_load.wait(2):
+                    raise TimeoutError("test did not release the payment load")
+                return {"total_ttc": "12", "paid": "1", "remaining": "11", "status": "partial"}
+
+            def get_facture_payments(self, _facture_id):
+                self.call_threads.append(threading.get_ident())
+                return [{"id": 4, "date": "2026-10-01", "amount": "1",
+                         "method": "Cash", "reference": "", "notes": ""}]
+
+            def add_facture_payment(self, *_args):
+                self.write_calls += 1
+                self.call_threads.append(threading.get_ident())
+                write_started.set()
+                if not release_write.wait(2):
+                    raise TimeoutError("test did not release the payment write")
+                return 5
+
+        database = RemoteDatabase()
+        dialog = FacturePaymentsDialog(database, 1)
+        self.assertTrue(load_started.wait(2), "payment load did not start in the worker")
+        self.assertEqual(dialog.table.rowCount(), 0)
+        release_load.set()
+        self.assertTrue(self._pump_until(
+            lambda: dialog._facture_request_thread is None and dialog.table.rowCount() == 1,
+            desc=f"payment initial load: thread={dialog._facture_request_thread}, rowCount={dialog.table.rowCount()}",
+        ))
+        self.assertIn("TTC: 12.00", dialog.summary.text())
+
+        dialog.amount.setValue(2)
+        dialog.add_payment()
+        self.assertTrue(write_started.wait(2), "payment write did not start in the worker")
+        self.assertEqual(database.write_calls, 1)
+        release_write.set()
+        self.assertTrue(self._pump_until(
+            lambda: dialog._facture_request_thread is None and
+            database.write_calls == 1 and dialog.table.rowCount() == 1 and
+            not _active_facture_request_jobs,
+            desc=f"payment write finish: thread={dialog._facture_request_thread}, write_calls={database.write_calls}, rows={dialog.table.rowCount()}, jobs={len(_active_facture_request_jobs)}",
+            timeout=3000,
+        ))
+        self.assertEqual(database.write_calls, 1)
+        self.assertTrue(database.call_threads)
+        self.assertTrue(all(thread_id != gui_thread for thread_id in database.call_threads))
+        dialog.close()
 
 
 class TestOperationsTableCatalog(unittest.TestCase):

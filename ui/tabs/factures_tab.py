@@ -96,14 +96,6 @@ class _FactureAsyncRequests:
         self._facture_request_worker = worker
         thread.start()
 
-    @Slot(object, object)
-    def _on_facture_request_loaded(self, context, results):
-        self._apply_facture_request(context, results)
-
-    @Slot(str, object)
-    def _on_facture_request_failed(self, error, context):
-        self._show_facture_request_error(error, context)
-
     @Slot()
     def _on_facture_request_thread_finished(self):
         self._facture_request_thread = None
@@ -360,6 +352,14 @@ class FactureEditor(_FactureAsyncRequests, QDialog):
             (source_ids, invoice_type, self.date.date().toString("yyyy-MM-dd")),
             {},
         )], context=("special_draft", invoice_type))
+
+    @Slot(object, object)
+    def _on_facture_request_loaded(self, context, results):
+        self._apply_facture_request(context, results)
+
+    @Slot(str, object)
+    def _on_facture_request_failed(self, error, context):
+        self._show_facture_request_error(error, context)
 
     def _apply_facture_request(self, context, results):
         if context and context[0] in ("special_draft", "choose_devis_draft"):
@@ -801,6 +801,14 @@ class FacturePaymentsDialog(_FactureAsyncRequests, QDialog):
             widget.setEnabled(enabled)
         self._update_actions()
 
+    @Slot(object, object)
+    def _on_facture_request_loaded(self, context, results):
+        self._apply_facture_request(context, results)
+
+    @Slot(str, object)
+    def _on_facture_request_failed(self, error, context):
+        self._show_facture_request_error(error, context)
+
     def _apply_facture_request(self, context, results):
         if context != "load":
             if context == "add":
@@ -955,6 +963,14 @@ class DevisSelectorDialog(_FactureAsyncRequests, QDialog):
     def _schedule_refresh(self):
         self._query_generation += 1
         self._search_timer.start()
+
+    @Slot(object, object)
+    def _on_facture_request_loaded(self, context, results):
+        self._apply_facture_request(context, results)
+
+    @Slot(str, object)
+    def _on_facture_request_failed(self, error, context):
+        self._show_facture_request_error(error, context)
 
     def _apply_facture_request(self, context, results):
         if context != self._query_generation:
@@ -1217,6 +1233,14 @@ class FacturesTab(_FactureAsyncRequests, QWidget):
             ("get_facture", (facture_id,), {}),
             ("get_facture_payments", (facture_id,), {}),
         ], context=("preview", facture_id, profile))
+
+    @Slot(object, object)
+    def _on_facture_request_loaded(self, context, results):
+        self._apply_facture_request(context, results)
+
+    @Slot(str, object)
+    def _on_facture_request_failed(self, error, context):
+        self._show_facture_request_error(error, context)
 
     def _apply_facture_request(self, context, results):
         if isinstance(context, tuple) and context[0] == "preview":

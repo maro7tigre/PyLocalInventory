@@ -739,8 +739,8 @@ class ClientAccountDialogTests(unittest.TestCase):
 
     def test_add_payment_blocks_overpayment(self):
         account = {
-            "sales": [_canonical_sale(1, total=Decimal("100.00"), paid=Decimal("0.00"),
-                                      remaining=Decimal("100.00"))],
+            "sales": [_canonical_sale(1, state="confirmed", total=Decimal("100.00"),
+                                      paid=Decimal("0.00"), remaining=Decimal("100.00"))],
             "payments": [],
         }
         database = _StubDatabase(account)

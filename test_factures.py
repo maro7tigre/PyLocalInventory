@@ -2,6 +2,7 @@
 
 import json
 import os
+import time
 import unittest
 from decimal import Decimal
 
@@ -19,6 +20,18 @@ from core.profiles import ProfileClass
 from core.sales_states import is_financially_active
 from ui.facture_document import _document_data, render_facture_preview_pages
 from ui.tabs.factures_tab import DevisSelectorDialog, FactureEditor, FacturePreviewDialog, FacturesTab
+
+
+def _wait_until(predicate, timeout=2.0):
+    """Bounded event-loop pump for the editor's async catalog/refresh loads."""
+    app = QApplication.instance() or QApplication([])
+    deadline = time.monotonic() + timeout
+    while time.monotonic() < deadline:
+        app.processEvents()
+        if predicate():
+            return True
+        time.sleep(0.005)
+    return predicate()
 
 
 class _FactureDatabase:
@@ -282,6 +295,7 @@ class FactureEditorTests(unittest.TestCase):
     def test_manual_facture_keeps_decimal_line_data_and_live_totals(self):
         database = _FactureDatabase()
         dialog = FactureEditor(database)
+        _wait_until(lambda: dialog._catalog_ready)
         try:
             dialog.items.cellWidget(0, 0).setCurrentIndex(dialog.items.cellWidget(0, 0).findData("service"))
             dialog.items.cellWidget(0, 1).setCurrentText("Pose")
@@ -292,6 +306,7 @@ class FactureEditorTests(unittest.TestCase):
             dialog.update_totals()
             self.assertEqual(dialog.total_ttc.text(), "Total TTC: 205.20 MAD")
             dialog.save()
+            _wait_until(lambda: not dialog._saving)
             header, items, facture_id = database.saved
             self.assertEqual(header["client_id"], 7)
             self.assertEqual(facture_id, None)
@@ -342,6 +357,7 @@ class FactureEditorTests(unittest.TestCase):
         tab = FacturesTab(_FactureDatabase())
         tab.refresh_table(force=True)
         tab.refresh_on_tab_switch()
+        _wait_until(lambda: tab._refresh_thread is None and not tab._refresh_pending)
         self.assertEqual(tab.table.rowCount(), 0)
 
     def test_invoice_rpc_payloads_are_json_safe(self):
@@ -368,6 +384,7 @@ class FactureEditorTests(unittest.TestCase):
             {"id": 2, "name": "Beta SARL", "username": None},
             {"id": 3, "name": None, "username": None},
         ]))
+        _wait_until(lambda: dialog._catalog_ready)
         try:
             self.assertEqual(set(dialog.client_records), {1, 2, 3})
             dialog._set_client(2)
@@ -381,6 +398,7 @@ class FactureEditorTests(unittest.TestCase):
                    "tva_rate": "20", "client_id": 91, "client_name": "Aptiv", "client_address": "Zone industrielle",
                    "client_city": "Tanger", "client_ice": "001", "notes": "", "items": []}
         dialog = FactureEditor(database, facture)
+        _wait_until(lambda: dialog._catalog_ready)
         try:
             self.assertEqual(dialog.client_id, 91)
             self.assertIn("historique", dialog.client.text())
@@ -394,6 +412,7 @@ class FactureEditorTests(unittest.TestCase):
             "total_ht": Decimal("22725"), "total_ttc": Decimal("27270"), "state": "confirmed",
         }]
         dialog = DevisSelectorDialog(database)
+        _wait_until(lambda: dialog.table.item(0, 1) is not None and dialog.table.item(0, 1).text() == "DE-2026-18")
         try:
             self.assertEqual(dialog.table.item(0, 1).text(), "DE-2026-18")
             dialog.table.item(0, 0).setCheckState(Qt.Checked); dialog.select()
@@ -409,8 +428,10 @@ class FactureEditorTests(unittest.TestCase):
             "remaining_ttc": Decimal("500000"), "items": [],
         }
         advance_db = _FactureDatabase(); advance = FactureEditor(advance_db)
+        _wait_until(lambda: advance._catalog_ready)
         try:
             advance_draft["facture_type"] = "advance"; advance.load_draft(advance_draft); advance.advance_amount.setValue(200000); advance.save()
+            _wait_until(lambda: not advance._saving)
             header, lines, _facture_id = advance_db.saved
             self.assertEqual(header["source_sale_ids"], [18, 19])
             self.assertEqual(lines[0]["unit_price"], "166666.67")
@@ -418,10 +439,12 @@ class FactureEditorTests(unittest.TestCase):
         finally:
             advance.reject()
         balance_db = _FactureDatabase(); balance = FactureEditor(balance_db)
+        _wait_until(lambda: balance._catalog_ready)
         try:
             balance_draft = {**advance_draft, "facture_type": "balance", "selected_total_ttc": Decimal("700000"),
                              "previous_advance_ttc": Decimal("600000"), "remaining_ttc": Decimal("100000")}
             balance.load_draft(balance_draft); balance.save()
+            _wait_until(lambda: not balance._saving)
             _header, lines, _facture_id = balance_db.saved
             self.assertEqual(lines[0]["unit_price"], "83333.33")
             self.assertIn("SOLDE", lines[0]["designation"])
@@ -594,6 +617,7 @@ class FactureEditorTests(unittest.TestCase):
         self.assertEqual([tab.table.horizontalHeaderItem(i).text() for i in range(tab.table.columnCount())], [
             "ID", "Facture N°", "Type", "Client", "Date", "Devis source", "Total TTC", "Statut",
         ])
+        _wait_until(lambda: tab._refresh_thread is None and not tab._refresh_pending)
 
     def test_preview_defaults_to_fit_page_without_a_scroll_area(self):
         facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",

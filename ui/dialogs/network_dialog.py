@@ -3,6 +3,10 @@ Network Dialog - Lets the super-admin host the current profile's database on
 the LAN and manage the user accounts / per-section role permission matrix
 that control what connecting clients can read, insert or delete.
 """
+from datetime import datetime
+import logging
+import os
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QLineEdit, QPushButton,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
@@ -12,9 +16,13 @@ from PySide6.QtCore import Qt, QTimer
 
 from core.network.server import DatabaseServer
 from core.network.protocol import DEFAULT_PORT
+from core.build_info import APP_BUILD_ID
 from core.user_manager import UserManager, MATRIX_SECTIONS
 from core import pg_config
 from ui.widgets.password_widget import CircularCheckBox
+
+
+logger = logging.getLogger(__name__)
 
 
 class PermissionCheckBox(CircularCheckBox):
@@ -243,6 +251,11 @@ class NetworkDialog(QDialog):
         self.status_label = QLabel()
         form.addWidget(self.status_label)
 
+        self.status_detail_label = QLabel()
+        self.status_detail_label.setWordWrap(True)
+        self.status_detail_label.setStyleSheet("color: palette(mid);")
+        form.addWidget(self.status_detail_label)
+
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("Port:"))
         self.port_input = QLineEdit(str(getattr(self.main_window, 'network_port', None) or DEFAULT_PORT))
@@ -269,24 +282,173 @@ class NetworkDialog(QDialog):
     def _refresh_hosting_status(self):
         server = getattr(self.main_window, 'network_server', None)
         running = bool(server and server.is_running)
-        self.status_label.setText(
+        status_text = (
             "Status: Hosting" if running else
             "Status: Server unavailable" if server else "Status: Not hosting"
         )
+        snapshot = self._snapshot_of(server) if server is not None else None
+        self.status_label.setText(status_text)
         self.toggle_btn.setText("Stop Hosting" if running else "Start Hosting")
         self.ip_label.setText(f"Your LAN IP: {DatabaseServer.local_ip()}" if running else "")
         self.port_input.setEnabled(not running)
+        detail_label = getattr(self, 'status_detail_label', None)
+        if detail_label is not None:
+            detail_label.setText(self._hosting_detail(server, running, snapshot))
+        self._log_host_status_change(status_text, server, snapshot)
+
+    def _log_host_status_change(self, status_text, server, snapshot):
+        previous = getattr(self, '_last_reported_host_status', None)
+        if previous == status_text:
+            return
+        self._last_reported_host_status = status_text
+        state = snapshot or getattr(self.main_window, 'host_last_snapshot', None) or {}
+        if not isinstance(state, dict):
+            state = {}
+        log = (
+            logger.warning
+            if previous == "Status: Hosting" and status_text != "Status: Hosting"
+            else logger.info
+        )
+        log(
+            'host_ui_status previous=%s status=%s server_present=%s state=%s '
+            'reason=%s thread_alive=%s listener=%s active_requests=%s '
+            'checked_out=%s sessions=%s build_id=%s pid=%s',
+            previous or 'none', status_text, server is not None,
+            state.get('state', 'none'), state.get('reason', 'none'),
+            state.get('thread_alive', 'unknown'),
+            state.get('listener_available', 'unknown'),
+            state.get('active_requests', 'unknown'),
+            state.get('checked_out', 'unknown'), state.get('sessions', 'unknown'),
+            state.get('build_id') or APP_BUILD_ID, state.get('pid') or os.getpid(),
+        )
+
+    @staticmethod
+    def _snapshot_of(server):
+        try:
+            snapshot = server.snapshot()
+        except Exception:
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    @staticmethod
+    def _host_identity(snapshot=None):
+        snapshot = snapshot or {}
+        return (
+            f"Build: {snapshot.get('build_id') or APP_BUILD_ID}; "
+            f"PID: {snapshot.get('pid') or os.getpid()}."
+        )
+
+    def _hosting_detail(self, server, running, snapshot=None):
+        """Explain the exact observed Host state without changing its meaning."""
+        if running:
+            if snapshot is None:
+                return (
+                    "Hosting checks pass, but detailed Host state is unavailable. "
+                    f"Check app.log for the last host_state record. "
+                    f"{self._host_identity()}"
+                )
+            healthy = (snapshot.get('thread_alive')
+                       and snapshot.get('listener_available'))
+            health_text = (
+                "Serving thread alive; listener accepting connections."
+                if healthy else
+                "Serving thread/listener health is degraded; stop and start hosting."
+            )
+            return (
+                f"{health_text} Active requests: {snapshot.get('active_requests', 0)}. "
+                f"DB connections in use: {snapshot.get('checked_out', 0)}. "
+                f"Sessions: {snapshot.get('sessions', 0)}. "
+                f"State: {snapshot.get('state', 'unknown')} since "
+                f"{snapshot.get('state_since', 'unknown')}. "
+                f"{self._host_identity(snapshot)}"
+            )
+        if server is not None:
+            if snapshot is None:
+                return (
+                    "The Host object still exists but its serving thread and listener "
+                    "are not healthy. Press Start Hosting to stop it and try again. "
+                    f"{self._host_identity()}"
+                )
+            category = snapshot.get('last_error_category')
+            return (
+                f"Host state: {snapshot.get('state', 'unknown')} since "
+                f"{snapshot.get('state_since', 'unknown')} "
+                f"(reason: {snapshot.get('reason', 'unknown')}; "
+                f"last error: {category or 'none'}). "
+                "Serving thread and listener are not both available. "
+                "Press Start Hosting to stop the stale Host and start it again. "
+                f"{self._host_identity(snapshot)}"
+            )
+
+        last = getattr(self.main_window, 'host_last_snapshot', None)
+        if isinstance(last, dict):
+            state = last.get('state', 'unknown')
+            reason = last.get('reason', 'unknown')
+            category = last.get('last_error_category') or 'none'
+            since = last.get('state_since', 'unknown')
+            identity = self._host_identity(last)
+            if state in ('stopped', 'not_started'):
+                history = ''
+                unhealthy_state = last.get('last_unhealthy_state')
+                if unhealthy_state:
+                    history = (
+                        f" Last unhealthy state: {unhealthy_state} "
+                        f"({last.get('last_unhealthy_reason', 'unknown')} at "
+                        f"{last.get('last_unhealthy_at', 'unknown')})."
+                    )
+                else:
+                    previous = last.get('previous_state')
+                    if previous in ('thread_exited', 'listener_lost', 'failed'):
+                        history = (
+                            f" Previous state: {previous} "
+                            f"({last.get('previous_reason', 'unknown')})."
+                        )
+                if category != 'none':
+                    history += (
+                        f" Last error: {category} at "
+                        f"{last.get('last_error_at', 'unknown')}."
+                    )
+                return (
+                    f"Last Host state: {state} at {since} (reason: {reason})."
+                    f"{history} Hosting does not resume automatically; "
+                    f"press Start Hosting to host again. {identity}"
+                )
+            return (
+                f"Last Host state: {state} at {since} (reason: {reason}; "
+                f"last error: {category}). Press Start Hosting to try again. "
+                f"{identity}"
+            )
+        return (
+            "Hosting has not been started since this application opened. "
+            "Hosting does not resume automatically after an application restart; "
+            f"press Start Hosting to host this profile. {self._host_identity()}"
+        )
+
+    def _remember_host_state(self, server):
+        snapshot = self._snapshot_of(server) if server is not None else None
+        if snapshot is not None:
+            self.main_window.host_last_snapshot = snapshot
 
     def _toggle_hosting(self):
         server = getattr(self.main_window, 'network_server', None)
+        logger.info(
+            'host_toggle_requested server_present=%s running=%s build_id=%s pid=%d',
+            server is not None, bool(server and server.is_running),
+            APP_BUILD_ID, os.getpid(),
+        )
         if server and server.is_running:
-            server.stop()
+            server.stop(reason='operator_stop')
+            self._remember_host_state(server)
+            logger.info('host_reference_cleared reason=operator_stop pid=%d', os.getpid())
             self.main_window.network_server = None
             self._refresh_hosting_status()
             return
         if server:
             # A dead serving thread still owns its pool until stop() cleans it.
-            server.stop()
+            server.stop(reason='stale_server_cleanup')
+            self._remember_host_state(server)
+            logger.info('host_reference_cleared reason=stale_server_cleanup pid=%d',
+                        os.getpid())
             self.main_window.network_server = None
 
         if not self.user_manager.has_any_superadmin():
@@ -312,13 +474,32 @@ class NetworkDialog(QDialog):
             return
 
         try:
+            server = None
+            logger.info('host_start_requested port=%d pid=%d build_id=%s',
+                        port, os.getpid(), APP_BUILD_ID)
             server = DatabaseServer(self.database, port=port)
             server.start()
         except Exception as e:
+            logger.error('host_start_failed_from_ui port=%d category=%s pid=%d',
+                         port, type(e).__name__, os.getpid())
+            if server is not None:
+                self._remember_host_state(server)
+            else:
+                self.main_window.host_last_snapshot = {
+                    'state': 'failed',
+                    'state_since': datetime.now().astimezone().isoformat(timespec='seconds'),
+                    'reason': 'create_failed',
+                    'last_error_category': type(e).__name__,
+                    'port': port,
+                }
+            self._refresh_hosting_status()
             QMessageBox.critical(self, "Could not start hosting", str(e))
             return
         self.main_window.network_server = server
         self.main_window.network_port = port
+        self.main_window.host_last_snapshot = None
+        logger.info('host_reference_installed port=%d pid=%d build_id=%s',
+                    port, os.getpid(), APP_BUILD_ID)
         self._refresh_hosting_status()
 
     # ---------------- Users tab ----------------

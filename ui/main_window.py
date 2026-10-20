@@ -94,6 +94,9 @@ class MainWindow(ThemedMainWindow):
         self.network_server = None
         self.network_port = DEFAULT_PORT
         self.last_network_host = ''
+        # Last Host state after it was stopped/cleared, so Network Config can
+        # explain "Not hosting" instead of only showing a bare status.
+        self.host_last_snapshot = None
         self._sync_coordinator = None
 
         # Bottom status bar: only meaningful for network clients, where it
@@ -261,6 +264,16 @@ class MainWindow(ThemedMainWindow):
     
     def closeEvent(self, event):
         """Handle application close event safely and idempotently."""
+        try:
+            spontaneous = (
+                bool(event.spontaneous()) if hasattr(event, 'spontaneous') else 'unknown'
+            )
+            logger.info(
+                "window_close_requested spontaneous=%s shutting_down=%s",
+                spontaneous, getattr(self, '_shutting_down', False),
+            )
+        except Exception:
+            pass
         if getattr(self, "_shutting_down", False):
             event.accept()
             return
@@ -321,7 +334,15 @@ class MainWindow(ThemedMainWindow):
             server = getattr(self, 'network_server', None)
             if server is not None:
                 _safe_log("info", "Stopping network server...")
-                server.stop()
+                try:
+                    server.stop(reason='application_shutdown')
+                finally:
+                    snapshot = getattr(server, 'snapshot', None)
+                    if callable(snapshot):
+                        try:
+                            self.host_last_snapshot = snapshot()
+                        except Exception:
+                            pass
         except Exception as e:
             _safe_log("error", f"Error stopping network server: {e}")
             

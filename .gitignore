@@ -82,6 +82,7 @@ tests/
 tests/*
 !tests/test_attachment_panel_transfers.py
 !tests/test_server_stability.py
+!tests/test_host_lifecycle_diagnostics.py
 # Editor and OS metadata
 .vscode/
 .idea/

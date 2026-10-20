@@ -63,6 +63,30 @@ def _positive_int_env(name, default):
     return default
 
 
+def _format_frames(frames):
+    rendered = []
+    for frame in frames:
+        filename = os.path.basename(frame.filename) or '<unknown>'
+        rendered.append(f'{filename}:{frame.lineno}:{frame.name}')
+    return ' <- '.join(rendered) if rendered else 'unavailable'
+
+
+def _safe_stack(error):
+    """Privacy-safe traceback: file basename, line number and function only.
+
+    ``traceback.format_tb`` includes the source line for every frame, which can
+    contain SQL text, literals, or values interpolated into a call. Exception
+    messages are deliberately excluded too because they can echo caller data.
+    """
+    traceback_obj = getattr(error, '__traceback__', None)
+    return _format_frames(traceback.extract_tb(traceback_obj))
+
+
+def _caller_stack():
+    """Sanitized call chain at this point, including this function's caller."""
+    return _format_frames(traceback.extract_stack()[:-1])
+
+
 class _RequestBodyError(Exception):
     def __init__(self, status, category, message):
         super().__init__(message)
@@ -114,8 +138,8 @@ class _BoundedHTTPServer(ThreadingHTTPServer):
         # request data) to stderr. Keep only a stack and the exception class.
         error = sys.exc_info()[1]
         if error is not None:
-            logger.error('http_worker_unhandled category=%s stack=\n%s',
-                         type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
+            logger.error('http_worker_unhandled category=%s stack=%s',
+                         type(error).__name__, _safe_stack(error))
 
 # method name -> (kind, index into `args` holding the section name)
 _SECTION_METHODS = {
@@ -208,6 +232,10 @@ class _SessionStore:
     def drop(self, token):
         with self._lock:
             self._sessions.pop(token, None)
+
+    def count(self):
+        with self._lock:
+            return len(self._sessions)
 
 
 def _check_permission(user, method, args, kwargs):
@@ -470,6 +498,250 @@ class DatabaseServer:
         self._checkout_times = {}
         self._body_lock = threading.Lock()
         self._body_inflight = 0
+        # Lifecycle diagnostics are deliberately in-process only. They make the
+        # Host state shown by the UI and written to app.log truthful without
+        # adding a second persistent file that could itself fail.
+        self._state_lock = threading.Lock()
+        self._state = 'not_started'
+        self._state_since = datetime.now().astimezone()
+        self._state_reason = 'initial'
+        self._previous_state = None
+        self._previous_reason = None
+        self._last_unhealthy_state = None
+        self._last_unhealthy_reason = None
+        self._last_unhealthy_at = None
+        self._started_at = None
+        self._last_error_category = None
+        self._last_error_at = None
+        self._monitor_stop = threading.Event()
+        self._monitor_thread = None
+        self._draining = 0
+        self.heartbeat_seconds = 300
+
+    def _ensure_lifecycle(self):
+        # Tests and a few old call sites construct a server with __new__ and
+        # inject only a pool; keep those objects diagnosable too.
+        if not hasattr(self, '_state_lock'):
+            self._state_lock = threading.Lock()
+            self._state = 'not_started'
+            self._state_since = datetime.now().astimezone()
+            self._state_reason = 'initial'
+            self._previous_state = None
+            self._previous_reason = None
+            self._last_unhealthy_state = None
+            self._last_unhealthy_reason = None
+            self._last_unhealthy_at = None
+            self._started_at = None
+            self._last_error_category = None
+            self._last_error_at = None
+            self._monitor_stop = threading.Event()
+            self._monitor_thread = None
+            self._draining = 0
+            self.heartbeat_seconds = 300
+        if not hasattr(self, '_body_lock'):
+            self._body_lock = threading.Lock()
+            self._body_inflight = 0
+        if not hasattr(self, '_stopping'):
+            self._stopping = False
+
+    def _get_state(self):
+        self._ensure_lifecycle()
+        with self._state_lock:
+            return self._state
+
+    def _runtime_fields(self):
+        self._ensure_pool_metrics()
+        with self._pool_lock:
+            checked_out = self._checked_out
+        with self._body_lock:
+            body_inflight = self._body_inflight
+        httpd = getattr(self, '_httpd', None)
+        try:
+            active_requests = httpd.active_requests if httpd is not None else 0
+        except Exception:
+            active_requests = 0
+        thread = getattr(self, '_thread', None)
+        try:
+            session_count = self.sessions.count()
+        except Exception:
+            session_count = 0
+        return {
+            'thread_alive': bool(thread and thread.is_alive()),
+            'listener_available': self._listener_available(),
+            'active_requests': active_requests,
+            'checked_out': checked_out,
+            'body_inflight': body_inflight,
+            'sessions': session_count,
+            'pool_drain_pending': int(getattr(self, '_draining', 0)),
+        }
+
+    def snapshot(self):
+        """Return a privacy-safe, point-in-time Host state summary.
+
+        Contains only state names, timestamps, counters and a sanitized error
+        category - never credentials, SQL, parameters, usernames or row data.
+        """
+        self._ensure_lifecycle()
+        with self._state_lock:
+            state = self._state
+            state_since = self._state_since
+            reason = self._state_reason
+            previous_state = self._previous_state
+            previous_reason = self._previous_reason
+            last_unhealthy_state = self._last_unhealthy_state
+            last_unhealthy_reason = self._last_unhealthy_reason
+            last_unhealthy_at = self._last_unhealthy_at
+            started_at = self._started_at
+            last_error_category = self._last_error_category
+            last_error_at = self._last_error_at
+        now = datetime.now().astimezone()
+        result = {
+            'state': state,
+            'state_since': state_since.isoformat(timespec='seconds'),
+            'reason': reason,
+            'previous_state': previous_state,
+            'previous_reason': previous_reason,
+            'last_unhealthy_state': last_unhealthy_state,
+            'last_unhealthy_reason': last_unhealthy_reason,
+            'last_unhealthy_at': (
+                last_unhealthy_at.isoformat(timespec='seconds')
+                if last_unhealthy_at is not None else None
+            ),
+            'port': getattr(self, 'port', None),
+            'pid': os.getpid(),
+            'build_id': APP_BUILD_ID,
+            'started_at': (
+                started_at.isoformat(timespec='seconds') if started_at is not None else None
+            ),
+            'uptime_seconds': (
+                round(max(0.0, (now - started_at).total_seconds()), 1)
+                if started_at is not None else None
+            ),
+            'last_error_category': last_error_category,
+            'last_error_at': (
+                last_error_at.isoformat(timespec='seconds') if last_error_at is not None else None
+            ),
+        }
+        result.update(self._runtime_fields())
+        return result
+
+    def _transition(self, new_state, reason, error_category=None, expected_state=None):
+        self._ensure_lifecycle()
+        now = datetime.now().astimezone()
+        with self._state_lock:
+            old_state = self._state
+            if expected_state is not None and old_state != expected_state:
+                return False
+            if old_state == new_state:
+                return False
+            self._previous_state = old_state
+            self._previous_reason = self._state_reason
+            self._state = new_state
+            self._state_since = now
+            self._state_reason = reason
+            if error_category:
+                self._last_error_category = error_category
+                self._last_error_at = now
+            if new_state in ('thread_exited', 'listener_lost', 'failed'):
+                self._last_unhealthy_state = new_state
+                self._last_unhealthy_reason = reason
+                self._last_unhealthy_at = now
+            if new_state == 'running':
+                self._started_at = now
+                # A successful new run starts a fresh failure history.
+                self._last_unhealthy_state = None
+                self._last_unhealthy_reason = None
+                self._last_unhealthy_at = None
+        fields = self._runtime_fields()
+        level = (
+            logging.ERROR
+            if new_state in ('failed', 'thread_exited', 'listener_lost')
+            else logging.INFO
+        )
+        logger.log(
+            level,
+            'host_state from=%s to=%s reason=%s port=%s pid=%s build_id=%s '
+            'thread_alive=%s listener=%s active_requests=%d checked_out=%d '
+            'body_inflight=%d sessions=%d pool_drain_pending=%d error_category=%s',
+            old_state, new_state, reason, getattr(self, 'port', None), os.getpid(),
+            APP_BUILD_ID,
+            fields['thread_alive'], fields['listener_available'],
+            fields['active_requests'], fields['checked_out'],
+            fields['body_inflight'], fields['sessions'],
+            fields['pool_drain_pending'], error_category or 'none',
+        )
+        return True
+
+    def _monitor_serving_thread(self, stop_event):
+        """Detect a serving thread/listener that died outside stop().
+
+        Also writes a low-frequency heartbeat, so a future incident can
+        distinguish an orderly stop (``host_stop_requested``) from a process
+        that disappeared without running any shutdown code (heartbeats end
+        abruptly, followed by a new ``Application startup`` line).
+        """
+        heartbeat_seconds = max(1.0, float(getattr(self, 'heartbeat_seconds', 300)))
+        last_heartbeat = time.monotonic()
+        while not stop_event.wait(1.0):
+            if self._stopping:
+                return
+            if self._get_state() != 'running':
+                return
+            thread = self._thread
+            if thread is None or not thread.is_alive():
+                self._transition('thread_exited', 'serving_thread_not_alive')
+                return
+            if not self._listener_available():
+                self._transition('listener_lost', 'listener_unavailable')
+                return
+            now = time.monotonic()
+            if now - last_heartbeat >= heartbeat_seconds:
+                last_heartbeat = now
+                try:
+                    snapshot = self.snapshot()
+                except Exception as error:
+                    logger.warning('host_heartbeat_failed category=%s',
+                                   type(error).__name__)
+                    continue
+                logger.info(
+                    'host_heartbeat state=%s uptime_s=%s port=%s pid=%d build_id=%s '
+                    'thread_alive=%s listener=%s active_requests=%d checked_out=%d '
+                    'body_inflight=%d sessions=%d',
+                    snapshot['state'], snapshot['uptime_seconds'], snapshot['port'],
+                    snapshot['pid'], snapshot['build_id'], snapshot['thread_alive'],
+                    snapshot['listener_available'], snapshot['active_requests'],
+                    snapshot['checked_out'], snapshot['body_inflight'],
+                    snapshot['sessions'],
+                )
+
+    def _start_monitor(self):
+        self._monitor_stop = threading.Event()
+        monitor = threading.Thread(
+            target=self._monitor_serving_thread,
+            args=(self._monitor_stop,),
+            name='LANServerMonitor',
+            daemon=True,
+        )
+        try:
+            monitor.start()
+        except Exception as error:
+            # Diagnostics must never prevent hosting from starting.
+            logger.warning('host_monitor_start_failed category=%s',
+                           type(error).__name__)
+            monitor = None
+        self._monitor_thread = monitor
+
+    def _stop_monitor(self):
+        stop_event = getattr(self, '_monitor_stop', None)
+        if stop_event is not None:
+            stop_event.set()
+        monitor = getattr(self, '_monitor_thread', None)
+        if (monitor is not None and monitor.is_alive()
+                and monitor is not threading.current_thread()):
+            monitor.join(timeout=1.5)
+            if monitor.is_alive():
+                logger.warning('host_monitor_join_timeout')
+        self._monitor_thread = None
 
     def _reserve_body(self, size):
         with self._body_lock:
@@ -533,29 +805,56 @@ class DatabaseServer:
         httpd = self._httpd
         if httpd is None:
             logger.error('server_thread_started_without_listener port=%d', self.port)
+            self._transition('failed', 'listener_missing')
             return
         try:
             httpd.serve_forever()
-        except Exception:
-            # This thread only runs socketserver's accept loop; no request
-            # payloads or SQL values can appear in this traceback.
-            logger.exception('server_thread_failed port=%d', self.port)
+        except Exception as error:
+            # This thread only runs socketserver's accept loop; the sanitized
+            # stack keeps source lines and SQL text out of the log.
+            logger.error('server_thread_failed port=%d category=%s stack=%s',
+                         self.port, type(error).__name__, _safe_stack(error))
+            if not self._stopping:
+                if not self._transition(
+                    'thread_exited', 'serving_thread_failed', type(error).__name__,
+                    expected_state='running',
+                ):
+                    self._transition(
+                        'thread_exited', 'serving_thread_failed', type(error).__name__,
+                        expected_state='starting',
+                    )
         finally:
             if not self._stopping:
-                logger.error('server_thread_terminated_unexpectedly port=%d', self.port)
+                if self._get_state() == 'running':
+                    self._transition('thread_exited', 'serving_thread_returned',
+                                     expected_state='running')
+                logger.error(
+                    'server_thread_terminated_unexpectedly port=%d state=%s reason=%s',
+                    self.port, self._get_state(), self._state_reason,
+                )
                 try:
                     httpd.server_close()
-                except Exception:
-                    logger.exception('server_listener_close_failed')
+                except Exception as error:
+                    logger.error('server_listener_close_failed category=%s stack=%s',
+                                 type(error).__name__, _safe_stack(error))
+                else:
+                    logger.error(
+                        'host_listener_closed port=%s trigger=unexpected_serving_thread_exit '
+                        'state=%s reason=%s',
+                        getattr(self, 'port', None), self._get_state(), self._state_reason,
+                    )
             else:
                 logger.info('server_thread_stopped port=%d', self.port)
 
     def start(self):
+        self._ensure_lifecycle()
         if self.is_running:
             return
-        if self._httpd or self._pool:
-            self.stop()
+        if self._httpd or self._pool or (self._thread and self._thread.is_alive()):
+            self.stop(reason='restart_before_start')
 
+        self._stopping = False
+        self._transition('starting', 'start_requested')
         logger.info('server_starting port=%d body_limit=%d inflight_limit=%d read_timeout=%ss thread_limit=%d db_statement_timeout_ms=%d',
                     self.port, self.max_request_bytes, self.max_inflight_body_bytes,
                 self.request_timeout, self.max_request_threads,
@@ -591,13 +890,13 @@ class DatabaseServer:
             self._httpd = _BoundedHTTPServer(('0.0.0.0', self.port), self._make_handler(),
                                              self.max_request_threads)
             self.port = self._httpd.server_port
-            self._stopping = False
             self._thread = threading.Thread(target=self._serve, name='LANServer', daemon=True)
             self._thread.start()
+            self._start_monitor()
         except Exception as error:
-            logger.error('server_start_failed port=%d category=%s stack=\n%s',
-                         self.port, type(error).__name__,
-                         ''.join(traceback.format_tb(error.__traceback__)))
+            self._stop_monitor()
+            logger.error('server_start_failed port=%d category=%s stack=%s',
+                         self.port, type(error).__name__, _safe_stack(error))
             if self._httpd:
                 try:
                     self._httpd.server_close()
@@ -611,49 +910,137 @@ class DatabaseServer:
                     logger.error('server_start_pool_cleanup_failed category=%s',
                                  type(cleanup_error).__name__)
             self._httpd = self._pool = self._thread = None
+            self._transition('failed', 'start_failed', type(error).__name__)
             raise
         if self.is_running:
-            logger.info('server_listening build_id=%s bind=0.0.0.0 port=%s',
-                        APP_BUILD_ID, self.port)
+            self._transition('running', 'start_succeeded', expected_state='starting')
+            logger.info('server_listening build_id=%s bind=0.0.0.0 port=%s state=%s',
+                        APP_BUILD_ID, self.port, self._get_state())
         else:
-            logger.warning('server_not_healthy_after_start port=%s', self.port)
+            logger.warning('server_not_healthy_after_start port=%s state=%s',
+                           self.port, self._get_state())
+            self._transition('failed', 'start_unhealthy', expected_state='starting')
 
-    def stop(self):
+    def stop(self, reason='unspecified'):
+        self._ensure_lifecycle()
+        self._ensure_pool_metrics()
+        logger.info(
+            'host_stop_requested reason=%s port=%s pid=%d thread=%s caller=%s',
+            reason, getattr(self, 'port', None), os.getpid(),
+            threading.current_thread().name, _caller_stack(),
+        )
+        httpd = getattr(self, '_httpd', None)
+        thread = getattr(self, '_thread', None)
+        pool = getattr(self, '_pool', None)
+        thread_alive = bool(thread and thread.is_alive())
+        with self._state_lock:
+            state_before = self._state
+            draining = int(getattr(self, '_draining', 0))
+        if httpd is None and pool is None and not thread_alive:
+            if draining:
+                logger.debug('server_stop_already_draining port=%d reason=%s draining=%d',
+                             self.port, reason, draining)
+                return
+            if state_before not in ('stopped', 'failed', 'not_started',
+                                    'thread_exited', 'listener_lost'):
+                self._transition('stopped', 'already_stopped')
+            logger.debug('server_stop_noop port=%d reason=%s state=%s',
+                         self.port, reason, state_before)
+            return
+
         self._stopping = True
-        logger.info('server_stopping port=%d', self.port)
-        httpd = self._httpd
-        if httpd:
-            if self._thread and self._thread.is_alive():
-                httpd.shutdown()
-            httpd.server_close()
-        if self._thread and self._thread.is_alive():
-            self._thread.join(timeout=2)
+        self._transition('stopping', reason)
+        logger.info('server_stopping port=%d reason=%s', self.port, reason)
+        failures = []
+
+        def attempt(label, action):
+            try:
+                action()
+            except Exception as error:
+                failures.append((label, type(error).__name__))
+                logger.error('host_stop_step_failed step=%s category=%s stack=%s',
+                             label, type(error).__name__, _safe_stack(error))
+
+        if httpd is not None:
+            if thread_alive:
+                attempt('listener_shutdown', httpd.shutdown)
+            close_failures_before = len(failures)
+            attempt('listener_close', httpd.server_close)
+            if len(failures) == close_failures_before:
+                logger.info('host_listener_closed port=%s trigger=stop reason=%s',
+                            getattr(self, 'port', None), reason)
+        if thread_alive:
+            try:
+                thread.join(timeout=2)
+            except Exception as error:
+                failures.append(('serving_thread_join', type(error).__name__))
+                logger.error('host_stop_step_failed step=serving_thread_join category=%s stack=%s',
+                             type(error).__name__, _safe_stack(error))
+            if thread.is_alive():
+                failures.append(('serving_thread_join', 'TimeoutError'))
+                logger.warning('server_stop_thread_join_timeout port=%d', self.port)
+        self._stop_monitor()
         self._httpd = None
         self._thread = None
-        pool = self._pool
-        if pool:
-            if httpd is not None and httpd.active_requests:
-                logger.warning('server_stop_waiting_for_requests active=%d', httpd.active_requests)
+
+        active_requests = 0
+        if httpd is not None:
+            try:
+                active_requests = int(httpd.active_requests)
+            except Exception:
+                active_requests = 0
+        if pool is not None:
+            if active_requests:
+                logger.warning('server_stop_waiting_for_requests active=%d', active_requests)
                 # Never close connections while an accepted request is still
                 # using them. Do not block the Qt event loop on long requests.
+                with self._state_lock:
+                    self._draining = int(getattr(self, '_draining', 0)) + 1
+                self._pool = None
                 active_httpd = httpd
                 active_pool = pool
+                had_cleanup_failures = bool(failures)
+                first_cleanup_category = failures[0][1] if failures else None
+
                 def close_when_drained():
                     while active_httpd.active_requests:
                         time.sleep(0.1)
+                    close_error = None
                     try:
                         active_pool.closeall()
                     except Exception as error:
-                        logger.error('server_pool_drain_close_failed category=%s stack=\n%s',
-                                     type(error).__name__,
-                                     ''.join(traceback.format_tb(error.__traceback__)))
+                        close_error = error
+                        logger.error('server_pool_drain_close_failed category=%s stack=%s',
+                                     type(error).__name__, _safe_stack(error))
                     else:
                         logger.info('server_pool_closed_after_drain')
-                threading.Thread(target=close_when_drained, name='LANPoolDrain', daemon=True).start()
-            else:
-                pool.closeall()
+                    with self._state_lock:
+                        self._draining = max(0, int(getattr(self, '_draining', 0)) - 1)
+                        still_draining = self._draining
+                        current_state = self._state
+                    if not still_draining and current_state == 'stopping':
+                        if close_error is not None:
+                            self._transition('failed', 'stop_pool_drain_failed',
+                                             type(close_error).__name__)
+                        elif had_cleanup_failures:
+                            self._transition('failed', 'stop_cleanup_failed',
+                                             first_cleanup_category)
+                        else:
+                            self._transition('stopped', 'stop_completed_after_drain')
+
+                threading.Thread(target=close_when_drained, name='LANPoolDrain',
+                                 daemon=True).start()
+                logger.info('server_stopped_pending_pool_drain port=%d active=%d state=%s',
+                            self.port, active_requests, self._get_state())
+                return
+            attempt('pool_close', pool.closeall)
         self._pool = None
-        logger.info('server_stopped port=%d', self.port)
+        if failures:
+            self._transition('failed', 'stop_cleanup_failed', failures[0][1])
+        else:
+            self._transition('stopped', 'stop_completed')
+        logger.info('server_stopped port=%d reason=%s state=%s',
+                    self.port, reason, self._get_state())
 
     @staticmethod
     def local_ip():
@@ -685,9 +1072,8 @@ class DatabaseServer:
         except Exception as error:
             with self._pool_lock:
                 in_use = self._pool_counts.get(pool, 0)
-            logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=\n%s',
-                           type(error).__name__, in_use,
-                           ''.join(traceback.format_tb(error.__traceback__)))
+            logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=%s',
+                           type(error).__name__, in_use, _safe_stack(error))
             raise
         with self._pool_lock:
             in_use = self._pool_counts.get(pool, 0) + 1
@@ -708,8 +1094,8 @@ class DatabaseServer:
             request_db.cursor = conn.cursor()
             return request_db
         except Exception as error:
-            logger.error('db_request_init_failed category=%s stack=\n%s',
-                         type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
+            logger.error('db_request_init_failed category=%s stack=%s',
+                         type(error).__name__, _safe_stack(error))
             self._release_connection(conn, discard=True, pool=pool)
             raise
 
@@ -738,8 +1124,8 @@ class DatabaseServer:
                 pool.putconn(connection)
             returned = True
         except Exception as error:
-            logger.error('db_return_failed category=%s stack=\n%s', type(error).__name__,
-                         ''.join(traceback.format_tb(error.__traceback__)))
+            logger.error('db_return_failed category=%s stack=%s', type(error).__name__,
+                         _safe_stack(error))
             raise
         finally:
             with self._pool_lock:
@@ -773,16 +1159,17 @@ class DatabaseServer:
                 if callable(rollback):
                     rollback()
         except Exception as error:
-            logger.warning('db_reset_failed category=%s stack=\n%s',
-                           type(error).__name__, ''.join(traceback.format_tb(error.__traceback__)))
+            logger.warning('db_reset_failed category=%s stack=%s',
+                           type(error).__name__, _safe_stack(error))
             discard = True
         try:
             self._release_connection(connection, discard=discard)
         except Exception:
             try:
                 connection.close()
-            except Exception:
-                logger.exception('db_connection_close_failed')
+            except Exception as error:
+                logger.error('db_connection_close_failed category=%s stack=%s',
+                             type(error).__name__, _safe_stack(error))
 
     def _create_client_backup_archive(self, work_dir):
         """Create a verified host-side archive for an authenticated client."""
@@ -1123,9 +1510,9 @@ class DatabaseServer:
                     self._error_category = 'peer_disconnected'
                 except Exception as error:
                     self._error_category = type(error).__name__
-                    logger.error('http_request_failed id=%s endpoint=%s category=%s stack=\n%s',
+                    logger.error('http_request_failed id=%s endpoint=%s category=%s stack=%s',
                                  self._request_id, endpoint, type(error).__name__,
-                                 ''.join(traceback.format_tb(error.__traceback__)))
+                                 _safe_stack(error))
                     self._send_error(500, 'Host request failed')
                 finally:
                     logger.log(logging.WARNING if self._response_status >= 500 else logging.INFO,
@@ -1191,9 +1578,9 @@ class DatabaseServer:
                             shutil.copyfileobj(stream, self.wfile, length=1024 * 1024)
                 except Exception as error:
                     self._error_category = type(error).__name__
-                    logger.error('backup_failed id=%s category=%s stack=\n%s',
+                    logger.error('backup_failed id=%s category=%s stack=%s',
                                  self._request_id, type(error).__name__,
-                                 ''.join(traceback.format_tb(error.__traceback__)))
+                                 _safe_stack(error))
                     if not response_started:
                         self._send_error(500, str(error))
 
@@ -1296,9 +1683,9 @@ class DatabaseServer:
                     return self._send_json(400, {'error': str(e)})
                 except Exception as e:
                     self._error_category = type(e).__name__
-                    logger.error('rpc_failed id=%s method=%s category=%s stack=\n%s',
+                    logger.error('rpc_failed id=%s method=%s category=%s stack=%s',
                                  self._request_id, _method_label(method), type(e).__name__,
-                                 ''.join(traceback.format_tb(e.__traceback__)))
+                                 _safe_stack(e))
                     return self._send_json(500, {'error': str(e)})
                 elapsed = time.perf_counter() - started
                 logger.log(

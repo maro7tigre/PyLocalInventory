@@ -13,7 +13,7 @@ from datetime import datetime
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
 from PySide6.QtCore import Qt, QSettings, QTimer
-from PySide6.QtGui import QAction, QActionGroup
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication
 
 from ui.widgets.themed_widgets import ThemedMainWindow
 from ui.widgets.welcome_widget import WelcomeWidget
@@ -69,6 +69,10 @@ from core.user_settings import (
 
 
 class MainWindow(ThemedMainWindow):
+    # A normal, usable window on common desktop resolutions. The saved
+    # geometry (when present) takes precedence, but startup is always windowed.
+    DEFAULT_WINDOW_SIZE = (1280, 820)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PyLocalInventory")
@@ -106,7 +110,7 @@ class MainWindow(ThemedMainWindow):
         self._sync_status_label = QLabel("")
         self._sync_status_label.setStyleSheet("color: #bbbbbb; padding: 2px 8px;")
         status_bar.addWidget(self._sync_status_label, 1)
-        status_bar.setSizeGripEnabled(False)
+        status_bar.setSizeGripEnabled(True)
         status_bar.setVisible(False)
 
         # Always show the welcome/entry screen on launch, even if a profile was
@@ -151,12 +155,69 @@ class MainWindow(ThemedMainWindow):
 
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
+    def _available_screen_geometry(self, point=None):
+        # For a restored window, prefer the monitor that actually contains it
+        # so a multi-monitor layout is not collapsed onto the primary screen.
+        screen = QGuiApplication.screenAt(point) if point is not None else None
+        screen = screen or self.screen() or QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _set_default_window_geometry(self):
+        """Place a sensibly sized normal window in the middle of the screen."""
+        available = self._available_screen_geometry()
+        default_width, default_height = self.DEFAULT_WINDOW_SIZE
+        if available is None:
+            self.resize(default_width, default_height)
+            return
+        width = max(self.minimumWidth(), min(default_width, available.width() - 40))
+        height = max(self.minimumHeight(), min(default_height, available.height() - 40))
+        x = available.left() + max(0, (available.width() - width) // 2)
+        y = available.top() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
+
+    def _fit_window_to_available_screen(self):
+        """Keep a restored window on-screen after a monitor/layout change."""
+        geometry = self.geometry()
+        available = self._available_screen_geometry(geometry.center())
+        if available is None:
+            return
+        width = max(self.minimumWidth(), min(geometry.width(), available.width()))
+        height = max(self.minimumHeight(), min(geometry.height(), available.height()))
+        x, y = geometry.x(), geometry.y()
+        if x < available.left() or x + width > available.right() + 1:
+            x = available.left() + max(0, (available.width() - width) // 2)
+        if y < available.top() or y + height > available.bottom() + 1:
+            y = available.top() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
+
+    def _restore_window_geometry(self, geometry):
+        """Restore saved size/position but never a maximized/full-screen start."""
+        if geometry:
+            if not self.restoreGeometry(geometry):
+                # Corrupt/incompatible settings must not leave a tiny Qt
+                # default window behind.
+                self._set_default_window_geometry()
+                return
+            constrained = self.windowState() & (
+                Qt.WindowMaximized | Qt.WindowFullScreen | Qt.WindowMinimized
+            )
+            if constrained:
+                normal = self.normalGeometry()
+                self.setWindowState(self.windowState() & ~(
+                    Qt.WindowMaximized | Qt.WindowFullScreen | Qt.WindowMinimized
+                ))
+                if normal.isValid() and normal.width() > 0 and normal.height() > 0:
+                    self.setGeometry(normal)
+                else:
+                    self._set_default_window_geometry()
+            self._fit_window_to_available_screen()
+        else:
+            self._set_default_window_geometry()
+
     def load_app_config(self):
         """Load application configuration from QSettings"""
-        # Restore window geometry
-        geometry = self.settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
+        # Restore size/position, but always open in normal windowed mode.
+        self._restore_window_geometry(self.settings.value("geometry"))
         
         # Use an absolute default because Startup shortcuts have an unrelated
         # working directory (commonly C:\\Windows\\System32).

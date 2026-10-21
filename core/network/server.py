@@ -155,10 +155,10 @@ _SECTION_METHODS = {
     'get_changes': ('read', 0),                 # get_changes(section, since_seq, limit)
 }
 _ATTACHMENT_METHODS = {
-    'get_attachment': ('read', 1),              # get_attachment(attachment_id)
-    'get_attachment_thumbnail': ('read', 1),    # get_attachment_thumbnail(attachment_id)
-    'get_attachment_thumbnails_bulk': ('read', 1),  # get_attachment_thumbnails_bulk(attachment_ids)
-    'update_attachment': ('write', 4),          # update_attachment(attachment_id, display_name, description, category),
+    'get_attachment': ('read', None),           # get_attachment(attachment_id) - no owner arg
+    'get_attachment_thumbnail': ('read', None),  # get_attachment_thumbnail(attachment_id) - no owner arg
+    'get_attachment_thumbnails_bulk': ('read', None),  # get_attachment_thumbnails_bulk(attachment_ids)
+    'update_attachment': ('write', None),       # update_attachment(attachment_id, display_name, ...)
     'list_attachments': ('read', 0),            # list_attachments(entity_type, entity_id)
     'upload_attachment': ('write', 0),          # upload_attachment(entity_type, entity_id, ...)
     'download_attachment': ('read', None),      # download_attachment(attachment_id) - no owner arg

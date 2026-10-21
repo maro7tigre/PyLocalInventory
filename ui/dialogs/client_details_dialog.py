@@ -802,8 +802,7 @@ class ClientDetailsDialog(QDialog):
             f"Client Account - {client_obj.get_value('name') or client_obj.get_value('username')}"
         )
         self.setMinimumSize(1050, 720)
-        from ui.widgets.workspace_dialog import maximize_workspace_dialog
-        maximize_workspace_dialog(self)
+        self.resize(1180, 780)
         # Schema changes belong to the trusted host connection, never to a
         # read-only LAN session. Database.connect() also ensures this table.
         if database.__class__.__name__ != "RemoteDatabase":
@@ -824,13 +823,14 @@ class ClientDetailsDialog(QDialog):
     def _show_attachments(self):
         """Manage documents owned by this client; sale association is optional."""
         from ui.widgets.attachments_widget import AttachmentPanel
-        from ui.widgets.workspace_dialog import maximize_workspace_dialog
         dialog = QDialog(self)
         dialog.setWindowTitle("Client Attachments")
-        dialog.resize(950, 680)
-        maximize_workspace_dialog(dialog)
+        dialog.setMinimumSize(950, 650)
+        dialog.resize(1100, 760)
         layout = QVBoxLayout(dialog)
-        layout.addWidget(AttachmentPanel(self.database, 'client', int(self.client_obj.id), dialog))
+        panel = AttachmentPanel(self.database, 'client', int(self.client_obj.id), dialog)
+        layout.addWidget(panel)
+        dialog.finished.connect(panel.shutdown)
         dialog.exec()
 
     def _ensure_payments_table(self):

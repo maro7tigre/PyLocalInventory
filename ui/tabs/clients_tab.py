@@ -43,12 +43,10 @@ class ClientsTab(BaseTab):
             QMessageBox.information(self, "Attachments", "Select a client first.")
             return
         from ui.widgets.attachments_widget import AttachmentPanel
-        from ui.widgets.workspace_dialog import maximize_workspace_dialog
         dialog = QDialog(self)
         dialog.setWindowTitle("Client Sales")
-        dialog.setMinimumSize(1100, 720)
+        dialog.setMinimumSize(1000, 650)
         dialog.resize(1180, 780)
-        maximize_workspace_dialog(dialog)
         layout = QVBoxLayout(dialog)
         panel = AttachmentPanel(self.database, 'client', client_id, dialog)
         layout.addWidget(panel)
@@ -78,7 +76,6 @@ class ClientsTab(BaseTab):
                 return
 
             dialog = ClientDetailsDialog(client, self.database, self)
-            dialog.showMaximized()
             dialog.exec()
         except Exception as error:
             QMessageBox.critical(self, "Client Error", f"Could not open the selected client:\n{error}")
@@ -88,7 +85,6 @@ class ClientsTab(BaseTab):
         client = ClientClass(obj_id, self.database)
         if client.load_database_data():
             dialog = ClientDetailsDialog(client, self.database, self)
-            dialog.showMaximized()
             dialog.exec()
     
     def get_preview_category(self):

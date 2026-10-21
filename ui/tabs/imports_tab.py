@@ -126,7 +126,6 @@ class ImportsTab(BaseTab):
                 return
 
             dialog = SupplierDetailsDialog(supplier, self.database, self)
-            dialog.showMaximized()
             dialog.exec()
         except Exception as e:
             QMessageBox.critical(

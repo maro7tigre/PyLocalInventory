@@ -51,7 +51,6 @@ class SuppliersTab(BaseTab):
                 return
 
             dialog = SupplierDetailsDialog(supplier, self.database, self)
-            dialog.showMaximized()
             dialog.exec()
         except Exception as error:
             QMessageBox.critical(self, "Supplier Error", f"Could not open the selected supplier:\n{error}")
@@ -61,7 +60,6 @@ class SuppliersTab(BaseTab):
         supplier = SupplierClass(obj_id, self.database)
         if supplier.load_database_data():
             dialog = SupplierDetailsDialog(supplier, self.database, self)
-            dialog.showMaximized()
             dialog.exec()
 
     def get_preview_category(self):

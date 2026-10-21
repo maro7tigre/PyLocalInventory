@@ -16,7 +16,6 @@ from PySide6.QtWidgets import (
 from core.calculations import calculate_line_subtotal, calculate_operation_totals, round_money, to_decimal
 from ui.facture_document import render_facture_preview_pages, render_facture_to_printer
 from ui.widgets.themed_widgets import BlueButton, GreenButton, OrangeButton, RedButton
-from ui.widgets.workspace_dialog import maximize_workspace_dialog
 
 def _money(value):
     return f"{round_money(value):,.2f}".replace(",", " ")
@@ -234,7 +233,6 @@ class FactureEditor(_FactureAsyncRequests, QDialog):
         self.operation_token = uuid4().hex if facture is None else ""
         self.setWindowTitle("Modifier la facture" if facture else "Nouvelle facture")
         self.resize(1050, 680)
-        maximize_workspace_dialog(self)
         layout = QVBoxLayout(self)
         form = QFormLayout()
         self.number = QLabel(facture["facture_number"] if facture else "Attribution à l'enregistrement")
@@ -1015,7 +1013,6 @@ class FacturePreviewDialog(QDialog):
     def __init__(self, images, parent=None):
         super().__init__(parent); self.images = images; self.page_index = 0; self.zoom = 0
         self.setWindowTitle("Aperçu facture"); self.resize(1050, 800)
-        maximize_workspace_dialog(self)
         layout = QVBoxLayout(self)
         self.preview = QScrollArea(); self.preview.setWidgetResizable(False)
         self.preview.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)

@@ -16,6 +16,8 @@ import time
 import os
 import zipfile
 import logging
+import threading
+from collections import OrderedDict
 from decimal import Decimal
 
 from core.network.protocol import (
@@ -27,6 +29,12 @@ from core.cache_policies import ENABLE_SQLITE_CACHE
 from core import diagnostics
 
 logger = logging.getLogger(__name__)
+
+# Thumbnails are small (the host caps them at 160 px), but a client may browse
+# many clients/sales. Keep the most recently used payloads in memory so a table
+# refresh or reopening the same attachment view does not re-download them.
+_ATTACHMENT_THUMBNAIL_CACHE_LIMIT = 512
+
 
 class RemoteProfile:
     """Read-only report branding supplied by the connected host."""
@@ -117,6 +125,12 @@ class RemoteDatabase:
         # never shared across users on a shared PC. Falls back to None if the
         # cache cannot be opened - the cache is display-only, never critical.
         self.cache = None
+
+        # In-memory, metadata-only thumbnail cache (attachment id -> base64
+        # PNG). This is a display cache; file bytes are still downloaded only
+        # through download_attachment() for Preview/Open/Export/Print.
+        self._attachment_thumbnail_cache = OrderedDict()
+        self._attachment_thumbnail_lock = threading.RLock()
 
         # Offline/read-only flag: set by the background sync when the host is
         # unreachable so tabs stop firing network refreshes that hang on a
@@ -427,6 +441,156 @@ class RemoteDatabase:
             args.append(scope)
         return self._call('list_attachments', args)
 
+    def _thumbnail_cache(self):
+        """Return the per-connection thumbnail cache, even for test doubles
+        created with ``RemoteDatabase.__new__``."""
+        cache = self.__dict__.get('_attachment_thumbnail_cache')
+        if cache is None:
+            cache = OrderedDict()
+            self.__dict__['_attachment_thumbnail_cache'] = cache
+        return cache
+
+    def _thumbnail_lock(self):
+        lock = self.__dict__.get('_attachment_thumbnail_lock')
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__['_attachment_thumbnail_lock'] = lock
+        return lock
+
+    def _remember_thumbnail(self, attachment_id, payload):
+        if not payload:
+            return
+        try:
+            attachment_id = int(attachment_id)
+        except (TypeError, ValueError):
+            return
+        with self._thumbnail_lock():
+            cache = self._thumbnail_cache()
+            cache[attachment_id] = payload
+            cache.move_to_end(attachment_id)
+            while len(cache) > _ATTACHMENT_THUMBNAIL_CACHE_LIMIT:
+                cache.popitem(last=False)
+
+    def get_attachment_thumbnail(self, attachment_id):
+        """Fetch one cached/small thumbnail through the authenticated RPC.
+
+        Offline clients return a cached payload (or None) without touching the
+        network. Thumbnails are never read from a host-local path here.
+        """
+        try:
+            attachment_id = int(attachment_id)
+        except (TypeError, ValueError):
+            return None
+        with self._thumbnail_lock():
+            cached = self._thumbnail_cache().get(attachment_id)
+        if cached:
+            with self._thumbnail_lock():
+                cache = self._thumbnail_cache()
+                if attachment_id in cache:
+                    cache.move_to_end(attachment_id)
+            return cached
+        if bool(self.__dict__.get('offline', False)):
+            return None
+        try:
+            payload = self._call('get_attachment_thumbnail', [attachment_id])
+        except ConnectionFailedError:
+            logger.warning(
+                "Thumbnail RPC interrupted attachment_id=%s host=%s port=%s",
+                attachment_id, self.host, self.port,
+            )
+            return None
+        self._remember_thumbnail(attachment_id, payload)
+        return payload
+
+    def get_attachment_thumbnails_bulk(self, attachment_ids):
+        """Fetch thumbnails for many attachments in one RPC round-trip.
+
+        JSON object keys always arrive as strings, so they are normalized back
+        to the integer attachment ids used by the UI. Cached ids are omitted
+        from the request and returned directly; an interrupted RPC keeps the
+        already-known previews instead of clearing them.
+        """
+        requested = []
+        for raw_id in attachment_ids or []:
+            try:
+                attachment_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if attachment_id not in requested:
+                requested.append(attachment_id)
+
+        result = {}
+        missing = []
+        with self._thumbnail_lock():
+            cache = self._thumbnail_cache()
+            for attachment_id in requested:
+                payload = cache.get(attachment_id)
+                if payload:
+                    result[attachment_id] = payload
+                    cache.move_to_end(attachment_id)
+                else:
+                    missing.append(attachment_id)
+
+        if not missing or bool(self.__dict__.get('offline', False)):
+            return result
+
+        try:
+            payloads = self._call('get_attachment_thumbnails_bulk', [missing]) or {}
+        except PermissionDeniedError:
+            # Hosts built before the attachment-permission fix can still deny
+            # thumbnail RPCs. download_attachment() was already allowed for
+            # those roles, so use it as a compatibility path instead of
+            # leaving every preview blank.
+            logger.warning(
+                "Host denied bulk thumbnail RPC; using attachment downloads "
+                "count=%d host=%s port=%s",
+                len(missing), self.host, self.port,
+            )
+            return self._download_legacy_thumbnails(missing, result)
+        except ConnectionFailedError:
+            logger.warning(
+                "Bulk thumbnail RPC interrupted count=%d host=%s port=%s",
+                len(missing), self.host, self.port,
+            )
+            return result
+
+        if not isinstance(payloads, dict):
+            return result
+        for raw_id, payload in payloads.items():
+            try:
+                attachment_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if not payload:
+                continue
+            result[attachment_id] = payload
+            self._remember_thumbnail(attachment_id, payload)
+        return result
+
+    def _download_legacy_thumbnails(self, attachment_ids, result):
+        """Fetch full files for hosts that still deny thumbnail RPCs.
+
+        The worker decodes and scales these payloads to thumbnail size before
+        the GUI sees them. They are intentionally not stored in the small
+        thumbnail LRU, which must not retain full attachment bytes.
+        """
+        downloaded = 0
+        for attachment_id in attachment_ids:
+            try:
+                payload = self._call('download_attachment', [attachment_id])
+            except (PermissionDeniedError, ConnectionFailedError):
+                break
+            except RemoteError:
+                continue
+            if payload:
+                result[attachment_id] = payload
+                downloaded += 1
+        logger.info(
+            "Legacy attachment preview fallback downloaded=%d requested=%d host=%s port=%s",
+            downloaded, len(attachment_ids), self.host, self.port,
+        )
+        return result
+
     def get_changes(self, section, since_seq=0, limit=500, timeout=4):
         """Fetch incremental changes for ``section`` since sequence
         ``since_seq``. Returns {'changes': [...], 'last_seq': N}."""
@@ -501,5 +665,7 @@ class RemoteDatabase:
             except Exception:
                 logger.exception("Failed to close local cache")
             self.cache = None
+        with self._thumbnail_lock():
+            self._thumbnail_cache().clear()
         logger.info("client_disconnected host=%s port=%s", self.host, self.port)
         self._token = None

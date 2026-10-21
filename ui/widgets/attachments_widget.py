@@ -11,6 +11,11 @@ from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
+# Host thumbnails are capped at 160 px. Legacy hosts may send the full image
+# instead (see RemoteDatabase._download_legacy_thumbnails), so decode-time
+# scaling keeps those previews small too.
+_THUMBNAIL_MAX_SIZE = 160
+
 from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot, QUrl
 from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
@@ -44,13 +49,20 @@ class _AttachmentFetchWorker(QObject):
     finished = Signal(object, object)
     error = Signal(str)
 
-    def __init__(self, database, entity_type, entity_id, needle, kind):
+    def __init__(self, database, entity_type, entity_id, needle, kind,
+                 known_thumbnail_ids=None):
         super().__init__()
         self.database = database
         self.entity_type = entity_type
         self.entity_id = entity_id
         self.needle = needle
         self.kind = kind
+        self.known_thumbnail_ids = set()
+        for attachment_id in known_thumbnail_ids or ():
+            try:
+                self.known_thumbnail_ids.add(int(attachment_id))
+            except (TypeError, ValueError):
+                continue
 
     @Slot()
     def run(self):
@@ -84,13 +96,23 @@ class _AttachmentFetchWorker(QObject):
                     or (kind == 'PDF' and r['mime_type'] == 'application/pdf')
                 )
             ]
-            image_ids = [r['id'] for r in shown if r['mime_type'].startswith('image/')]
+            image_ids = [
+                r['id'] for r in shown
+                if str(r['mime_type']).startswith('image/')
+                and int(r['id']) not in self.known_thumbnail_ids
+            ]
             thumbnails = {}
             if image_ids and hasattr(worker_db, 'get_attachment_thumbnails_bulk'):
                 try:
                     thumbnails = worker_db.get_attachment_thumbnails_bulk(image_ids)
-                except Exception as e:
-                    print(f"Error fetching bulk thumbnails: {e}")
+                except Exception:
+                    logger.warning(
+                        "Bulk attachment thumbnails unavailable; previews will be empty",
+                        exc_info=True,
+                    )
+            # Decode here, not while painting the table: a slow/broken image
+            # must never freeze the GUI thread.
+            thumbnails = _decode_thumbnail_payloads(thumbnails)
             logger.debug(
                 "[ATTACH WORKER] attachment query worker=%s records=%s; emit finished",
                 id(self), len(shown),
@@ -159,6 +181,46 @@ def _worker_database(database):
     if not worker_db.connect(initialize_schema=False):
         raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
     return worker_db, True
+
+
+def _decode_thumbnail_image(raw):
+    """Decode one thumbnail payload off the GUI thread.
+
+    RPC responses use JSON object keys, so callers normalize ids separately.
+    Invalid/missing payloads simply produce no image instead of an exception.
+    """
+    if isinstance(raw, QImage):
+        return None if raw.isNull() else raw
+    if not raw:
+        return None
+    try:
+        data = bytes(raw) if isinstance(raw, (bytes, bytearray, memoryview)) else base64.b64decode(raw)
+        image = QImage.fromData(data)
+        if image.isNull():
+            return None
+        if max(image.width(), image.height()) > _THUMBNAIL_MAX_SIZE:
+            image = image.scaled(
+                _THUMBNAIL_MAX_SIZE, _THUMBNAIL_MAX_SIZE,
+                Qt.KeepAspectRatio, Qt.SmoothTransformation,
+            )
+        return image
+    except Exception:
+        logger.warning("Attachment thumbnail could not be decoded", exc_info=True)
+        return None
+
+
+def _decode_thumbnail_payloads(thumbnails):
+    """Normalize JSON string keys and decode every thumbnail in a worker."""
+    decoded = {}
+    for raw_id, raw in (thumbnails or {}).items():
+        try:
+            attachment_id = int(raw_id)
+        except (TypeError, ValueError):
+            continue
+        image = _decode_thumbnail_image(raw)
+        if image is not None:
+            decoded[attachment_id] = image
+    return decoded
 
 
 def _upload_attachment(database, entity_type, entity_id, filename, data, sale_id=None):
@@ -478,7 +540,10 @@ class AttachmentPanel(QWidget):
 
         needle, kind = self.search.text().lower().strip(), self.filter.currentText()
         thread = QThread()
-        worker = _AttachmentFetchWorker(self.database, self.entity_type, self.entity_id, needle, kind)
+        worker = _AttachmentFetchWorker(
+            self.database, self.entity_type, self.entity_id, needle, kind,
+            known_thumbnail_ids=set(getattr(self, '_thumbnails_cache', {}) or {}),
+        )
         worker.moveToThread(thread)
         thread.started.connect(worker.run)
 
@@ -528,30 +593,31 @@ class AttachmentPanel(QWidget):
 
     def _render_attachments(self, shown, thumbnails):
         self._shown = shown
-        self._thumbnails_cache = thumbnails
+        # Keep already-decoded previews when a refresh only returns a subset
+        # (for example after a transient RPC failure), and let fresh payloads
+        # replace stale ones. Thumbnail ids are always integers at this point.
+        cached = dict(getattr(self, '_thumbnails_cache', {}) or {})
+        if thumbnails:
+            cached.update(thumbnails)
+        self._thumbnails_cache = cached
         self.table.setRowCount(len(self._shown))
         for row, record in enumerate(self._shown):
+            is_image = str(record['mime_type']).startswith('image/')
             preview = QTableWidgetItem('PDF' if record['mime_type'] == 'application/pdf' else '')
             thumbnail = self._thumbnail(record)
             if thumbnail is not None:
                 preview.setIcon(QIcon(thumbnail))
+            elif is_image:
+                # Keep a clear empty state instead of an indistinguishable
+                # blank cell when a file is missing or a download failed.
+                preview.setText('Unavailable')
+                preview.setToolTip('The image preview could not be loaded.')
+                preview.setTextAlignment(Qt.AlignCenter)
             self.table.setItem(row, 0, preview)
             values = [record['display_name'], record['mime_type'].split('/')[-1].upper(), self._size(record['file_size']), str(record['created_at'])[:16]]
             for col, value in enumerate(values, 1): self.table.setItem(row, col, QTableWidgetItem(str(value)))
             # PDFs remain compact; only image rows need room for the preview.
-            self.table.setRowHeight(row, 112 if record['mime_type'].startswith('image/') else 42)
-        if self.entity_type == 'client':
-            return
-        # Keep a short list compact instead of leaving a large empty table.
-        content_height = self.table.horizontalHeader().height() + sum(
-            self.table.rowHeight(row) for row in range(self.table.rowCount())
-        ) + 4
-        table_height = min(620, max(86, content_height))
-        self.table.setMinimumHeight(table_height)
-        self.table.setMaximumHeight(table_height)
-        host = self.window()
-        if self.entity_type != 'client' and isinstance(host, QDialog):
-            host.resize(max(host.width(), 900), min(760, table_height + 165))
+            self.table.setRowHeight(row, 112 if is_image else 42)
 
     @staticmethod
     def _money(value):
@@ -697,7 +763,8 @@ class AttachmentPanel(QWidget):
             id(self), self.entity_id,
         )
         self._shown = []
-        self._thumbnails_cache = {}
+        # Keep decoded previews: a full refresh of the same client must not
+        # blank/redownload thumbnails that are still on screen.
         self.table.setRowCount(0)
         self.client_sales_table.setRowCount(0)
         self.client_sales_empty.setVisible(False)
@@ -741,16 +808,22 @@ class AttachmentPanel(QWidget):
             self.refresh_sales()
 
     def _thumbnail(self, record):
-        if not record['mime_type'].startswith('image/'):
+        if not str(record['mime_type']).startswith('image/'):
             return None
-        try:
-            raw = getattr(self, '_thumbnails_cache', {}).get(record['id'])
-            if raw is None:
-                raw = self.database.get_attachment_thumbnail(record['id'])
-            image = QImage.fromData(base64.b64decode(raw)) if raw else QImage()
-            return QPixmap.fromImage(image) if not image.isNull() else None
-        except Exception:
+        cache = getattr(self, '_thumbnails_cache', {}) or {}
+        # Host workers return integer ids. RemoteDatabase normalizes JSON keys
+        # too, but accepting the string form keeps older/newer peers compatible.
+        raw = cache.get(record['id'])
+        if raw is None:
+            raw = cache.get(str(record['id']))
+        if raw is None:
+            # Never issue a synchronous RPC from the GUI thread here. The
+            # fetch worker has already requested every visible thumbnail.
             return None
+        if isinstance(raw, QPixmap):
+            return raw if not raw.isNull() else None
+        image = _decode_thumbnail_image(raw)
+        return QPixmap.fromImage(image) if image is not None else None
 
     @staticmethod
     def _size(value):

@@ -706,6 +706,7 @@ class SupplierDetailsDialog(QDialog):
             f"Supplier Account - {supplier_obj.get_value('name') or supplier_obj.get_value('username')}"
         )
         self.setMinimumSize(1050, 720)
+        self.resize(1180, 780)
         # Schema changes belong to the trusted host connection, never to a
         # read-only LAN session. Database.connect() also ensures this table.
         if database.__class__.__name__ != "RemoteDatabase":

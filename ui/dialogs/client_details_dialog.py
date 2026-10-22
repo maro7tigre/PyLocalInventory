@@ -255,6 +255,50 @@ class _ClientReportWorker(QObject):
                 s["sale_id"]: s.get("state") or "pending" for s in (summaries.get("sales") or [])
             }
 
+        # The Client View intentionally shows every Devis, including pending
+        # and on-hold ones. A printed Client Statement is different: only
+        # confirmed workflow stages may contribute sections, payment history,
+        # or totals. is_financially_active() is the project's established
+        # confirmation rule (confirmed and the later finished stage).
+        if self.report_type == "full_statement":
+            self._keep_only_confirmed_statement_sales()
+
+    @staticmethod
+    def _sale_id_key(value):
+        """Normalize Sale IDs from local rows and JSON/RPC responses."""
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return str(value)
+
+    def _keep_only_confirmed_statement_sales(self):
+        """Drop unconfirmed Devis from the full-statement data set.
+
+        Filtering happens before sale grouping and total accumulation, so an
+        unconfirmed Devis cannot affect any printed amount or running balance.
+        Payments linked to those Devis are removed too; unallocated general
+        client payments are not tied to a Devis and remain printable.
+        """
+        states = {}
+        for purchase in self.purchases:
+            states[self._sale_id_key(purchase.get("sale_id"))] = purchase.get("state")
+        for sale_id, state in (self.sale_state_by_id or {}).items():
+            if state is not None:
+                states[self._sale_id_key(sale_id)] = state
+
+        def is_confirmed(sale_id):
+            return is_financially_active(states.get(self._sale_id_key(sale_id)))
+
+        self.purchases = [
+            purchase for purchase in self.purchases
+            if is_confirmed(purchase.get("sale_id"))
+        ]
+        self.payments = [
+            payment for payment in self.payments
+            if payment.get("sale_id") is None
+            or is_confirmed(payment.get("sale_id"))
+        ]
+
     def _html_to_pdf(self, html_content, output_path):
         temp_html_path = None
         try:
@@ -398,6 +442,10 @@ class _ClientReportWorker(QObject):
                 if p.get("sale_id") == self.selected_sale_id
             ]
         else:
+            # Re-apply before grouping: _generate_html is also used directly
+            # by tests/older callers that populate purchases without calling
+            # _fetch_report_data(). The filter is idempotent.
+            self._keep_only_confirmed_statement_sales()
             filtered = list(self.purchases)
 
         sales = {}

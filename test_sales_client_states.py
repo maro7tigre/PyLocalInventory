@@ -284,29 +284,44 @@ def _statement_worker(report_type, selected_sale_id=None):
     ]
     worker.payments = [
         {"payment_id": 1, "sale_id": 8, "item_id": None, "date": "2026-08-04", "amount": "5000.00"},
-        {"payment_id": 2, "sale_id": 10, "item_id": None, "date": "2026-08-08", "amount": "100.00"},
+        {"payment_id": 2, "sale_id": 6, "item_id": None, "date": "2026-08-08", "amount": "100.00"},
         {"payment_id": 3, "sale_id": None, "item_id": None, "date": "2026-08-09", "amount": "1000.00"},
     ]
+    worker.devis_by_sale = {6: "DE-2026-6", 8: "DE-2026-8", 9: "DE-2026-9"}
     worker.sale_state_by_id = {6: "pending", 8: "confirmed", 9: "finished"}
     return worker
 
 
 class ClientStatementRuleTests(unittest.TestCase):
-    def test_statement_totals_match_the_view_client_rule(self):
+    def test_statement_excludes_unconfirmed_devis_and_totals(self):
         worker = _statement_worker("full_statement")
-        sections = {
-            purchase["sale_id"]: worker._render_sale_section(purchase["sale_id"], [purchase], "MAD")
-            for purchase in worker.purchases
-        }
+        html = worker._generate_html()
+
+        # Only confirmed/finished Devis reach the printed statement.
+        self.assertNotIn("DE-2026-6", html)
+        self.assertNotIn("DEVIS NON CONFIRM", html)
+        self.assertIn("DE-2026-8", html)
+        self.assertIn("DE-2026-9", html)
+        self.assertEqual(html.count("VENTE N°"), 2)
+
+        # The pending Devis and its payment are excluded from every total.
+        self.assertEqual(
+            worker.sale_ttc_by_id,
+            {8: Decimal("20000.00"), 9: Decimal("30000.00")},
+        )
+        self.assertEqual(
+            worker.sale_paid_by_id,
+            {8: Decimal("5000.00"), 9: Decimal("0")},
+        )
+        self.assertEqual([pay["sale_id"] for pay in worker.payments], [8, None])
         total_sales = sum(worker.sale_ttc_by_id.values(), Decimal("0"))
         total_paid = sum(worker.sale_paid_by_id.values(), Decimal("0")) + Decimal("1000.00")
         self.assertEqual(total_sales, Decimal("50000.00"))
         self.assertEqual(total_paid, Decimal("6000.00"))
         self.assertEqual(max(total_sales - total_paid, Decimal("0")), Decimal("44000.00"))
-        self.assertEqual(worker.sale_ttc_by_id[6], Decimal("0"))
-        self.assertIn("DEVIS NON CONFIRM", sections[6])
-        self.assertNotIn("Total TTC", sections[6])
-        self.assertIn("Reste à payer : <strong>— (devis non confirmé)", sections[6])
+        self.assertIn("50 000,00 MAD", html)
+        self.assertIn("6 000,00 MAD", html)
+        self.assertIn("44 000,00 MAD", html)
 
     def test_pending_sale_document_is_still_printable_in_full(self):
         worker = _statement_worker("selected_sale", 6)

@@ -19,7 +19,11 @@ from core.database import (
     normalize_client_account,
     normalize_client_sale_summaries,
 )
-from ui.dialogs.client_details_dialog import ClientDetailsDialog, _EditPaymentDialog
+from ui.dialogs.client_details_dialog import (
+    ClientDetailsDialog,
+    _ClientReportWorker,
+    _EditPaymentDialog,
+)
 
 
 def _canonical_purchase(sale_id, item_id, **overrides):
@@ -918,6 +922,168 @@ class ClientAccountDialogTests(unittest.TestCase):
         self.assertFalse(dialog._payment_delete_inflight)
         self.assertEqual(dialog.delete_payment_btn.text(), "Delete Payment")
         refresh.assert_called_once()
+
+
+class _StatementDatabase(_StubDatabase):
+    """A client with one pending, one confirmed, and one finished Devis."""
+
+    def __init__(self, account, purchases):
+        super().__init__(account)
+        self.purchases = purchases
+
+    def get_client_account(self, _client_id):
+        return {
+            "purchases": list(self.purchases),
+            "payments": list(self.account.get("payments") or []),
+        }
+
+    def get_client_sale_items(self, sale_id):
+        return {
+            "purchases": [
+                row for row in self.purchases if row["sale_id"] == sale_id
+            ],
+            "payments": [
+                pay for pay in self.account.get("payments") or []
+                if pay["sale_id"] == sale_id
+            ],
+            "sales": [
+                sale for sale in self.account.get("sales") or []
+                if sale["sale_id"] == sale_id
+            ],
+        }
+
+
+class ClientStatementPrintingTests(unittest.TestCase):
+    @classmethod
+    def setUpClass(cls):
+        cls.app = QApplication.instance() or QApplication([])
+
+    def setUp(self):
+        payments = [
+            _canonical_payment(1, 1, amount=Decimal("10.00")),
+            _canonical_payment(2, 2, amount=Decimal("50.00")),
+            _canonical_payment(3, 3, amount=Decimal("300.00")),
+            _canonical_payment(4, None, amount=Decimal("25.00")),
+        ]
+        account = {
+            "sales": [
+                _canonical_sale(1, state="pending", devis="DE-2026-1",
+                                total=Decimal("100.00"), paid=Decimal("10.00"),
+                                remaining=Decimal("90.00")),
+                _canonical_sale(2, state="confirmed", devis="DE-2026-2",
+                                total=Decimal("200.00"), paid=Decimal("50.00"),
+                                remaining=Decimal("150.00")),
+                _canonical_sale(3, state="finished", devis="DE-2026-3",
+                                total=Decimal("300.00"), paid=Decimal("300.00"),
+                                remaining=Decimal("0.00")),
+            ],
+            "payments": payments,
+        }
+        purchases = [
+            _canonical_purchase(
+                1, 101, state="pending", product="Unconfirmed item",
+                unit_price=Decimal("100"), vat=Decimal("0"),
+            ),
+            _canonical_purchase(
+                2, 102, state="confirmed", product="Confirmed item",
+                unit_price=Decimal("200"), vat=Decimal("0"),
+            ),
+            _canonical_purchase(
+                3, 103, state="finished", product="Finished item",
+                unit_price=Decimal("300"), vat=Decimal("0"),
+            ),
+        ]
+        self.database = _StatementDatabase(account, purchases)
+
+    def _worker(self, report_type="full_statement", selected_sale_id=None):
+        return _ClientReportWorker(
+            report_type,
+            {"name": "Aptiv"},
+            {"currency": "MAD"},
+            self.database,
+            1,
+            selected_sale_id,
+        )
+
+    def test_client_view_still_displays_confirmed_and_unconfirmed_devis(self):
+        with patch.object(ClientDetailsDialog, "refresh_data", lambda self: None):
+            dialog = ClientDetailsDialog(_client_obj(), self.database)
+        self.addCleanup(dialog.close)
+        dialog._apply_account_data(self.database.account)
+
+        self.assertEqual(dialog.purchases_table.rowCount(), 3)
+        self.assertEqual(
+            [dialog.purchases_table.item(row, 2).text() for row in range(3)],
+            [
+                "Devis N° DE-2026-1",
+                "Devis N° DE-2026-2",
+                "Devis N° DE-2026-3",
+            ],
+        )
+        self.assertEqual(
+            [dialog.purchases_table.item(row, 3).text() for row in range(3)],
+            ["Pending", "Confirmed", "Finished"],
+        )
+        # The Client View still keeps the pending Devis visible while hiding
+        # its amount from the debt totals, exactly as before this change.
+        self.assertEqual(dialog.purchases_table.item(0, 4).text(), "—")
+
+    def test_full_statement_includes_only_confirmed_devis_and_totals(self):
+        worker = self._worker()
+        worker._fetch_report_data()
+
+        self.assertEqual([row["sale_id"] for row in worker.purchases], [2, 3])
+        self.assertEqual([row["sale_id"] for row in worker.payments], [2, 3, None])
+
+        html = worker._generate_html()
+
+        self.assertNotIn("Unconfirmed item", html)
+        self.assertNotIn("DE-2026-1", html)
+        self.assertNotIn("DEVIS NON CONFIRM", html)
+        self.assertIn("Confirmed item", html)
+        self.assertIn("Finished item", html)
+        self.assertIn("DE-2026-2", html)
+        self.assertIn("DE-2026-3", html)
+        self.assertEqual(html.count("VENTE N°"), 2)
+
+        self.assertEqual(worker.sale_ttc_by_id, {
+            2: Decimal("200.00"),
+            3: Decimal("300.00"),
+        })
+        self.assertEqual(worker.sale_paid_by_id, {
+            2: Decimal("50.00"),
+            3: Decimal("300.00"),
+        })
+        total_sales = sum(worker.sale_ttc_by_id.values(), Decimal("0"))
+        general_paid = sum(
+            (
+                payment["amount"]
+                for payment in worker.payments
+                if payment.get("sale_id") is None
+            ),
+            Decimal("0"),
+        )
+        total_paid = (
+            sum(worker.sale_paid_by_id.values(), Decimal("0")) + general_paid
+        )
+        self.assertEqual(total_sales, Decimal("500.00"))
+        self.assertEqual(total_paid, Decimal("375.00"))
+        self.assertEqual(
+            max(total_sales - total_paid, Decimal("0")), Decimal("125.00")
+        )
+        self.assertIn("500,00 MAD", html)
+        self.assertIn("375,00 MAD", html)
+        self.assertIn("125,00 MAD", html)
+
+    def test_selected_sale_print_keeps_existing_pending_devis_behavior(self):
+        worker = self._worker("selected_sale", selected_sale_id=1)
+        worker._fetch_report_data()
+
+        html = worker._generate_html()
+
+        self.assertIn("Unconfirmed item", html)
+        self.assertIn("DE-2026-1", html)
+        self.assertNotIn("DEVIS NON CONFIRM", html)
 
 
 if __name__ == "__main__":

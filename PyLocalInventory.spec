@@ -10,6 +10,11 @@ if not browser_root.is_dir():
 
 playwright_datas, playwright_binaries, playwright_hiddenimports = collect_all('playwright')
 
+# Attachment printing renders PDFs with QtPdf and sends them through
+# QtPrintSupport. Include both explicitly so the packaged app never depends
+# on runtime-only imports or a Windows PDF file association.
+printing_hiddenimports = ['PySide6.QtPdf', 'PySide6.QtPrintSupport']
+
 application_datas = [
     (str(project_root / 'logo.png'), '.'),
     (str(project_root / 'report'), 'report'),
@@ -35,7 +40,7 @@ a = Analysis(
     pathex=[str(project_root)],
     binaries=playwright_binaries,
     datas=playwright_datas + application_datas,
-    hiddenimports=playwright_hiddenimports,
+    hiddenimports=playwright_hiddenimports + printing_hiddenimports,
     hookspath=[],
     hooksconfig={},
     runtime_hooks=[],

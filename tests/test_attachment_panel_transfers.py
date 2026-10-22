@@ -6,14 +6,26 @@ import time
 from pathlib import Path
 from unittest.mock import patch
 
+import pytest
+
 os.environ.setdefault("QT_QPA_PLATFORM", "offscreen")
 
-from PySide6.QtCore import QBuffer, QEvent, QIODevice, QItemSelectionModel, Qt
-from PySide6.QtGui import QImage
-from PySide6.QtTest import QTest
+from PySide6.QtCore import (
+    QBuffer, QEvent, QIODevice, QItemSelectionModel, QMarginsF, QSize, Qt,
+)
+from PySide6.QtGui import QColor, QImage, QPageLayout, QPageSize
+from PySide6.QtPdf import QPdfDocument
+from PySide6.QtPrintSupport import QPrinter
 from PySide6.QtWidgets import QApplication, QDialog, QLabel
 
-from ui.widgets.attachments_widget import AttachmentPanel, _active_attachment_jobs, _active_attachment_threads
+from ui.widgets.attachments_widget import (
+    AttachmentPanel,
+    _active_attachment_jobs,
+    _active_attachment_threads,
+    _cleanup_print_artifacts,
+    _ensure_windows_ole,
+    _print_combined_pdf,
+)
 
 
 class _RemoteAttachmentDatabase:
@@ -49,7 +61,8 @@ def _wait_until(predicate, timeout_ms=3000):
         QApplication.processEvents()
         if predicate():
             return True
-        QTest.qWait(5)
+        time.sleep(0.005)
+    QApplication.processEvents()
     return predicate()
 
 
@@ -58,6 +71,69 @@ def _wait_for_transfer(panel, timeout_ms=3000):
     assert thread is not None
     assert thread.wait(timeout_ms), "attachment transfer QThread did not stop in time"
     assert _wait_until(lambda: panel._transfer_thread is None, timeout_ms)
+
+
+def _wait_for_print(panel, timeout_ms=10000):
+    assert _wait_until(
+        lambda: (
+            not panel._print_busy
+            and panel._print_thread is None
+        ),
+        timeout_ms,
+    ), "attachment print workflow did not stop in time"
+
+
+def _pdf_output_printer(path):
+    """A real QPrinter job, but written to a PDF instead of physical paper."""
+    _ensure_windows_ole()
+    printer = QPrinter(QPrinter.HighResolution)
+    printer.setResolution(300)
+    printer.setOutputFormat(QPrinter.PdfFormat)
+    printer.setOutputFileName(str(path))
+    printer.setPageSize(QPageSize(QPageSize.A4))
+    printer.setPageMargins(QMarginsF(10, 10, 10, 10), QPageLayout.Millimeter)
+    return printer
+
+
+def _patch_native_printing(monkeypatch, output_path):
+    """Use one file-backed QPrinter and track native cleanup/no ShellExecute."""
+    printers = []
+
+    def choose_printer(_parent):
+        printer = _pdf_output_printer(output_path)
+        printers.append(printer)
+        return printer
+
+    cleanups = []
+    original_cleanup = _cleanup_print_artifacts
+
+    def track_cleanup(path):
+        cleanups.append(Path(path))
+        original_cleanup(path)
+
+    startfile_calls = []
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._choose_print_printer",
+        choose_printer,
+    )
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._cleanup_print_artifacts",
+        track_cleanup,
+    )
+    monkeypatch.setattr(
+        os,
+        "startfile",
+        lambda *args: startfile_calls.append(args),
+        raising=False,
+    )
+    return printers, cleanups, startfile_calls
+
+
+def _load_output_pdf(path):
+    document = QPdfDocument()
+    assert document.load(str(path)) == QPdfDocument.Error.None_
+    assert document.status() == QPdfDocument.Status.Ready
+    return document
 
 
 def _panel(database, entity_type="sale"):
@@ -87,13 +163,28 @@ def _record(attachment_id, name, mime="application/pdf"):
     }
 
 
-def _png_bytes():
-    image = QImage(3, 2, QImage.Format_RGB32)
-    image.fill(Qt.red)
+def _png_bytes(width=3, height=2, color=Qt.red):
+    image = QImage(width, height, QImage.Format_RGB32)
+    image.fill(color)
     buffer = QBuffer()
     assert buffer.open(QIODevice.WriteOnly)
     assert image.save(buffer, "PNG")
     return bytes(buffer.data())
+
+
+def _assert_rendered_color(document, page, color):
+    image = document.render(page, QSize(100, 100))
+    assert not image.isNull()
+    sample = image.pixelColor(50, 50)
+    expected = QColor(color).name().lower()
+    if expected in ("#ff0000", "#fe0000"):
+        assert sample.red() > 200 and sample.green() < 80 and sample.blue() < 80
+    elif expected in ("#00ff00", "#008001"):
+        assert sample.green() > 100 and sample.red() < 80 and sample.blue() < 80
+    elif expected in ("#0000ff", "#0000fe"):
+        assert sample.blue() > 200 and sample.red() < 80 and sample.green() < 80
+    else:
+        assert sample.name().lower() == expected
 
 
 def test_export_multiple_files_preserves_content_and_cleans_transfer():
@@ -129,15 +220,17 @@ def test_export_single_attachment_preserves_content_and_cleans_temporary_file():
     panel.shutdown()
 
 
-def test_open_and_print_use_local_qurl_and_mocked_windows_callback(monkeypatch):
-    database = _RemoteAttachmentDatabase({1: b"document to open", 2: b"document to print"})
+def test_open_and_print_use_local_qurl_and_native_printer(monkeypatch):
+    database = _RemoteAttachmentDatabase({
+        1: b"document to open",
+        2: _png_bytes(40, 20, Qt.red),
+    })
     panel = _panel(database)
-    opened, printed = [], []
+    opened = []
     monkeypatch.setattr(
         "ui.widgets.attachments_widget.QDesktopServices.openUrl",
         lambda url: opened.append(url),
     )
-    monkeypatch.setattr(os, "startfile", lambda path, action: printed.append((path, action)))
     with tempfile.TemporaryDirectory() as directory, patch.dict(os.environ, {"TEMP": directory}):
         _select(panel, [_record(1, "open.pdf")])
         panel.open_selected()
@@ -145,12 +238,324 @@ def test_open_and_print_use_local_qurl_and_mocked_windows_callback(monkeypatch):
         assert Path(opened[0].toLocalFile()).read_bytes() == b"document to open"
         assert opened[0].isLocalFile()
 
-        _select(panel, [_record(2, "print.pdf")])
+        output = Path(directory) / "native-print-output.pdf"
+        printers, cleanups, startfile_calls = _patch_native_printing(monkeypatch, output)
+        _select(panel, [_record(2, "print.png", "image/png")])
         panel.print_selected()
-        _wait_for_transfer(panel)
-        assert Path(printed[0][0]).read_bytes() == b"document to print"
-        assert printed[0][1] == "print"
+        _wait_for_print(panel)
+
+        assert len(printers) == 1
+        assert startfile_calls == []
+        assert cleanups and not cleanups[0].exists()
+        document = _load_output_pdf(output)
+        assert document.pageCount() == 1
+        _assert_rendered_color(document, 0, Qt.red)
+        document.close()
+        del document
     panel.shutdown()
+
+
+def test_print_empty_selection_asks_for_attachments(monkeypatch):
+    database = _RemoteAttachmentDatabase({})
+    panel = _panel(database)
+    notices = []
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget.QMessageBox.information",
+        lambda *_args: notices.append(_args[-1]),
+    )
+    printed = []
+    monkeypatch.setattr(os, "startfile", lambda path, action: printed.append((path, action)))
+
+    panel.table.clearSelection()
+    panel.print_selected()
+
+    assert printed == []
+    assert notices and "Select one or more attachments" in notices[0]
+    panel.shutdown()
+
+
+def test_print_single_image_builds_one_pdf_and_submits_one_native_job(monkeypatch):
+    database = _RemoteAttachmentDatabase({1: _png_bytes(80, 40, Qt.red)})
+    panel = _panel(database, "client")
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "single-output.pdf"
+        printers, cleanups, startfile_calls = _patch_native_printing(monkeypatch, output)
+
+        _select(panel, [_record(1, "single.png", "image/png")])
+        panel.print_selected()
+        _wait_for_print(panel)
+
+        assert database.download_calls == [1]
+        assert len(printers) == 1
+        assert startfile_calls == []
+        assert cleanups and not cleanups[0].exists()
+        document = _load_output_pdf(output)
+        assert document.pageCount() == 1
+        _assert_rendered_color(document, 0, Qt.red)
+        document.close()
+        del document
+    panel.shutdown()
+
+
+def test_print_multiple_client_images_is_one_ordered_multipage_job(monkeypatch):
+    payloads = {
+        1: _png_bytes(80, 40, Qt.red),
+        2: _png_bytes(40, 80, Qt.green),
+        3: _png_bytes(50, 50, Qt.blue),
+    }
+    database = _RemoteAttachmentDatabase(payloads)
+    panel = _panel(database, "client")
+    records = [
+        _record(1, "first-landscape.png", "image/png"),
+        _record(2, "second-portrait.png", "image/png"),
+        _record(3, "third-square.png", "image/png"),
+    ]
+
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "multi-output.pdf"
+        printers, cleanups, startfile_calls = _patch_native_printing(monkeypatch, output)
+        _select(panel, records)
+        panel.print_selected()
+        _wait_for_print(panel)
+
+        # Remote/client mode fetched every selected attachment through the RPC
+        # download path, in Attachments-table order, and used one QPrinter job.
+        assert database.download_calls == [1, 2, 3]
+        assert len(printers) == 1
+        assert startfile_calls == []
+        assert cleanups and not cleanups[0].exists()
+        document = _load_output_pdf(output)
+        assert document.pageCount() == 3
+        first, second, third = (document.pagePointSize(i) for i in range(3))
+        assert first.width() > first.height()
+        assert second.height() > second.width()
+        assert third.height() > third.width()
+        _assert_rendered_color(document, 0, Qt.red)
+        _assert_rendered_color(document, 1, Qt.green)
+        _assert_rendered_color(document, 2, Qt.blue)
+        document.close()
+        del document
+    panel.shutdown()
+
+
+def test_print_failed_download_and_invalid_image_do_not_print(monkeypatch):
+    database = _RemoteAttachmentDatabase({
+        1: RuntimeError("network interrupted"),
+        2: b"not an image",
+    })
+    panel = _panel(database, "client")
+    warnings, print_dialogs, startfile_calls = [], [], []
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget.QMessageBox.warning",
+        lambda *_args: warnings.append(_args[-1]),
+    )
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._choose_print_printer",
+        lambda parent: print_dialogs.append(parent),
+    )
+    monkeypatch.setattr(
+        os,
+        "startfile",
+        lambda *args: startfile_calls.append(args),
+        raising=False,
+    )
+
+    _select(panel, [
+        _record(1, "unavailable.png", "image/png"),
+        _record(2, "corrupt.png", "image/png"),
+    ])
+    panel.print_selected()
+    _wait_for_print(panel)
+
+    assert print_dialogs == []
+    assert startfile_calls == []
+    assert warnings
+    message = warnings[-1]
+    assert "unavailable.png" in message and "network interrupted" in message
+    assert "corrupt.png" in message and "invalid" in message.lower()
+    panel.shutdown()
+
+
+def test_print_mixed_selection_reports_unsupported_files(monkeypatch):
+    database = _RemoteAttachmentDatabase({
+        1: _png_bytes(40, 20, Qt.red),
+        2: b"plain text that must not be printed",
+    })
+    panel = _panel(database, "client")
+    warnings = []
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "mixed-output.pdf"
+        printers, cleanups, startfile_calls = _patch_native_printing(monkeypatch, output)
+        monkeypatch.setattr(
+            "ui.widgets.attachments_widget.QMessageBox.warning",
+            lambda *_args: warnings.append(_args[-1]),
+        )
+
+        _select(panel, [
+            _record(1, "photo.png", "image/png"),
+            _record(2, "notes.txt", "text/plain"),
+        ])
+        panel.print_selected()
+        _wait_for_print(panel)
+
+        assert database.download_calls == [1]
+        assert len(printers) == 1
+        assert startfile_calls == []
+        assert cleanups and not cleanups[0].exists()
+        document = _load_output_pdf(output)
+        assert document.pageCount() == 1
+        document.close()
+        del document
+        assert warnings and "notes.txt" in warnings[-1]
+        assert "unsupported file type" in warnings[-1]
+    panel.shutdown()
+
+
+def test_repeated_print_clicks_submit_only_one_job(monkeypatch):
+    started, release = threading.Event(), threading.Event()
+
+    class SlowDatabase(_RemoteAttachmentDatabase):
+        def download_attachment(self, attachment_id):
+            started.set()
+            if not release.wait(2):
+                raise TimeoutError("test did not release the active RPC")
+            return super().download_attachment(attachment_id)
+
+    database = SlowDatabase({1: _png_bytes(40, 20, Qt.red)})
+    panel = _panel(database)
+    notices = []
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget.QMessageBox.information",
+        lambda *_args: notices.append(_args[-1]),
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "repeat-output.pdf"
+        printers, cleanups, startfile_calls = _patch_native_printing(monkeypatch, output)
+        _select(panel, [_record(1, "slow.png", "image/png")])
+        panel.print_selected()
+        assert started.wait(2), "download RPC did not start in time"
+        panel.print_selected()
+        release.set()
+        _wait_for_print(panel)
+
+        assert database.download_calls == [1]
+        assert len(printers) == 1
+        assert startfile_calls == []
+        assert cleanups and not cleanups[0].exists()
+        assert notices and "already being prepared" in notices[-1]
+    panel.shutdown()
+
+
+def test_print_dialog_cancellation_cleans_temporary_pdf(monkeypatch):
+    database = _RemoteAttachmentDatabase({1: _png_bytes(40, 20, Qt.red)})
+    panel = _panel(database, "client")
+    cleanups = []
+    print_dialogs = []
+    original_cleanup = _cleanup_print_artifacts
+
+    def track_cleanup(path):
+        cleanups.append(Path(path))
+        original_cleanup(path)
+
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._cleanup_print_artifacts",
+        track_cleanup,
+    )
+
+    def cancel_print(_parent):
+        print_dialogs.append(True)
+        return None
+
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._choose_print_printer",
+        cancel_print,
+    )
+    _select(panel, [_record(1, "cancelled.png", "image/png")])
+    panel.print_selected()
+    _wait_for_print(panel)
+
+    assert print_dialogs == [True]
+    assert len(cleanups) == 1
+    assert not cleanups[0].exists()
+    assert not cleanups[0].parent.exists()
+    assert panel.print_button.isEnabled()
+    panel.shutdown()
+
+
+def test_printer_failure_is_reported_and_temporary_pdf_is_cleaned(monkeypatch):
+    database = _RemoteAttachmentDatabase({1: _png_bytes(40, 20, Qt.red)})
+    panel = _panel(database, "client")
+    warnings, cleanups = [], []
+    original_cleanup = _cleanup_print_artifacts
+
+    def track_cleanup(path):
+        cleanups.append(Path(path))
+        original_cleanup(path)
+
+    monkeypatch.setattr(
+        "ui.widgets.attachments_widget._cleanup_print_artifacts",
+        track_cleanup,
+    )
+    with tempfile.TemporaryDirectory() as directory:
+        output = Path(directory) / "printer-error-output.pdf"
+        monkeypatch.setattr(
+            "ui.widgets.attachments_widget._choose_print_printer",
+            lambda _parent: _pdf_output_printer(output),
+        )
+        monkeypatch.setattr(
+            "ui.widgets.attachments_widget._print_combined_pdf",
+            lambda *_args, **_kwargs: (_ for _ in ()).throw(
+                RuntimeError("printer unavailable")
+            ),
+        )
+        monkeypatch.setattr(
+            "ui.widgets.attachments_widget.QMessageBox.warning",
+            lambda *_args: warnings.append(_args[-1]),
+        )
+    monkeypatch.setattr(
+        os,
+        "startfile",
+        lambda *args: (_ for _ in ()).throw(
+            AssertionError("native printing must not use Windows file associations")
+        ),
+        raising=False,
+    )
+
+    _select(panel, [_record(1, "printer-error.png", "image/png")])
+    panel.print_selected()
+    _wait_for_print(panel)
+
+    assert warnings and "Could not print the combined document" in warnings[0]
+    assert len(cleanups) == 1
+    assert not cleanups[0].exists()
+    assert panel.print_button.isEnabled()
+    panel.shutdown()
+
+
+def test_invalid_combined_pdf_is_reported_without_crashing():
+    directory = Path(tempfile.mkdtemp(prefix="pylocalinventory-print-invalid-"))
+    pdf_path = directory / "attachments.pdf"
+    pdf_path.write_bytes(b"not a pdf")
+    output = directory / "output.pdf"
+    try:
+        with pytest.raises(RuntimeError, match="valid PDF"):
+            _print_combined_pdf(pdf_path, _pdf_output_printer(output))
+        assert not pdf_path.exists()
+        assert not directory.exists()
+    finally:
+        _cleanup_print_artifacts(pdf_path)
+
+
+def test_print_cleanup_removes_only_temporary_print_folder():
+    directory = Path(tempfile.mkdtemp(prefix="pylocalinventory-print-test-"))
+    pdf_path = directory / "attachments.pdf"
+    pdf_path.write_bytes(b"%PDF-test")
+    try:
+        _cleanup_print_artifacts(pdf_path)
+        assert not pdf_path.exists()
+        assert not directory.exists()
+    finally:
+        _cleanup_print_artifacts(pdf_path)
 
 
 def test_image_preview_decodes_and_displays_downloaded_image(monkeypatch):

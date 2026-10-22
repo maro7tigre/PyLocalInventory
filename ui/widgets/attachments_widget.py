@@ -16,12 +16,27 @@ logger = logging.getLogger(__name__)
 # scaling keeps those previews small too.
 _THUMBNAIL_MAX_SIZE = 160
 
-from PySide6.QtCore import Qt, QBuffer, QIODevice, QSize, QObject, QThread, Signal, Slot, QUrl
-from PySide6.QtGui import QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence
+from PySide6.QtCore import (
+    Qt, QBuffer, QIODevice, QMarginsF, QSize, QObject, QThread, Signal, Slot, QUrl,
+)
+from PySide6.QtGui import (
+    QGuiApplication, QImage, QPixmap, QDesktopServices, QIcon, QKeySequence,
+    QPageLayout, QPageSize, QPainter, QPdfWriter,
+)
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget,
     QTableWidgetItem, QPushButton, QFileDialog, QMessageBox, QLineEdit, QComboBox,
     QInputDialog, QDialog, QLabel, QScrollArea, QCheckBox, QDialogButtonBox, QHeaderView,
-    QSplitter)
+    QProgressDialog, QSplitter)
+
+_PRINT_MARGIN_MM = 10
+_PRINT_OUTPUT_DPI = 300
+# PDF attachments are rasterised at a print-usable resolution. 200 dpi keeps
+# multi-page PDF combining reasonably fast and memory-safe while still looking
+# sharp. Native printer rendering is capped at 300 dpi to avoid huge images.
+_PRINT_PDF_RENDER_DPI = 200
+_PRINT_PRINTER_MAX_DPI = 300
+_windows_ole_initialized = False
 
 _active_attachment_threads = set()
 # A QThread does not own a QObject moved to it. Retain each worker until the
@@ -335,6 +350,442 @@ class _AttachmentDownloadWorker(QObject):
             self.finished.emit(results, errors)
 
 
+def _attachment_print_name(record):
+    return str(record.get('display_name') or record.get('original_filename') or 'Attachment')
+
+
+def _iter_pdf_page_images(data):
+    """Render each page of a PDF attachment to a QImage, one at a time."""
+    from PySide6.QtPdf import QPdfDocument
+
+    document = QPdfDocument()
+    buffer = QBuffer()
+    buffer.setData(data)
+    try:
+        if not buffer.open(QIODevice.ReadOnly):
+            raise RuntimeError('the PDF data could not be opened')
+        document.load(buffer)
+        if document.status() != QPdfDocument.Status.Ready or document.pageCount() <= 0:
+            raise ValueError('the PDF is invalid or has no pages')
+        for index in range(document.pageCount()):
+            point_size = document.pagePointSize(index)
+            if point_size.width() <= 0 or point_size.height() <= 0:
+                raise ValueError(f'page {index + 1} has no usable size')
+            width = max(1, round(point_size.width() * _PRINT_PDF_RENDER_DPI / 72.0))
+            height = max(1, round(point_size.height() * _PRINT_PDF_RENDER_DPI / 72.0))
+            image = document.render(index, QSize(width, height))
+            if image.isNull():
+                raise ValueError(f'page {index + 1} could not be rendered')
+            yield image
+    finally:
+        document.close()
+        buffer.close()
+
+
+class _CombinedAttachmentPdf:
+    """Writes attachment images as A4 pages, one image per page."""
+
+    def __init__(self, path):
+        self.path = Path(path)
+        self.writer = QPdfWriter(str(self.path))
+        self.writer.setResolution(_PRINT_OUTPUT_DPI)
+        self.painter = None
+        self.page_count = 0
+        self._closed = False
+
+    @staticmethod
+    def _page_layout(landscape):
+        return QPageLayout(
+            QPageSize(QPageSize.A4),
+            QPageLayout.Landscape if landscape else QPageLayout.Portrait,
+            QMarginsF(_PRINT_MARGIN_MM, _PRINT_MARGIN_MM,
+                      _PRINT_MARGIN_MM, _PRINT_MARGIN_MM),
+            QPageLayout.Millimeter,
+        )
+
+    def add_image(self, image):
+        if image.isNull():
+            raise ValueError('the image is invalid')
+        if self._closed:
+            raise RuntimeError('the combined PDF is already closed')
+        landscape = image.width() > image.height()
+        if self.painter is None:
+            self.writer.setPageLayout(self._page_layout(landscape))
+            self.painter = QPainter(self.writer)
+            if not self.painter.isActive():
+                raise RuntimeError('the PDF page could not be painted')
+        else:
+            self.writer.setPageLayout(self._page_layout(landscape))
+            if not self.writer.newPage():
+                raise RuntimeError('a new PDF page could not be added')
+        width, height = self.writer.width(), self.writer.height()
+        target = image.size().scaled(QSize(width, height), Qt.KeepAspectRatio)
+        if target != image.size():
+            image = image.scaled(target, Qt.KeepAspectRatio, Qt.SmoothTransformation)
+        self.painter.drawImage(
+            (width - target.width()) // 2,
+            (height - target.height()) // 2,
+            image,
+        )
+        self.page_count += 1
+
+    def add_pdf(self, data):
+        for image in _iter_pdf_page_images(data):
+            self.add_image(image)
+
+    def close(self):
+        if self._closed:
+            return
+        self._closed = True
+        if self.painter is not None:
+            self.painter.end()
+            self.painter = None
+
+
+def _cleanup_print_artifacts(path):
+    """Delete one temporary print PDF (and its now-empty private folder)."""
+    path = Path(path)
+    try:
+        path.unlink(missing_ok=True)
+    except OSError:
+        logger.warning("Temporary print file could not be removed: %s", path, exc_info=True)
+    try:
+        path.parent.rmdir()
+    except OSError:
+        pass
+
+
+def _ensure_windows_ole():
+    """Make the Windows print/QPrinter COM backend available when needed.
+
+    Qt's native Windows platform plugin initializes OLE itself, but Qt's
+    offscreen/minimal test platforms do not. Initializing it explicitly keeps
+    native QPrinter rendering reliable in both GUI and headless test runs.
+    """
+    global _windows_ole_initialized
+    if sys.platform != 'win32' or _windows_ole_initialized:
+        return
+    try:
+        import ctypes
+        ctypes.windll.ole32.OleInitialize(None)
+        _windows_ole_initialized = True
+    except Exception:
+        logger.debug("Windows OLE initialization failed", exc_info=True)
+
+
+def _choose_print_printer(parent):
+    """Pick a printer once for the whole combined document.
+
+    This deliberately uses Qt's print stack instead of the Windows
+    ShellExecute "print" verb, so no default PDF viewer is required.
+    """
+    _ensure_windows_ole()
+    try:
+        available = QPrinterInfo.availablePrinterNames()
+    except Exception:
+        available = []
+    if not available:
+        QMessageBox.warning(
+            parent,
+            'No Printer',
+            'No printer is installed or available on this computer.',
+        )
+        return None
+
+    printer = QPrinter(QPrinter.HighResolution)
+    default_printer = QPrinterInfo.defaultPrinter()
+    if not default_printer.isNull():
+        printer.setPrinterName(default_printer.printerName())
+
+    dialog = QPrintDialog(printer, parent)
+    if dialog.exec() != QPrintDialog.Accepted:
+        return None
+    return printer
+
+
+class _AttachmentPrintWorker(QObject):
+    """Downloads selected attachments and builds one combined PDF off the GUI
+    thread. Remote clients use download_attachment() for the bytes, so no
+    Host-local path is ever required."""
+
+    progress = Signal(int, int, str)
+    finished = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, database, records):
+        super().__init__()
+        self.database = database
+        self.records = list(records)
+
+    @Slot()
+    def run(self):
+        worker_db = self.database
+        close_worker_db = False
+        temp_directory = None
+        output_path = None
+        builder = None
+        result = {
+            'pdf_path': None,
+            'page_count': 0,
+            'included': [],
+            'warnings': [],
+            'cancelled': False,
+        }
+        try:
+            worker_db, close_worker_db = _worker_database(self.database)
+            temp_directory = Path(tempfile.mkdtemp(prefix='pylocalinventory-print-'))
+            output_path = temp_directory / 'attachments.pdf'
+            total = len(self.records)
+
+            # A lone PDF already is a complete print document; pass its exact
+            # bytes through instead of rasterising and re-encoding it.
+            if total == 1 and str(self.records[0].get('mime_type') or '').lower() == 'application/pdf':
+                record = self.records[0]
+                name = _attachment_print_name(record)
+                self.progress.emit(0, 1, name)
+                if QThread.currentThread().isInterruptionRequested():
+                    result['cancelled'] = True
+                else:
+                    try:
+                        data = base64.b64decode(worker_db.download_attachment(record['id']))
+                        if not data:
+                            raise ValueError('the downloaded PDF is empty')
+                        output_path.write_bytes(data)
+                        result['pdf_path'] = str(output_path)
+                        result['included'].append(record.get('id'))
+                    except Exception as exc:
+                        result['warnings'].append(f'{name}: {exc}')
+                self.progress.emit(1, 1, name)
+            else:
+                for index, record in enumerate(self.records):
+                    if QThread.currentThread().isInterruptionRequested():
+                        result['cancelled'] = True
+                        break
+                    name = _attachment_print_name(record)
+                    self.progress.emit(index, total, name)
+                    mime_type = str(record.get('mime_type') or '').lower()
+                    if mime_type != 'application/pdf' and not mime_type.startswith('image/'):
+                        result['warnings'].append(
+                            f"{name}: unsupported file type ({mime_type or 'unknown'}) - skipped."
+                        )
+                        self.progress.emit(index + 1, total, name)
+                        continue
+                    try:
+                        data = base64.b64decode(worker_db.download_attachment(record['id']))
+                        if not data:
+                            raise ValueError('the downloaded file is empty')
+                        if mime_type.startswith('image/'):
+                            image = QImage.fromData(data)
+                            if image.isNull():
+                                raise ValueError('the image is invalid or unreadable')
+                            if builder is None:
+                                builder = _CombinedAttachmentPdf(output_path)
+                            builder.add_image(image)
+                        else:
+                            if builder is None:
+                                builder = _CombinedAttachmentPdf(output_path)
+                            builder.add_pdf(data)
+                        result['included'].append(record.get('id'))
+                    except Exception as exc:
+                        result['warnings'].append(f'{name}: {exc}')
+                    self.progress.emit(index + 1, total, name)
+
+                if builder is not None:
+                    result['page_count'] = builder.page_count
+                    builder.close()
+                    builder = None
+                    if result['page_count'] > 0 and output_path.is_file() and output_path.stat().st_size > 0:
+                        result['pdf_path'] = str(output_path)
+
+            if QThread.currentThread().isInterruptionRequested():
+                result['cancelled'] = True
+            if result['pdf_path'] and output_path.is_file() and output_path.stat().st_size > 0:
+                result['pdf_path'] = str(output_path)
+            else:
+                result['pdf_path'] = None
+            if result['cancelled']:
+                result['pdf_path'] = None
+            if result['pdf_path'] is None:
+                _cleanup_print_artifacts(output_path)
+            self.finished.emit(result)
+        except Exception as exc:
+            if builder is not None:
+                try:
+                    builder.close()
+                except Exception:
+                    pass
+                builder = None
+            if output_path is not None:
+                _cleanup_print_artifacts(output_path)
+            elif temp_directory is not None:
+                shutil.rmtree(temp_directory, ignore_errors=True)
+            logger.exception("Preparing attachments for printing failed")
+            self.error.emit(str(exc))
+        finally:
+            if builder is not None:
+                try:
+                    builder.close()
+                except Exception:
+                    pass
+            if close_worker_db:
+                worker_db.close()
+
+
+def _print_combined_pdf(pdf_path, printer, progress_callback=None):
+    """Render a prepared PDF to one QPrinter in a single print operation.
+
+    This runs on the GUI thread because the Windows QPrinter backend must be
+    created and painted on the same thread. PDF loading/preparation has already
+    happened in a worker; this step only streams pages to the printer. The PDF
+    is read into memory first so Windows never locks the temporary file while
+    printing. All pages share one QPrinter/QPainter job, with newPage()
+    separating them and each page keeping its landscape/portrait orientation.
+
+    The temporary source PDF is always removed before this function returns.
+    """
+    path = Path(pdf_path)
+    document = None
+    buffer = None
+    painter = None
+
+    _ensure_windows_ole()
+
+    def report(completed, total):
+        if progress_callback is None:
+            return
+        try:
+            progress_callback(completed, total)
+        except Exception:
+            logger.exception('Could not update the attachment print progress')
+
+    try:
+        try:
+            from PySide6.QtPdf import QPdfDocument
+        except ImportError as exc:
+            raise RuntimeError(
+                'Qt PDF support is not available in this build; install '
+                'PySide6 with the QtPdf module to print attachments.'
+            ) from exc
+
+        if not path.is_file():
+            raise RuntimeError('The combined print document no longer exists.')
+        data = path.read_bytes()
+        if not data:
+            raise RuntimeError('The combined print document is empty.')
+
+        buffer = QBuffer()
+        buffer.setData(data)
+        if not buffer.open(QIODevice.ReadOnly):
+            raise RuntimeError('The combined print document could not be opened.')
+
+        document = QPdfDocument()
+        document.load(buffer)
+        if document.status() != QPdfDocument.Status.Ready:
+            raise RuntimeError('The combined print document is not a valid PDF.')
+        total = int(document.pageCount())
+        if total <= 0:
+            raise RuntimeError('The combined print document contains no pages.')
+
+        first_page, last_page = 1, total
+        if printer.printRange() == QPrinter.PageRange:
+            first_page = max(1, int(printer.fromPage() or 1))
+            last_page = min(total, int(printer.toPage() or total))
+            if first_page > last_page:
+                raise RuntimeError('The selected printer page range is empty.')
+        page_indexes = list(range(first_page - 1, last_page))
+        report(0, len(page_indexes))
+
+        base_layout = printer.pageLayout()
+        base_page_size = base_layout.pageSize()
+        base_margins = base_layout.margins()
+        base_units = base_layout.units()
+
+        def layout_for_page(index):
+            size = document.pagePointSize(index)
+            orientation = (
+                QPageLayout.Landscape
+                if size.width() > size.height()
+                else QPageLayout.Portrait
+            )
+            return QPageLayout(
+                base_page_size,
+                orientation,
+                base_margins,
+                base_units,
+            )
+
+        # Establish the first page's orientation before opening the painter,
+        # then change layout before every subsequent newPage().
+        printer.setPageLayout(layout_for_page(page_indexes[0]))
+        painter = QPainter(printer)
+        if not painter.isActive():
+            raise RuntimeError('The selected printer could not be opened.')
+
+        resolution = max(72, int(printer.resolution() or 300))
+        render_dpi = min(resolution, _PRINT_PRINTER_MAX_DPI)
+        for printed_count, index in enumerate(page_indexes):
+            if printed_count:
+                printer.setPageLayout(layout_for_page(index))
+                if not printer.newPage():
+                    raise RuntimeError('The printer rejected a new page.')
+
+            point_size = document.pagePointSize(index)
+            render_size = QSize(
+                max(1, round(point_size.width() * render_dpi / 72.0)),
+                max(1, round(point_size.height() * render_dpi / 72.0)),
+            )
+            image = document.render(index, render_size)
+            if image.isNull():
+                raise RuntimeError(f'Page {index + 1} could not be rendered.')
+
+            width, height = printer.width(), printer.height()
+            target = image.size().scaled(
+                QSize(width, height), Qt.KeepAspectRatio
+            )
+            if target != image.size():
+                image = image.scaled(
+                    target,
+                    Qt.KeepAspectRatio,
+                    Qt.SmoothTransformation,
+                )
+            painter.drawImage(
+                (width - target.width()) // 2,
+                (height - target.height()) // 2,
+                image,
+            )
+            report(printed_count + 1, len(page_indexes))
+
+        ended = painter.end()
+        painter = None
+        if not ended:
+            raise RuntimeError('The print job could not be completed.')
+        if printer.printerState() in (
+                QPrinter.PrinterState.Error,
+                QPrinter.PrinterState.Aborted):
+            raise RuntimeError('The printer reported an error.')
+        return len(page_indexes)
+    except Exception:
+        if painter is not None:
+            try:
+                painter.end()
+            except Exception:
+                pass
+        logger.exception('Printing combined attachments failed')
+        raise
+    finally:
+        if document is not None:
+            try:
+                document.close()
+            except Exception:
+                pass
+        if buffer is not None:
+            try:
+                buffer.close()
+            except Exception:
+                pass
+        _cleanup_print_artifacts(path)
+
+
 def _scan_with_windows_wia(output_path):
     """Open the Windows WIA scanner UI and save one scanned page as PNG."""
     powershell = shutil.which('powershell.exe') or shutil.which('powershell')
@@ -394,6 +845,11 @@ class AttachmentPanel(QWidget):
         self._transfer_worker = None
         self._download_record = None
         self._download_completed = None
+        self._print_thread = None
+        self._print_worker = None
+        self._print_progress = None
+        self._print_busy = False
+        self.print_button = None
         self._closing = False
         self.client_sales_table = None
         self.client_sales_empty = None
@@ -447,6 +903,8 @@ class AttachmentPanel(QWidget):
         actions = QHBoxLayout()
         for label, slot in [('Preview', self.preview), ('Open', self.open_selected), ('Export', self.export_selected), ('Print', self.print_selected), ('Rename', self.rename_selected), ('Delete', self.delete_selected)]:
             button = QPushButton(label); button.clicked.connect(slot); actions.addWidget(button)
+            if label == 'Print':
+                self.print_button = button
         actions.addStretch(); layout.addLayout(actions)
         if self.entity_type == 'client':
             self.refresh_all_data()
@@ -787,7 +1245,9 @@ class AttachmentPanel(QWidget):
             "[CLIENT ATTACHMENTS DEBUG] panel=%s client_id=%s closing",
             id(self), self.entity_id,
         )
-        for thread in (self._fetch_thread, self._sales_thread, self._transfer_thread):
+        self._close_print_progress()
+        for thread in (self._fetch_thread, self._sales_thread,
+                       self._transfer_thread, self._print_thread):
             if thread is not None and thread.isRunning():
                 thread.requestInterruption()
 
@@ -1074,20 +1534,243 @@ class AttachmentPanel(QWidget):
         self._start_download(jobs, lambda _results: None)
 
     def print_selected(self):
+        """Print every selected attachment as one combined PDF / print job."""
         records = self._selected()
         if not records:
+            QMessageBox.information(
+                self,
+                'Print attachments',
+                'Select one or more attachments to print.',
+            )
             return
-        directory = Path(os.getenv('TEMP') or '.')
-        def print_results(results):
-            for record, path, _data in results:
-                try:
-                    os.startfile(path, 'print')
-                except Exception as exc:
-                    logger.exception("Print failed for attachment %s", record.get('id'))
-                    QMessageBox.warning(self, 'Print', f'Could not print {record["display_name"]}: {exc}')
-        self._start_download(
-            [(record, directory / record['original_filename']) for record in records], print_results,
+        if self._print_busy or self._print_thread is not None:
+            QMessageBox.information(
+                self,
+                'Print attachments',
+                'A print job is already being prepared. Please wait for it to finish.',
+            )
+            return
+        self._start_print(records)
+
+    def _start_print(self, records):
+        if self._print_busy or self._print_thread is not None:
+            return
+        self._print_busy = True
+        thread = QThread()
+        worker = _AttachmentPrintWorker(self.database, records)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.progress.connect(self._on_print_progress)
+        worker.finished.connect(self._on_print_finished)
+        worker.error.connect(self._on_print_error)
+        worker.finished.connect(thread.quit, Qt.DirectConnection)
+        worker.error.connect(thread.quit, Qt.DirectConnection)
+        thread.finished.connect(lambda t=thread: _release_attachment_job(t))
+        thread.finished.connect(worker.deleteLater)
+        thread.finished.connect(self._on_print_thread_finished)
+        thread.finished.connect(thread.deleteLater)
+        self._print_thread = thread
+        self._print_worker = worker
+        _active_attachment_threads.add(thread)
+        _active_attachment_jobs[thread] = worker
+        if len(records) > 1:
+            progress = QProgressDialog(
+                'Preparing selected attachments for printing…',
+                'Cancel',
+                0,
+                len(records),
+                self,
+            )
+            progress.setWindowTitle('Print attachments')
+            progress.setWindowModality(Qt.WindowModal)
+            progress.setMinimumDuration(0)
+            progress.setAutoClose(False)
+            progress.setAutoReset(False)
+            progress.canceled.connect(self._cancel_print)
+            self._print_progress = progress
+            progress.show()
+        if self.print_button is not None:
+            self.print_button.setEnabled(False)
+        thread.start()
+
+    @Slot(int, int, str)
+    def _on_print_progress(self, completed, total, name):
+        progress = self._print_progress
+        if progress is None:
+            return
+        progress.setMaximum(max(1, int(total)))
+        progress.setValue(min(int(completed), int(total)))
+        progress.setLabelText(
+            f'Preparing {name} ({min(int(completed) + 1, int(total))} of {int(total)})…'
         )
+
+    @Slot()
+    def _cancel_print(self):
+        thread = self._print_thread
+        if thread is not None and thread.isRunning():
+            thread.requestInterruption()
+        progress = self._print_progress
+        if progress is not None:
+            progress.setLabelText('Cancelling printing preparation…')
+            progress.setCancelButton(None)
+
+    def _close_print_progress(self):
+        progress, self._print_progress = self._print_progress, None
+        if progress is not None:
+            progress.close()
+            progress.deleteLater()
+
+    @Slot(object)
+    def _on_print_finished(self, result):
+        self._close_print_progress()
+        result = result or {}
+        pdf_path = result.get('pdf_path')
+        if self._closing:
+            if pdf_path:
+                _cleanup_print_artifacts(pdf_path)
+            self._finish_print_workflow()
+            return
+        warnings = list(result.get('warnings') or [])
+        if result.get('cancelled'):
+            if pdf_path:
+                _cleanup_print_artifacts(pdf_path)
+            QMessageBox.information(self, 'Print attachments', 'Printing was cancelled.')
+            self._finish_print_workflow()
+            return
+        if not pdf_path:
+            detail = '\n'.join(warnings) if warnings else 'No printable attachments were found.'
+            QMessageBox.warning(
+                self,
+                'Nothing was printed',
+                f'No print job was sent because no attachment could be prepared:\n\n{detail}',
+            )
+            self._finish_print_workflow()
+            return
+        self._start_native_print(pdf_path, warnings)
+
+    def _start_native_print(self, pdf_path, warnings):
+        """Show the print dialog once, then stream the PDF to that printer."""
+        if self._closing:
+            _cleanup_print_artifacts(pdf_path)
+            self._finish_print_workflow()
+            return
+        try:
+            printer = _choose_print_printer(self)
+        except Exception as exc:
+            logger.exception("Could not open the attachment print dialog")
+            _cleanup_print_artifacts(pdf_path)
+            QMessageBox.warning(
+                self,
+                'Print',
+                f'Could not open the printer selection dialog:\n{exc}',
+            )
+            self._finish_print_workflow()
+            return
+        if printer is None:
+            # Either the dialog was cancelled or no printer is available;
+            # _choose_print_printer already warned for the latter.
+            _cleanup_print_artifacts(pdf_path)
+            self._finish_print_workflow()
+            return
+        if self._closing:
+            _cleanup_print_artifacts(pdf_path)
+            self._finish_print_workflow()
+            return
+        if warnings:
+            QMessageBox.warning(
+                self,
+                'Some attachments were not printed',
+                'These files could not be included in the combined print job:\n\n'
+                + '\n'.join(warnings),
+            )
+        self._print_native_document(pdf_path, printer)
+
+    def _print_native_document(self, pdf_path, printer):
+        """Paint every prepared page through the dialog's one QPrinter job."""
+        self._print_busy = True
+        progress = QProgressDialog(
+            'Sending the combined document to the printer…',
+            '',
+            0,
+            0,
+            self,
+        )
+        progress.setWindowTitle('Print attachments')
+        progress.setWindowModality(Qt.WindowModal)
+        progress.setMinimumDuration(0)
+        progress.setAutoClose(False)
+        progress.setAutoReset(False)
+        progress.setCancelButton(None)
+        self._print_progress = progress
+        progress.show()
+        progress.repaint()
+        try:
+            pages = _print_combined_pdf(
+                pdf_path,
+                printer,
+                self._on_printer_progress,
+            )
+            logger.info("Printed %s attachment page(s) in one print job", pages)
+        except Exception as exc:
+            logger.exception("Could not print the combined attachments")
+            # _print_combined_pdf cleans up in its finally block. Retry only
+            # when the failure happened before that cleanup could run.
+            if Path(pdf_path).exists():
+                _cleanup_print_artifacts(pdf_path)
+            self._close_print_progress()
+            if not self._closing:
+                detail = str(exc) or exc.__class__.__name__
+                QMessageBox.warning(
+                    self,
+                    'Print',
+                    f'Could not print the combined document:\n{detail}',
+                )
+        finally:
+            self._close_print_progress()
+            self._finish_print_workflow()
+
+    @Slot(int, int)
+    def _on_printer_progress(self, completed, total):
+        progress = self._print_progress
+        if progress is None:
+            return
+        total = max(1, int(total))
+        completed = max(0, min(int(completed), total))
+        progress.setMaximum(total)
+        progress.setValue(completed)
+        progress.setLabelText(
+            f'Printing page {max(1, completed)} of {total}…'
+        )
+        progress.repaint()
+
+    def _finish_print_workflow(self):
+        """Re-enable Print once PDF preparation has finished."""
+        self._close_print_progress()
+        if self._print_thread is not None:
+            return
+        self._print_busy = False
+        if self._closing:
+            return
+        if self.print_button is not None:
+            self.print_button.setEnabled(True)
+
+    @Slot(str)
+    def _on_print_error(self, error):
+        self._close_print_progress()
+        if self._closing:
+            return
+        QMessageBox.warning(
+            self,
+            'Print',
+            f'Could not prepare the selected attachments for printing:\n{error}',
+        )
+        self._finish_print_workflow()
+
+    @Slot()
+    def _on_print_thread_finished(self):
+        self._print_thread = None
+        self._print_worker = None
+        self._finish_print_workflow()
 
     def rename_selected(self):
         selected = self._selected()

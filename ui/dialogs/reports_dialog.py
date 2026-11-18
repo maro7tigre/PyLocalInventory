@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 from core import diagnostics
-from core.report_context import company_context, profile_logo_bytes
+from core.report_context import company_context, profile_logo_bytes, report_profile
 from decimal import Decimal, InvalidOperation
 import traceback
 import time
@@ -360,9 +360,7 @@ class ReportsDialog(QDialog):
         # Get current profile path
         if database is None:
             database = getattr(self.sales_obj, 'database', None)
-        profile = getattr(self.profile_manager, "selected_profile", None)
-        if not profile:
-            profile = getattr(database, "remote_profile", None)
+        profile = report_profile(database, self.profile_manager)
         if not profile:
             raise Exception("The host did not provide report profile details")
         self._active_profile = profile
@@ -479,11 +477,7 @@ class ReportsDialog(QDialog):
             # Get profile data
             profile = (
                 getattr(self, "_active_profile", None)
-                or getattr(self.profile_manager, "selected_profile", None)
-                or getattr(
-                    getattr(self.sales_obj, "database", None),
-                    "remote_profile", None,
-                )
+                or report_profile(getattr(self.sales_obj, "database", None), self.profile_manager)
             )
             if not profile:
                 raise RuntimeError("Report profile details are unavailable")

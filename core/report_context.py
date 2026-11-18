@@ -22,6 +22,20 @@ REPORT_PROFILE_KEYS = (
 )
 
 
+def report_profile(database=None, profile_manager=None):
+    """The profile whose company details belong on printed documents.
+
+    A LAN client still has a local profile selected (remembered from earlier
+    sessions), but it prints on behalf of the host, so the host-supplied
+    ``remote_profile`` always wins over the local selection.
+    """
+    remote = getattr(database, "remote_profile", None)
+    if remote is not None:
+        return remote
+    manager = profile_manager or getattr(database, "profile_manager", None)
+    return getattr(manager, "selected_profile", None)
+
+
 def _value(profile, key):
     if profile is None:
         return ""

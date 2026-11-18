@@ -24,7 +24,7 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox,
                                QVBoxLayout)
 
 from core.calculations import to_decimal
-from core.report_context import company_context
+from core.report_context import company_context, report_profile
 from core.runtime_paths import resource_path, local_reports_dir
 from ui.widgets.themed_widgets import RedButton
 
@@ -113,11 +113,7 @@ class _ImportBdlWorker(QObject):
 
     def _active_profile(self):
         """Local profile, or the host-supplied one on LAN clients."""
-        profile = getattr(self.profile_manager, "selected_profile", None)
-        if profile is None:
-            database = getattr(self.import_obj, "database", None)
-            profile = getattr(database, "remote_profile", None)
-        return profile
+        return report_profile(getattr(self.import_obj, "database", None), self.profile_manager)
 
     def _generate_html(self, import_id, bl_number):
         """Render the import Bon de Livraison from the selected import only."""

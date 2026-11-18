@@ -41,6 +41,32 @@ def user_data_root():
     return root
 
 
+def shared_data_root():
+    """Data shared by the SCM service and interactive desktop application.
+
+    Before the Windows Service is installed, retain the legacy per-user path.
+    The installer copies existing attachment files into ProgramData without
+    deleting the originals.
+    """
+    override = os.getenv("PYLOCALINVENTORY_SHARED_DATA_ROOT")
+    if override:
+        root = override
+    else:
+        program_data = os.getenv("PROGRAMDATA")
+        service_root = (
+            os.path.join(program_data, "PyLocalInventory", "LANService")
+            if program_data else ""
+        )
+        service_data = os.path.join(service_root, "data") if service_root else ""
+        root = (
+            service_data
+            if service_data and os.path.isdir(service_data)
+            else user_data_root()
+        )
+    os.makedirs(root, exist_ok=True)
+    return root
+
+
 def portable_dir(name):
     """Return writable per-user storage, seeding existing/bundled data once."""
     target = os.path.join(user_data_root(), name)

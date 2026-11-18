@@ -1595,12 +1595,21 @@ class DatabaseServer:
                 self._handle_request(endpoint, action)
 
             def do_GET(self):
-                endpoint = self.path if self.path in ('/backup', '/health') else 'unknown'
+                endpoint = self.path if self.path in ('/backup', '/health', '/service-health') else 'unknown'
                 self._handle_request(endpoint, lambda: self._handle_get(endpoint))
 
             def _handle_get(self, endpoint):
-                if endpoint not in ('/backup', '/health'):
+                if endpoint not in ('/backup', '/health', '/service-health'):
                     return self._send_json(404, {'error': 'not found'})
+                if endpoint == '/service-health':
+                    # Loopback supervisor probe: intentionally contains no
+                    # database, profile, session, or user information.
+                    if self.client_address[0] not in ('127.0.0.1', '::1'):
+                        return self._send_json(404, {'error': 'not found'})
+                    return self._send_json(200, {
+                        'http_responsive': True,
+                        'listener_available': server_obj._listener_available(),
+                    })
                 auth_header = self.headers.get("Authorization") or ""
                 token = auth_header[7:] if auth_header.startswith("Bearer ") else ""
                 user = server_obj.sessions.get(token) if token else None

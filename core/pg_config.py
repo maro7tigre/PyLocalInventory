@@ -10,7 +10,9 @@ from core.runtime_paths import portable_dir
 
 import psycopg2
 
-CONFIG_PATH = os.path.join(portable_dir("profiles"), "_server_config.json")
+CONFIG_PATH = os.getenv("PYLOCALINVENTORY_PG_CONFIG") or os.path.join(
+    portable_dir("profiles"), "_server_config.json"
+)
 
 DEFAULT_CONFIG = {
     "host": "localhost",
@@ -23,27 +25,43 @@ DEFAULT_CONFIG = {
 }
 
 
+def _config_path():
+    return os.getenv("PYLOCALINVENTORY_PG_CONFIG") or CONFIG_PATH
+
+
 def load_server_config():
     """Load Postgres connection settings, creating a default file if absent."""
-    if not os.path.exists(CONFIG_PATH):
+    path = _config_path()
+    if not os.path.exists(path):
         save_server_config(DEFAULT_CONFIG)
         return dict(DEFAULT_CONFIG)
 
     try:
-        with open(CONFIG_PATH, 'r', encoding='utf-8') as f:
+        with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
         config = dict(DEFAULT_CONFIG)
         config.update(data)
+        protected = config.pop("password_dpapi", None)
+        if protected is not None:
+            from core.network.windows_service import unprotect_machine_secret
+            config["password"] = unprotect_machine_secret(protected)
         return config
     except Exception as e:
+        if os.getenv("PYLOCALINVENTORY_PG_CONFIG"):
+            raise RuntimeError(
+                "Unable to load the Windows Service PostgreSQL configuration"
+            ) from e
         print(f"Failed to load Postgres server config, using defaults: {e}")
         return dict(DEFAULT_CONFIG)
 
 
 def save_server_config(config):
     """Persist Postgres connection settings."""
-    os.makedirs(os.path.dirname(CONFIG_PATH), exist_ok=True)
-    with open(CONFIG_PATH, 'w', encoding='utf-8') as f:
+    path = _config_path()
+    if os.getenv("PYLOCALINVENTORY_PG_CONFIG"):
+        raise RuntimeError("The Windows Service PostgreSQL configuration is read-only")
+    os.makedirs(os.path.dirname(path), exist_ok=True)
+    with open(path, 'w', encoding='utf-8') as f:
         json.dump(config, f, indent=2)
 
 

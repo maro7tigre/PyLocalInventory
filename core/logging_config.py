@@ -16,7 +16,11 @@ _LOG_PATH = None
 
 
 def _choose_log_directory():
-    candidates = (app_path("logs"), os.path.join(user_data_root(), "logs"))
+    override = os.getenv("PYLOCALINVENTORY_LOG_DIR")
+    candidates = (
+        (override,) if override else
+        (app_path("logs"), os.path.join(user_data_root(), "logs"))
+    )
     last_error = None
     for directory in candidates:
         try:

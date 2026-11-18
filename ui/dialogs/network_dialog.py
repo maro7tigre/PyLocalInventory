@@ -15,7 +15,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 
 from core.network.server import DatabaseServer
-from core.network.host_process import HostProcessController
+from core.network.windows_service import WindowsServiceController as HostProcessController
 from core.network.protocol import DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
 from core.user_manager import UserManager, MATRIX_SECTIONS
@@ -259,7 +259,11 @@ class NetworkDialog(QDialog):
 
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("Port:"))
-        self.port_input = QLineEdit(str(getattr(self.main_window, 'network_port', None) or DEFAULT_PORT))
+        service_config = HostProcessController.configuration()
+        configured_port = service_config.get(
+            "port", getattr(self.main_window, 'network_port', None) or DEFAULT_PORT
+        )
+        self.port_input = QLineEdit(str(configured_port))
         port_row.addWidget(self.port_input)
         form.addLayout(port_row)
 
@@ -270,16 +274,18 @@ class NetworkDialog(QDialog):
         self.toggle_btn.clicked.connect(self._toggle_hosting)
         form.addWidget(self.toggle_btn)
 
-        self.host_startup_checkbox = QCheckBox("Start hosting when this Windows user signs in")
-        self.host_startup_checkbox.setChecked(HostProcessController.startup_enabled())
-        self.host_startup_checkbox.stateChanged.connect(self._host_startup_changed)
-        form.addWidget(self.host_startup_checkbox)
+        self.service_startup_label = QLabel(
+            "Windows boot startup: "
+            + ("Automatic" if HostProcessController.startup_enabled() else "Service not installed")
+        )
+        form.addWidget(self.service_startup_label)
 
         note = QLabel(
             "Other PyLocalInventory users on this network can connect using the IP "
             "above, this port, and a username/password created in the Users tab.\n"
-            "The LAN host runs in a separate background process and continues after "
-            "this desktop window closes. Windows Firewall may prompt the first time."
+            "The LAN host runs as a Windows Service before user login and remains "
+            "independent from this desktop application. Administrator rights may be "
+            "required to start or stop the service."
         )
         note.setWordWrap(True)
         form.addWidget(note)
@@ -288,7 +294,7 @@ class NetworkDialog(QDialog):
 
     def _refresh_hosting_status(self):
         # Keep legacy in-process objects visible for old sessions/tests, while
-        # production hosting is owned by the detached supervisor.
+        # production hosting is owned by the Windows Service supervisor.
         server = getattr(self.main_window, 'network_server', None)
         external = HostProcessController.status() if server is None else None
         running = bool(server and server.is_running) if server is not None else bool(
@@ -310,7 +316,24 @@ class NetworkDialog(QDialog):
         )
         self.toggle_btn.setText("Stop Hosting" if controllable_process else "Start Hosting")
         self.ip_label.setText(f"Your LAN IP: {DatabaseServer.local_ip()}" if running else "")
-        self.port_input.setEnabled(not controllable_process)
+        service_installed = bool(external and external.get('service_installed'))
+        self.port_input.setEnabled(not service_installed and not controllable_process)
+        self.port_input.setToolTip(
+            "Rerun the administrator install script to change the service port."
+            if service_installed else ""
+        )
+        startup_label = getattr(self, 'service_startup_label', None)
+        if startup_label is not None:
+            startup_label.setText(
+                "Windows boot startup: "
+                + (
+                    "Automatic"
+                    if external and external.get('startup_automatic')
+                    else "Manual"
+                    if service_installed
+                    else "Service not installed"
+                )
+            )
         detail_label = getattr(self, 'status_detail_label', None)
         if detail_label is not None:
             detail_label.setText(self._hosting_detail(server_present, running, snapshot))
@@ -441,8 +464,9 @@ class NetworkDialog(QDialog):
             )
         return (
             "Hosting has not been started since this application opened. "
-            "Press Start Hosting to launch the independent background host for this profile; "
-            "hosting does not resume automatically unless Windows startup is enabled. "
+            "Hosting does not resume automatically until the Windows Service is installed. "
+            "The LAN Windows Service is not currently running. Install it once with "
+            "scripts\\install_lan_service.ps1, then use Start Hosting. "
             f"{self._host_identity()}"
         )
 
@@ -450,28 +474,6 @@ class NetworkDialog(QDialog):
         snapshot = self._snapshot_of(server) if server is not None else None
         if snapshot is not None:
             self.main_window.host_last_snapshot = snapshot
-
-    def _host_startup_changed(self, _state):
-        """Persist the startup choice immediately, including while hosting."""
-        profile = self.main_window.profile_manager.selected_profile
-        if profile is None:
-            return
-        try:
-            port = int(self.port_input.text().strip() or DEFAULT_PORT)
-            if not 1 <= port <= 65535:
-                raise ValueError("Port must be between 1 and 65535")
-            HostProcessController.configure_startup(
-                self.host_startup_checkbox.isChecked(), profile.name, port
-            )
-        except Exception as error:
-            QMessageBox.warning(
-                self, "Hosting Startup",
-                f"Could not update Windows hosting startup: {error}",
-            )
-            actual = HostProcessController.startup_enabled()
-            self.host_startup_checkbox.blockSignals(True)
-            self.host_startup_checkbox.setChecked(actual)
-            self.host_startup_checkbox.blockSignals(False)
 
     def _toggle_hosting(self):
         server = getattr(self.main_window, 'network_server', None)
@@ -497,11 +499,27 @@ class NetworkDialog(QDialog):
             self.main_window.network_server = None
 
         if external and external.get('process_alive'):
-            HostProcessController.stop()
+            try:
+                HostProcessController.stop()
+            except Exception as error:
+                QMessageBox.critical(
+                    self, "Could not stop hosting",
+                    f"Windows Service Control Manager rejected the stop request:\n{error}\n\n"
+                    "Run PyLocalInventory as Administrator and try again.",
+                )
+                return
             self.main_window.host_last_snapshot = external
             self.status_label.setText("Status: Stopping")
             self.toggle_btn.setEnabled(False)
             QTimer.singleShot(1000, self._finish_host_toggle)
+            return
+
+        if not HostProcessController.installed():
+            QMessageBox.information(
+                self, "LAN Service Not Installed",
+                "Install the Windows Service once from an Administrator PowerShell:\n\n"
+                ".\\scripts\\install_lan_service.ps1 -ProfileName \"Your Profile\" -Port 8765",
+            )
             return
 
         if not self.user_manager.has_any_superadmin():
@@ -529,13 +547,7 @@ class NetworkDialog(QDialog):
         try:
             logger.info('host_start_requested port=%d pid=%d build_id=%s',
                         port, os.getpid(), APP_BUILD_ID)
-            profile = self.main_window.profile_manager.selected_profile
-            if profile is None:
-                raise RuntimeError("No unlocked profile is selected")
-            HostProcessController.configure_startup(
-                self.host_startup_checkbox.isChecked(), profile.name, port
-            )
-            HostProcessController.start(profile.name, port)
+            HostProcessController.start()
         except Exception as e:
             logger.error('host_start_failed_from_ui port=%d category=%s pid=%d',
                          port, type(e).__name__, os.getpid())

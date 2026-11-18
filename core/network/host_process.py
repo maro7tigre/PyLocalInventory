@@ -15,13 +15,16 @@ from pathlib import Path
 import subprocess
 import sys
 import time
+import urllib.request
 
 from core.build_info import APP_BUILD_ID
 from core.runtime_paths import app_root, user_data_root
 
 logger = logging.getLogger(__name__)
 
-HOST_DIR = Path(user_data_root()) / "lan-host"
+HOST_DIR = Path(
+    os.getenv("PYLOCALINVENTORY_HOST_DIR") or (Path(user_data_root()) / "lan-host")
+)
 STATUS_PATH = HOST_DIR / "status.json"
 STOP_PATH = HOST_DIR / "stop.request"
 LOCK_PATH = HOST_DIR / "supervisor.lock"
@@ -97,12 +100,27 @@ def _host_command(profile_name, port):
         return [sys.executable, *arguments]
     # Use an absolute entry-point path so an HKCU Run launch works even when
     # Windows supplies System32 (rather than the repository) as the cwd.
-    return [sys.executable, os.path.join(app_root(), "main.py"), *arguments]
+    python_executable = os.getenv("PYLOCALINVENTORY_PYTHON_EXE") or sys.executable
+    entrypoint = os.getenv("PYLOCALINVENTORY_ENTRYPOINT") or os.path.join(app_root(), "main.py")
+    return [python_executable, entrypoint, *arguments]
 
 
 def _worker_command(profile_name, port, supervisor_pid):
     command = _host_command(profile_name, port)
     return [*command, "--worker", "--supervisor-pid", str(int(supervisor_pid))]
+
+
+def _http_worker_healthy(port):
+    try:
+        with urllib.request.urlopen(
+                f"http://127.0.0.1:{int(port)}/service-health", timeout=3) as response:
+            payload = json.loads(response.read().decode("utf-8"))
+        return bool(
+            response.status == 200 and payload.get("http_responsive")
+            and payload.get("listener_available")
+        )
+    except Exception:
+        return False
 
 
 class HostProcessController:
@@ -284,9 +302,13 @@ def _run_server_worker(profile_name, port, supervisor_pid):
             if STOP_PATH.exists():
                 break
             try:
-                manager = ProfileManager()
-                if not manager.load_profile(profile_name):
-                    raise RuntimeError("Configured profile is not available")
+                if os.getenv("PYLOCALINVENTORY_SERVICE_PROFILE"):
+                    from core.network.windows_service import load_service_profile_manager
+                    manager = load_service_profile_manager(profile_name)
+                else:
+                    manager = ProfileManager()
+                    if not manager.load_profile(profile_name):
+                        raise RuntimeError("Configured profile is not available")
                 database = Database(manager)
                 _register_classes(database)
                 if not database.connect(initialize_schema=True):
@@ -353,7 +375,7 @@ def _run_server_worker(profile_name, port, supervisor_pid):
         worker_lock.close()
 
 
-def run_supervisor(profile_name, port):
+def run_supervisor(profile_name, port, clear_stop_request=True):
     """Supervise the server worker process until an explicit stop request.
 
     Keeping supervision in a separate process means an unhandled worker
@@ -367,10 +389,11 @@ def run_supervisor(profile_name, port):
         logger.error("LAN host supervisor is already running")
         return 2
     try:
-        try:
-            STOP_PATH.unlink()
-        except FileNotFoundError:
-            pass
+        if clear_stop_request:
+            try:
+                STOP_PATH.unlink()
+            except FileNotFoundError:
+                pass
         failure_streak = 0
         restart_count = 0
         while not STOP_PATH.exists():
@@ -382,7 +405,31 @@ def run_supervisor(profile_name, port):
                 creationflags=(subprocess.CREATE_NO_WINDOW if sys.platform.startswith("win") else 0),
             )
             worker_started = time.monotonic()
+            next_health_probe = worker_started + 10
+            health_failures = 0
             while worker.poll() is None and not STOP_PATH.exists():
+                now = time.monotonic()
+                if now >= next_health_probe:
+                    next_health_probe = now + 10
+                    status = _read_json(STATUS_PATH) or {}
+                    if (status.get("worker_pid") == worker.pid
+                            and status.get("state") == "running"):
+                        if _http_worker_healthy(port):
+                            health_failures = 0
+                        else:
+                            health_failures += 1
+                            logger.warning(
+                                "LAN HTTP health probe failed count=%d worker_pid=%d",
+                                health_failures, worker.pid,
+                            )
+                            if health_failures >= 3:
+                                logger.error("LAN worker is unresponsive; restarting it")
+                                worker.terminate()
+                                break
+                    else:
+                        # PostgreSQL/startup recovery is healthy supervisor
+                        # activity even though no HTTP listener exists yet.
+                        health_failures = 0
                 time.sleep(0.5)
             if STOP_PATH.exists():
                 try:

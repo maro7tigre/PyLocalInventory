@@ -11,7 +11,7 @@ import uuid
 from datetime import datetime
 from pathlib import Path
 
-from core.runtime_paths import safe_windows_component, user_data_root
+from core.runtime_paths import safe_windows_component, shared_data_root
 
 logger = logging.getLogger(__name__)
 
@@ -34,7 +34,7 @@ def storage_root(database) -> Path:
     identity = safe_windows_component(
         getattr(database, "database_name", None) or getattr(database, "schema_name", None) or "default"
     )
-    root = Path(user_data_root()) / "attachments" / identity
+    root = Path(shared_data_root()) / "attachments" / identity
     root.mkdir(parents=True, exist_ok=True)
     return root
 

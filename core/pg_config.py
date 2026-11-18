@@ -16,7 +16,7 @@ DEFAULT_CONFIG = {
     "host": "localhost",
     "port": 5432,
     "maintenance_database": "postgres",
-    "database": "pylocalinventory",
+    "database": "lamidap",
     "user": "",
     "password": "",
     "postgres_bin_dir": "",

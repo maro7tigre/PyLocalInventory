@@ -7,4 +7,4 @@ from the logs, that a given machine is running the build that contains a
 given fix rather than a stale one.
 """
 
-APP_BUILD_ID = "profile-branding-2026-11-18-v2"
+APP_BUILD_ID = "headless-server-2026-11-18-v1"

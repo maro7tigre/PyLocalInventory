@@ -340,9 +340,7 @@ class ProfileClass:
         self.database_name = None
         self.schema_name = None
         self.parameters = {
-            "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "", "options": [], "type": "string"},
-            # Business line shown next to the company name in report footers
-            "activity": {"value": None, "display name": {"en": "activity", "fr": "activité", "es": "actividad"}, "required": False, "default": "", "options": [], "type": "string"},
+            "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
             "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": False, "default": "", "options": [], "type": "string"},
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
             "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"},
@@ -362,7 +360,7 @@ class ProfileClass:
         }
         self.available_parameters = {
             # Order determines display order in dialog
-            "dialog" : ["company name", "activity", "address", "email", "phone", "fax", "website", "ice", "patente", "if number", "rc", "cnss", "bank name", "bank account", "bank agency", "report footer"],
+            "dialog" : ["company name", "address", "email", "phone", "fax", "website", "ice", "patente", "if number", "rc", "cnss", "bank name", "bank account", "bank agency", "report footer"],
             "table" : ["company name"]
         }
         

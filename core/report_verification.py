@@ -32,14 +32,10 @@ def generate_verification_report():
     sale.database = None
 
     profile = _Values({
-        'company name': 'Societe Exemple SARL',
-        'activity': 'Activite de demonstration',
-        'phone': '+000 000 00 00 00',
-        'address': '1, Rue Exemple, 00000 Ville',
-        'email': 'contact@example.com',
-        'ice': '000000000000000',
-        'bank name': 'Banque Exemple',
-        'bank account': '000 000 0000000000000000 00',
+        'company name': 'LAMIDAP SARL',
+        'phone': '+212 539 39 45 60',
+        'address': '288, Zone Industrielle Gzenaya, 90000 Tanger',
+        'email': 'lamidap@gmail.com',
         'report footer': '',
     })
     manager = type('VerificationProfileManager', (), {'selected_profile': profile})()

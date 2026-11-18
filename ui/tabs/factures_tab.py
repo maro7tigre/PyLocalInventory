@@ -1292,9 +1292,10 @@ class FacturesTab(_FactureAsyncRequests, QWidget):
             render_facture_to_printer(printer, facture, payments, profile)
 
     def _get_report_profile(self):
-        """Host profile on LAN clients, otherwise the local selected profile."""
-        from core.report_context import report_profile
+        """Match the profile source order used by the existing report dialogs."""
+        profile_manager = getattr(self.database, "profile_manager", None)
         return (
-            report_profile(self.database)
+            getattr(profile_manager, "selected_profile", None)
             or getattr(getattr(self.window(), "profile_manager", None), "selected_profile", None)
+            or getattr(self.database, "remote_profile", None)
         )

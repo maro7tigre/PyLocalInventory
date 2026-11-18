@@ -40,7 +40,6 @@ from core.database import Database
 from core import pg_backup
 from core.attachments import DEFAULT_MAX_BYTES, attachment_backup_root
 from core.pg_config import load_server_config
-from core.report_context import LOGO_BASE64_KEY, REPORT_PROFILE_KEYS, profile_logo_base64
 from core.user_manager import UserManager, SECTION_GROUP
 from core.network.protocol import classify_sql, DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
@@ -1649,18 +1648,12 @@ class DatabaseServer:
                 )
                 profile_values = {}
                 if selected_profile:
-                    for key in REPORT_PROFILE_KEYS:
+                    for key in (
+                        "company name", "address", "email", "phone", "fax", "website",
+                        "ice", "patente", "if number", "rc", "cnss", "bank name",
+                        "bank account", "bank agency", "report footer", "currency",
+                    ):
                         profile_values[key] = selected_profile.get_value(key)
-                    # Clients cannot read the host's profile folder, so the
-                    # report logo travels with the login response.
-                    profile_values[LOGO_BASE64_KEY] = profile_logo_base64(selected_profile)
-                logger.info(
-                    'login_profile id=%s profile=%s logo_path=%s logo_bytes=%s',
-                    self._request_id,
-                    getattr(selected_profile, "name", None),
-                    getattr(selected_profile, "preview_path", None),
-                    len(profile_values.get(LOGO_BASE64_KEY) or "") * 3 // 4,
-                )
                 logger.info(
                     'login_accepted id=%s role_id=%s build_id=%s',
                     self._request_id, user.get('role_id'), APP_BUILD_ID,

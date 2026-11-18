@@ -2402,7 +2402,7 @@ class Database:
             return
 
         lock_target = self.database_name or self.schema_name
-        lock_key = f"pylocalinventory_migrate_{lock_target}"
+        lock_key = f"lamidap_migrate_{lock_target}"
         try:
             self.cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_key,))
         except Exception as e:

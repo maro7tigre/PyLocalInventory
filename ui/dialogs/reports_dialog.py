@@ -18,7 +18,7 @@ from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
 from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
 from core import diagnostics
-import base64
+from core.report_context import company_context, profile_logo_bytes
 from decimal import Decimal, InvalidOperation
 import traceback
 import time
@@ -450,19 +450,6 @@ class ReportsDialog(QDialog):
         
         return html_content
     
-    def _get_lamidap_logo_block(self):
-        """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
-        logo_path = resource_path('report', 'lamidap_logo.png')
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, 'rb') as img_f:
-            b64 = base64.b64encode(img_f.read()).decode('ascii')
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
-
     def _extract_sales_data(self, report_type: str, database=None):
         """Extract data from sales object"""
         try:
@@ -500,13 +487,8 @@ class ReportsDialog(QDialog):
             )
             if not profile:
                 raise RuntimeError("Report profile details are unavailable")
-            company_name = profile.get_value("company name") or "Your Company"
-            company_phone = profile.get_value("phone") or ""
-            company_address = profile.get_value("address") or ""
-            company_email = profile.get_value("email") or ""
+            company = company_context(profile)
             report_footer = profile.get_value("report footer") or ""
-
-            logo_block = self._get_lamidap_logo_block()
 
             # Extract sales data
             client_username = self.sales_obj.get_value('client_username') or ""
@@ -822,10 +804,7 @@ class ReportsDialog(QDialog):
             reste_a_livrer = 0
 
             return {
-                'company_name': company_name,
-                'company_phone': company_phone,
-                'company_address': company_address,
-                'company_email': company_email,
+                **company,
                 'report_footer': report_footer.replace('\n', '<br/>'),
                 'company_siret': "",  # Add if available in profile
                 'company_tva': "",    # Add if available in profile
@@ -849,8 +828,6 @@ class ReportsDialog(QDialog):
                 # BDL specific pricing fields
                 'tva': _fmt_fr(tva_amount),
                 'total_ttc': _fmt_fr(total_ttc),
-                # Logo block
-                'logo_block': logo_block
             }
         except Exception as e:
             raise RuntimeError(f"Could not extract report data: {e}") from e
@@ -904,7 +881,8 @@ class ReportsDialog(QDialog):
 
     def _log_report_resources(self, report_type, template_path):
         report_dir = resource_path('report')
-        logo_path = resource_path('report', 'lamidap_logo.png')
+        profile = getattr(self, "_active_profile", None)
+        logo_path = getattr(profile, "preview_path", None) or "profile logo (host-supplied or none)"
         browser_path = self._find_installed_chromium()
         self._write_report_log("\n".join([
             f"Frozen runtime: {bool(getattr(sys, 'frozen', False))}",
@@ -918,7 +896,7 @@ class ReportsDialog(QDialog):
             f"CSS source exists: {os.path.isfile(template_path)}",
             "Fonts: Arial/Helvetica system fonts (no custom font files referenced)",
             f"Logo: {logo_path}",
-            f"Logo exists: {os.path.isfile(logo_path)}",
+            f"Logo exists: {bool(profile_logo_bytes(profile))}",
             f"Chromium: {browser_path or 'not found'}",
             f"Chromium exists: {bool(browser_path and os.path.isfile(browser_path))}",
         ]))

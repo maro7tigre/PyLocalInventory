@@ -689,8 +689,7 @@ class SupplierWorkerTests(unittest.TestCase):
 
     def test_report_worker_full_statement_generates_complete_html(self):
         worker = self._full_statement_worker()
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
-            html = worker._generate_html()
+        html = worker._generate_html()
         self.assertNotIn("{{", html)
         self.assertIn("Relevé de Compte Fournisseur", html)
         self.assertIn("Fournisseur Alpha", html)
@@ -706,8 +705,7 @@ class SupplierWorkerTests(unittest.TestCase):
     def test_report_worker_selected_import_uses_detail_title(self):
         worker = self._full_statement_worker()
         worker.report_type = "selected_import"
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
-            html = worker._generate_html()
+        html = worker._generate_html()
         self.assertIn("Détail d'Importation", html)
         # The global/final account summary blocks are full-statement only.
         self.assertNotIn("Total des achats", html)
@@ -721,8 +719,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker.payments = []
         worker.bl_by_import = {1: ""}
         worker.historical_by_import = {1: True}
-        with patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
-            html = worker._generate_html()
+        html = worker._generate_html()
         self.assertIn("HISTORIQUE", html)
 
     def test_report_worker_raises_on_leftover_placeholder(self):
@@ -745,8 +742,7 @@ class SupplierWorkerTests(unittest.TestCase):
         worker = self._report_worker("full_statement")
         worker.imports = []
         worker.payments = []
-        with patch.object(sdd_module, "resource_path", side_effect=fake_resource_path), \
-                patch.object(_SupplierReportWorker, "_get_lamidap_logo_block", return_value="LOGO"):
+        with patch.object(sdd_module, "resource_path", side_effect=fake_resource_path):
             with self.assertRaises(RuntimeError):
                 worker._generate_html()
 

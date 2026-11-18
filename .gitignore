@@ -92,3 +92,7 @@ tests/*
 Thumbs.db
 #////////////////
 PyLocalinventory
+
+# Company branding never belongs in the repo (logo comes from the profile)
+report/*.png
+report/*.jpg

@@ -6,7 +6,6 @@ against an Import (import-level, no item targeting), and the statement
 reports are rendered through the supplier statement template.
 """
 
-import base64
 import html as html_lib
 import logging
 import os
@@ -40,6 +39,7 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 from core.calculations import calculate_operation_totals, to_decimal
+from core.report_context import company_context
 from core.runtime_paths import resource_path
 from ui.widgets.preview_widget import PreviewWidget
 
@@ -272,18 +272,11 @@ class _SupplierReportWorker(QObject):
                 except OSError:
                     pass
 
-    def _get_lamidap_logo_block(self):
-        logo_path = resource_path("report", "lamidap_logo.png")
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, "rb") as img_f:
-            b64 = base64.b64encode(img_f.read()).decode("ascii")
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; '
-            f'object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
+    def _company_placeholders(self):
+        """Company header/footer/logo placeholders built from the profile."""
+        empty = company_context(None)
+        info = self.company_info or {}
+        return {key: info.get(key, value) for key, value in empty.items()}
 
     @classmethod
     def _format_french_date(cls, value):
@@ -425,7 +418,7 @@ class _SupplierReportWorker(QObject):
             report_footer = html_lib.escape(str(report_footer)).replace("\n", "<br>")
 
         data = {
-            "logo_block": self._get_lamidap_logo_block(),
+            **self._company_placeholders(),
             "document_title": document_title,
             "document_date": document_date,
             "supplier_block": supplier_block,
@@ -1448,10 +1441,7 @@ class SupplierDetailsDialog(QDialog):
         if profile is None:
             return {}
         return {
-            "company_name": profile.get_value("company name") or "",
-            "company_address": profile.get_value("address") or "",
-            "company_phone": profile.get_value("phone") or "",
-            "company_email": profile.get_value("email") or "",
+            **company_context(profile),
             "report_footer": profile.get_value("report footer") or "",
             "currency": profile.get_value("currency") or "MAD",
         }

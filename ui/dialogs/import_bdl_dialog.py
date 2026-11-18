@@ -9,7 +9,6 @@ the same import always yields the same Bon de Livraison number.
 Rendering runs in a QThread worker (RPC/DB data collection + Chromium PDF
 render), mirroring the Sales ReportsDialog lifecycle.
 """
-import base64
 import logging
 import os
 import subprocess
@@ -25,6 +24,7 @@ from PySide6.QtWidgets import (QDialog, QHBoxLayout, QLabel, QMessageBox,
                                QVBoxLayout)
 
 from core.calculations import to_decimal
+from core.report_context import company_context
 from core.runtime_paths import resource_path, local_reports_dir
 from ui.widgets.themed_widgets import RedButton
 
@@ -111,18 +111,13 @@ class _ImportBdlWorker(QObject):
         except Exception:
             return str(value)
 
-    def _get_lamidap_logo_block(self):
-        logo_path = resource_path("report", "lamidap_logo.png")
-        if not os.path.isfile(logo_path):
-            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
-        with open(logo_path, "rb") as img_f:
-            b64 = base64.b64encode(img_f.read()).decode("ascii")
-        return (
-            f'<img src="data:image/png;base64,{b64}" '
-            f'class="report-logo" width="120" '
-            f'style="width: 120px; height: auto; max-height: 80px; '
-            f'object-fit: contain; display: block; margin: 0 0 6px 0;" />'
-        )
+    def _active_profile(self):
+        """Local profile, or the host-supplied one on LAN clients."""
+        profile = getattr(self.profile_manager, "selected_profile", None)
+        if profile is None:
+            database = getattr(self.import_obj, "database", None)
+            profile = getattr(database, "remote_profile", None)
+        return profile
 
     def _generate_html(self, import_id, bl_number):
         """Render the import Bon de Livraison from the selected import only."""
@@ -189,7 +184,7 @@ class _ImportBdlWorker(QObject):
             rows_html = '<tr class="empty-row"><td colspan="3">Aucun article</td></tr>'
 
         data = {
-            'logo_block': self._get_lamidap_logo_block(),
+            **company_context(self._active_profile()),
             'document_ref': html_lib.escape(str(bl_number)),
             'date': html_lib.escape(str(date_value)),
             'supplier_name': html_lib.escape(str(supplier_name)),

@@ -256,7 +256,7 @@ class ProfilesDialog(QDialog):
         self.scroll_layout = QVBoxLayout()
         
         # Image preview
-        self.image_label = QLabel("Click to select image")
+        self.image_label = QLabel("Click to select the company logo (printed on reports)")
         self.image_label.setFixedHeight(150)
         self.image_label.setAlignment(Qt.AlignCenter)
         self.image_label.setStyleSheet("""
@@ -350,7 +350,7 @@ class ProfilesDialog(QDialog):
         try:
             # Clear the pixmap to release file handles
             self.image_label.clear()
-            self.image_label.setText("Click to select image")
+            self.image_label.setText("Click to select the company logo (printed on reports)")
             # Force garbage collection of any lingering QPixmap objects
             import gc
             gc.collect()
@@ -394,7 +394,7 @@ class ProfilesDialog(QDialog):
             self.original_image_path = profile.preview_path
         else:
             self.image_label.clear()
-            self.image_label.setText("Click to select image")
+            self.image_label.setText("Click to select the company logo (printed on reports)")
             self.image_path = ""
             self.original_image_path = ""
         

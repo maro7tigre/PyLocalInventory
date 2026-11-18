@@ -638,21 +638,21 @@ class FactureEditorTests(unittest.TestCase):
     def test_company_profile_data_renders_without_empty_legal_labels(self):
         profile = ProfileClass("test")
         profile.set_values({
-            "company name": "LAMIDAP - S.A.R.L", "address": "288, Zone Industrielle Gzenaya\n90000 Tanger",
-            "phone": "00 212 539 39 45 60", "fax": "00 212 539 39 45 59",
-            "email": "lamidap@lamidap.com", "website": "www.lamidap.com",
-            "ice": "000066710000023", "patente": "52981388", "if number": "04909316",
-            "rc": "31073", "cnss": "7412042", "bank name": "ATTIJARI WAFA BANQUE - CENTRE D'AFFAIRE",
-            "bank account": "1370A000000023", "bank agency": "GZENAYA Z-F",
+            "company name": "EXEMPLE - S.A.R.L", "address": "1, Rue Exemple\n00000 Ville",
+            "phone": "00 000 000 00 00 00", "fax": "00 000 000 00 00 01",
+            "email": "contact@example.com", "website": "www.example.com",
+            "ice": "000000000000001", "patente": "11111111", "if number": "22222222",
+            "rc": "33333", "cnss": "4444444", "bank name": "BANQUE EXEMPLE - AGENCE CENTRALE",
+            "bank account": "0000A000000001", "bank agency": "AGENCE EXEMPLE",
         })
         facture = {"facture_number": "FA001/2026", "date": "2026-09-23", "client_name": "Aptiv",
                    "items": [], "total_ht": Decimal("0"), "vat_amount": Decimal("0"), "total_ttc": Decimal("0"),
                    "paid": Decimal("0"), "remaining": Decimal("0"), "amount_in_words": "ZÉRO DIRHAM"}
         data = _document_data(facture, [], profile)
-        self.assertIn("Fax : 00 212 539 39 45 59", data["contact"])
-        self.assertEqual(data["website"], "www.lamidap.com")
-        self.assertIn("ICE: 000066710000023", "\n".join(data["legal_lines"]))
-        self.assertIn("COMPTE N°: 1370A000000023", data["bank_line"])
+        self.assertIn("Fax : 00 000 000 00 00 01", data["contact"])
+        self.assertEqual(data["website"], "www.example.com")
+        self.assertIn("ICE: 000000000000001", "\n".join(data["legal_lines"]))
+        self.assertIn("COMPTE N°: 0000A000000001", data["bank_line"])
         empty = ProfileClass("empty")
         empty_data = _document_data(facture, [], empty)
         self.assertEqual(empty_data["legal_lines"], [])

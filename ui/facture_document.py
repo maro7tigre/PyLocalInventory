@@ -8,7 +8,7 @@ from PySide6.QtCore import QMarginsF, QRectF, Qt
 from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPageLayout, QPageSize, QPen
 
 from core.calculations import calculate_line_subtotal, round_money
-from core.runtime_paths import resource_path
+from core.report_context import profile_logo_bytes
 
 
 PAGE_MARGINS_MM = QMarginsF(14, 12, 14, 14)
@@ -35,6 +35,12 @@ def quantity(value):
 
 def _profile_value(profile, key):
     return str(profile.get_value(key) or "") if profile else ""
+
+
+def _profile_logo_image(profile):
+    """The profile's logo as a QImage; a null image when none is configured."""
+    data = profile_logo_bytes(profile)
+    return QImage.fromData(data) if data else QImage()
 
 
 def _display_date(value):
@@ -246,7 +252,7 @@ def _document_data(facture, payments, profile):
         "legal_lines": legal_lines,
         "bank_line": " - ".join(f"{label}: {value}" for label, value in bank_parts if value),
         "report_footer": report_footer,
-        "logo": QImage(resource_path("report", "lamidap_logo.png")),
+        "logo": _profile_logo_image(profile),
     }
     return data
 

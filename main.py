@@ -4,12 +4,6 @@ Application entry point - initializes and starts the PySide6 application
 import sys
 import logging
 import os
-from PySide6.QtWidgets import QApplication
-from PySide6.QtGui import QIcon
-from core.runtime_paths import resource_path
-from ui.main_window import MainWindow
-from ui.theme import apply_dark_theme
-from core.logging_config import setup_logging
 from core.build_info import APP_BUILD_ID
 
 
@@ -21,6 +15,21 @@ logger.setLevel(logging.INFO)
 
 def main():
     """Application entry point"""
+    # The packaged executable doubles as the detached LAN host. Route this
+    # mode before importing Qt or any widgets so the background process has no
+    # desktop/UI lifetime dependency.
+    if '--lan-server' in sys.argv:
+        from core.network.host_process import main as host_main
+        arguments = [arg for arg in sys.argv[1:] if arg != '--lan-server']
+        raise SystemExit(host_main(arguments))
+
+    from PySide6.QtWidgets import QApplication
+    from PySide6.QtGui import QIcon
+    from core.runtime_paths import resource_path
+    from ui.main_window import MainWindow
+    from ui.theme import apply_dark_theme
+    from core.logging_config import setup_logging
+
     log_file = setup_logging()
     from core import diagnostics
     logger.info("Application startup build_id=%s pid=%d log=%s",

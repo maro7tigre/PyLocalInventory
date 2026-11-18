@@ -455,7 +455,8 @@ class DatabaseServer:
 
     def __init__(self, database, port=DEFAULT_PORT, *, max_request_bytes=None,
                  request_timeout=None, max_request_threads=None, max_inflight_body_bytes=None,
-                 database_statement_timeout_ms=None):
+                 database_statement_timeout_ms=None, max_db_connections=None,
+                 db_acquire_timeout=None):
         self.database = database
         self.port = port
         self.max_request_bytes = (max_request_bytes if max_request_bytes is not None else
@@ -464,7 +465,15 @@ class DatabaseServer:
         self.request_timeout = (request_timeout if request_timeout is not None else
                                 _positive_int_env('PYLOCALINVENTORY_HTTP_TIMEOUT_SECONDS', 30))
         self.max_request_threads = (max_request_threads if max_request_threads is not None else
-                                    _positive_int_env('PYLOCALINVENTORY_MAX_HTTP_THREADS', 32))
+                                    _positive_int_env('PYLOCALINVENTORY_MAX_HTTP_THREADS', 16))
+        self.max_db_connections = (
+            max_db_connections if max_db_connections is not None else
+            _positive_int_env('PYLOCALINVENTORY_MAX_DB_CONNECTIONS', 8)
+        )
+        self.db_acquire_timeout = (
+            float(db_acquire_timeout) if db_acquire_timeout is not None else
+            float(_positive_int_env('PYLOCALINVENTORY_DB_ACQUIRE_TIMEOUT_SECONDS', 2))
+        )
         self.database_statement_timeout_ms = (
             database_statement_timeout_ms if database_statement_timeout_ms is not None else
             _positive_int_env('PYLOCALINVENTORY_DB_STATEMENT_TIMEOUT_MS', 8000)
@@ -477,7 +486,7 @@ class DatabaseServer:
         )
         if min(
             self.max_request_bytes, self.request_timeout, self.max_request_threads,
-            self.database_statement_timeout_ms,
+            self.database_statement_timeout_ms, self.max_db_connections,
         ) <= 0:
             raise ValueError("Server request limits must be positive")
         if self.max_inflight_body_bytes < self.max_request_bytes:
@@ -496,6 +505,7 @@ class DatabaseServer:
         self._checked_out = 0
         self._pool_counts = {}
         self._checkout_times = {}
+        self._db_slots = threading.BoundedSemaphore(self.max_db_connections)
         self._body_lock = threading.Lock()
         self._body_inflight = 0
         # Lifecycle diagnostics are deliberately in-process only. They make the
@@ -855,9 +865,10 @@ class DatabaseServer:
 
         self._stopping = False
         self._transition('starting', 'start_requested')
-        logger.info('server_starting port=%d body_limit=%d inflight_limit=%d read_timeout=%ss thread_limit=%d db_statement_timeout_ms=%d',
+        logger.info('server_starting port=%d body_limit=%d inflight_limit=%d read_timeout=%ss thread_limit=%d db_pool_limit=%d db_statement_timeout_ms=%d',
                     self.port, self.max_request_bytes, self.max_inflight_body_bytes,
                 self.request_timeout, self.max_request_threads,
+                self.max_db_connections,
                 self.database_statement_timeout_ms)
         try:
             pg_config = load_server_config()
@@ -884,7 +895,7 @@ class DatabaseServer:
                     f'-c search_path={self.schema_name} '
                     f'-c statement_timeout={self.database_statement_timeout_ms}'
                 )
-            self._pool = ThreadedConnectionPool(2, 10, **pool_args)
+            self._pool = ThreadedConnectionPool(2, self.max_db_connections, **pool_args)
             with self._pool_lock:
                 self._checked_out = 0
             self._httpd = _BoundedHTTPServer(('0.0.0.0', self.port), self._make_handler(),
@@ -1075,13 +1086,21 @@ class DatabaseServer:
         # the request; otherwise the host can remain listening while serving
         # errors indefinitely from dead pooled sockets.
         for attempt in range(2):
+            if not self._db_slots.acquire(timeout=self.db_acquire_timeout):
+                logger.warning(
+                    'db_checkout_timeout wait_s=%.1f capacity=%d',
+                    self.db_acquire_timeout, self.max_db_connections,
+                )
+                raise PoolError('Timed out waiting for a host database connection')
             try:
                 conn = pool.getconn()
             except Exception as error:
+                self._db_slots.release()
                 with self._pool_lock:
                     in_use = self._pool_counts.get(pool, 0)
-                logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=%s',
-                               type(error).__name__, in_use, _safe_stack(error))
+                logger.warning('db_checkout_failed category=%s in_use=%d capacity=%d stack=%s',
+                               type(error).__name__, in_use, self.max_db_connections,
+                               _safe_stack(error))
                 raise
             with self._pool_lock:
                 in_use = self._pool_counts.get(pool, 0) + 1
@@ -1114,10 +1133,12 @@ class DatabaseServer:
                     raise
         if conn is None:
             raise RuntimeError('No usable PostgreSQL connection is available')
-        logger.info('db_checkout in_use=%d capacity=10 wait_ms=%.1f',
-                    in_use, (time.monotonic() - started) * 1000)
-        if in_use >= 8:
-            logger.warning('db_pool_near_capacity in_use=%d capacity=10', in_use)
+        logger.info('db_checkout in_use=%d capacity=%d wait_ms=%.1f',
+                    in_use, self.max_db_connections,
+                    (time.monotonic() - started) * 1000)
+        if in_use >= max(1, self.max_db_connections - 1):
+            logger.warning('db_pool_near_capacity in_use=%d capacity=%d',
+                           in_use, self.max_db_connections)
         try:
             request_db = Database(profile_manager=None)
             request_db.registered_classes = self.database.registered_classes
@@ -1140,6 +1161,12 @@ class DatabaseServer:
             self._checked_out = 0
             self._pool_counts = {}
             self._checkout_times = {}
+        if not hasattr(self, 'max_db_connections'):
+            self.max_db_connections = 10
+        if not hasattr(self, 'db_acquire_timeout'):
+            self.db_acquire_timeout = 2.0
+        if not hasattr(self, '_db_slots'):
+            self._db_slots = threading.BoundedSemaphore(self.max_db_connections)
 
     def _release_connection(self, connection, discard=False, pool=None):
         self._ensure_pool_metrics()
@@ -1164,17 +1191,19 @@ class DatabaseServer:
             with self._pool_lock:
                 checkout = self._checkout_times.get(id(connection))
                 in_use = self._pool_counts.get(pool, 0)
-                if returned:
+                if checkout is not None:
                     self._checkout_times.pop(id(connection), None)
                     in_use = max(0, in_use - 1)
                     self._pool_counts[pool] = in_use
                     if self._pool is pool:
                         self._checked_out = in_use
+            if checkout is not None:
+                self._db_slots.release()
             age_ms = (time.monotonic() - checkout[0]) * 1000 if checkout else 0
             logger.log(logging.WARNING if not returned or age_ms >= 10000 else logging.INFO,
-                       'db_%s in_use=%d capacity=10 held_ms=%.1f',
+                       'db_%s in_use=%d capacity=%d held_ms=%.1f',
                        'return_failed' if not returned else 'discard' if discard else 'return',
-                       in_use, age_ms)
+                       in_use, self.max_db_connections, age_ms)
 
     def _return_database(self, request_db):
         connection = request_db.conn

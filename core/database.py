@@ -769,6 +769,36 @@ class Database:
             self.conn.rollback()
             print(f"Warning: could not create workflow indexes: {exc}")
 
+        # Contains searches intentionally use %term% for familiar business
+        # lookup behavior. B-tree indexes cannot serve that pattern; pg_trgm
+        # GIN indexes can. This migration is optional because managed
+        # PostgreSQL accounts may not be allowed to install extensions.
+        try:
+            self.cursor.execute("CREATE EXTENSION IF NOT EXISTS pg_trgm")
+            search_columns = {
+                "products": ("username", "name"),
+                "clients": ("username", "name", "ice"),
+                "suppliers": ("username", "name"),
+                "services": ("name", "description", "keywords"),
+                "sales": ("client_username", "client_name", "date"),
+                "imports": ("supplier_username", "supplier_name", "date", "bl_number"),
+                "reports": ("department", "date", "report_type"),
+            }
+            for table, columns in search_columns.items():
+                for column in columns:
+                    self.cursor.execute(
+                        f"CREATE INDEX IF NOT EXISTS {table}_{column}_trgm_idx "
+                        f"ON {table} USING GIN "
+                        f"((LOWER(COALESCE(CAST({column} AS text), ''))) gin_trgm_ops)"
+                    )
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning(
+                "Trigram search indexes are unavailable; continuing without them: %s",
+                type(exc).__name__,
+            )
+
         # Existing installations created these columns as INTEGER.
         # PostgreSQL's cast keeps all old values intact. Check first to avoid
         # taking an unnecessary table lock on every startup.
@@ -3972,9 +4002,10 @@ class Database:
         base_table = section.lower()
         item_table = 'sales_items' if section == 'Sales' else 'import_items'
         foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
-        # The inner summary subquery joins base_table under alias "i" (see
-        # below), never "s" - "s" is only in scope in the outer query. Both
-        # sections must reference the inner join's own alias here.
+        # The summary is a LATERAL aggregate for one operation at a time. With
+        # the existing foreign-key indexes PostgreSQL can fetch only the item
+        # rows for each candidate operation and stop after the requested page,
+        # instead of grouping the entire sales/import item table first.
         tva_source = 'i.tva'
 
         # Remise only exists on the sales table (discounts); imports have no
@@ -4020,8 +4051,8 @@ class Database:
             )
         query += (
             f" FROM {base_table} s "
-            f"LEFT JOIN ("
-            f"  SELECT si.{foreign_key}, "
+            f"LEFT JOIN LATERAL ("
+            f"  SELECT "
             f"         SUM(si.quantity * si.unit_price) AS subtotal, "
             f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
             f"         {information_select} AS information, "
@@ -4029,8 +4060,8 @@ class Database:
             f"         {production_select} AS total_production "
             f"  FROM {item_table} si "
             f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
-            f"  GROUP BY si.{foreign_key} "
-            f") summary ON summary.{foreign_key} = s.id "
+            f"  WHERE si.{foreign_key} = s.id "
+            f") summary ON TRUE "
         )
         params = []
         conditions = []

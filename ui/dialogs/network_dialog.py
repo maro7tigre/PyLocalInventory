@@ -15,6 +15,7 @@ from PySide6.QtWidgets import (
 from PySide6.QtCore import Qt, QTimer
 
 from core.network.server import DatabaseServer
+from core.network.host_process import HostProcessController
 from core.network.protocol import DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
 from core.user_manager import UserManager, MATRIX_SECTIONS
@@ -269,10 +270,15 @@ class NetworkDialog(QDialog):
         self.toggle_btn.clicked.connect(self._toggle_hosting)
         form.addWidget(self.toggle_btn)
 
+        self.host_startup_checkbox = QCheckBox("Start hosting when this Windows user signs in")
+        self.host_startup_checkbox.setChecked(HostProcessController.startup_enabled())
+        form.addWidget(self.host_startup_checkbox)
+
         note = QLabel(
             "Other PyLocalInventory users on this network can connect using the IP "
             "above, this port, and a username/password created in the Users tab.\n"
-            "Windows Firewall may prompt to allow this the first time you start hosting."
+            "The LAN host runs in a separate background process and continues after "
+            "this desktop window closes. Windows Firewall may prompt the first time."
         )
         note.setWordWrap(True)
         form.addWidget(note)
@@ -280,21 +286,34 @@ class NetworkDialog(QDialog):
         return widget
 
     def _refresh_hosting_status(self):
+        # Keep legacy in-process objects visible for old sessions/tests, while
+        # production hosting is owned by the detached supervisor.
         server = getattr(self.main_window, 'network_server', None)
-        running = bool(server and server.is_running)
+        external = HostProcessController.status() if server is None else None
+        running = bool(server and server.is_running) if server is not None else bool(
+            external and external.get('is_running')
+        )
+        server_present = server if server is not None else (
+            HostProcessController if external and external.get('process_alive') else None
+        )
         status_text = (
             "Status: Hosting" if running else
-            "Status: Server unavailable" if server else "Status: Not hosting"
+            "Status: Server unavailable" if server_present else "Status: Not hosting"
         )
-        snapshot = self._snapshot_of(server) if server is not None else None
+        snapshot = self._snapshot_of(server) if server is not None else external
+        if snapshot is not None:
+            self.main_window.host_last_snapshot = snapshot
         self.status_label.setText(status_text)
-        self.toggle_btn.setText("Stop Hosting" if running else "Start Hosting")
+        controllable_process = running or bool(
+            external and external.get('process_alive')
+        )
+        self.toggle_btn.setText("Stop Hosting" if controllable_process else "Start Hosting")
         self.ip_label.setText(f"Your LAN IP: {DatabaseServer.local_ip()}" if running else "")
-        self.port_input.setEnabled(not running)
+        self.port_input.setEnabled(not controllable_process)
         detail_label = getattr(self, 'status_detail_label', None)
         if detail_label is not None:
-            detail_label.setText(self._hosting_detail(server, running, snapshot))
-        self._log_host_status_change(status_text, server, snapshot)
+            detail_label.setText(self._hosting_detail(server_present, running, snapshot))
+        self._log_host_status_change(status_text, server_present, snapshot)
 
     def _log_host_status_change(self, status_text, server, snapshot):
         previous = getattr(self, '_last_reported_host_status', None)
@@ -410,8 +429,8 @@ class NetworkDialog(QDialog):
                     )
                 return (
                     f"Last Host state: {state} at {since} (reason: {reason})."
-                    f"{history} Hosting does not resume automatically; "
-                    f"press Start Hosting to host again. {identity}"
+                    f"{history} Hosting does not resume automatically unless the "
+                    f"Windows startup option is enabled; press Start Hosting to host again. {identity}"
                 )
             return (
                 f"Last Host state: {state} at {since} (reason: {reason}; "
@@ -420,8 +439,9 @@ class NetworkDialog(QDialog):
             )
         return (
             "Hosting has not been started since this application opened. "
-            "Hosting does not resume automatically after an application restart; "
-            f"press Start Hosting to host this profile. {self._host_identity()}"
+            "Press Start Hosting to launch the independent background host for this profile; "
+            "hosting does not resume automatically unless Windows startup is enabled. "
+            f"{self._host_identity()}"
         )
 
     def _remember_host_state(self, server):
@@ -431,6 +451,7 @@ class NetworkDialog(QDialog):
 
     def _toggle_hosting(self):
         server = getattr(self.main_window, 'network_server', None)
+        external = HostProcessController.status() if server is None else None
         logger.info(
             'host_toggle_requested server_present=%s running=%s build_id=%s pid=%d',
             server is not None, bool(server and server.is_running),
@@ -450,6 +471,14 @@ class NetworkDialog(QDialog):
             logger.info('host_reference_cleared reason=stale_server_cleanup pid=%d',
                         os.getpid())
             self.main_window.network_server = None
+
+        if external and external.get('process_alive'):
+            HostProcessController.stop()
+            self.main_window.host_last_snapshot = external
+            self.status_label.setText("Status: Stopping")
+            self.toggle_btn.setEnabled(False)
+            QTimer.singleShot(1000, self._finish_host_toggle)
+            return
 
         if not self.user_manager.has_any_superadmin():
             username, ok = QInputDialog.getText(self, "Create Super Admin", "Choose a super-admin username:")
@@ -474,32 +503,37 @@ class NetworkDialog(QDialog):
             return
 
         try:
-            server = None
             logger.info('host_start_requested port=%d pid=%d build_id=%s',
                         port, os.getpid(), APP_BUILD_ID)
-            server = DatabaseServer(self.database, port=port)
-            server.start()
+            profile = self.main_window.profile_manager.selected_profile
+            if profile is None:
+                raise RuntimeError("No unlocked profile is selected")
+            HostProcessController.configure_startup(
+                self.host_startup_checkbox.isChecked(), profile.name, port
+            )
+            HostProcessController.start(profile.name, port)
         except Exception as e:
             logger.error('host_start_failed_from_ui port=%d category=%s pid=%d',
                          port, type(e).__name__, os.getpid())
-            if server is not None:
-                self._remember_host_state(server)
-            else:
-                self.main_window.host_last_snapshot = {
-                    'state': 'failed',
-                    'state_since': datetime.now().astimezone().isoformat(timespec='seconds'),
-                    'reason': 'create_failed',
-                    'last_error_category': type(e).__name__,
-                    'port': port,
-                }
+            self.main_window.host_last_snapshot = {
+                'state': 'failed',
+                'state_since': datetime.now().astimezone().isoformat(timespec='seconds'),
+                'reason': 'create_failed',
+                'last_error_category': type(e).__name__,
+                'port': port,
+            }
             self._refresh_hosting_status()
             QMessageBox.critical(self, "Could not start hosting", str(e))
             return
-        self.main_window.network_server = server
         self.main_window.network_port = port
         self.main_window.host_last_snapshot = None
-        logger.info('host_reference_installed port=%d pid=%d build_id=%s',
+        logger.info('host_process_launched port=%d pid=%d build_id=%s',
                     port, os.getpid(), APP_BUILD_ID)
+        self.toggle_btn.setEnabled(False)
+        QTimer.singleShot(1000, self._finish_host_toggle)
+
+    def _finish_host_toggle(self):
+        self.toggle_btn.setEnabled(True)
         self._refresh_hosting_status()
 
     # ---------------- Users tab ----------------

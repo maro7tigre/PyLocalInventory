@@ -306,11 +306,10 @@ class Database:
             print(self.last_error)
             return False
 
-        # Close existing connection
+        # Reconnect through the normal cleanup path so cursors, diagnostics,
+        # and sockets are not leaked across profile changes/retries.
         if self.conn:
-            self.conn.close()
-            self.conn = None
-            self.cursor = None
+            self.close()
 
         try:
             pg_config = load_server_config()
@@ -377,12 +376,30 @@ class Database:
             self.last_error = str(e)
             logger.exception("PostgreSQL connection failed")
             print(f"✗ Failed to connect to database: {e}")
+            self._close_failed_connection()
             return False
         except Exception as e:
             self.last_error = str(e)
             logger.exception("Database initialization failed")
             print(f"✗ Failed to connect to database: {e}")
+            self._close_failed_connection()
             return False
+
+    def _close_failed_connection(self):
+        """Release a partially initialized connection after connect failure."""
+        cursor, connection = self.cursor, self.conn
+        self.cursor = None
+        self.conn = None
+        if cursor is not None:
+            try:
+                cursor.close()
+            except Exception:
+                pass
+        if connection is not None:
+            try:
+                connection.close()
+            except Exception:
+                logger.exception("Could not close failed PostgreSQL connection")
 
     def _initialize_schema(self):
         """Run controlled schema initialization on the startup connection only."""
@@ -715,6 +732,11 @@ class Database:
                 "CREATE INDEX IF NOT EXISTS import_items_product_id_idx ON import_items(product_id)",
                 "CREATE INDEX IF NOT EXISTS sales_items_product_id_idx ON sales_items(product_id)",
                 "CREATE INDEX IF NOT EXISTS imports_supplier_id_idx ON imports(supplier_id)",
+                # Dashboard totals and six-month charts filter these TEXT date
+                # fields by YYYY-MM on every refresh. Matching expression
+                # indexes avoid rescanning the full operation tables.
+                "CREATE INDEX IF NOT EXISTS sales_date_month_idx ON sales ((LEFT(date, 7)))",
+                "CREATE INDEX IF NOT EXISTS imports_date_month_idx ON imports ((LEFT(date, 7)))",
                 "CREATE INDEX IF NOT EXISTS products_normalized_name_idx "
                 "ON products (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
                 "CREATE INDEX IF NOT EXISTS products_normalized_username_idx "

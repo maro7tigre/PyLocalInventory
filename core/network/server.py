@@ -1067,20 +1067,53 @@ class DatabaseServer:
         pool = self._pool
         if pool is None:
             raise RuntimeError('LAN database pool is not running')
-        try:
-            conn = pool.getconn()
-        except Exception as error:
+        conn = None
+        in_use = 0
+        # A psycopg2 pool does not proactively notice that PostgreSQL was
+        # restarted or that an idle LAN socket was dropped.  Validate a
+        # checkout and discard/recreate one stale connection before failing
+        # the request; otherwise the host can remain listening while serving
+        # errors indefinitely from dead pooled sockets.
+        for attempt in range(2):
+            try:
+                conn = pool.getconn()
+            except Exception as error:
+                with self._pool_lock:
+                    in_use = self._pool_counts.get(pool, 0)
+                logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=%s',
+                               type(error).__name__, in_use, _safe_stack(error))
+                raise
             with self._pool_lock:
-                in_use = self._pool_counts.get(pool, 0)
-            logger.warning('db_checkout_failed category=%s in_use=%d capacity=10 stack=%s',
-                           type(error).__name__, in_use, _safe_stack(error))
-            raise
-        with self._pool_lock:
-            in_use = self._pool_counts.get(pool, 0) + 1
-            self._pool_counts[pool] = in_use
-            if self._pool is pool:
-                self._checked_out = in_use
-            self._checkout_times[id(conn)] = (started, pool)
+                in_use = self._pool_counts.get(pool, 0) + 1
+                self._pool_counts[pool] = in_use
+                if self._pool is pool:
+                    self._checked_out = in_use
+                self._checkout_times[id(conn)] = (started, pool)
+            try:
+                validation_cursor = conn.cursor()
+                try:
+                    validation_cursor.execute('SELECT 1')
+                finally:
+                    validation_cursor.close()
+                conn.rollback()
+                break
+            except Exception as error:
+                logger.warning(
+                    'db_stale_connection attempt=%d category=%s',
+                    attempt + 1, type(error).__name__,
+                )
+                try:
+                    self._release_connection(conn, discard=True, pool=pool)
+                except Exception:
+                    try:
+                        conn.close()
+                    except Exception:
+                        pass
+                conn = None
+                if attempt:
+                    raise
+        if conn is None:
+            raise RuntimeError('No usable PostgreSQL connection is available')
         logger.info('db_checkout in_use=%d capacity=10 wait_ms=%.1f',
                     in_use, (time.monotonic() - started) * 1000)
         if in_use >= 8:

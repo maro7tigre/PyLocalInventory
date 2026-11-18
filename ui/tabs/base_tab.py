@@ -795,7 +795,9 @@ class BaseTab(QWidget):
         worker.finished.connect(worker.deleteLater)
         worker.failed.connect(worker.deleteLater)
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_refresh_thread_finished)
+        thread.finished.connect(
+            lambda t=thread, w=worker: self._on_refresh_thread_finished(t, w)
+        )
         thread.finished.connect(
             lambda: diagnostics.worker_cleanup("table_fetch", self.section, refresh_id)
         )
@@ -1078,9 +1080,19 @@ class BaseTab(QWidget):
             QTimer.singleShot(0, lambda: self.refresh_table(force=True))
 
     @Slot()
-    def _on_refresh_thread_finished(self):
-        self._refresh_thread = None
-        self._refresh_worker = None
+    def _on_refresh_thread_finished(self, expected_thread=None, expected_worker=None):
+        """Release only the job that emitted this completion signal.
+
+        A queued ``finished`` signal can be delivered after a replacement
+        refresh has already been installed.  Clearing the replacement here
+        loses its strong references and can destroy a running QThread.
+        """
+        if (expected_thread is None
+                or getattr(self, "_refresh_thread", None) is expected_thread):
+            self._refresh_thread = None
+        if (expected_worker is None
+                or getattr(self, "_refresh_worker", None) is expected_worker):
+            self._refresh_worker = None
 
     def _wait_for_refresh_thread(self, timeout_ms=5000):
         """Do not destroy a QThread while an in-flight HTTP call is unwinding."""

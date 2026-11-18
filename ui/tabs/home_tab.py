@@ -931,7 +931,9 @@ class HomeTab(QWidget):
         worker.cancelled.connect(worker.deleteLater)
         
         thread.finished.connect(thread.deleteLater)
-        thread.finished.connect(self._on_dashboard_thread_finished)
+        thread.finished.connect(
+            lambda t=thread, w=worker: self._on_dashboard_thread_finished(t, w)
+        )
         
         self._dashboard_thread = thread
         self._dashboard_worker = worker
@@ -1018,9 +1020,14 @@ class HomeTab(QWidget):
             )
 
     @Slot()
-    def _on_dashboard_thread_finished(self):
-        self._dashboard_thread = None
-        self._dashboard_worker = None
+    def _on_dashboard_thread_finished(self, expected_thread=None, expected_worker=None):
+        """Do not let a delayed completion clear a newer dashboard job."""
+        if (expected_thread is None
+                or getattr(self, "_dashboard_thread", None) is expected_thread):
+            self._dashboard_thread = None
+        if (expected_worker is None
+                or getattr(self, "_dashboard_worker", None) is expected_worker):
+            self._dashboard_worker = None
 
     def _wait_for_dashboard_thread(self, timeout_ms=5000):
         thread = getattr(self, "_dashboard_thread", None)

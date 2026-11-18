@@ -12,7 +12,7 @@ from datetime import datetime
 
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
-from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtCore import Qt, QSettings, QTimer, QObject, QThread, Signal, Slot
 from PySide6.QtGui import QAction, QActionGroup, QGuiApplication
 
 from ui.widgets.themed_widgets import ThemedMainWindow
@@ -68,6 +68,29 @@ from core.user_settings import (
 )
 
 
+class _NetworkLoginWorker(QObject):
+    """Perform the bounded LAN login handshake away from the GUI thread."""
+
+    succeeded = Signal(object)
+    failed = Signal(str)
+
+    def __init__(self, database):
+        super().__init__()
+        self.database = database
+
+    @Slot()
+    def run(self):
+        try:
+            self.database.connect()
+        except (AuthError, ConnectionFailedError, RemoteError) as error:
+            self.failed.emit(str(error))
+        except Exception:
+            logger.exception("Unexpected background network login failure")
+            self.failed.emit("Network login failed unexpectedly")
+        else:
+            self.succeeded.emit(self.database)
+
+
 class MainWindow(ThemedMainWindow):
     # A normal, usable window on common desktop resolutions. The saved
     # geometry (when present) takes precedence, but startup is always windowed.
@@ -102,6 +125,9 @@ class MainWindow(ThemedMainWindow):
         # explain "Not hosting" instead of only showing a bare status.
         self.host_last_snapshot = None
         self._sync_coordinator = None
+        self._network_login_thread = None
+        self._network_login_worker = None
+        self._network_login_context = None
 
         # Bottom status bar: only meaningful for network clients, where it
         # shows when the local cache last pulled incremental changes from the
@@ -363,6 +389,25 @@ class MainWindow(ThemedMainWindow):
             self._stop_sync_coordinator()
         except Exception as e:
             _safe_log("error", f"Error stopping sync during shutdown: {e}")
+
+        # A login handshake has a five-second network timeout. Keep its Qt
+        # objects alive until it unwinds so closing the window cannot destroy
+        # a running QThread.
+        login_thread = getattr(self, '_network_login_thread', None)
+        try:
+            login_running = login_thread is not None and login_thread.isRunning()
+        except RuntimeError:
+            login_running = False
+            self._network_login_thread = None
+            self._network_login_worker = None
+        if login_running:
+            login_thread.requestInterruption()
+            login_thread.quit()
+            if not login_thread.wait(6000):
+                _safe_log("error", "Network login thread timed out during shutdown")
+                self._shutting_down = False
+                event.ignore()
+                return
             
         # Stop background workers in tabs
         try:
@@ -696,12 +741,39 @@ class MainWindow(ThemedMainWindow):
             self._show_login_error("Invalid port. Enter a number from 1 to 65535.")
             return
 
-        remote_db = RemoteDatabase(self.profile_manager, host, port_num, username, password)
-        try:
-            remote_db.connect()
-        except (AuthError, ConnectionFailedError, RemoteError) as e:
-            self._show_login_error(str(e))
+        existing = getattr(self, '_network_login_thread', None)
+        if existing is not None and existing.isRunning():
             return
+
+        remote_db = RemoteDatabase(self.profile_manager, host, port_num, username, password)
+        worker = _NetworkLoginWorker(remote_db)
+        thread = QThread(self)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        worker.succeeded.connect(self._network_login_succeeded)
+        worker.failed.connect(self._network_login_failed)
+        worker.succeeded.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.succeeded.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(
+            lambda t=thread, w=worker: self._network_login_finished(t, w)
+        )
+        self._network_login_context = (
+            host, port_num, username, bool(remember_connection), bool(startup_enabled)
+        )
+        self._network_login_thread = thread
+        self._network_login_worker = worker
+        self._set_network_login_busy(True)
+        thread.start()
+
+    @Slot(object)
+    def _network_login_succeeded(self, remote_db):
+        context = self._network_login_context
+        if not context:
+            return
+        host, port_num, username, remember_connection, startup_enabled = context
 
         if remember_connection:
             self.user_settings = set_remembered_network(
@@ -739,6 +811,28 @@ class MainWindow(ThemedMainWindow):
                 "and restart the host first.",
             )
         self.refresh_app()
+
+    @Slot(str)
+    def _network_login_failed(self, message):
+        self._set_network_login_busy(False)
+        self._show_login_error(message)
+
+    def _network_login_finished(self, expected_thread, expected_worker):
+        if self._network_login_thread is expected_thread:
+            self._network_login_thread = None
+        if self._network_login_worker is expected_worker:
+            self._network_login_worker = None
+        self._network_login_context = None
+        self._set_network_login_busy(False)
+
+    def _set_network_login_busy(self, busy):
+        """Disable only the active login form while its worker is running."""
+        for index in range(self.main_layout.count()):
+            widget = self.main_layout.itemAt(index).widget()
+            if isinstance(widget, (LoginWidget, NetworkUnlockWidget)):
+                widget.setEnabled(not busy)
+                if busy and hasattr(widget, 'set_error'):
+                    widget.set_error("Connecting…")
 
     def _show_login_error(self, message):
         for i in range(self.main_layout.count()):

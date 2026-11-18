@@ -25,6 +25,8 @@ HOST_DIR = Path(user_data_root()) / "lan-host"
 STATUS_PATH = HOST_DIR / "status.json"
 STOP_PATH = HOST_DIR / "stop.request"
 LOCK_PATH = HOST_DIR / "supervisor.lock"
+WORKER_LOCK_PATH = HOST_DIR / "worker.lock"
+START_LOCK_PATH = HOST_DIR / "start.lock"
 STARTUP_REG_PATH = r"Software\Microsoft\Windows\CurrentVersion\Run"
 STARTUP_REG_NAME = "PyLocalInventory LAN Host"
 _STALE_STATUS_SECONDS = 12
@@ -39,6 +41,14 @@ def _atomic_json(path: Path, payload: dict):
     temporary = path.with_suffix(path.suffix + f".{os.getpid()}.tmp")
     temporary.write_text(json.dumps(payload, default=str), encoding="utf-8")
     os.replace(temporary, path)
+
+
+def _publish_status(payload):
+    """Best-effort diagnostics must never take a healthy listener offline."""
+    try:
+        _atomic_json(STATUS_PATH, payload)
+    except OSError as error:
+        logger.warning("Could not publish LAN host status: %s", type(error).__name__)
 
 
 def _read_json(path: Path):
@@ -119,47 +129,55 @@ class HostProcessController:
 
     @staticmethod
     def start(profile_name, port):
-        current = HostProcessController.status()
-        if current and current.get("process_alive"):
-            raise RuntimeError("A LAN host process is already running")
-        HOST_DIR.mkdir(parents=True, exist_ok=True)
+        start_lock = _acquire_file_lock(START_LOCK_PATH)
+        if start_lock is None:
+            raise RuntimeError("Another LAN host start is already in progress")
         try:
-            STOP_PATH.unlink()
-        except FileNotFoundError:
-            pass
-        command = _host_command(str(profile_name), int(port))
-        creationflags = 0
-        startupinfo = None
-        if sys.platform.startswith("win"):
-            creationflags = (
-                subprocess.CREATE_NEW_PROCESS_GROUP
-                | subprocess.DETACHED_PROCESS
-                | subprocess.CREATE_NO_WINDOW
+            current = HostProcessController.status()
+            if _lock_is_held(LOCK_PATH) or (
+                    current and current.get("process_alive") and current.get("status_fresh")):
+                raise RuntimeError("A LAN host process is already running")
+            HOST_DIR.mkdir(parents=True, exist_ok=True)
+            try:
+                STOP_PATH.unlink()
+            except FileNotFoundError:
+                pass
+            command = _host_command(str(profile_name), int(port))
+            creationflags = 0
+            startupinfo = None
+            if sys.platform.startswith("win"):
+                creationflags = (
+                    subprocess.CREATE_NEW_PROCESS_GROUP
+                    | subprocess.DETACHED_PROCESS
+                    | subprocess.CREATE_NO_WINDOW
+                )
+                startupinfo = subprocess.STARTUPINFO()
+                startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
+            process = subprocess.Popen(
+                command,
+                cwd=app_root(),
+                stdin=subprocess.DEVNULL,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
+                close_fds=True,
+                creationflags=creationflags,
+                startupinfo=startupinfo,
             )
-            startupinfo = subprocess.STARTUPINFO()
-            startupinfo.dwFlags |= subprocess.STARTF_USESHOWWINDOW
-        process = subprocess.Popen(
-            command,
-            cwd=app_root(),
-            stdin=subprocess.DEVNULL,
-            stdout=subprocess.DEVNULL,
-            stderr=subprocess.DEVNULL,
-            close_fds=True,
-            creationflags=creationflags,
-            startupinfo=startupinfo,
-        )
-        _atomic_json(STATUS_PATH, {
-            "state": "starting", "reason": "process_launched",
-            "pid": process.pid, "profile": str(profile_name), "port": int(port),
-            "build_id": APP_BUILD_ID, "supervisor_updated_at": _now(),
-            "thread_alive": False, "listener_available": False,
-        })
-        return process.pid
+            _publish_status({
+                "state": "starting", "reason": "process_launched",
+                "pid": process.pid, "profile": str(profile_name), "port": int(port),
+                "build_id": APP_BUILD_ID, "supervisor_updated_at": _now(),
+                "thread_alive": False, "listener_available": False,
+            })
+            return process.pid
+        finally:
+            start_lock.close()
 
     @staticmethod
     def stop():
         current = HostProcessController.status()
-        if not current or not current.get("process_alive"):
+        if not _lock_is_held(LOCK_PATH) and (
+                not current or not current.get("process_alive")):
             return False
         _atomic_json(STOP_PATH, {"requested_at": _now(), "requested_by": os.getpid()})
         return True
@@ -192,11 +210,11 @@ class HostProcessController:
                     pass
 
 
-def _acquire_single_instance_lock():
+def _acquire_file_lock(path):
     HOST_DIR.mkdir(parents=True, exist_ok=True)
-    handle = open(LOCK_PATH, "a+b")
-    handle.seek(0)
-    if handle.tell() == 0:
+    handle = open(path, "a+b")
+    if os.fstat(handle.fileno()).st_size == 0:
+        handle.seek(0)
         handle.write(b"0")
         handle.flush()
     if sys.platform.startswith("win"):
@@ -207,7 +225,22 @@ def _acquire_single_instance_lock():
         except OSError:
             handle.close()
             return None
+    else:
+        import fcntl
+        try:
+            fcntl.flock(handle.fileno(), fcntl.LOCK_EX | fcntl.LOCK_NB)
+        except OSError:
+            handle.close()
+            return None
     return handle
+
+
+def _lock_is_held(path):
+    handle = _acquire_file_lock(path)
+    if handle is None:
+        return True
+    handle.close()
+    return False
 
 
 def _register_classes(database):
@@ -242,6 +275,10 @@ def _run_server_worker(profile_name, port, supervisor_pid):
     failures = 0
     restart_count = 0
     server = None
+    worker_lock = _acquire_file_lock(WORKER_LOCK_PATH)
+    if worker_lock is None:
+        logger.error("A LAN server worker is already running")
+        return 3
     try:
         while True:
             if STOP_PATH.exists():
@@ -271,7 +308,7 @@ def _run_server_worker(profile_name, port, supervisor_pid):
                         "supervisor_started_at": started_at,
                         "supervisor_updated_at": _now(), "restart_count": restart_count,
                     })
-                    _atomic_json(STATUS_PATH, snapshot)
+                    _publish_status(snapshot)
                     time.sleep(2)
                 if STOP_PATH.exists():
                     break
@@ -286,7 +323,7 @@ def _run_server_worker(profile_name, port, supervisor_pid):
                         logger.exception("Could not clean up failed LAN server")
                     server = None
                 delay = min(30, 2 ** min(failures - 1, 5))
-                _atomic_json(STATUS_PATH, {
+                _publish_status({
                     "state": "recovering", "reason": type(error).__name__,
                     "pid": supervisor_pid, "worker_pid": os.getpid(),
                     "profile": profile_name, "port": int(port),
@@ -301,7 +338,10 @@ def _run_server_worker(profile_name, port, supervisor_pid):
                     time.sleep(0.25)
         if server is not None:
             server.stop(reason="operator_stop")
-        _atomic_json(STATUS_PATH, {
+            deadline = time.monotonic() + 30
+            while server.snapshot().get("state") == "stopping" and time.monotonic() < deadline:
+                time.sleep(0.1)
+        _publish_status({
             "state": "stopped", "reason": "operator_stop", "pid": supervisor_pid,
             "worker_pid": os.getpid(),
             "profile": profile_name, "port": int(port), "build_id": APP_BUILD_ID,
@@ -310,7 +350,7 @@ def _run_server_worker(profile_name, port, supervisor_pid):
         })
         return 0
     finally:
-        pass
+        worker_lock.close()
 
 
 def run_supervisor(profile_name, port):
@@ -322,7 +362,7 @@ def run_supervisor(profile_name, port):
     from core.logging_config import setup_logging
 
     setup_logging()
-    lock = _acquire_single_instance_lock()
+    lock = _acquire_file_lock(LOCK_PATH)
     if lock is None:
         logger.error("LAN host supervisor is already running")
         return 2
@@ -346,17 +386,22 @@ def run_supervisor(profile_name, port):
                 time.sleep(0.5)
             if STOP_PATH.exists():
                 try:
-                    worker.wait(timeout=12)
+                    worker.wait(timeout=35)
                 except subprocess.TimeoutExpired:
                     logger.error("LAN worker ignored graceful stop; terminating")
                     worker.terminate()
-                    worker.wait(timeout=5)
+                    try:
+                        worker.wait(timeout=5)
+                    except subprocess.TimeoutExpired:
+                        logger.error("LAN worker did not terminate; killing")
+                        worker.kill()
+                        worker.wait(timeout=5)
                 break
             stable_seconds = time.monotonic() - worker_started
             failure_streak = 1 if stable_seconds >= 60 else failure_streak + 1
             restart_count += 1
             delay = min(30, 2 ** min(failure_streak - 1, 5))
-            _atomic_json(STATUS_PATH, {
+            _publish_status({
                 "state": "recovering", "reason": "worker_process_exited",
                 "pid": os.getpid(), "worker_pid": worker.pid,
                 "profile": profile_name, "port": int(port),
@@ -369,7 +414,7 @@ def run_supervisor(profile_name, port):
                 time.sleep(0.25)
         # The worker normally writes the final stopped record. Ensure one is
         # present even if it had to be terminated.
-        _atomic_json(STATUS_PATH, {
+        _publish_status({
             "state": "stopped", "reason": "operator_stop", "pid": os.getpid(),
             "profile": profile_name, "port": int(port), "build_id": APP_BUILD_ID,
             "supervisor_updated_at": _now(), "thread_alive": False,

@@ -272,6 +272,7 @@ class NetworkDialog(QDialog):
 
         self.host_startup_checkbox = QCheckBox("Start hosting when this Windows user signs in")
         self.host_startup_checkbox.setChecked(HostProcessController.startup_enabled())
+        self.host_startup_checkbox.stateChanged.connect(self._host_startup_changed)
         form.addWidget(self.host_startup_checkbox)
 
         note = QLabel(
@@ -377,6 +378,7 @@ class NetworkDialog(QDialog):
                 f"{health_text} Active requests: {snapshot.get('active_requests', 0)}. "
                 f"DB connections in use: {snapshot.get('checked_out', 0)}. "
                 f"Sessions: {snapshot.get('sessions', 0)}. "
+                f"Profile: {snapshot.get('profile', 'unknown')}. "
                 f"State: {snapshot.get('state', 'unknown')} since "
                 f"{snapshot.get('state_since', 'unknown')}. "
                 f"{self._host_identity(snapshot)}"
@@ -448,6 +450,28 @@ class NetworkDialog(QDialog):
         snapshot = self._snapshot_of(server) if server is not None else None
         if snapshot is not None:
             self.main_window.host_last_snapshot = snapshot
+
+    def _host_startup_changed(self, _state):
+        """Persist the startup choice immediately, including while hosting."""
+        profile = self.main_window.profile_manager.selected_profile
+        if profile is None:
+            return
+        try:
+            port = int(self.port_input.text().strip() or DEFAULT_PORT)
+            if not 1 <= port <= 65535:
+                raise ValueError("Port must be between 1 and 65535")
+            HostProcessController.configure_startup(
+                self.host_startup_checkbox.isChecked(), profile.name, port
+            )
+        except Exception as error:
+            QMessageBox.warning(
+                self, "Hosting Startup",
+                f"Could not update Windows hosting startup: {error}",
+            )
+            actual = HostProcessController.startup_enabled()
+            self.host_startup_checkbox.blockSignals(True)
+            self.host_startup_checkbox.setChecked(actual)
+            self.host_startup_checkbox.blockSignals(False)
 
     def _toggle_hosting(self):
         server = getattr(self.main_window, 'network_server', None)

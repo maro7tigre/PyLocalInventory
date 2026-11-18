@@ -1101,7 +1101,9 @@ class DatabaseServer:
                 logger.warning('db_checkout_failed category=%s in_use=%d capacity=%d stack=%s',
                                type(error).__name__, in_use, self.max_db_connections,
                                _safe_stack(error))
-                raise
+                if isinstance(error, PoolError):
+                    raise
+                raise PoolError('Host database connection is unavailable') from error
             with self._pool_lock:
                 in_use = self._pool_counts.get(pool, 0) + 1
                 self._pool_counts[pool] = in_use
@@ -1130,7 +1132,7 @@ class DatabaseServer:
                         pass
                 conn = None
                 if attempt:
-                    raise
+                    raise PoolError('Host database connection is unavailable') from error
         if conn is None:
             raise RuntimeError('No usable PostgreSQL connection is available')
         logger.info('db_checkout in_use=%d capacity=%d wait_ms=%.1f',

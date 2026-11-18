@@ -3950,10 +3950,6 @@ class Database:
         base_table = section.lower()
         item_table = 'sales_items' if section == 'Sales' else 'import_items'
         foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
-        # The inner summary subquery joins base_table under alias "i" (see
-        # below), never "s" - "s" is only in scope in the outer query. Both
-        # sections must reference the inner join's own alias here.
-        tva_source = 'i.tva'
 
         # Remise only exists on the sales table (discounts); imports have no
         # discount column, so their computed totals reduce to the raw sums.
@@ -3976,7 +3972,7 @@ class Database:
             information_select = "''"
             production_select = "0"
 
-        query = (
+        select_list = (
             f"SELECT s.*, "
             f"COALESCE(summary.subtotal, 0) AS subtotal, "
             f"COALESCE(summary.total_price, 0) AS total_price, "
@@ -3992,32 +3988,29 @@ class Database:
             # before the TEXT column backfill) fall back to a computed
             # DE-YEAR-N so the Sales table always shows a stable reference.
             # The later duplicate "devis" key overrides s.* in the row dict.
-            query += (
+            select_list += (
                 f", COALESCE(NULLIF(BTRIM(s.devis), ''), "
                 f"'DE-' || {_DEVIS_YEAR_EXPR} || '-' || COALESCE(s.devis_number::text, '')) AS devis"
             )
-        query += (
-            f" FROM {base_table} s "
-            f"LEFT JOIN ("
-            f"  SELECT si.{foreign_key}, "
-            f"         SUM(si.quantity * si.unit_price) AS subtotal, "
-            f"         SUM(si.quantity * si.unit_price * (1 + COALESCE({tva_source}, 0) / 100.0)) AS total_price, "
-            f"         {information_select} AS information, "
-            f"         COALESCE(SUM(si.quantity), 0) AS total_quantity, "
-            f"         {production_select} AS total_production "
-            f"  FROM {item_table} si "
-            f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
-            f"  GROUP BY si.{foreign_key} "
-            f") summary ON summary.{foreign_key} = s.id "
+        summary_columns = (
+            f"SUM(si.quantity * si.unit_price) AS subtotal, "
+            f"SUM(si.quantity * si.unit_price * (1 + COALESCE({{tva}}, 0) / 100.0)) AS total_price, "
+            f"{information_select} AS information, "
+            f"COALESCE(SUM(si.quantity), 0) AS total_quantity, "
+            f"{production_select} AS total_production "
         )
         params = []
         conditions = []
+        # Filtering or sorting on a computed column needs every operation's
+        # totals before the page can be chosen.
+        needs_all_summaries = False
 
         if search_text and search_columns:
             search_term = f"%{search_text.lower()}%"
             clauses = []
             for col in search_columns:
                 if col == 'information':
+                    needs_all_summaries = True
                     clauses.append("LOWER(COALESCE(summary.information, '')) LIKE %s")
                 else:
                     clauses.append(
@@ -4029,6 +4022,8 @@ class Database:
 
         direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
         order_expr = self._summary_order_expression(order_by)
+        if order_expr and 'summary.' in order_expr:
+            needs_all_summaries = True
         cursor_value = self._keyset_sort_value(order_by, after_sort)
         keyset_fragment, keyset_params = self._keyset_condition(
             order_expr, direction, after_id, cursor_value
@@ -4037,20 +4032,49 @@ class Database:
             conditions.append(keyset_fragment)
             params.extend(keyset_params)
 
-        if conditions:
-            query += " WHERE " + " AND ".join(conditions)
-
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
         if order_expr:
-            query += f" ORDER BY {order_expr} {direction}, s.id {direction}"
+            order_clause = f" ORDER BY {order_expr} {direction}, s.id {direction}"
         else:
-            query += " ORDER BY s.id"
-
+            order_clause = " ORDER BY s.id"
+        limit_clause = ""
         if limit is not None:
-            query += " LIMIT %s"
+            limit_clause = " LIMIT %s"
             params.append(int(limit))
             if offset is not None:
-                query += " OFFSET %s"
+                limit_clause += " OFFSET %s"
                 params.append(int(offset))
+
+        if needs_all_summaries or limit is None:
+            # One pass over the item table, grouped per operation. The inner
+            # join to base_table (alias "i") supplies each line's tva; "s" is
+            # only in scope in the outer query.
+            query = (
+                f"{select_list} FROM {base_table} s "
+                f"LEFT JOIN ("
+                f"  SELECT si.{foreign_key}, {summary_columns.format(tva='i.tva')}"
+                f"  FROM {item_table} si "
+                f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
+                f"  GROUP BY si.{foreign_key} "
+                f") summary ON summary.{foreign_key} = s.id"
+                f"{where_clause}{order_clause}{limit_clause}"
+            )
+        else:
+            # Choose the page from the operation table alone, then total only
+            # those operations through the item table's foreign-key index.
+            # The grouped form above sums every line of every operation on
+            # each page request, so its cost grows with the whole history
+            # while this one stays proportional to the page.
+            query = (
+                f"{select_list} FROM ("
+                f"  SELECT s.* FROM {base_table} s{where_clause}{order_clause}{limit_clause}"
+                f") s "
+                f"LEFT JOIN LATERAL ("
+                f"  SELECT {summary_columns.format(tva='s.tva')}"
+                f"  FROM {item_table} si WHERE si.{foreign_key} = s.id"
+                f") summary ON TRUE"
+                f"{order_clause}"
+            )
 
         mode = 'remote' if user is not None else 'local'
         try:
@@ -4226,6 +4250,10 @@ class Database:
     def get_product_stock_levels_for_product_ids(self, product_ids):
         if not product_ids:
             return {}
+        # The id filter is repeated inside both aggregates: PostgreSQL does
+        # not push the outer p.id filter through GROUP BY on its own, and
+        # without it every import and sale line is summed to answer for one
+        # page of products.
         self.cursor.execute(
             f"""
             SELECT p.id,
@@ -4236,6 +4264,7 @@ class Database:
                 FROM import_items ii
                 JOIN imports i ON i.id = ii.import_id
                 WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                  AND ii.product_id = ANY(%s)
                 GROUP BY ii.product_id
             ) imported ON imported.product_id=p.id
             LEFT JOIN (
@@ -4243,11 +4272,12 @@ class Database:
                 FROM sales_items si
                 JOIN sales s ON s.id=si.sales_id
                 WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+                  AND si.product_id = ANY(%s)
                 GROUP BY si.product_id
             ) sold ON sold.product_id=p.id
             WHERE p.id = ANY(%s)
             """,
-            (product_ids,)
+            (product_ids, product_ids, product_ids)
         )
         return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
 

@@ -74,6 +74,7 @@ PyLocalInventory/
 |-- LICENSE                  # GNU GPL version 3 license
 |-- logo.png                 # Application icon
 |-- main.py                  # Application entry point
+|-- server.py                # Headless LAN server entry point
 |-- PyLocalInventory.spec    # PyInstaller build definition
 |-- README.md
 `-- requirements.txt
@@ -308,6 +309,23 @@ Start hosting, create the initial Super Admin when prompted, and create
 application users and roles. Client computers sign in with the host address,
 hosting port, username, and password. The default hosting port is `8765`; it
 must be allowed through the host firewall for LAN clients.
+
+### Hosting without the desktop window
+
+Hosting from the desktop app stops whenever that window is closed and slows
+down whenever it is busy. For a host that should stay available, run the
+server on its own instead:
+
+```powershell
+.\dist\PyLocalInventory\PyLocalInventoryServer.exe serve --port 8765
+```
+
+From source the equivalent is `py server.py serve`. It uses the profile and
+database settings already saved by the desktop app, creates the first Super
+Admin with `create-admin`, and restarts its listener by itself. A Super Admin
+signed in from any PC can then manage users and roles under **Network >
+Network Config**. See [docs/headless_server.md](docs/headless_server.md) for
+all commands and for starting it with Windows.
 
 ## Permissions and User Roles
 

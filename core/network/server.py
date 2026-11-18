@@ -87,6 +87,21 @@ def _caller_stack():
     return _format_frames(traceback.extract_stack()[:-1])
 
 
+def port_in_use(port, timeout=1.0):
+    """True when something on this computer already accepts connections on
+    ``port``.
+
+    Binding is not a reliable test on Windows: http.server sets SO_REUSEADDR,
+    which there lets a second process bind a port that is already being
+    served, after which the two hosts split incoming client connections.
+    """
+    try:
+        with socket.create_connection(('127.0.0.1', port), timeout=timeout):
+            return True
+    except OSError:
+        return False
+
+
 class _RequestBodyError(Exception):
     def __init__(self, status, category, message):
         super().__init__(message)

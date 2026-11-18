@@ -14,7 +14,8 @@ from PySide6.QtWidgets import (
 )
 from PySide6.QtCore import Qt, QTimer
 
-from core.network.server import DatabaseServer
+from core.network.server import DatabaseServer, port_in_use
+from core.network.client import RemoteCursor, RemoteDatabase
 from core.network.protocol import DEFAULT_PORT
 from core.build_info import APP_BUILD_ID
 from core.user_manager import UserManager, MATRIX_SECTIONS
@@ -45,10 +46,26 @@ class PermissionCheckBox(CircularCheckBox):
         super().mouseReleaseEvent(event)
 
 
+class _RemoteAdminSession:
+    """Database stand-in giving UserManager its own cursor on a network login.
+
+    RemoteDatabase.cursor is one shared object that tab refresh workers also
+    use, so reading rows from it here could return another thread's result.
+    """
+
+    def __init__(self, remote_database):
+        self.cursor = RemoteCursor(remote_database)
+        self.conn = remote_database.conn
+
+
 class NetworkDialog(QDialog):
     """Database settings are always editable; hosting, users and roles are only
     available after a profile has been unlocked and the local database is
-    connected."""
+    connected.
+
+    A super admin signed in over the network gets the Users and Roles tabs
+    only: the host runs those statements, while database settings and hosting
+    belong to the computer that owns PostgreSQL."""
 
     def __init__(self, main_window, focus_tab=0):
         super().__init__(main_window)
@@ -57,15 +74,25 @@ class NetworkDialog(QDialog):
         self.can_manage_network = bool(
             getattr(main_window.profile_manager, 'selected_profile', None)
             and getattr(self.database, 'conn', None)
+            and not isinstance(self.database, RemoteDatabase)
         )
-        self.user_manager = UserManager(self.database) if self.can_manage_network else None
-        self.setWindowTitle("Network & Users")
+        self.remote_admin = bool(
+            isinstance(self.database, RemoteDatabase)
+            and getattr(self.database, 'is_superadmin', False)
+        )
+        self.can_manage_users = self.can_manage_network or self.remote_admin
+        if self.remote_admin:
+            self.user_manager = UserManager(_RemoteAdminSession(self.database))
+        else:
+            self.user_manager = UserManager(self.database) if self.can_manage_network else None
+        self.setWindowTitle("Users & Roles" if self.remote_admin else "Network & Users")
         self.setMinimumSize(640, 520)
 
         layout = QVBoxLayout(self)
         self.tabs = QTabWidget()
-        self.tabs.addTab(self._build_db_server_tab(), "Database Server")
-        self.tabs.addTab(self._build_hosting_tab(), "Hosting")
+        if not self.remote_admin:
+            self.tabs.addTab(self._build_db_server_tab(), "Database Server")
+            self.tabs.addTab(self._build_hosting_tab(), "Hosting")
         self.tabs.addTab(self._build_users_tab(), "Users")
         self.tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
         layout.addWidget(self.tabs)
@@ -74,13 +101,15 @@ class NetworkDialog(QDialog):
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
-        self._refresh_db_server_fields()
-        self._apply_access_state()
+        if not self.remote_admin:
+            self._refresh_db_server_fields()
+            self._apply_access_state()
 
-        if self.can_manage_network:
-            self._refresh_hosting_status()
+        if self.can_manage_users:
             self._refresh_users_table()
             self._refresh_roles_combo()
+        if self.can_manage_network:
+            self._refresh_hosting_status()
             self._hosting_status_timer = QTimer(self)
             self._hosting_status_timer.setInterval(2000)
             self._hosting_status_timer.timeout.connect(self._refresh_hosting_status)
@@ -473,6 +502,15 @@ class NetworkDialog(QDialog):
             QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
             return
 
+        if port_in_use(port):
+            QMessageBox.warning(
+                self, "Port In Use",
+                f"Something is already answering on port {port}. If the background "
+                "server (PyLocalInventoryServer) is running, this profile is already "
+                "hosted and there is nothing to start here. Otherwise choose another port."
+            )
+            return
+
         try:
             server = None
             logger.info('host_start_requested port=%d pid=%d build_id=%s',
@@ -508,7 +546,7 @@ class NetworkDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        if not self.can_manage_network:
+        if not self.can_manage_users:
             note = QLabel(
                 "Users can only be created after a profile is unlocked and the local database is connected."
             )
@@ -640,7 +678,7 @@ class NetworkDialog(QDialog):
         widget = QWidget()
         layout = QVBoxLayout(widget)
 
-        if not self.can_manage_network:
+        if not self.can_manage_users:
             note = QLabel(
                 "Roles and permissions can only be edited after a profile is unlocked and the local database is connected."
             )

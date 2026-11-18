@@ -44,6 +44,7 @@ from classes.sales_item_class import SalesItemClass
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
 from classes.reports_class import ReportsClass
+from classes.registry import register_all
 
 from core.profiles import ProfileManager
 from core.runtime_paths import portable_dir
@@ -140,18 +141,7 @@ class MainWindow(ThemedMainWindow):
         """Register parameter classes with the database"""
         print("📋 Registering parameter classes...")
         
-        # Register all parameter classes
-        self.database.register_class(ProductClass)
-        self.database.register_class(ServiceClass)
-        self.database.register_class(DoorTypeClass)
-        self.database.register_class(WoodTypeClass)
-        self.database.register_class(ClientClass)
-        self.database.register_class(SupplierClass)
-        self.database.register_class(SalesClass)
-        self.database.register_class(SalesItemClass)
-        self.database.register_class(ImportClass)
-        self.database.register_class(ImportItemClass)
-        self.database.register_class(ReportsClass)
+        register_all(self.database)
 
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
@@ -1155,10 +1145,18 @@ class MainWindow(ThemedMainWindow):
     def open_network_dialog(self):
         """Open the network hosting / users & roles management dialog."""
         if self.connection_mode == 'client':
-            QMessageBox.information(
-                self, "Not Available",
-                "Network hosting isn't available while connected as a network client."
-            )
+            if not getattr(self.database, 'is_superadmin', False):
+                QMessageBox.information(
+                    self, "Not Available",
+                    "Only a Super Admin can manage users and roles on the host."
+                )
+                return
+            try:
+                dialog = NetworkDialog(self, focus_tab=0)
+            except RemoteError as error:
+                QMessageBox.warning(self, "Host Unavailable", str(error))
+                return
+            dialog.exec()
             return
 
         dialog = NetworkDialog(self, focus_tab=1)

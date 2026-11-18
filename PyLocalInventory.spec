@@ -68,10 +68,50 @@ exe = EXE(
     entitlements_file=None,
     icon=str(project_root / 'logo.png'),
 )
+# Console build of the headless LAN server (server.py). It shares the
+# _internal runtime folder with the desktop executable, so it adds one small
+# .exe to the distribution instead of a second copy of Python and Qt.
+server_a = Analysis(
+    [str(project_root / 'server.py')],
+    pathex=[str(project_root)],
+    binaries=[],
+    datas=[],
+    hiddenimports=[],
+    hookspath=[],
+    hooksconfig={},
+    runtime_hooks=[],
+    excludes=['weasyprint', 'xhtml2pdf', 'pdfkit', 'playwright'],
+    noarchive=False,
+    optimize=0,
+)
+server_pyz = PYZ(server_a.pure)
+
+server_exe = EXE(
+    server_pyz,
+    server_a.scripts,
+    [],
+    exclude_binaries=True,
+    name='PyLocalInventoryServer',
+    debug=False,
+    bootloader_ignore_signals=False,
+    strip=False,
+    upx=False,
+    console=True,
+    disable_windowed_traceback=False,
+    argv_emulation=False,
+    target_arch=None,
+    codesign_identity=None,
+    entitlements_file=None,
+    icon=str(project_root / 'logo.png'),
+)
+
 coll = COLLECT(
     exe,
     a.binaries,
     a.datas,
+    server_exe,
+    server_a.binaries,
+    server_a.datas,
     strip=False,
     upx=False,
     upx_exclude=[],

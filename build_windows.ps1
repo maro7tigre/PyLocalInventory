@@ -49,7 +49,7 @@ try {
     Set-Location -LiteralPath $RepositoryRoot
     Write-Host "Repository root: $RepositoryRoot"
 
-    foreach ($RequiredSource in @("main.py", "requirements.txt", "PyLocalInventory.spec", "logo.png", "report")) {
+    foreach ($RequiredSource in @("main.py", "server.py", "requirements.txt", "PyLocalInventory.spec", "logo.png", "report")) {
         $RequiredPath = Join-Path $RepositoryRoot $RequiredSource
         if (-not (Test-Path -LiteralPath $RequiredPath)) {
             throw "Required project source is missing: $RequiredPath"

@@ -124,6 +124,21 @@ def configure_machine(profile_name: str, port: int):
     return root
 
 
+def repair_machine_runtime(python_executable: str, project_root: str):
+    """Update only runtime locations, preserving all service business data."""
+    config = load_service_configuration()
+    python_path = Path(python_executable).resolve()
+    project_path = Path(project_root).resolve()
+    if not python_path.is_file():
+        raise RuntimeError(f"Service Python does not exist: {python_path}")
+    if not (project_path / "main.py").is_file():
+        raise RuntimeError(f"Project entry point does not exist: {project_path / 'main.py'}")
+    config["python_executable"] = str(python_path)
+    config["project_root"] = str(project_path)
+    _atomic_json(service_config_path(), config)
+    return machine_root()
+
+
 class ServiceProfileManager:
     """Minimal ProfileManager surface backed by the ProgramData profile copy."""
 
@@ -336,12 +351,22 @@ def main(argv=None):
     parser.add_argument("command", nargs="?")
     parser.add_argument("--profile")
     parser.add_argument("--port", type=int, default=8765)
+    parser.add_argument("--python-executable")
+    parser.add_argument("--project-root")
     known, _unknown = parser.parse_known_args(argv)
     if known.command == "configure":
         if not known.profile:
             raise SystemExit("--profile is required")
         root = configure_machine(known.profile, known.port)
         print(f"Configured LAN service under {root}")
+        return 0
+    if known.command == "repair-runtime":
+        if not known.python_executable or not known.project_root:
+            raise SystemExit("--python-executable and --project-root are required")
+        root = repair_machine_runtime(
+            known.python_executable, known.project_root
+        )
+        print(f"Updated LAN service runtime paths under {root}")
         return 0
 
     # HandleCommandLine reads sys.argv so preserve standard pywin32 service

@@ -1,5 +1,7 @@
 [CmdletBinding()]
-param()
+param(
+    [string]$PythonExecutable
+)
 
 $ErrorActionPreference = "Stop"
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
@@ -9,7 +11,18 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
 }
 
 $repo = (Resolve-Path -LiteralPath (Join-Path $PSScriptRoot "..")).Path
-$python = Join-Path $repo ".venv\Scripts\python.exe"
+if ([string]::IsNullOrWhiteSpace($PythonExecutable)) {
+    $PythonExecutable = @(
+        (Join-Path $repo ".venv\Scripts\python.exe"),
+        ($repo + ".venv\Scripts\python.exe")
+    ) | Where-Object { Test-Path -LiteralPath $_ -PathType Leaf } |
+        Select-Object -First 1
+}
+if ([string]::IsNullOrWhiteSpace($PythonExecutable) -or
+        -not (Test-Path -LiteralPath $PythonExecutable -PathType Leaf)) {
+    throw "Pass -PythonExecutable with the full path to the service virtual environment Python."
+}
+$python = (Resolve-Path -LiteralPath $PythonExecutable).Path
 $serviceScript = Join-Path $repo "core\network\windows_service.py"
 $serviceName = "PyLocalInventoryLAN"
 $service = Get-Service -Name $serviceName -ErrorAction SilentlyContinue

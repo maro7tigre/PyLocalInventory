@@ -238,9 +238,13 @@ class RemoteDatabase:
         self.host_build_id = data.get('build_id')
         self._open_cache()
         diagnostics.set_mode('client')
+        profile_payload = data.get("profile") or {}
         logger.info(
-            "client_connected host=%s port=%s host_build_id=%s",
+            "client_connected host=%s port=%s host_build_id=%s "
+            "profile_company=%s profile_logo_received=%s",
             self.host, self.port, self.host_build_id,
+            bool(profile_payload.get("company name")),
+            bool(profile_payload.get("logo base64")),
         )
         if self.host_build_id != APP_BUILD_ID:
             logger.warning(

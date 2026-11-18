@@ -1655,6 +1655,13 @@ class DatabaseServer:
                     # report logo travels with the login response.
                     profile_values[LOGO_BASE64_KEY] = profile_logo_base64(selected_profile)
                 logger.info(
+                    'login_profile id=%s profile=%s logo_path=%s logo_bytes=%s',
+                    self._request_id,
+                    getattr(selected_profile, "name", None),
+                    getattr(selected_profile, "preview_path", None),
+                    len(profile_values.get(LOGO_BASE64_KEY) or "") * 3 // 4,
+                )
+                logger.info(
                     'login_accepted id=%s role_id=%s build_id=%s',
                     self._request_id, user.get('role_id'), APP_BUILD_ID,
                 )

@@ -1,17 +1,83 @@
 """
 Home tab - Beautiful dashboard with charts, statistics, and quick actions
 """
+import shiboken6
 from PySide6.QtWidgets import (
-    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, 
+    QWidget, QVBoxLayout, QHBoxLayout, QGridLayout, QLabel, QApplication,
     QPushButton, QFrame, QScrollArea, QSizePolicy, QSpacerItem
 )
-from PySide6.QtCore import Qt, QTimer, Signal
+from PySide6.QtCore import Qt, QTimer, Signal, QObject, QThread, Slot, QPointF
 from PySide6.QtGui import QFont, QPainter, QPen, QBrush, QColor, QLinearGradient
 from PySide6.QtCharts import QChart, QChartView, QPieSeries, QBarSeries, QBarSet, QLineSeries, QValueAxis, QBarCategoryAxis
 from datetime import datetime, timedelta
-import sqlite3
+from decimal import Decimal
+import time
+import logging
 
 from ui.widgets.themed_widgets import GreenButton, BlueButton, OrangeButton, RedButton
+from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
+
+logger = logging.getLogger(__name__)
+
+
+class _DashboardWorker(QObject):
+    finished = Signal(object, float)
+    failed = Signal(str, float)
+    cancelled = Signal(float)
+
+    def __init__(self, database):
+        super().__init__()
+        self.database = database
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        snapshot = None
+        worker_db = self.database
+        close_worker_db = False
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+
+            # A local Database owns a psycopg cursor and cannot be used from
+            # this QThread. RemoteDatabase is safe to use for one RPC here.
+            from core.database import Database
+            if isinstance(self.database, Database):
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, "language", "en")
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect(initialize_schema=False):
+                    raise RuntimeError(
+                        f"Worker could not connect to database: {worker_db.last_error}"
+                    )
+                close_worker_db = True
+                
+            with diagnostics.operation("dashboard_snapshot", mode="client"):
+                snapshot = worker_db.get_dashboard_snapshot()
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                
+                is_success = True
+        except Exception as error:
+            logger.exception("Remote dashboard load failed")
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if close_worker_db:
+                worker_db.close()
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(snapshot, started)
+            else:
+                self.failed.emit(error_msg, started)
+
 
 class StatCard(QFrame):
     """Beautiful statistic card widget"""
@@ -155,11 +221,18 @@ class HomeTab(QWidget):
         self.language = (language or 'en').lower()
         self.stat_cards = {}
         self.charts = {}
+        self._dashboard_snapshot = None
+        self._dashboard_thread = None
         self.refresh_timer = QTimer()
         self.refresh_timer.timeout.connect(self.refresh_statistics)
         self.refresh_timer.start(30000)  # Refresh every 30 seconds
         self.setup_ui()
-        self.refresh_statistics()
+        # setup_ui already populated the two detail lists once.
+        self.refresh_statistics(force=True, refresh_lists=False)
+        self._last_full_refresh_at = time.monotonic()
+        app = QApplication.instance()
+        if app:
+            app.aboutToQuit.connect(self._wait_for_dashboard_thread)
 
     def _t(self):
         """Lightweight translations for Home tab UI strings."""
@@ -433,9 +506,12 @@ class HomeTab(QWidget):
             month_name = date.strftime("%b")
             months.append(month_name)
             
-            # Get sales and imports for this month
-            sales_total = self.get_monthly_total('Sales', date.year, date.month)
-            imports_total = self.get_monthly_total('Imports', date.year, date.month)
+            # All clients (local or remote) receive all six months in one
+            # background dashboard-snapshot query - never block the GUI
+            # thread here. refresh_statistics() fills these placeholders in
+            # moments later via _apply_dashboard_snapshot.
+            sales_total = 0.0
+            imports_total = 0.0
             profit = sales_total - imports_total
             
             sales_data.append(sales_total)
@@ -511,6 +587,9 @@ class HomeTab(QWidget):
         chart_view.setStyleSheet("background-color: transparent; border: 2px solid #555555; border-radius: 8px;")
         
         self.charts['monthly_comparison'] = chart_view
+        self._monthly_sales_set = sales_set
+        self._monthly_imports_set = imports_set
+        self._monthly_profit_series = profit_series
         parent_layout.addWidget(chart_view)
     
     def create_low_stock_section(self, parent_layout):
@@ -592,8 +671,19 @@ class HomeTab(QWidget):
             if w is not None:
                 w.setParent(None)
             layout.removeItem(item)
-        # Rebuild
-        low_stock_products = self.get_low_stock_products()
+        # Rebuild from the async dashboard snapshot - never block the GUI
+        # thread with a live query here (local or remote alike).
+        low_stock_products = (
+            (self._dashboard_snapshot or {}).get("low_stock_products", [])
+        )
+        low_stock_products = [
+            {
+                **product,
+                "stock": int(Decimal(str(product.get("stock") or 0))),
+                "alert": int(Decimal(str(product.get("alert") or 0))),
+            }
+            for product in low_stock_products
+        ]
         if not low_stock_products:
             no_issues = QLabel(self._t()("low_stock_ok"))
             no_issues.setStyleSheet("color: #4CAF50; font-size: 12px; padding: 8px;")
@@ -674,17 +764,19 @@ class HomeTab(QWidget):
         
         # Activity container
         activity_frame = QFrame()
+        activity_frame.setObjectName("recentActivityFrame")
         activity_frame.setStyleSheet("""
-            QFrame {
+            QFrame#recentActivityFrame {
                 background-color: #3c3c3c;
                 border: 2px solid #555555;
                 border-radius: 12px;
-                padding: 16px;
             }
         """)
         activity_frame.setFixedHeight(400)
         
         activity_layout = QVBoxLayout(activity_frame)
+        activity_layout.setContentsMargins(24, 24, 24, 24)
+        activity_layout.setSpacing(12)
         self.recent_activity_layout = activity_layout
         self.recent_activity_frame = activity_frame
         
@@ -706,7 +798,13 @@ class HomeTab(QWidget):
             if widget:
                 widget.setParent(None)
 
-        recent_activities = self.get_recent_activities()
+        recent_activities = (
+            (self._dashboard_snapshot or {}).get("recent_activities", [])
+        )
+        recent_activities = [
+            {**activity, "amount": float(activity.get("amount") or 0)}
+            for activity in recent_activities
+        ]
 
         if not recent_activities:
             no_activity = QLabel(self._t()("no_recent_activity"))
@@ -723,18 +821,20 @@ class HomeTab(QWidget):
     def create_activity_item(self, activity):
         """Create a single activity item widget"""
         item_frame = QFrame()
+        item_frame.setObjectName("recentActivityItem")
+        item_frame.setMinimumHeight(58)
+        item_frame.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Fixed)
         item_frame.setStyleSheet("""
-            QFrame {
+            QFrame#recentActivityItem {
                 background-color: #2b2b2b;
                 border: 1px solid #555555;
                 border-radius: 6px;
-                padding: 8px;
-                margin: 2px;
             }
         """)
         
         item_layout = QHBoxLayout(item_frame)
-        item_layout.setContentsMargins(12, 8, 12, 8)
+        item_layout.setContentsMargins(16, 10, 16, 10)
+        item_layout.setSpacing(14)
         
         # Activity type badge
         _ = self._t()
@@ -750,13 +850,16 @@ class HomeTab(QWidget):
             f"color: {badge_color}; font-size: 11px; font-weight: bold;"
         )
         badge_label.setMinimumWidth(60)
-        badge_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        badge_label.setMinimumHeight(24)
+        badge_label.setAlignment(Qt.AlignCenter)
         item_layout.addWidget(badge_label)
         
         # Description
         desc_label = QLabel(activity['description'])
         desc_label.setStyleSheet("color: #ffffff; font-size: 12px;")
-        item_layout.addWidget(desc_label)
+        desc_label.setMinimumHeight(24)
+        desc_label.setAlignment(Qt.AlignLeft | Qt.AlignVCenter)
+        item_layout.addWidget(desc_label, 1)
         
         item_layout.addStretch()
         
@@ -764,183 +867,197 @@ class HomeTab(QWidget):
         amount_label = QLabel(f"{activity['amount']:.2f} MAD")
         amount_color = "#4CAF50" if activity['type'] == 'Sales' else "#2196F3"
         amount_label.setStyleSheet(f"color: {amount_color}; font-size: 12px; font-weight: bold;")
+        amount_label.setMinimumHeight(24)
+        amount_label.setMinimumWidth(120)
+        amount_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         item_layout.addWidget(amount_label)
         
         return item_frame
     
-    def refresh_statistics(self):
-        """Refresh all statistics and charts"""
+    def refresh_statistics(self, force=False, refresh_lists=True):
+        """Refresh all statistics and charts.
+
+        Always goes through the async dashboard-snapshot worker
+        (_DashboardWorker / Database.get_dashboard_snapshot). A local Postgres
+        connection can block just as long as a remote one under lock
+        contention (another PC mid-transaction on Sales/Products/Imports), so
+        the GUI thread must never run these queries directly - this used to
+        have a separate synchronous branch here for the local-Database case
+        (5+ cursor.execute calls run straight on the GUI thread), which froze
+        the Home tab under exactly that contention.
+        """
+        if not force and not self.isVisible():
+            return
         if not self.database or not self.database.conn:
             return
-        
-        try:
-            # Update stat cards
-            current_month = datetime.now().month
-            current_year = datetime.now().year
-            
-            # Total sales this month
-            sales_total = self.get_monthly_total('Sales', current_year, current_month)
-            if 'total_sales' in self.stat_cards:
-                self.stat_cards['total_sales'].update_value(f"{sales_total:.0f} MAD", "This month")
-            
-            # Total imports this month
-            imports_total = self.get_monthly_total('Imports', current_year, current_month)
-            if 'total_imports' in self.stat_cards:
-                self.stat_cards['total_imports'].update_value(f"{imports_total:.0f} MAD", "This month")
-            
-            # Products count
-            products_count = self.get_table_count('Products')
-            if 'products_count' in self.stat_cards:
-                self.stat_cards['products_count'].update_value(products_count, "In inventory")
-            
-            # Low stock items
-            low_stock_count = self.get_low_stock_count()
-            if 'low_stock' in self.stat_cards:
-                self.stat_cards['low_stock'].update_value(low_stock_count, "At/Below alert")
-            # Refresh the detailed list
-            self._populate_low_stock_products()
-            self._populate_recent_activities()
-            
-            # Clients count
-            clients_count = self.get_table_count('Clients')
-            if 'clients_count' in self.stat_cards:
-                self.stat_cards['clients_count'].update_value(clients_count, "Active clients")
-            
-            # Suppliers count
-            suppliers_count = self.get_table_count('Suppliers')
-            if 'suppliers_count' in self.stat_cards:
-                self.stat_cards['suppliers_count'].update_value(suppliers_count, "Active suppliers")
-            
-            print("✓ Dashboard statistics refreshed")
-            
-        except Exception as e:
-            print(f"Error refreshing statistics: {e}")
-    
-    def get_monthly_total(self, table_name, year, month):
-        """Get total amount for a specific month"""
-        if not self.database or not self.database.cursor:
-            return 0.0
-        
-        try:
-            if table_name == 'Sales':
-                # Calculate total from Sales_Items for sales in this month (exclude on_hold)
-                query = """
-                    SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
-                    FROM Sales s
-                    JOIN Sales_Items si ON s.ID = si.sales_id
-                    WHERE s.state != 'on_hold' AND strftime('%Y', s.date) = ? AND strftime('%m', s.date) = ?
-                """
-            elif table_name == 'Imports':
-                # Calculate total from Import_Items for imports in this month
-                query = """
-                    SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
-                    FROM Imports i
-                    JOIN Import_Items ii ON i.ID = ii.import_id
-                    WHERE strftime('%Y', i.date) = ? AND strftime('%m', i.date) = ?
-                """
-            else:
-                return 0.0
-            
-            self.database.cursor.execute(query, (str(year), f"{month:02d}"))
-            result = self.database.cursor.fetchone()
-            return float(result[0]) if result else 0.0
-        except Exception as e:
-            print(f"Error getting monthly total for {table_name}: {e}")
-            return 0.0
-    
-    def get_table_count(self, table_name):
-        """Get count of records in a table"""
-        if not self.database or not self.database.cursor:
-            return 0
-        
-        try:
-            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table_name}")
-            result = self.database.cursor.fetchone()
-            return int(result[0]) if result else 0
-        except Exception as e:
-            print(f"Error getting count for {table_name}: {e}")
-            return 0
-    
-    def get_low_stock_count(self):
-        """Get count of products whose quantity is <= their stock_alert (if set >0) or <=5 legacy fallback.
-        stock_alert default is 0 (disabled). If all stock_alert are 0 we maintain legacy <=5 behavior.
-        """
-        if not self.database or not self.database.cursor:
-            return 0
-        
-        try:
-            self._ensure_stock_alert_column()
-            # Quantity calculation subquery reused
-            # Condition: if stock_alert > 0 then qty <= stock_alert else qty <= 5
-            query = """
-                SELECT COUNT(*) FROM (
-                    SELECT p.ID,
-                        (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID),0) -
-                         COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')),0)) as qty,
-                        COALESCE(p.stock_alert,0) as alert
-                    FROM Products p
-                ) t
-                WHERE (CASE WHEN alert > 0 THEN qty <= alert ELSE qty <= 5 END)
-            """
-            self.database.cursor.execute(query)
-            row = self.database.cursor.fetchone()
-            return int(row[0]) if row else 0
-        except Exception as e:
-            print(f"Error getting low stock count: {e}")
-            return 0
-    
-    def get_low_stock_products(self, threshold=None):
-        """Get products whose quantity is <= per-product stock_alert if set, otherwise <=5 legacy.
-        Ordered by quantity ascending, then by name. Limit 50 for display.
-        """
-        if not self.database or not self.database.cursor:
-            return []
-        
-        try:
-            self._ensure_stock_alert_column()
-            # We ignore the passed threshold now (kept for backward compatibility)
-            query = """
-                SELECT * FROM (
-                    SELECT p.name AS name, p.username AS username,
-                        (COALESCE((SELECT SUM(ii.quantity) FROM Import_Items ii WHERE ii.product_id = p.ID), 0)
-                         - COALESCE((SELECT SUM(si.quantity) FROM Sales_Items si JOIN Sales s ON si.sales_id = s.ID 
-                                     WHERE si.product_id = p.ID AND (s.state IS NULL OR s.state != 'on_hold')), 0)) AS stock_level,
-                        COALESCE(p.stock_alert,0) AS alert
-                    FROM Products p
-                ) t
-                WHERE (CASE WHEN alert > 0 THEN stock_level <= alert ELSE stock_level <= 5 END)
-                ORDER BY stock_level ASC, name ASC
-                LIMIT 50
-            """
-            self.database.cursor.execute(query)
-            results = self.database.cursor.fetchall()
-            
-            products = []
-            for row in results:
-                name, username, stock_level, alert = row
-                products.append({
-                    'name': name or username or 'Unknown Product',
-                    'username': username or '',
-                    'stock': int(stock_level),
-                    'alert': int(alert or 0)
-                })
-            
-            return products
-            
-        except Exception as e:
-            print(f"Error getting low stock products: {e}")
-            return []
+        # Offline: never start a network thread that would hang on the
+        # host - render the last persisted snapshot from disk instead.
+        if bool(getattr(self.database, 'offline', False)):
+            if not self._render_cached_dashboard():
+                logger.warning(
+                    "Offline dashboard has no cached snapshot to render"
+                )
+            return
+        self._start_remote_dashboard_refresh()
 
-    def _ensure_stock_alert_column(self):
-        """Ensure Products table has stock_alert column (runtime safety if app updated while DB open)."""
+    def _start_remote_dashboard_refresh(self):
+        existing_thread = getattr(self, "_dashboard_thread", None)
+        is_running = False
+        if existing_thread is not None:
+            try:
+                if shiboken6.isValid(existing_thread) and existing_thread.isRunning():
+                    is_running = True
+            except RuntimeError:
+                pass
+        
+        if is_running:
+            logger.warning("Duplicate dashboard refresh requested while active. Ignoring.")
+            return False
+            
+        thread = QThread()
+        worker = _DashboardWorker(self.database)
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        
+        worker.finished.connect(self._remote_dashboard_finished)
+        worker.failed.connect(self._remote_dashboard_failed)
+        
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_dashboard_thread_finished)
+        
+        self._dashboard_thread = thread
+        self._dashboard_worker = worker
+        diagnostics.worker_started("dashboard_snapshot", "home", "dashboard")
+        thread.start()
+        return True
+
+    @Slot(object, float)
+    def _remote_dashboard_finished(self, snapshot, started):
+        diagnostics.worker_finished("dashboard_snapshot", "home", "dashboard")
+        if ENABLE_SQLITE_CACHE:
+            try:
+                cache = getattr(self.database, 'cache', None)
+                if cache is not None and hasattr(cache, 'store_dashboard'):
+                    cache.store_dashboard(snapshot or {})
+            except Exception:
+                logger.exception("Could not persist dashboard snapshot to cache")
+        self._apply_dashboard_snapshot(snapshot, started)
+
+    @Slot(str, float)
+    def _remote_dashboard_failed(self, error, started):
+        diagnostics.worker_failed("dashboard_snapshot", "home", "dashboard")
+        logger.error(
+            "Remote dashboard refresh failed after %.3fs error=%s",
+            time.perf_counter() - started, error,
+        )
+        # Keep showing the last-known snapshot (from RAM or disk) instead of
+        # blanking the Home tab when the host is briefly unreachable.
+        if not self._dashboard_snapshot:
+            self._render_cached_dashboard()
+
+    def _render_cached_dashboard(self):
+        """Render the last persisted dashboard snapshot from the on-disk cache
+        (offline path). Returns True when a snapshot was rendered."""
+        if not ENABLE_SQLITE_CACHE:
+            return False
+        cache = getattr(self.database, 'cache', None)
+        if cache is None or not hasattr(cache, 'get_dashboard'):
+            return False
         try:
-            self.database.cursor.execute("PRAGMA table_info('Products')")
-            cols = {r[1] for r in self.database.cursor.fetchall()}
-            if 'stock_alert' not in cols:
-                self.database.cursor.execute("ALTER TABLE 'Products' ADD COLUMN 'stock_alert' INTEGER")
-                self.database.conn.commit()
+            snapshot, _stored_at = cache.get_dashboard()
         except Exception:
-            pass
+            logger.exception("Could not read dashboard snapshot from cache")
+            return False
+        if not snapshot:
+            return False
+        self._apply_dashboard_snapshot(snapshot)
+        return True
+
+    def _apply_dashboard_snapshot(self, snapshot, started=None):
+        """Render a dashboard snapshot into the cards, lists and monthly chart.
+        Used by the online success path and the offline cache path alike."""
+        self._dashboard_snapshot = dict(snapshot or {})
+        values = self._dashboard_snapshot
+        cards = (
+            ("total_sales", f"{float(values.get('sales_total', 0)):.0f} MAD", "This month"),
+            ("total_imports", f"{float(values.get('imports_total', 0)):.0f} MAD", "This month"),
+            ("products_count", values.get("products_count", 0), "In inventory"),
+            ("low_stock", values.get("low_stock_count", 0), "At/Below alert"),
+            ("clients_count", values.get("clients_count", 0), "Active clients"),
+            ("suppliers_count", values.get("suppliers_count", 0), "Active suppliers"),
+        )
+        for key, value, subtitle in cards:
+            if key in self.stat_cards:
+                self.stat_cards[key].update_value(value, subtitle)
+        self._populate_low_stock_products()
+        self._populate_recent_activities()
+        monthly = values.get("monthly", {})
+        for index, offset in enumerate(range(5, -1, -1)):
+            date = datetime.now() - timedelta(days=offset * 30)
+            row = monthly.get(date.strftime("%Y-%m"), {})
+            sales = float(row.get("sales", 0))
+            imports = float(row.get("imports", 0))
+            self._monthly_sales_set.replace(index, sales)
+            self._monthly_imports_set.replace(index, -imports)
+            self._monthly_profit_series.replace(
+                index, QPointF(index, sales - imports)
+            )
+        if started is not None:
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "dashboard_refresh completed in %.3f seconds mode=client", elapsed,
+            )
+
+    @Slot()
+    def _on_dashboard_thread_finished(self):
+        self._dashboard_thread = None
+        self._dashboard_worker = None
+
+    def _wait_for_dashboard_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_dashboard_thread", None)
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+                self._dashboard_thread = None
+                self._dashboard_worker = None
+                return True
+
+        except RuntimeError:
+            # If it's deleted during the checks, it's already finished.
+            self._dashboard_thread = None
+            self._dashboard_worker = None
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Remote dashboard thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        # Successful wait implies thread finished executing its event loop
+        # Identity-safe reference cleanup
+        if getattr(self, "_dashboard_thread", None) is thread:
+            self._dashboard_thread = None
+            self._dashboard_worker = None
+            
+        return True
     
     def create_low_stock_item(self, product):
         """Create a single low stock product item"""
@@ -974,68 +1091,6 @@ class HomeTab(QWidget):
         layout.addWidget(stock_label)
         
         return item_widget
-    
-    def get_recent_activities(self):
-        """Get recent sales and import activities"""
-        activities = []
-        
-        if not self.database or not self.database.cursor:
-            return activities
-        
-        try:
-            # Get recent sales with calculated totals
-            sales_query = """
-                SELECT 'Sales' as type, s.date, 
-                    COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0) as total,
-                    'Sale to ' || s.client_username as description
-                FROM Sales s
-                LEFT JOIN Sales_Items si ON s.ID = si.sales_id
-                WHERE s.state IS NULL OR s.state != 'on_hold'
-                GROUP BY s.ID, s.date, s.client_username, s.tva
-                ORDER BY s.date DESC, s.ID DESC 
-                LIMIT 5
-            """
-            self.database.cursor.execute(sales_query)
-            sales_results = self.database.cursor.fetchall()
-            
-            for result in sales_results:
-                activities.append({
-                    'type': result[0],
-                    'date': result[1],
-                    'amount': float(result[2]),
-                    'description': result[3]
-                })
-            
-            # Get recent imports with calculated totals
-            imports_query = """
-                SELECT 'Imports' as type, i.date,
-                    COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0) as total,
-                    'Import from ' || i.supplier_username as description
-                FROM Imports i
-                LEFT JOIN Import_Items ii ON i.ID = ii.import_id
-                GROUP BY i.ID, i.date, i.supplier_username, i.tva
-                ORDER BY i.date DESC, i.ID DESC 
-                LIMIT 5
-            """
-            self.database.cursor.execute(imports_query)
-            imports_results = self.database.cursor.fetchall()
-            
-            for result in imports_results:
-                activities.append({
-                    'type': result[0],
-                    'date': result[1],
-                    'amount': float(result[2]),
-                    'description': result[3]
-                })
-            
-            # Sort all activities by date (most recent first)
-            activities.sort(key=lambda x: x['date'], reverse=True)
-            
-            return activities[:5]  # Return top 5 most recent
-            
-        except Exception as e:
-            print(f"Error getting recent activities: {e}")
-            return activities
     
     def handle_quick_action(self, action_type):
         """Handle quick action button clicks"""
@@ -1100,14 +1155,15 @@ class HomeTab(QWidget):
 
     def refresh_on_tab_switch(self):
         """Called when this tab becomes active - refresh all data"""
+        now = time.monotonic()
+        if now - getattr(self, "_last_full_refresh_at", 0.0) < 30.0:
+            return
         self.refresh_statistics()
-        # Ensure list is in sync when user returns
-        self._populate_low_stock_products()
-        self._populate_recent_activities()
         # Re-apply quick-actions visibility in case it changed while away
         mw = self.parent()
         while mw and not hasattr(mw, 'tab_visibility'):
             mw = mw.parent() if callable(getattr(mw, 'parent', None)) else None
         if mw:
             self.update_quick_actions_visibility(mw.tab_visibility)
+        self._last_full_refresh_at = now
         print("✓ Home tab refreshed on switch")

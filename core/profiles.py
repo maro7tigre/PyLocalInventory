@@ -5,13 +5,17 @@ import os
 import json
 import shutil
 import time
-import sqlite3
+
+from core.database import Database
+from core.runtime_paths import portable_dir
 
 class ProfileManager:
     def __init__(self):
         self.selected_profile : ProfileClass = None
         self.available_profiles = {}
-        self.profiles_path = "./profiles"
+        # Never depend on the process working directory. Windows Startup often
+        # launches applications from a protected system directory.
+        self.profiles_path = portable_dir("profiles")
 
         self.empty_profile = ProfileClass("")
         empty_values = {
@@ -45,11 +49,12 @@ class ProfileManager:
                 try:
                     profile = ProfileClass(item)
                     profile.config_path = config_path
-                    profile.database_path = os.path.join(profile_dir, f"{item}.db")
                     profile.preview_path = os.path.join(profile_dir, "preview.png")  # Check for preview image
                     
                     # Load profile data from config
                     profile.load_config_data()
+                    if not profile.database_name and not profile.schema_name:
+                        profile.schema_name = Database._sanitize_schema_name(item)
                     
                     self.available_profiles[item] = profile
                 except Exception as e:
@@ -91,7 +96,7 @@ class ProfileManager:
             # Create profile instance
             profile = ProfileClass(profile_name)
             profile.config_path = os.path.join(profile_dir, "config.json")
-            profile.database_path = os.path.join(profile_dir, f"{profile_name}.db")
+            profile.database_name = Database._profile_database_name(profile_data.get('company name') or profile_name)
             
             # Set profile data
             for key, value in profile_data.items():
@@ -208,7 +213,7 @@ class ProfileManager:
         """Get list of available profiles"""
         return list(self.available_profiles.keys())
     
-    def duplicate_profile(self, source_name, new_name):
+    def duplicate_profile(self, source_name, new_name, database_name=None):
         """Duplicate an existing profile with a new name"""
         if source_name not in self.available_profiles:
             raise ValueError(f"Source profile '{source_name}' not found")
@@ -242,16 +247,21 @@ class ProfileManager:
         # Create new profile instance
         new_profile = ProfileClass(new_name)
         new_profile.config_path = os.path.join(new_dir, "config.json")
-        new_profile.database_path = os.path.join(new_dir, f"{new_name}.db")
         new_profile.preview_path = os.path.join(new_dir, "preview.png")
-        
+
         # Load and update the config
         new_profile.load_config_data()
-        
-        # Copy and modify database (only specific tables)
-        source_db = os.path.join(source_dir, f"{source_name}.db")
-        if os.path.exists(source_db):
-            self._copy_database_tables(source_db, new_profile.database_path)
+        new_profile.database_name = database_name or Database._profile_database_name(
+            new_profile.get_value('company name') or new_name
+        )
+
+        # Copy the source storage model into the new profile.
+        if getattr(source_profile, 'database_name', None):
+            from core import pg_backup
+            pg_backup.clone_database(source_profile.database_name, new_profile.database_name)
+        else:
+            # Legacy fallback for older schema-based profiles.
+            self._copy_database_tables(source_profile.schema_name, new_profile.schema_name)
         
         # Save updated config
         new_profile.save_to_config()
@@ -261,76 +271,64 @@ class ProfileManager:
         
         return new_profile
     
-    def _copy_database_tables(self, source_db_path, dest_db_path):
-        """Copy only specific tables from source database to destination"""
-        import sqlite3
-        
-        # Tables to copy (only base data, not operations)
-        tables_to_copy = ['Products', 'Clients', 'Suppliers']
-        
+    def _copy_database_tables(self, source_schema, dest_schema):
+        """Copy only specific tables (base data, not operations) from the source
+        profile's Postgres schema into the destination profile's schema, within
+        the one shared database - both schemas live side by side, so this is a
+        same-database schema-to-schema copy rather than a file-to-file one."""
+        import psycopg2
+        from core.pg_config import load_server_config
+
+        tables_to_copy = ['products', 'clients', 'suppliers']
+        pg_config = load_server_config()
+
         try:
-            # Connect to source database
-            source_conn = sqlite3.connect(source_db_path)
-            source_cursor = source_conn.cursor()
-            
-            # Connect to destination database (create if doesn't exist)
-            dest_conn = sqlite3.connect(dest_db_path)
-            dest_cursor = dest_conn.cursor()
-            
+            conn = psycopg2.connect(
+                host=pg_config.get('host'),
+                port=pg_config.get('port'),
+                dbname=pg_config.get('database'),
+                user=pg_config.get('user'),
+                password=pg_config.get('password'),
+            )
+            cursor = conn.cursor()
+            cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {dest_schema}")
+            conn.commit()
+
             for table_name in tables_to_copy:
                 try:
-                    # Check if table exists in source
-                    source_cursor.execute(
-                        "SELECT name FROM sqlite_master WHERE type='table' AND name=?", 
-                        (table_name,)
+                    # Skip if the source table doesn't exist yet
+                    cursor.execute("SELECT to_regclass(%s)", (f"{source_schema}.{table_name}",))
+                    if not cursor.fetchone()[0]:
+                        continue
+
+                    cursor.execute(
+                        f"CREATE TABLE IF NOT EXISTS {dest_schema}.{table_name} "
+                        f"(LIKE {source_schema}.{table_name} INCLUDING ALL)"
                     )
-                    if not source_cursor.fetchone():
-                        continue  # Skip if table doesn't exist
-                    
-                    # Get table structure
-                    source_cursor.execute(f"SELECT sql FROM sqlite_master WHERE type='table' AND name='{table_name}'")
-                    table_sql = source_cursor.fetchone()
-                    if table_sql:
-                        # Create table in destination
-                        dest_cursor.execute(table_sql[0])
-                    
-                    # Copy data
-                    source_cursor.execute(f"SELECT * FROM {table_name}")
-                    rows = source_cursor.fetchall()
-                    
-                    if rows:
-                        # Get column count
-                        source_cursor.execute(f"PRAGMA table_info({table_name})")
-                        columns_info = source_cursor.fetchall()
-                        column_count = len(columns_info)
-                        
-                        # Prepare insert statement
-                        placeholders = ','.join(['?' for _ in range(column_count)])
-                        insert_sql = f"INSERT INTO {table_name} VALUES ({placeholders})"
-                        
-                        # Insert all rows
-                        dest_cursor.executemany(insert_sql, rows)
-                        print(f"✓ Copied {len(rows)} records from {table_name}")
-                    
+                    cursor.execute(f"INSERT INTO {dest_schema}.{table_name} SELECT * FROM {source_schema}.{table_name}")
+
+                    cursor.execute(f"SELECT MAX(id) FROM {dest_schema}.{table_name}")
+                    max_id = cursor.fetchone()[0]
+                    if max_id is not None:
+                        cursor.execute(
+                            f"SELECT setval(pg_get_serial_sequence('{dest_schema}.{table_name}', 'id'), %s)",
+                            (max_id,)
+                        )
+
+                    conn.commit()
+                    cursor.execute(f"SELECT COUNT(*) FROM {dest_schema}.{table_name}")
+                    print(f"✓ Copied {cursor.fetchone()[0]} records from {table_name}")
+
                 except Exception as e:
+                    conn.rollback()
                     print(f"✗ Error copying table {table_name}: {e}")
                     continue
-            
-            # Commit changes and close connections
-            dest_conn.commit()
-            source_conn.close()
-            dest_conn.close()
-            
-            print(f"✓ Database tables copied successfully to {dest_db_path}")
-            
+
+            conn.close()
+            print(f"✓ Database tables copied successfully to schema {dest_schema}")
+
         except Exception as e:
             print(f"✗ Error copying database: {e}")
-            # Create empty database if copy failed
-            try:
-                conn = sqlite3.connect(dest_db_path)
-                conn.close()
-            except:
-                pass
     
     
 class ProfileClass:
@@ -339,18 +337,30 @@ class ProfileClass:
         self.preview_path = None
         self.encrypted_phrase = None  # Placeholder for encrypted validation phrase
         self.config_path = "./config.json"
-        self.database_path = "./database.db"
+        self.database_name = None
+        self.schema_name = None
         self.parameters = {
             "company name": {"value": None, "display name": {"en" : "company name","fr": "nom de l'entreprise", "es": "nombre de la empresa"}, "required": True, "default": "Lamibois", "options": ["Lamidap", "Lamibois", "porte amazone"], "type": "string"},
             "address": {"value": None, "display name": {"en" : "address","fr": "adresse", "es": "dirección"}, "required": False, "default": "", "options": [], "type": "string"},
             "email": {"value": None, "display name": {"en" : "email", "fr": "email", "es": "correo electrónico"}, "required": False, "default": "", "options": [], "type": "string"},
             "phone": {"value": None, "display name": {"en" : "phone", "fr": "téléphone", "es": "teléfono"}, "required": False, "default": "", "options": [], "type": "string"},
+            "fax": {"value": None, "display name": {"en": "fax", "fr": "fax", "es": "fax"}, "required": False, "default": "", "options": [], "type": "string"},
+            "website": {"value": None, "display name": {"en": "website", "fr": "site web", "es": "sitio web"}, "required": False, "default": "", "options": [], "type": "string"},
+            "ice": {"value": None, "display name": {"en": "ICE", "fr": "ICE", "es": "ICE"}, "required": False, "default": "", "options": [], "type": "string"},
+            "patente": {"value": None, "display name": {"en": "patente", "fr": "patente", "es": "patente"}, "required": False, "default": "", "options": [], "type": "string"},
+            "if number": {"value": None, "display name": {"en": "tax number", "fr": "I.F", "es": "NIF"}, "required": False, "default": "", "options": [], "type": "string"},
+            "rc": {"value": None, "display name": {"en": "RC", "fr": "R.C", "es": "R.C"}, "required": False, "default": "", "options": [], "type": "string"},
+            "cnss": {"value": None, "display name": {"en": "CNSS", "fr": "CNSS", "es": "CNSS"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank name": {"value": None, "display name": {"en": "bank", "fr": "banque", "es": "banco"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank account": {"value": None, "display name": {"en": "bank account", "fr": "compte / RIB", "es": "cuenta / RIB"}, "required": False, "default": "", "options": [], "type": "string"},
+            "bank agency": {"value": None, "display name": {"en": "bank agency", "fr": "agence bancaire", "es": "agencia bancaria"}, "required": False, "default": "", "options": [], "type": "string"},
             # Multiline footer text that will appear centered at the bottom of the last report page
-            "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"}
+            "report footer": {"value": None, "display name": {"en" : "report footer", "fr": "pied de page du rapport", "es": "pie de informe"}, "required": False, "default": "", "options": [], "type": "text"},
+            "currency": {"value": None, "display name": {"en" : "currency","fr": "devise", "es": "moneda"}, "required": False, "default": "DA", "options": [], "type": "string"}
         }
         self.available_parameters = {
             # Order determines display order in dialog
-            "dialog" : ["company name", "address", "email", "phone", "report footer"],
+            "dialog" : ["company name", "address", "email", "phone", "fax", "website", "ice", "patente", "if number", "rc", "cnss", "bank name", "bank account", "bank agency", "report footer"],
             "table" : ["company name"]
         }
         
@@ -407,6 +417,12 @@ class ProfileClass:
                 # Load encrypted phrase if exists
                 if "encrypted_phrase" in data:
                     self.encrypted_phrase = bytes.fromhex(data["encrypted_phrase"])
+
+                if "database_name" in data:
+                    self.database_name = data["database_name"]
+
+                if "schema_name" in data:
+                    self.schema_name = data["schema_name"]
                 
                 return  # Success, exit retry loop
                 
@@ -437,6 +453,12 @@ class ProfileClass:
                 # Save encrypted phrase if exists
                 if self.encrypted_phrase:
                     data["encrypted_phrase"] = self.encrypted_phrase.hex()
+
+                if self.database_name:
+                    data["database_name"] = self.database_name
+
+                if self.schema_name:
+                    data["schema_name"] = self.schema_name
                 
                 # Ensure directory exists
                 os.makedirs(os.path.dirname(self.config_path), exist_ok=True)

@@ -2,7 +2,8 @@
 Reports Tab - Manage department reports
 """
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
-                               QTextEdit, QFrame)
+                               QTextEdit, QFrame, QComboBox, QDateEdit, QCheckBox)
+from PySide6.QtCore import QDate
 from ui.tabs.base_tab import BaseTab
 from classes.reports_class import ReportsClass
 from ui.dialogs.edit_dialogs.reports_edit_dialog import ReportsEditDialog
@@ -14,6 +15,131 @@ class ReportsTab(BaseTab):
     def __init__(self, database=None, parent=None):
         super().__init__(ReportsClass, ReportsEditDialog, database, parent)
 
+    def _cache_key(self):
+        """Reports add user/date-range/type filters to the cache key so a
+        cached result is never served across different report filters."""
+        owner_id = self.user_filter.currentData() if self.user_filter else None
+        use_dates = self.date_filter_enabled.isChecked()
+        date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
+        date_to = self.date_to.date().toString("yyyy-MM-dd") if use_dates else None
+        report_type = self.type_filter.currentText()
+        if report_type == "All types":
+            report_type = None
+        return (
+            self.search_bar.text().strip(),
+            self.order_combo.currentText(),
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+        )
+
+    def add_additional_toolbar_buttons(self, layout):
+        self.user_filter = None
+        if getattr(self.database, "is_superadmin", True):
+            layout.insertWidget(layout.count() - 1, QLabel("User:"))
+            self.user_filter = QComboBox()
+            self.user_filter.addItem("All users", None)
+            try:
+                for user in self.database.list_report_users():
+                    self.user_filter.addItem(user["username"], user["id"])
+            except Exception as error:
+                print(f"Could not load report users: {error}")
+            self.user_filter.currentIndexChanged.connect(
+                lambda _index: self.refresh_table()
+            )
+            layout.insertWidget(layout.count() - 1, self.user_filter)
+
+        layout.insertWidget(layout.count() - 1, QLabel("Type:"))
+        self.type_filter = QComboBox()
+        self.type_filter.addItems([
+            "All types", "General", "Sales", "Products", "Services", "Clients",
+            "Revenue", "Profit", "Activity",
+        ])
+        self.type_filter.currentIndexChanged.connect(
+            lambda _index: self.refresh_table()
+        )
+        layout.insertWidget(layout.count() - 1, self.type_filter)
+
+        self.date_filter_enabled = QCheckBox("Date range")
+        self.date_from = QDateEdit(QDate.currentDate().addYears(-1))
+        self.date_to = QDateEdit(QDate.currentDate())
+        for editor in (self.date_from, self.date_to):
+            editor.setCalendarPopup(True)
+            editor.setDisplayFormat("dd-MM-yyyy")
+            editor.setEnabled(False)
+            editor.dateChanged.connect(lambda _date: self.refresh_table())
+        self.date_filter_enabled.toggled.connect(self._toggle_date_filter)
+        layout.insertWidget(layout.count() - 1, self.date_filter_enabled)
+        layout.insertWidget(layout.count() - 1, self.date_from)
+        layout.insertWidget(layout.count() - 1, self.date_to)
+
+    def _toggle_date_filter(self, enabled):
+        self.date_from.setEnabled(enabled)
+        self.date_to.setEnabled(enabled)
+        self.refresh_table()
+
+    def fetch_items(self, search_text=None, order_option=None, limit=None, offset=None,
+                    after_id=None, after_sort=None):
+        owner_id = self.user_filter.currentData() if self.user_filter else None
+        use_dates = self.date_filter_enabled.isChecked()
+        date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
+        date_to = self.date_to.date().toString("yyyy-MM-dd") if use_dates else None
+        report_type = self.type_filter.currentText()
+        if report_type == "All types":
+            report_type = None
+        return self.database.get_reports(
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+            search_text=search_text,
+            search_columns=self.get_searchable_fields(),
+            order_by=self._order_by_field(order_option),
+            order_dir=self._order_direction(order_option),
+            limit=limit,
+            offset=offset,
+            after_id=after_id,
+            after_sort=after_sort,
+        )
+
+    def background_fetcher(self, refresh_id=None, database=None):
+        """Capture filter widgets and the keyset cursor on the GUI thread."""
+        owner_id = self.user_filter.currentData() if self.user_filter else None
+        use_dates = self.date_filter_enabled.isChecked()
+        date_from = self.date_from.date().toString("yyyy-MM-dd") if use_dates else None
+        date_to = self.date_to.date().toString("yyyy-MM-dd") if use_dates else None
+        report_type = self.type_filter.currentText()
+        if report_type == "All types":
+            report_type = None
+        search_text = self.search_bar.text().strip()
+        order_option = self.order_combo.currentText()
+        order_by = self._order_by_field(order_option)
+        order_dir = self._order_direction(order_option)
+        limit = self.page_size + 1
+        after_id = self._after_id
+        after_sort = self._after_sort
+        database = self.database
+
+        def fetch():
+            items = database.get_reports(
+                owner_id,
+                date_from,
+                date_to,
+                report_type,
+                search_text=search_text,
+                search_columns=self.get_searchable_fields(),
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+            metrics = self._keyset_metrics(order_by, items, limit)
+            return items, None, metrics, refresh_id
+
+        return fetch
+
     def details_callback(self, obj_id):
         """Show full report text in a read-only popup"""
         try:
@@ -21,9 +147,14 @@ class ReportsTab(BaseTab):
             if not report_obj:
                 return
 
-            department = report_obj.get_value('Department') or ''
-            date_val = report_obj.get_value('Date') or ''
-            report_text = report_obj.get_value('Report') or ''
+            department = (
+                report_obj.get_value('created_by_username')
+                or report_obj.get_value('department')
+                or 'Legacy / Unassigned'
+            )
+            date_val = report_obj.get_value('date') or ''
+            report_type = report_obj.get_value("report_type") or "General"
+            report_text = report_obj.get_value('report') or ''
 
             from ui.widgets.themed_widgets import RedButton
 
@@ -43,6 +174,9 @@ class ReportsTab(BaseTab):
             date_label = QLabel(f"Date:  {date_val}")
             date_label.setStyleSheet("font-size: 13px; color: #aaaaaa;")
             layout.addWidget(date_label)
+            type_label = QLabel(f"Type:  {report_type}")
+            type_label.setStyleSheet("font-size: 13px; color: #aaaaaa;")
+            layout.addWidget(type_label)
 
             sep = QFrame()
             sep.setFrameShape(QFrame.HLine)
@@ -78,7 +212,7 @@ class ReportsTab(BaseTab):
         options = set()
         for obj in self.all_items:
             try:
-                dept = obj.get_value('Department')
+                dept = obj.get_value('department')
                 if dept:
                     options.add(str(dept))
             except Exception:
@@ -96,16 +230,21 @@ class ReportsTab(BaseTab):
         ])
 
     def get_searchable_fields(self):
-        return ['Department', 'Date']
+        return ['department', 'date', 'report_type']
 
     def matches_search(self, obj, search_text):
         if not search_text:
             return True
         search_lower = search_text.lower()
         try:
-            dept = obj.get_value('Department') or ""
-            date_val = obj.get_value('Date') or ""
-            if search_lower in dept.lower() or search_lower in date_val.lower():
+            dept = obj.get_value('department') or ""
+            date_val = obj.get_value('date') or ""
+            report_type = obj.get_value("report_type") or "General"
+            if (
+                search_lower in dept.lower()
+                or search_lower in date_val.lower()
+                or search_lower in report_type.lower()
+            ):
                 return True
         except Exception:
             pass
@@ -116,13 +255,13 @@ class ReportsTab(BaseTab):
             return items
         try:
             if order_option == "Department ↑":
-                items.sort(key=lambda x: str(x.get_value('Department') or "").lower())
+                items.sort(key=lambda x: str(x.get_value('department') or "").lower())
             elif order_option == "Department ↓":
-                items.sort(key=lambda x: str(x.get_value('Department') or "").lower(), reverse=True)
+                items.sort(key=lambda x: str(x.get_value('department') or "").lower(), reverse=True)
             elif order_option == "Date ↑":
-                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('Date')))
+                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('date')))
             elif order_option == "Date ↓":
-                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('Date')), reverse=True)
+                items.sort(key=lambda x: self.parse_date_for_sorting(x.get_value('date')), reverse=True)
         except Exception as e:
             print(f"Error sorting reports: {e}")
         return items

@@ -24,6 +24,23 @@ except ImportError:
 import shutil
 
 
+class AdaptiveDecimalSpinBox(QDoubleSpinBox):
+    """Show only meaningful decimal digits while retaining decimal input."""
+
+    def textFromValue(self, value):
+        text = f"{value:.{self.decimals()}f}"
+        if "." in text:
+            text = text.rstrip("0").rstrip(".")
+        return text
+
+    def valueFromText(self, text):
+        from core.calculations import to_decimal
+        try:
+            return float(to_decimal(text))
+        except Exception:
+            return 0.0
+
+
 class NumericWidget(QWidget):
     """Widget for int/float parameters with validation"""
     
@@ -38,9 +55,9 @@ class NumericWidget(QWidget):
         # Determine if int or float
         param_type = param_info.get('type', 'int')
         
-        if param_type == 'float':
-            self.spinbox = QDoubleSpinBox()
-            self.spinbox.setDecimals(2)
+        if param_type in ('float', 'decimal'):
+            self.spinbox = AdaptiveDecimalSpinBox()
+            self.spinbox.setDecimals(param_info.get('precision', 2))
         else:
             self.spinbox = QSpinBox()
         
@@ -109,7 +126,12 @@ class StringWidget(QWidget):
         
         # Set enabled state
         self.line_edit.setEnabled(editable)
-        
+
+        # Honor an optional maximum length (e.g. the Devis reference).
+        max_length = param_info.get('maxlength')
+        if max_length:
+            self.line_edit.setMaxLength(int(max_length))
+
         # Connect validation
         self.line_edit.textChanged.connect(self.validate_input)
         
@@ -160,6 +182,12 @@ class DateWidget(QWidget):
         
         self.date_edit = QDateEdit()
         self.date_edit.setCalendarPopup(True)
+        # Without an explicit format, QDateEdit falls back to the OS locale,
+        # which reads/shows month/day/year on this system - display/edit as
+        # day/month/year instead (New/Edit Sale, New/Edit Import). The
+        # underlying value stored to the database is untouched - date()
+        # below always serializes to yyyy-MM-dd regardless of display format.
+        self.date_edit.setDisplayFormat("dd/MM/yyyy")
         self.date_edit.setDate(QDate.currentDate())  # Default to today
         self.date_edit.setEnabled(editable)
         
@@ -447,7 +475,7 @@ class ParameterWidgetFactory:
         ui_config = ui_config or {}
         param_type = param_info.get('type', 'string')
         
-        if param_type in ['int', 'float']:
+        if param_type in ['int', 'float', 'decimal']:
             return NumericWidget(param_info, editable)
         elif param_type == 'bool':
             # Checkbox that maps to true_value / false_value

@@ -26,10 +26,40 @@ class ProductEditDialog(BaseEditDialog):
         if product_id:
             self.product = ProductClass(product_id, database)
             self.product.load_database_data()
+            current_quantity = self.product.get_value("quantity")
             window_title = f"Edit Product - {self.product.get_value('name') or 'Unnamed'}"
         else:
             self.product = ProductClass(0, database)
+            current_quantity = 0
             window_title = "New Product"
+
+        # Stock is ledger-based, so this writable presentation field is saved
+        # as one opening/adjustment ledger entry. Keep it directly before the
+        # stock-alert threshold in both create and edit forms.
+        self.product.parameters["quantity"] = {
+            "value": current_quantity,
+            "display_name": {
+                "en": "Stock Quantity" if product_id else "Initial Quantity",
+                "fr": "Quantité en stock" if product_id else "Quantité initiale",
+                "es": "Cantidad en stock" if product_id else "Cantidad inicial",
+            },
+            "required": False,
+            "default": 0,
+            "options": [],
+            "type": "decimal",
+            "precision": 3,
+            "min": 0,
+            "max": 999999999,
+        }
+        dialog_fields = self.product.available_parameters["dialog"]
+        reordered = {}
+        for key, permission in dialog_fields.items():
+            if key == "stock_alert":
+                reordered["quantity"] = "rw"
+            reordered[key] = permission
+        if "quantity" not in reordered:
+            reordered["quantity"] = "rw"
+        self.product.available_parameters["dialog"] = reordered
         
         # Define product-specific UI configuration
         ui_config = {
@@ -47,6 +77,7 @@ class ProductEditDialog(BaseEditDialog):
         
         # Set specific window title
         self.setWindowTitle(window_title)
+        self._saving = False
     
     def validate_data(self):
         """Product-specific validation (extends base validation)"""
@@ -90,6 +121,11 @@ class ProductEditDialog(BaseEditDialog):
     
     def save_changes(self):
         """Save product changes without annoying success popup"""
+        if self._saving:
+            return
+        self._saving = True
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving...")
         try:
             # Validate data first
             errors = self.validate_data()
@@ -121,6 +157,8 @@ class ProductEditDialog(BaseEditDialog):
                 value = ParameterWidgetFactory.get_widget_value(widget)
                 form_values[param_key] = value
 
+            target_quantity = form_values.pop("quantity", 0)
+
             # Default username to product name if left empty
             if not form_values.get('username'):
                 form_values['username'] = form_values.get('name') or self.product.get_value('name') or ''
@@ -128,8 +166,25 @@ class ProductEditDialog(BaseEditDialog):
             for param_key, value in form_values.items():
                 self.product.set_value(param_key, value)
             
-            # Save to database
-            success = self.product.save_to_database()
+            # A new product and its opening stock must be one transaction so
+            # rapid clicks or a partial failure cannot duplicate stock.
+            if not self.product_id:
+                product_data = self.product.get_value(destination="database")
+                result = self.database.save_product_with_opening_stock(
+                    product_data, target_quantity
+                )
+                success = bool(result and result.get("product_id"))
+                if success:
+                    self.product.id = int(result["product_id"])
+                    self.product.parameters["id"]["value"] = self.product.id
+            else:
+                product_data = self.product.get_value(destination="database")
+                result = self.database.update_product_with_stock(
+                    self.product_id, product_data, target_quantity
+                )
+                success = bool(
+                    result and result.get("transaction") == "committed"
+                )
             
             if success:
                 # No success popup - just close dialog
@@ -139,6 +194,11 @@ class ProductEditDialog(BaseEditDialog):
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save product: {str(e)}")
+        finally:
+            if self.result() != QDialog.Accepted:
+                self._saving = False
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
     
     def get_product_data(self):
         """Get the product object (useful for parent windows)"""

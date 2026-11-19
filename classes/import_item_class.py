@@ -57,8 +57,9 @@ class ImportItemClass(BaseClass):
                 "required": True,
                 "default": 1,
                 "options": [],
-                "type": "int",
-                "min": 1
+                "type": "decimal",
+                "precision": 3,
+                "min": 0.001
             },
             "unit_price": {
                 "value": 0.0,
@@ -128,7 +129,7 @@ class ImportItemClass(BaseClass):
             return None
         
         try:
-            self.database.cursor.execute("SELECT ID, unit_price, preview_image FROM Products WHERE name = ?", (product_name,))
+            self.database.cursor.execute("SELECT ID, unit_price, preview_image FROM Products WHERE name = %s", (product_name,))
             result = self.database.cursor.fetchone()
             if result:
                 return {
@@ -170,10 +171,18 @@ class ImportItemClass(BaseClass):
             pass
     
     def calculate_subtotal(self):
-        """Calculate subtotal (quantity * unit_price)"""
-        quantity = self.get_value('quantity') or 0
-        unit_price = self.get_value('unit_price') or 0.0
-        return quantity * unit_price
+        """Calculate subtotal (quantity * unit_price) with Decimal precision.
+
+        quantity is stored as a Decimal (decimal parameter type) while
+        unit_price is a float, so multiplying them directly raised
+        ``TypeError: unsupported operand type(s) for *: 'decimal.Decimal' and
+        'float'``. Both inputs are normalized through the shared helper.
+        """
+        from core.calculations import calculate_line_subtotal
+        return calculate_line_subtotal(
+            self.get_value('quantity'),
+            self.get_value('unit_price'),
+        )
     
     def get_product_name(self):
         """Return stored snapshot product_name; try live name if product_id valid; fallback to snapshot."""
@@ -188,7 +197,7 @@ class ImportItemClass(BaseClass):
         if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
             return snapshot or f"Product {product_id}"
         try:
-            self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT name FROM Products WHERE ID = %s", (product_id,))
             row = self.database.cursor.fetchone()
             if row and row[0]:
                 if row[0] != snapshot:
@@ -209,7 +218,7 @@ class ImportItemClass(BaseClass):
         
         try:
             product_id = self.get_value('product_id')
-            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = %s", (product_id,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
@@ -228,7 +237,7 @@ class ImportItemClass(BaseClass):
             return None
         
         try:
-            self.database.cursor.execute("SELECT ID, name, unit_price FROM Products WHERE name = ?", (product_name,))
+            self.database.cursor.execute("SELECT ID, name, unit_price FROM Products WHERE name = %s", (product_name,))
             result = self.database.cursor.fetchone()
             if result:
                 return {
@@ -340,7 +349,7 @@ class ImportItemClass(BaseClass):
 
             if product_name and getattr(self.database, 'cursor', None):
                 self.database.cursor.execute(
-                    "SELECT ID FROM Products WHERE name = ? LIMIT 1",
+                    "SELECT ID FROM Products WHERE name = %s LIMIT 1",
                     (product_name,)
                 )
                 row = self.database.cursor.fetchone()

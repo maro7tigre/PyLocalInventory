@@ -21,7 +21,7 @@ class ReportsClass(BaseClass):
                 "options": [],
                 "type": "int"
             },
-            "Department": {
+            "department": {
                 "value": "",
                 "display_name": {"en": "Department", "fr": "Département", "es": "Departamento"},
                 "required": True,
@@ -29,7 +29,7 @@ class ReportsClass(BaseClass):
                 "options": ["sohaib cuisine", "monime porte", "omarchapa", "abd-aziiz vernise", "zohir"],
                 "type": "string"
             },
-            "Date": {
+            "date": {
                 "value": today,
                 "display_name": {"en": "Date", "fr": "Date", "es": "Fecha"},
                 "required": True,
@@ -37,13 +37,36 @@ class ReportsClass(BaseClass):
                 "options": [],
                 "type": "date"
             },
-            "Report": {
+            "report": {
                 "value": "",
                 "display_name": {"en": "Report", "fr": "Rapport", "es": "Informe"},
                 "required": True,
                 "default": "",
                 "options": [],
                 "type": "string"
+            },
+            "report_type": {
+                "value": "General",
+                "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
+                "required": False,
+                "default": "General",
+                "options": [
+                    "General", "Sales", "Products", "Services", "Clients",
+                    "Revenue", "Profit", "Activity",
+                ],
+                "type": "string"
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
             },
             "view_details": {
                 "value": None,
@@ -61,18 +84,24 @@ class ReportsClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
-                "Department": "r",
-                "Date": "r",
+                "department": "r",
+                "date": "r",
+                "report_type": "r",
                 "view_details": "r"
             },
             "dialog": {
-                "Department": "rw",
-                "Date": "rw",
-                "Report": "rw"
+                "department": "rw",
+                "date": "rw",
+                "report_type": "rw",
+                "report": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r"
             },
             "database": {
-                "Department": "rw",
-                "Date": "rw",
-                "Report": "rw"
+                "department": "rw",
+                "date": "rw",
+                "report_type": "rw",
+                "report": "rw"
             }
         }

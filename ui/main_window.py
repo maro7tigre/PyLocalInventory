@@ -2,15 +2,23 @@
 Main window - Updated with unified tabs approach
 All tabs now use consistent BaseTab experience
 """
+import os
+import time
+from datetime import datetime
+import logging
+
+logger = logging.getLogger(__name__)
+from datetime import datetime
+
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QLabel, 
                              QTabWidget, QMenu, QMessageBox)
-from PySide6.QtCore import Qt, QSettings
-from PySide6.QtGui import QAction, QActionGroup
+from PySide6.QtCore import Qt, QSettings, QTimer
+from PySide6.QtGui import QAction, QActionGroup, QGuiApplication
 
 from ui.widgets.themed_widgets import ThemedMainWindow
 from ui.widgets.welcome_widget import WelcomeWidget
 from ui.widgets.password_widget import PasswordWidget
-from ui.widgets.login_widget import LoginWidget
+from ui.widgets.login_widget import LoginWidget, NetworkUnlockWidget
 from ui.dialogs.profiles_dialog import ProfilesDialog
 from ui.dialogs.backups_dialog import BackupsDialog
 from ui.dialogs.network_dialog import NetworkDialog
@@ -21,6 +29,7 @@ from ui.tabs.clients_tab import ClientsTab
 from ui.tabs.suppliers_tab import SuppliersTab
 from ui.tabs.sales_tab import SalesTab
 from ui.tabs.imports_tab import ImportsTab
+from ui.tabs.factures_tab import FacturesTab
 from ui.tabs.reports_tab import ReportsTab
 # from ui.tabs.log_tab import LogTab  # Hidden per request
 
@@ -35,15 +44,36 @@ from classes.sales_item_class import SalesItemClass
 from classes.import_class import ImportClass
 from classes.import_item_class import ImportItemClass
 from classes.reports_class import ReportsClass
+from classes.registry import register_all
 
 from core.profiles import ProfileManager
+from core.runtime_paths import portable_dir
 from core.password import PasswordManager
 from core.database import Database
 from core.network.client import RemoteDatabase
 from core.network.protocol import AuthError, ConnectionFailedError, RemoteError, DEFAULT_PORT
+from core.build_info import APP_BUILD_ID
+from core.sync import SyncCoordinator
+from core.cache_policies import ENABLE_SQLITE_CACHE, ENABLE_INCREMENTAL_SYNC
+from core import diagnostics
+from core.user_settings import (
+    load_settings,
+    remember_profile_enabled,
+    get_remembered_profile_id,
+    set_remembered_profile,
+    clear_remembered_profile,
+    get_remembered_network,
+    set_remembered_network,
+    clear_remembered_network,
+    set_startup_enabled,
+)
 
 
 class MainWindow(ThemedMainWindow):
+    # A normal, usable window on common desktop resolutions. The saved
+    # geometry (when present) takes precedence, but startup is always windowed.
+    DEFAULT_WINDOW_SIZE = (1280, 820)
+
     def __init__(self):
         super().__init__()
         self.setWindowTitle("PyLocalInventory")
@@ -52,6 +82,8 @@ class MainWindow(ThemedMainWindow):
         # Load application settings
         self.settings = QSettings("PyLocalInventory", "MainApp")
         self.load_app_config()
+        self.user_settings = load_settings()
+        self.ensure_startup_registration()
         
         # Core managers
         self.profile_manager = ProfileManager()
@@ -60,11 +92,27 @@ class MainWindow(ThemedMainWindow):
         # Network state: 'standalone' (default, unaffected) or 'client' (connected
         # to a remote host instead of a local profile database). network_server is
         # only set when this instance is also hosting (super-admin toggled it on).
-        self.connection_mode = 'standalone'
+        self.remembered_network = get_remembered_network(self.user_settings)
+        self.connection_mode = 'client' if self.remembered_network else 'standalone'
         self._client_connected = False
+        self._network_unlock_mode = bool(self.remembered_network)
         self.network_server = None
         self.network_port = DEFAULT_PORT
         self.last_network_host = ''
+        # Last Host state after it was stopped/cleared, so Network Config can
+        # explain "Not hosting" instead of only showing a bare status.
+        self.host_last_snapshot = None
+        self._sync_coordinator = None
+
+        # Bottom status bar: only meaningful for network clients, where it
+        # shows when the local cache last pulled incremental changes from the
+        # host. Hidden for standalone profiles so the window looks unchanged.
+        status_bar = self.statusBar()
+        self._sync_status_label = QLabel("")
+        self._sync_status_label.setStyleSheet("color: #bbbbbb; padding: 2px 8px;")
+        status_bar.addWidget(self._sync_status_label, 1)
+        status_bar.setSizeGripEnabled(True)
+        status_bar.setVisible(False)
 
         # Always show the welcome/entry screen on launch, even if a profile was
         # remembered from last time - only auto-skip to it on later refreshes
@@ -78,6 +126,8 @@ class MainWindow(ThemedMainWindow):
         self.database = Database(self.profile_manager)
         # Propagate current language to database for display name resolution
         self.database.language = getattr(self, 'language', 'en')
+        # Diagnostics context: standalone/host until a remote connect happens.
+        diagnostics.set_mode('host')
         
         # Register parameter classes manually
         self.register_parameter_classes()
@@ -91,30 +141,80 @@ class MainWindow(ThemedMainWindow):
         """Register parameter classes with the database"""
         print("📋 Registering parameter classes...")
         
-        # Register all parameter classes
-        self.database.register_class(ProductClass)
-        self.database.register_class(ServiceClass)
-        self.database.register_class(DoorTypeClass)
-        self.database.register_class(WoodTypeClass)
-        self.database.register_class(ClientClass)
-        self.database.register_class(SupplierClass)
-        self.database.register_class(SalesClass)
-        self.database.register_class(SalesItemClass)
-        self.database.register_class(ImportClass)
-        self.database.register_class(ImportItemClass)
-        self.database.register_class(ReportsClass)
+        register_all(self.database)
 
         print(f"✓ Registered {len(self.database.registered_classes)} parameter classes")
     
+    def _available_screen_geometry(self, point=None):
+        # For a restored window, prefer the monitor that actually contains it
+        # so a multi-monitor layout is not collapsed onto the primary screen.
+        screen = QGuiApplication.screenAt(point) if point is not None else None
+        screen = screen or self.screen() or QGuiApplication.primaryScreen()
+        return screen.availableGeometry() if screen is not None else None
+
+    def _set_default_window_geometry(self):
+        """Place a sensibly sized normal window in the middle of the screen."""
+        available = self._available_screen_geometry()
+        default_width, default_height = self.DEFAULT_WINDOW_SIZE
+        if available is None:
+            self.resize(default_width, default_height)
+            return
+        width = max(self.minimumWidth(), min(default_width, available.width() - 40))
+        height = max(self.minimumHeight(), min(default_height, available.height() - 40))
+        x = available.left() + max(0, (available.width() - width) // 2)
+        y = available.top() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
+
+    def _fit_window_to_available_screen(self):
+        """Keep a restored window on-screen after a monitor/layout change."""
+        geometry = self.geometry()
+        available = self._available_screen_geometry(geometry.center())
+        if available is None:
+            return
+        width = max(self.minimumWidth(), min(geometry.width(), available.width()))
+        height = max(self.minimumHeight(), min(geometry.height(), available.height()))
+        x, y = geometry.x(), geometry.y()
+        if x < available.left() or x + width > available.right() + 1:
+            x = available.left() + max(0, (available.width() - width) // 2)
+        if y < available.top() or y + height > available.bottom() + 1:
+            y = available.top() + max(0, (available.height() - height) // 2)
+        self.setGeometry(x, y, width, height)
+
+    def _restore_window_geometry(self, geometry):
+        """Restore saved size/position but never a maximized/full-screen start."""
+        if geometry:
+            if not self.restoreGeometry(geometry):
+                # Corrupt/incompatible settings must not leave a tiny Qt
+                # default window behind.
+                self._set_default_window_geometry()
+                return
+            constrained = self.windowState() & (
+                Qt.WindowMaximized | Qt.WindowFullScreen | Qt.WindowMinimized
+            )
+            if constrained:
+                normal = self.normalGeometry()
+                self.setWindowState(self.windowState() & ~(
+                    Qt.WindowMaximized | Qt.WindowFullScreen | Qt.WindowMinimized
+                ))
+                if normal.isValid() and normal.width() > 0 and normal.height() > 0:
+                    self.setGeometry(normal)
+                else:
+                    self._set_default_window_geometry()
+            self._fit_window_to_available_screen()
+        else:
+            self._set_default_window_geometry()
+
     def load_app_config(self):
         """Load application configuration from QSettings"""
-        # Restore window geometry
-        geometry = self.settings.value("geometry")
-        if geometry:
-            self.restoreGeometry(geometry)
+        # Restore size/position, but always open in normal windowed mode.
+        self._restore_window_geometry(self.settings.value("geometry"))
         
-        # Load profiles path (default to ./profiles)
-        profiles_path = self.settings.value("profiles_path", "./profiles")
+        # Use an absolute default because Startup shortcuts have an unrelated
+        # working directory (commonly C:\\Windows\\System32).
+        profiles_path = self.settings.value("profiles_path", portable_dir("profiles"))
+        if not os.path.isabs(profiles_path):
+            # Migrate the legacy "./profiles" preference to per-user storage.
+            profiles_path = portable_dir("profiles")
         self.profiles_path = profiles_path
 
         # Load language (default to 'en')
@@ -142,22 +242,49 @@ class MainWindow(ThemedMainWindow):
             'suppliers': _bool(self.settings.value("tab_visible/suppliers")),
             'sales':     _bool(self.settings.value("tab_visible/sales")),
             'imports':   _bool(self.settings.value("tab_visible/imports")),
+            'factures':  _bool(self.settings.value("tab_visible/factures")),
             'reports':   _bool(self.settings.value("tab_visible/reports")),
         }
     
+    def ensure_startup_registration(self):
+        """Ensure startup registration state is consistent with saved settings."""
+        if self.user_settings.get("start_with_windows"):
+            try:
+                set_startup_enabled(True)
+            except Exception as exc:
+                print(f"Warning: could not enable startup registration: {exc}")
+
     def load_saved_profile(self):
-        """Load the last selected profile from config"""
+        """Load the last selected profile from config or the remembered profile settings."""
+        self.profile_manager.profiles_path = self.profiles_path
+        self.profile_manager.load_profiles()
+
+        # Prefer the remembered profile stored in per-user settings
+        remembered_profile_name = get_remembered_profile_id(self.user_settings)
+        if remembered_profile_name:
+            if self.profile_manager.load_profile(remembered_profile_name):
+                print(f"✓ Loaded remembered profile: {remembered_profile_name}")
+                return
+            print(f"⚠️  Could not load remembered profile: {remembered_profile_name}")
+            clear_remembered_profile(self.user_settings)
+
+        # Fall back to the last selected profile stored in QSettings
         saved_profile_name = self.settings.value("selected_profile")
         if saved_profile_name:
-            # Set profiles path first
-            self.profile_manager.profiles_path = self.profiles_path
-            self.profile_manager.load_profiles()
-            
-            # Try to load the saved profile
             if self.profile_manager.load_profile(saved_profile_name):
                 print(f"✓ Loaded saved profile: {saved_profile_name}")
+                return
             else:
                 print(f"⚠️  Could not load saved profile: {saved_profile_name}")
+
+        # A renamed profile can leave both persisted selections stale. Selecting
+        # the sole installed profile preserves the existing local report source
+        # without guessing when the user has more than one profile.
+        available_profiles = self.profile_manager.list_profiles()
+        if len(available_profiles) == 1:
+            recovered_profile = available_profiles[0]
+            self.profile_manager.load_profile(recovered_profile)
+            print(f"✓ Recovered sole available profile: {recovered_profile}")
     
     def save_app_config(self):
         """Save application configuration to QSettings"""
@@ -165,7 +292,7 @@ class MainWindow(ThemedMainWindow):
         self.settings.setValue("geometry", self.saveGeometry())
         
         # Save profiles path
-        self.settings.setValue("profiles_path", getattr(self, 'profiles_path', './profiles'))
+        self.settings.setValue("profiles_path", getattr(self, 'profiles_path', portable_dir("profiles")))
         
         # Save selected profile
         if self.profile_manager.selected_profile:
@@ -187,12 +314,105 @@ class MainWindow(ThemedMainWindow):
             self.settings.setValue(f"tab_visible/{key}", visible)
     
     def closeEvent(self, event):
-        """Handle application close event"""
-        self.save_app_config()
-        if self.network_server and self.network_server.is_running:
-            self.network_server.stop()
-        if self.database:
-            self.database.close()
+        """Handle application close event safely and idempotently."""
+        try:
+            spontaneous = (
+                bool(event.spontaneous()) if hasattr(event, 'spontaneous') else 'unknown'
+            )
+            logger.info(
+                "window_close_requested spontaneous=%s shutting_down=%s",
+                spontaneous, getattr(self, '_shutting_down', False),
+            )
+        except Exception:
+            pass
+        if getattr(self, "_shutting_down", False):
+            event.accept()
+            return
+            
+        self._shutting_down = True
+        
+        # Create a robust local logger helper to prevent teardown errors
+        def _safe_log(level, message, *args):
+            try:
+                # Catch NameError since the global 'logger' may be cleared during Python shutdown
+                getattr(logger, level)(message, *args)
+            except (NameError, AttributeError, RuntimeError, TypeError):
+                pass
+        
+        try:
+            _safe_log("info", "Application closing: initiating robust shutdown sequence")
+        except Exception:
+            pass
+            
+        try:
+            self.save_app_config()
+        except Exception as e:
+            _safe_log("error", f"Error saving config during shutdown: {e}")
+            
+        try:
+            self._stop_sync_coordinator()
+        except Exception as e:
+            _safe_log("error", f"Error stopping sync during shutdown: {e}")
+            
+        # Stop background workers in tabs
+        try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                for i in range(self.tab_widget.count()):
+                    tab = self.tab_widget.widget(i)
+                    if hasattr(tab, '_wait_for_refresh_thread'):
+                        try:
+                            if not tab._wait_for_refresh_thread():
+                                _safe_log("error", f"Refresh thread in tab {i} timed out during shutdown")
+                                self._shutting_down = False
+                                event.ignore()
+                                return
+                        except Exception as e:
+                            _safe_log("error", f"Error stopping refresh thread in tab: {e}")
+                    if hasattr(tab, '_wait_for_dashboard_thread'):
+                        try:
+                            if not tab._wait_for_dashboard_thread():
+                                _safe_log("error", f"Dashboard thread in tab {i} timed out during shutdown")
+                                self._shutting_down = False
+                                event.ignore()
+                                return
+                        except Exception as e:
+                            _safe_log("error", f"Error stopping dashboard thread in tab: {e}")
+        except Exception as e:
+            _safe_log("error", f"Error during tab thread cleanup: {e}")
+            
+        # Stop network server
+        try:
+            server = getattr(self, 'network_server', None)
+            if server is not None:
+                _safe_log("info", "Stopping network server...")
+                try:
+                    server.stop(reason='application_shutdown')
+                finally:
+                    snapshot = getattr(server, 'snapshot', None)
+                    if callable(snapshot):
+                        try:
+                            self.host_last_snapshot = snapshot()
+                        except Exception:
+                            pass
+        except Exception as e:
+            _safe_log("error", f"Error stopping network server: {e}")
+            
+        # Close database only after workers stop
+        try:
+            if getattr(self, 'database', None):
+                _safe_log("info", "Closing database connection...")
+                self.database.close()
+        except Exception as e:
+            _safe_log("error", f"Error closing database: {e}")
+            
+        # Flush logs
+        try:
+            import logging
+            for handler in logging.getLogger().handlers:
+                handler.flush()
+        except Exception:
+            pass
+            
         event.accept()
     
     def setup_menu(self):
@@ -209,10 +429,19 @@ class MainWindow(ThemedMainWindow):
         backups_action.triggered.connect(self.open_backups_dialog)
         menubar.addAction(backups_action)
 
-        # Network menu action (host on LAN / manage users & roles)
-        network_action = QAction("Network", self)
-        network_action.triggered.connect(self.open_network_dialog)
-        menubar.addAction(network_action)
+        # Network dropdown: database settings are always reachable, while the
+        # hosting / users / roles tools stay gated by an unlocked profile.
+        network_menu = QMenu("Network", self)
+
+        database_config_action = QAction("Database Config", self)
+        database_config_action.triggered.connect(self.open_database_config)
+        network_menu.addAction(database_config_action)
+
+        network_config_action = QAction("Network Config", self)
+        network_config_action.triggered.connect(self.open_network_dialog)
+        network_menu.addAction(network_config_action)
+
+        menubar.addMenu(network_menu)
 
         # Language selector menu (between Backups and Log Out)
         lang_menu = QMenu("Language", self)
@@ -255,6 +484,7 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales':     "💰 Sales",
             'imports':   "📥 Imports",
+            'factures':  "🧾 Factures",
             'reports':   "📝 Reports",
         }
         self._tab_visibility_actions = {}
@@ -345,20 +575,25 @@ class MainWindow(ThemedMainWindow):
 
         if self.connection_mode == 'client':
             if not self._client_connected:
-                self.setup_login_entry()
+                if self._network_unlock_mode and self.remembered_network:
+                    self.setup_network_unlock()
+                else:
+                    self.setup_login_entry()
             else:
                 self.setup_main_tabs()
             return
 
         # Set profiles path in profile manager
-        self.profile_manager.profiles_path = getattr(self, 'profiles_path', './profiles')
+        self.profile_manager.profiles_path = getattr(self, 'profiles_path', portable_dir("profiles"))
 
-        # First screen of a fresh launch is always the welcome/entry screen,
-        # regardless of a remembered profile - the user picks a profile or a
-        # network host explicitly every time the app starts.
+        # Show the remembered profile's password entry directly if the user has
+        # chosen to remember a profile and it is valid.
         if not self._initial_screen_shown:
             self._initial_screen_shown = True
-            self.setup_profile_selection()
+            if remember_profile_enabled(self.user_settings) and self.profile_manager.validate():
+                self.setup_password_entry()
+            else:
+                self.setup_profile_selection()
         elif not self.profile_manager.validate():
             self.setup_profile_selection()
         elif not self.password_manager.validate():
@@ -385,40 +620,70 @@ class MainWindow(ThemedMainWindow):
 
     def setup_password_entry(self):
         """Show password entry widget"""
-        password_widget = PasswordWidget(self.profile_manager.selected_profile)
+        self.user_settings = load_settings()
+        remember_checked = remember_profile_enabled(self.user_settings)
+        startup_checked = bool(self.user_settings.get("start_with_windows"))
+        password_widget = PasswordWidget(
+            self.profile_manager.selected_profile,
+            remember_profile=remember_checked,
+            startup_enabled=startup_checked,
+        )
         password_widget.password_submitted.connect(self.validate_password)
         password_widget.profile_change_requested.connect(self.open_profiles_dialog)
         self.main_layout.addWidget(password_widget)
 
     def setup_login_entry(self):
         """Show the network login widget (client mode)"""
+        saved = self.remembered_network or {}
         login_widget = LoginWidget(
-            default_host=self.last_network_host,
-            default_port=str(self.network_port) if self.network_port else ''
+            default_host=saved.get("host", self.last_network_host),
+            default_port=str(saved.get("port", self.network_port or '')),
+            default_username=saved.get("username", ""),
+            remember_connection=bool(saved),
+            startup_enabled=bool(self.user_settings.get("start_with_windows")),
         )
         login_widget.login_submitted.connect(self.attempt_network_login)
         login_widget.back_requested.connect(self.cancel_network_login)
         self.main_layout.addWidget(login_widget)
 
+    def setup_network_unlock(self):
+        widget = NetworkUnlockWidget(
+            self.remembered_network,
+            startup_enabled=bool(self.user_settings.get("start_with_windows")),
+        )
+        widget.login_submitted.connect(self.attempt_network_login)
+        widget.change_requested.connect(self.change_network_connection)
+        self.main_layout.addWidget(widget)
+
+    def change_network_connection(self):
+        self._network_unlock_mode = False
+        self.refresh_app()
+
     def start_network_login(self):
         """Switch from local-profile flow to connecting to a network host"""
         self.connection_mode = 'client'
         self._client_connected = False
+        self._network_unlock_mode = False
         self.refresh_app()
 
     def cancel_network_login(self):
         """Switch back from the network login screen to local profiles"""
         self.connection_mode = 'standalone'
         self._client_connected = False
+        self._network_unlock_mode = False
         self.refresh_app()
 
-    def attempt_network_login(self, host, port, username, password):
+    def attempt_network_login(self, host, port, username, password,
+                              remember_connection=False, startup_enabled=False):
         """Try to log into a remote host; on success swap self.database for a
         RemoteDatabase and proceed exactly like a normal profile unlock."""
         try:
             port_num = int(port) if port else DEFAULT_PORT
         except ValueError:
-            self._show_login_error("Port must be a number.")
+            self._show_login_error("Invalid port. Enter a number from 1 to 65535.")
+            return
+        if not 1 <= port_num <= 65535:
+            self._show_login_error("Invalid port. Enter a number from 1 to 65535.")
             return
 
         remote_db = RemoteDatabase(self.profile_manager, host, port_num, username, password)
@@ -428,13 +693,41 @@ class MainWindow(ThemedMainWindow):
             self._show_login_error(str(e))
             return
 
+        if remember_connection:
+            self.user_settings = set_remembered_network(
+                self.user_settings, host, port_num, username
+            )
+            self.remembered_network = get_remembered_network(self.user_settings)
+        else:
+            self.user_settings = clear_remembered_network(self.user_settings)
+            self.remembered_network = {}
+        try:
+            set_startup_enabled(bool(startup_enabled))
+            self.user_settings = load_settings()
+        except Exception as exc:
+            QMessageBox.warning(self, "Startup Registration", f"Could not update startup registration: {exc}")
+
         self.database = remote_db
         self.database.language = getattr(self, 'language', 'en')
         self.register_parameter_classes()
+        diagnostics.set_mode('client')
 
         self.last_network_host = host
         self.network_port = port_num
         self._client_connected = True
+        host_build = remote_db.host_build_id
+        self.setWindowTitle("PyLocalInventory")
+        if host_build != APP_BUILD_ID:
+            QMessageBox.warning(
+                self,
+                "Host build mismatch",
+                f"This client is running build:\n  {APP_BUILD_ID}\n\n"
+                f"But the host at {host}:{port_num} reports:\n  {host_build or 'unknown (older build)'}\n\n"
+                "A fix present in this client's build may not be active on the host "
+                "until the host application is restarted on the latest deployed code. "
+                "If you're troubleshooting a bug that should already be fixed, redeploy "
+                "and restart the host first.",
+            )
         self.refresh_app()
 
     def _show_login_error(self, message):
@@ -442,6 +735,8 @@ class MainWindow(ThemedMainWindow):
             widget = self.main_layout.itemAt(i).widget()
             if hasattr(widget, 'set_error'):
                 widget.set_error(message)
+                if hasattr(widget, 'clear_password'):
+                    widget.clear_password()
                 break
     
     def setup_main_tabs(self):
@@ -455,13 +750,10 @@ class MainWindow(ThemedMainWindow):
                 self.show_database_error(str(e))
                 return
             if not connected:
-                self.show_database_error()
+                self.show_database_error(getattr(self.database, 'last_error', None))
                 return
         
         tab_widget = QTabWidget()
-        
-        # Connect tab change signal to refresh the newly selected tab
-        tab_widget.currentChanged.connect(self.on_tab_changed)
         
         # Store reference to tab widget for later access
         self.tab_widget = tab_widget
@@ -471,65 +763,39 @@ class MainWindow(ThemedMainWindow):
 
         # Add Home tab
         tab_widget.addTab(HomeTab(self.database, language=getattr(self, 'language', 'en')), labels['home'])
-        
-        # Add all entity tabs - now all using BaseTab for consistency
-        try:
-            products_tab = ProductsTab(self.database, self)
-            tab_widget.addTab(products_tab, labels['products'])
-            print("✓ Added Products tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Products tab: {e}")
-            self.add_error_tab(tab_widget, "Products", e)
-        
-        try:
-            services_tab = ServicesTab(self.database, self)
-            tab_widget.addTab(services_tab, labels['services'])
-            print("✓ Added Services tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Services tab: {e}")
-            self.add_error_tab(tab_widget, "Services", e)
-        
-        try:
-            clients_tab = ClientsTab(self.database, self)
-            tab_widget.addTab(clients_tab, labels['clients'])
-            print("✓ Added Clients tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Clients tab: {e}")
-            self.add_error_tab(tab_widget, "Clients", e)
-        
-        try:
-            suppliers_tab = SuppliersTab(self.database, self)
-            tab_widget.addTab(suppliers_tab, labels['suppliers'])
-            print("✓ Added Suppliers tab (BaseTab)")
-        except Exception as e:
-            print(f"✗ Error adding Suppliers tab: {e}")
-            self.add_error_tab(tab_widget, "Suppliers", e)
-        
-        try:
-            # Sales tab now uses BaseTab with BaseOperationDialog - unified experience!
-            sales_tab = SalesTab(self.database, self)
-            tab_widget.addTab(sales_tab, labels['sales'])
-            print("✓ Added Sales tab (BaseTab + BaseOperationDialog)")
-        except Exception as e:
-            print(f"✗ Error adding Sales tab: {e}")
-            self.add_error_tab(tab_widget, "Sales", e)
-        
-        try:
-            # Imports tab now uses BaseTab with BaseOperationDialog - unified experience!
-            imports_tab = ImportsTab(self.database, self)
-            tab_widget.addTab(imports_tab, labels['imports'])
-            print("✓ Added Imports tab (BaseTab + BaseOperationDialog)")
-        except Exception as e:
-            print(f"✗ Error adding Imports tab: {e}")
-            self.add_error_tab(tab_widget, "Imports", e)
 
-        try:
-            reports_tab = ReportsTab(self.database, self)
-            tab_widget.addTab(reports_tab, labels['reports'])
-            print("✓ Added Reports tab")
-        except Exception as e:
-            print(f"✗ Error adding Reports tab: {e}")
-            self.add_error_tab(tab_widget, "Reports", e)
+        # Add all entity tabs - now all using BaseTab for consistency. A tab is
+        # only added at all if the logged-in user (or the local host, which is
+        # always fully permitted) has read access to its section - a user with
+        # no read permission never sees the tab exist, rather than seeing it
+        # and hitting a permission-denied error when it tries to load.
+        entity_tabs = [
+            ('products',  'Products',  lambda: ProductsTab(self.database, self)),
+            ('services',  'Services',  lambda: ServicesTab(self.database, self)),
+            ('clients',   'Clients',   lambda: ClientsTab(self.database, self)),
+            ('suppliers', 'Suppliers', lambda: SuppliersTab(self.database, self)),
+            ('sales',     'Sales',     lambda: SalesTab(self.database, self)),
+            ('imports',   'Imports',   lambda: ImportsTab(self.database, self)),
+            ('factures',  'Factures',  lambda: FacturesTab(self.database, self)),
+            ('reports',   'Reports',   lambda: ReportsTab(self.database, self)),
+        ]
+
+        self._tab_key_to_index = {'home': 0}
+        readable_keys = {'home'}
+
+        for key, section, factory in entity_tabs:
+            if section != "Reports" and not self.database.has_permission(section, 'read'):
+                print(f"– Skipped {section} tab: no read permission")
+                continue
+            try:
+                tab = factory()
+                self._tab_key_to_index[key] = tab_widget.addTab(tab, labels[key])
+                readable_keys.add(key)
+                print(f"✓ Added {section} tab (BaseTab)")
+            except Exception as e:
+                print(f"✗ Error adding {section} tab: {e}")
+                self._tab_key_to_index[key] = self.add_error_tab(tab_widget, section, e)
+                readable_keys.add(key)
 
     # Hidden per request: Log tab
     # tab_widget.addTab(LogTab(self.database), labels['log'])
@@ -537,14 +803,14 @@ class MainWindow(ThemedMainWindow):
         # Style change: increase tab title font size (fixed)
         tab_widget.setStyleSheet("QTabBar::tab { font-size: 18px; }")
 
-        # Fixed key→index mapping (matches insertion order above)
-        self._tab_key_to_index = {
-            'home': 0, 'products': 1, 'services': 2, 'clients': 3,
-            'suppliers': 4, 'sales': 5, 'imports': 6, 'reports': 7,
-        }
-
         # Apply stored tab visibility
         self._apply_tab_visibility()
+
+        # Sections the user has no read permission for never got a tab/index at
+        # all, so the "Tabs" view-menu toggle for them is meaningless - hide it
+        # rather than let it look like a working option.
+        for key, action in getattr(self, '_tab_visibility_actions', {}).items():
+            action.setVisible(key in readable_keys)
 
         # Sync home tab quick-action cards with current tab visibility
         home_tab = tab_widget.widget(0)
@@ -552,6 +818,33 @@ class MainWindow(ThemedMainWindow):
             home_tab.update_quick_actions_visibility(self.tab_visibility)
 
         self.main_layout.addWidget(tab_widget)
+
+        # Connecting before addTab() refreshed Home while the remaining tabs
+        # were still being built, doubling startup work on network clients.
+        tab_widget.currentChanged.connect(self.on_tab_changed)
+
+        # Startup preload: warm the session cache of every readable entity tab
+        # (first ~page_size records each). Firing every tab's worker thread /
+        # HTTP fetch at once would create a thundering herd of 6-8 concurrent
+        # network or database requests right after login. Instead the first
+        # entity tab refreshes immediately and the rest are warmed one at a
+        # time on a staggered QTimer, so the window stays snappy and each
+        # refresh gets the full host/DB attention instead of competing.
+        self._preload_tabs = {}
+        for i in range(1, tab_widget.count()):
+            widget = tab_widget.widget(i)
+            if hasattr(widget, 'refresh_table'):
+                self._preload_tabs[i] = widget
+        self._preload_timer = QTimer(self)
+        self._preload_timer.setInterval(600)
+        self._preload_timer.timeout.connect(self._step_preload)
+        self._step_preload()
+
+        # Network clients additionally run a background incremental sync that
+        # keeps the on-disk cache warm by pulling only the host's change log
+        # deltas (instead of whole tables on every visit). The status bar
+        # shows when the cache last heard from the host.
+        self._start_sync_coordinator()
         
         # Debug info
         print(f"\n📊 Database Status:")
@@ -559,14 +852,119 @@ class MainWindow(ThemedMainWindow):
         print(f"   • Registered classes: {len(self.database.registered_classes)}")
         print(f"   • Unified Experience: ✓ All tabs now use BaseTab")
         print(f"   • Operations: Sales & Imports use BaseOperationDialog")
-        for section_name in self.database.registered_classes.keys():
-            try:
-                items_count = len(self.database.get_items(section_name))
-                print(f"   • {section_name}: {items_count} items")
-            except Exception as e:
-                print(f"   • {section_name}: error getting items ({e})")
+        print("   • Startup row-count scan: skipped (tabs load their own data)")
 
     # ──────────────────────────── View menu helpers ────────────────────────────
+
+    def _step_preload(self):
+        """Refresh the next not-yet-warmed entity tab in the background.
+
+        Runs once immediately at startup and then on a staggered QTimer until
+        every readable tab has had its first refresh. Tabs the user visits
+        early are dropped from the queue by ``on_tab_changed`` because their
+        own ``refresh_on_tab_switch`` already warms them.
+        """
+        if not self._preload_tabs:
+            self._preload_timer.stop()
+            return
+        index = next(iter(self._preload_tabs))
+        widget = self._preload_tabs.pop(index)
+        try:
+            widget.refresh_table(force=True)
+        except Exception as error:
+            print(f"✗ Preload failed for tab_{index}: {error}")
+        if self._preload_tabs:
+            self._preload_timer.start()
+
+    def _start_sync_coordinator(self):
+        """Start background incremental sync for a network client, or clear
+        the status bar for a standalone host session.
+
+        The sync only exists to keep the experimental on-disk cache warm; when
+        the disk cache is disabled the coordinator is never started, so the
+        client never polls the host from the GUI thread."""
+        self._stop_sync_coordinator()
+        if not ENABLE_SQLITE_CACHE or not ENABLE_INCREMENTAL_SYNC:
+            self.statusBar().setVisible(False)
+            return
+        database = self.database
+        if not (self._client_connected and database is not None
+                and database.__class__.__name__ == "RemoteDatabase"):
+            self.statusBar().setVisible(False)
+            return
+
+        entity_sections = [
+            'Products', 'Services', 'Clients', 'Suppliers', 'Sales', 'Imports',
+        ]
+        sections = [
+            section for section in entity_sections
+            if database.has_permission(section, 'read')
+        ]
+        # Attachment metadata streams under the same permission model as the
+        # entity files themselves: read on either Clients or Sales.
+        if database.has_permission('Clients', 'read') or database.has_permission('Sales', 'read'):
+            sections.append('attachments')
+        coordinator = SyncCoordinator(database, sections, parent=self)
+        coordinator.status.connect(self._on_sync_status)
+        self._sync_coordinator = coordinator
+        self._sync_status_label.setText("")
+        self.statusBar().setVisible(True)
+        coordinator.start()
+
+    def _stop_sync_coordinator(self):
+        """Stop the background sync timer if one is running."""
+        coordinator = getattr(self, '_sync_coordinator', None)
+        if coordinator is not None:
+            try:
+                coordinator.stop()
+            except Exception:
+                pass
+            self._sync_coordinator = None
+
+    def _on_sync_status(self, state, applied, last_success, error):
+        """Update the status-bar sync indicator from SyncCoordinator."""
+        label = getattr(self, '_sync_status_label', None)
+        if label is None:
+            return
+        if state == 'syncing':
+            label.setText("Syncing with host…")
+        elif state == 'ok':
+            suffix = f" · {applied} change(s) applied" if applied else ""
+            label.setText(
+                f"Last sync: {self._format_sync_age(last_success)}{suffix}"
+            )
+            coordinator = getattr(self, '_sync_coordinator', None)
+            if coordinator is not None and applied:
+                for section in coordinator.last_applied_sections:
+                    self._mark_section_tab_dirty(section)
+        else:
+            label.setText(
+                f"Sync unavailable · last successful: "
+                f"{self._format_sync_age(last_success)}"
+            )
+
+    def _format_sync_age(self, timestamp):
+        """Human-friendly relative age for the last-sync timestamp."""
+        if not timestamp:
+            return "never"
+        seconds = int(time.time() - timestamp)
+        if seconds < 5:
+            return "just now"
+        if seconds < 60:
+            return f"{seconds}s ago"
+        if seconds < 3600:
+            return f"{seconds // 60} min ago"
+        return f"{seconds // 3600} h ago"
+
+    def _mark_section_tab_dirty(self, section):
+        """Ask the tab for ``section`` to re-fetch on its next visit, so
+        changes synced in from the host show up promptly."""
+        if not hasattr(self, 'tab_widget') or not self.tab_widget:
+            return
+        for i in range(self.tab_widget.count()):
+            widget = self.tab_widget.widget(i)
+            if getattr(widget, 'section', None) == section and hasattr(widget, 'mark_dirty'):
+                widget.mark_dirty()
 
     def _apply_tab_visibility(self):
         """Apply self.tab_visibility to the current tab_widget."""
@@ -574,7 +972,7 @@ class MainWindow(ThemedMainWindow):
             return
         mapping = getattr(self, '_tab_key_to_index', {})
         for key, index in mapping.items():
-            visible = self.tab_visibility.get(key, True)
+            visible = True if key == "reports" else self.tab_visibility.get(key, True)
             self.tab_widget.setTabVisible(index, visible)
 
     def _toggle_tab_visible(self, key: str, checked: bool):
@@ -619,6 +1017,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Fournisseurs",
                 'sales': "💰 Ventes",
                 'imports': "📥 Importations",
+                'factures': "🧾 Factures",
                 'reports': "📝 Rapports",
                 'log': "📋 Journal",
             }
@@ -631,6 +1030,7 @@ class MainWindow(ThemedMainWindow):
                 'suppliers': "🏭 Proveedores",
                 'sales': "💰 Ventas",
                 'imports': "📥 Importaciones",
+                'factures': "🧾 Facturas",
                 'reports': "📝 Informes",
                 'log': "📋 Registro",
             }
@@ -643,18 +1043,19 @@ class MainWindow(ThemedMainWindow):
             'suppliers': "🏭 Suppliers",
             'sales': "💰 Sales",
             'imports': "📥 Imports",
+            'factures': "🧾 Factures",
             'reports': "📝 Reports",
             'log': "📋 Log",
         }
     
     def add_error_tab(self, tab_widget, tab_name, error):
-        """Add error placeholder tab"""
+        """Add error placeholder tab. Returns the new tab's index."""
         error_widget = QWidget()
         error_layout = QVBoxLayout(error_widget)
         error_label = QLabel(f"{tab_name} tab error: {str(error)}")
         error_label.setStyleSheet("color: red; padding: 20px;")
         error_layout.addWidget(error_label)
-        tab_widget.addTab(error_widget, f"{tab_name} (Error)")
+        return tab_widget.addTab(error_widget, f"{tab_name} (Error)")
     
     def show_database_error(self, message=None):
         """Show database connection error"""
@@ -667,7 +1068,7 @@ class MainWindow(ThemedMainWindow):
         error_layout.addWidget(error_label, Qt.AlignCenter)
         self.main_layout.addWidget(error_widget)
     
-    def validate_password(self, password):
+    def validate_password(self, password, remember_profile=False, startup_enabled=False):
         """Validate entered password"""
         if not self.password_manager.validate(password):
             # Find the password widget and show error
@@ -677,12 +1078,27 @@ class MainWindow(ThemedMainWindow):
                     widget.set_password_error()
                     break
             return False
+
+        self.password_manager.set_password(password)
+
+        # Persist profile preferences and Windows startup registration.
+        if remember_profile:
+            self.user_settings = set_remembered_profile(self.user_settings, self.profile_manager.selected_profile.name)
         else:
-            self.password_manager.set_password(password)
-            # Save the successful profile selection
-            self.save_app_config()
-            self.refresh_app()
-            return True
+            self.user_settings = clear_remembered_profile(self.user_settings)
+
+        try:
+            if startup_enabled:
+                set_startup_enabled(True)
+            else:
+                set_startup_enabled(False)
+        except Exception as exc:
+            QMessageBox.warning(self, "Startup Registration", f"Could not update startup registration: {exc}")
+
+        # Save the successful profile selection
+        self.save_app_config()
+        self.refresh_app()
+        return True
     
     def open_profiles_dialog(self):
         """Open profiles management dialog"""
@@ -690,14 +1106,23 @@ class MainWindow(ThemedMainWindow):
         if dialog.exec():
             # Profile may have changed, refresh the main window
             self.profiles_path = dialog.profiles_path
+            if self.user_settings.get("remember_profile") and self.profile_manager.selected_profile:
+                self.user_settings = set_remembered_profile(
+                    self.user_settings,
+                    self.profile_manager.selected_profile.name,
+                )
             # Save the new profile selection
             self.save_app_config()
             self.refresh_app()
     
     def open_backups_dialog(self):
         """Open backups management dialog"""
-        # Check if profile is selected before opening backups
-        if not self.profile_manager or not self.profile_manager.selected_profile:
+        # Network clients intentionally have no local business profile. Their
+        # backup dialog downloads a host-generated archive to this PC.
+        if (
+            self.connection_mode != "client"
+            and (not self.profile_manager or not self.profile_manager.selected_profile)
+        ):
             QMessageBox.warning(self, "No Profile Selected", 
                               "Please select a profile before accessing backups.")
             return
@@ -705,24 +1130,41 @@ class MainWindow(ThemedMainWindow):
         dialog = BackupsDialog(self)
         dialog.exec()
 
-    def open_network_dialog(self):
-        """Open the network hosting / users & roles management dialog"""
+    def open_database_config(self):
+        """Open the shared PostgreSQL connection settings dialog."""
         if self.connection_mode == 'client':
             QMessageBox.information(
                 self, "Not Available",
-                "Network hosting isn't available while connected as a network client."
+                "Database configuration isn't available while connected as a network client."
             )
             return
-        if not self.profile_manager or not self.profile_manager.selected_profile or not self.database.conn:
-            QMessageBox.warning(self, "No Profile Unlocked",
-                              "Unlock a profile before managing network access.")
+
+        dialog = NetworkDialog(self, focus_tab=0)
+        dialog.exec()
+
+    def open_network_dialog(self):
+        """Open the network hosting / users & roles management dialog."""
+        if self.connection_mode == 'client':
+            if not getattr(self.database, 'is_superadmin', False):
+                QMessageBox.information(
+                    self, "Not Available",
+                    "Only a Super Admin can manage users and roles on the host."
+                )
+                return
+            try:
+                dialog = NetworkDialog(self, focus_tab=0)
+            except RemoteError as error:
+                QMessageBox.warning(self, "Host Unavailable", str(error))
+                return
+            dialog.exec()
             return
 
-        dialog = NetworkDialog(self)
+        dialog = NetworkDialog(self, focus_tab=1)
         dialog.exec()
 
     def logout(self):
         """Log out current user"""
+        self._stop_sync_coordinator()
         self.database.close()
 
         if self.connection_mode == 'client':
@@ -732,6 +1174,7 @@ class MainWindow(ThemedMainWindow):
             self.database = Database(self.profile_manager)
             self.database.language = getattr(self, 'language', 'en')
             self.register_parameter_classes()
+            diagnostics.set_mode('host')
         else:
             self.password_manager.logout()
             self.profile_manager.logout()
@@ -761,6 +1204,11 @@ class MainWindow(ThemedMainWindow):
     def on_tab_changed(self, index):
         """Handle tab change to refresh data in the newly selected tab"""
         try:
+            if hasattr(self, 'tab_widget') and self.tab_widget:
+                diagnostics.set_active_tab(self.tab_widget.tabText(index).replace('&', ''))
+            pending = getattr(self, '_preload_tabs', None)
+            if pending is not None:
+                pending.pop(index, None)
             if hasattr(self, 'tab_widget') and self.tab_widget:
                 current_widget = self.tab_widget.widget(index)
                 

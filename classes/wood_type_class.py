@@ -37,7 +37,7 @@ class WoodTypeClass(BaseClass):
 
         try:
             self.database.cursor.execute(
-                "SELECT COUNT(*) FROM Wood_Types WHERE name = ? AND ID != ?",
+                "SELECT COUNT(*) FROM Wood_Types WHERE name = %s AND ID != %s",
                 (name, self.id or 0)
             )
             result = self.database.cursor.fetchone()

@@ -2,10 +2,16 @@
 Report Viewer Widget - displays reports in a table format with print/export capabilities
 """
 from PySide6.QtWidgets import (QWidget, QVBoxLayout, QHBoxLayout, QTableWidget, 
-                               QTableWidgetItem, QHeaderView, QLabel, QTextEdit)
+                               QTableWidgetItem, QHeaderView, QLabel, QTextEdit,
+                               QMessageBox)
 from PySide6.QtCore import Qt
-from PySide6.QtGui import QFont
+from PySide6.QtGui import QFont, QTextDocument
+from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
 from ui.widgets.themed_widgets import BlueButton, GreenButton
+import html
+import logging
+
+logger = logging.getLogger(__name__)
 
 
 class ReportViewerWidget(QWidget):
@@ -17,6 +23,7 @@ class ReportViewerWidget(QWidget):
         self.report_data = []
         self.headers = []
         self.summary_text = ""
+        self._printing = False
         
         self.setup_ui()
         self.apply_theme()
@@ -63,6 +70,7 @@ class ReportViewerWidget(QWidget):
         self.table.horizontalHeader().setSectionResizeMode(QHeaderView.Stretch)
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
+        self.table.setWordWrap(True)
         layout.addWidget(self.table)
     
     def set_report_data(self, headers, data, summary=None):
@@ -72,14 +80,21 @@ class ReportViewerWidget(QWidget):
         self.summary_text = summary or ""
         
         # Update table
-        self.table.setColumnCount(len(headers))
-        self.table.setHorizontalHeaderLabels(headers)
-        self.table.setRowCount(len(data))
-        
-        # Fill table with data
-        for row, item in enumerate(data):
-            for col, value in enumerate(item):
-                self.table.setItem(row, col, QTableWidgetItem(str(value)))
+        self.table.setUpdatesEnabled(False)
+        signals_blocked = self.table.blockSignals(True)
+        try:
+            self.table.setColumnCount(len(headers))
+            self.table.setHorizontalHeaderLabels(headers)
+            self.table.setRowCount(len(data))
+            for row, item in enumerate(data):
+                for col, value in enumerate(item):
+                    self.table.setItem(row, col, QTableWidgetItem(str(value)))
+            if len(data) <= 300:
+                self.table.resizeRowsToContents()
+        finally:
+            self.table.blockSignals(signals_blocked)
+            self.table.setUpdatesEnabled(True)
+            self.table.viewport().update()
         
         # Update summary if provided
         if summary:
@@ -101,9 +116,56 @@ class ReportViewerWidget(QWidget):
         print(f"Exporting report: {self.title}")
     
     def print_report(self):
-        """Print report (placeholder)"""
-        # TODO: Implement print functionality
-        print(f"Printing report: {self.title}")
+        """Print through this PC's standard dialog and default printer."""
+        if self._printing:
+            return
+        self._printing = True
+        self.print_btn.setEnabled(False)
+        try:
+            if not QPrinterInfo.availablePrinterNames():
+                QMessageBox.warning(
+                    self, "No Printer",
+                    "No printer is installed or available on this computer.",
+                )
+                return
+            printer = QPrinter(QPrinter.HighResolution)
+            default_printer = QPrinterInfo.defaultPrinter()
+            if not default_printer.isNull():
+                printer.setPrinterName(default_printer.printerName())
+
+            rows = [
+                "<tr>" + "".join(
+                    f"<th>{html.escape(str(header))}</th>"
+                    for header in self.headers
+                ) + "</tr>"
+            ]
+            rows.extend(
+                "<tr>" + "".join(
+                    f"<td>{html.escape(str(value))}</td>" for value in row
+                ) + "</tr>"
+                for row in self.report_data
+            )
+            summary = (
+                f"<p><b>Summary:</b><br>{html.escape(self.summary_text)}</p>"
+                if self.summary_text else ""
+            )
+            document = QTextDocument(self)
+            document.setHtml(
+                f"<h2>{html.escape(self.title)}</h2>{summary}"
+                "<table border='1' cellspacing='0' cellpadding='4'>"
+                + "".join(rows) + "</table>"
+            )
+            dialog = QPrintDialog(printer, self)
+            if dialog.exec() == QPrintDialog.Accepted:
+                document.print_(printer)
+        except Exception as error:
+            logger.exception("Report printing failed title=%s", self.title)
+            QMessageBox.critical(
+                self, "Print Error", f"Could not print this report:\n{error}"
+            )
+        finally:
+            self._printing = False
+            self.print_btn.setEnabled(True)
     
     def apply_theme(self):
         """Apply dark theme styling"""

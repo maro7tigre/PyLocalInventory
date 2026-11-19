@@ -9,6 +9,7 @@ class BaseCardsList(QWidget):
     
     def __init__(self, category=None, card_type=SquareCard, add_available=True, parent=None):
         super().__init__(parent)
+        self.setStyleSheet("background-color: #2b2b2b; color: #f2f2f2;")
         self.card_type = card_type
         self.add_available = add_available
         self.category = category
@@ -17,13 +18,16 @@ class BaseCardsList(QWidget):
         self.selected_card = None  # Currently selected card ID
         self.add_card = None  # Reference to add card if enabled
 
-        
         self.setup_ui()
         self.load_cards()
     
     def setup_ui(self):
         """Setup the base UI - override in subclasses for specific layouts"""
         pass
+
+    def _set_container_background(self, widget):
+        """Ensure child containers do not inherit a white background."""
+        widget.setStyleSheet("background-color: #2b2b2b; color: #f2f2f2;")
     
     def load_cards(self):
         """Load available cards - load from parent's profile manager or backup manager"""
@@ -198,6 +202,7 @@ class _GridCardsList(BaseCardsList):
         
         # Container widget for grid positioning
         self.grid_container = QWidget()
+        self._set_container_background(self.grid_container)
         self.layout.addWidget(self.grid_container)
         self.layout.addStretch()  # Push grid to top
         

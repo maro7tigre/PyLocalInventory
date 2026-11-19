@@ -8,7 +8,9 @@ from classes.sales_item_class import SalesItemClass
 from ui.widgets.operations_table import OperationsTableWidget
 from PySide6.QtWidgets import QDialog, QMessageBox, QVBoxLayout, QHBoxLayout, QLabel, QWidget
 from PySide6.QtGui import QFont
+from core.calculations import calculate_operation_totals, to_decimal
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 
 
 class SaleEditDialog(QDialog):
@@ -155,7 +157,7 @@ class SaleEditDialog(QDialog):
             item_class=SalesItemClass,
             parent_operation=self.sale_obj,
             database=self.database,
-            columns=['product_preview', 'product_description','product_name', 'quantity', 'unit_price', 'subtotal', 'delete_action'],
+            columns=['product_preview', 'product_description','product_name', 'quantity', 'unit_price', 'discount_percentage', 'subtotal', 'delete_action'],
             parent=self,
             highlight_stock_exceed=True
         )
@@ -185,6 +187,10 @@ class SaleEditDialog(QDialog):
         button_layout.addStretch()
         
         from ui.widgets.themed_widgets import GreenButton, RedButton
+        if self.sale_id:
+            self.attachments_btn = QPushButton("Attachments…")
+            self.attachments_btn.clicked.connect(self.show_attachments)
+            button_layout.addWidget(self.attachments_btn)
         self.save_btn = GreenButton("Save")
         self.save_btn.clicked.connect(self.save_changes)
         button_layout.addWidget(self.save_btn)
@@ -197,6 +203,19 @@ class SaleEditDialog(QDialog):
         
         # Apply dark theme
         self.apply_theme()
+
+    def show_attachments(self):
+        """Open the sale-specific attachment section without crowding item editing."""
+        if not self.sale_id:
+            QMessageBox.information(self, "Attachments", "Save the sale first, then reopen it to add attachments.")
+            return
+        from ui.widgets.attachments_widget import AttachmentPanel
+        dialog = QDialog(self)
+        dialog.setWindowTitle(f"Sale {self.sale_id} Attachments")
+        dialog.resize(900, 600)
+        layout = QVBoxLayout(dialog)
+        layout.addWidget(AttachmentPanel(self.database, 'sale', int(self.sale_id), dialog))
+        dialog.exec()
     
     def minimumSizeHint(self):
         """Calculate minimum size to prevent component overlay"""
@@ -317,31 +336,28 @@ class SaleEditDialog(QDialog):
             # Get current items
             items = self.sales_items_table.get_items_data()
             
-            # Calculate subtotal
-            subtotal = sum(item.get_value('subtotal') or 0 for item in items)
+            # Calculate subtotal (Decimal line totals through the shared helper)
+            subtotal = sum(to_decimal(item.get_value('subtotal') or 0) for item in items)
             
             # Get VAT percentage from the tva parameter widget
-            vat_percent = 0
+            vat_percent = Decimal("0")
             if 'tva' in self.parameter_widgets:
                 try:
-                    vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
-                except Exception:
-                    vat_percent = 0
+                    vat_percent = Decimal(str(self.get_widget_value(self.parameter_widgets['tva']) or 0))
+                except (InvalidOperation, ValueError, TypeError):
+                    vat_percent = Decimal("0")
             
-            # Calculate VAT amount
-            vat_amount = subtotal * (vat_percent / 100)
-            
-            # Calculate total
-            total = subtotal + vat_amount
+            # Centralized Decimal math: TVA = Subtotal * rate, Total = Subtotal + TVA.
+            totals = calculate_operation_totals(subtotal, 0, vat_percent)
             
             # Update widgets
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             if hasattr(self, 'subtotal_widget'):
-                ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
+                ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
             if hasattr(self, 'vat_widget'):
-                ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
+                ParameterWidgetFactory.set_widget_value(self.vat_widget, totals['vat_amount'])
             if hasattr(self, 'total_widget'):
-                ParameterWidgetFactory.set_widget_value(self.total_widget, total)
+                ParameterWidgetFactory.set_widget_value(self.total_widget, totals['total_ttc'])
                 
         except Exception as e:
             print(f"Error updating totals: {e}")
@@ -382,7 +398,7 @@ class SaleEditDialog(QDialog):
             return False
         
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = ?", (username,))
+            self.database.cursor.execute("SELECT COUNT(*) FROM Clients WHERE username = %s", (username,))
             result = self.database.cursor.fetchone()
             return result[0] > 0 if result else False
         except Exception as e:
@@ -403,43 +419,27 @@ class SaleEditDialog(QDialog):
                 value = self.get_widget_value(widget)
                 self.sale_obj.set_value(param_key, value)
             
-            # Save sale to database first
-            if self.sale_id:
-                # Update existing sale
-                success = self.sale_obj.save_to_database()
-                action = "updated"
-            else:
-                # Add new sale and get the new ID
-                success = self.sale_obj.save_to_database()
-                if success:
-                    self.sale_id = self.sale_obj.id
-                    action = "created"
-            
-            if success:
-                # Simple approach: Clear all existing items and add current ones
-                operation_id = self.sale_obj.id
-                
-                # Delete all existing sales items for this operation
-                if hasattr(self.sale_obj, 'get_sales_items'):
-                    existing_items = self.sale_obj.get_sales_items()
-                    for item in existing_items:
-                        if hasattr(item, 'id') and item.id:
-                            self.database.delete_item(item.id, "Sales_Items")
-                
-                # Add all current table items
-                current_data = self.sales_items_table.get_current_table_data()
-                items_saved = 0
-                
-                for item_data in current_data:
-                    item_data['sales_id'] = operation_id
-                    if self.database.add_item(item_data, "Sales_Items"):
-                        items_saved += 1
-                
-                QMessageBox.information(self, "Success", 
-                    f"Sale {action} successfully!\n{items_saved} items saved.")
-                self.accept()  # Close dialog
-            else:
-                QMessageBox.critical(self, "Error", "Failed to save sale to database")
+            action = "updated" if self.sale_id else "created"
+            current_data = self.sales_items_table.get_current_table_data()
+            header = {
+                key: self.sale_obj.get_value(key)
+                for key in self.sale_obj.get_visible_parameters('database')
+                if not self.sale_obj.is_parameter_calculated(key)
+            }
+            result = self.database.save_sale_with_items(
+                header, current_data, self.sale_id, len(current_data)
+            )
+            if not isinstance(result, dict) or result.get('saved') != len(current_data):
+                raise RuntimeError(
+                    f"Sale was not saved: {len(current_data)} visible items were found, "
+                    f"but the server confirmed {result.get('saved', 0) if isinstance(result, dict) else 0}."
+                )
+            self.sale_id = result['sale_id']
+            self.sale_obj.id = result['sale_id']
+            QMessageBox.information(
+                self, "Success", f"Sale {action} successfully. {result['saved']} items saved."
+            )
+            self.accept()
                 
         except Exception as e:
             QMessageBox.critical(self, "Error", f"Failed to save sale: {str(e)}")

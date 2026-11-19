@@ -1,0 +1,541 @@
+"""Deterministic Facture drawing shared by preview, PDF export, and printing."""
+
+import os
+from datetime import date, datetime
+from decimal import Decimal, InvalidOperation
+
+from PySide6.QtCore import QMarginsF, QRectF, Qt
+from PySide6.QtGui import QColor, QFont, QFontMetricsF, QImage, QPainter, QPageLayout, QPageSize, QPen
+
+from core.calculations import calculate_line_subtotal, round_money
+from core.runtime_paths import resource_path
+
+
+PAGE_MARGINS_MM = QMarginsF(14, 12, 14, 14)
+PRINTABLE_WIDTH_MM = 182
+PREVIEW_DPI = 144
+TABLE_HEADER_HEIGHT = 9
+MIN_ITEM_ROW_HEIGHT = 9
+TOTAL_ROW_HEIGHT = 6
+FINAL_SAFE_GAP = 5
+MIN_TABLE_ROWS = 13
+
+
+def money(value):
+    return f"{round_money(value):,.2f}".replace(",", " ").replace(".", ",")
+
+
+def quantity(value):
+    try:
+        number = Decimal(str(value or 0))
+    except (InvalidOperation, ValueError):
+        return str(value or "")
+    return f"{number:,.3f}".replace(",", " ").replace(".", ",")
+
+
+def _profile_value(profile, key):
+    return str(profile.get_value(key) or "") if profile else ""
+
+
+def _display_date(value):
+    if isinstance(value, (date, datetime)):
+        return value.strftime("%d/%m/%Y")
+    try:
+        return datetime.strptime(str(value or "")[:10], "%Y-%m-%d").strftime("%d/%m/%Y")
+    except ValueError:
+        return str(value or "")
+
+
+def configure_facture_page(printer):
+    """Apply the physical A4 geometry used by every Facture output target."""
+    layout = QPageLayout(
+        QPageSize(QPageSize.A4), QPageLayout.Portrait, PAGE_MARGINS_MM, QPageLayout.Millimeter
+    )
+    printer.setPageLayout(layout)
+    return printer.pageLayout()
+
+
+def facture_page_geometry(layout, dpi):
+    """Return page and printable rectangles in device pixels and physical millimetres."""
+    return {
+        "dpi": dpi,
+        "page_mm": layout.fullRect(QPageLayout.Millimeter),
+        "printable_mm": layout.paintRect(QPageLayout.Millimeter),
+        "page_points": layout.fullRect(QPageLayout.Point),
+        "printable_points": layout.paintRect(QPageLayout.Point),
+        "page_px": layout.fullRectPixels(dpi),
+        "printable_px": layout.paintRectPixels(dpi),
+    }
+
+
+def _print_layout_debug(target, geometry):
+    print("[FACTURE LAYOUT DEBUG]")
+    print(f"target = {target}")
+    print(f"page size mm = {geometry['page_mm']}")
+    print(f"printable rect mm = {geometry['printable_mm']}")
+    print(f"page rect points = {geometry['page_points']}")
+    print(f"printable rect points = {geometry['printable_points']}")
+    print(f"page rect px = {geometry['page_px']}")
+    print(f"printable rect px = {geometry['printable_px']}")
+    print(f"renderer table width mm = {PRINTABLE_WIDTH_MM:.2f}")
+
+
+def _document_data(facture, payments, profile):
+    company = _profile_value(profile, "company name")
+    address = _profile_value(profile, "address")
+    phone = _profile_value(profile, "phone")
+    fax = _profile_value(profile, "fax")
+    email = _profile_value(profile, "email")
+    website = _profile_value(profile, "website")
+    currency = _profile_value(profile, "currency") or "MAD"
+    report_footer = _profile_value(profile, "report footer")
+    contact = [address]
+    if phone:
+        contact.append(f"Tél. : {phone}")
+    if fax:
+        contact.append(f"Fax : {fax}")
+    legal_values = [
+        ("ICE", _profile_value(profile, "ice")),
+        ("PATENTE", _profile_value(profile, "patente")),
+        ("I.F", _profile_value(profile, "if number")),
+        ("R.C", _profile_value(profile, "rc")),
+        ("CNSS", _profile_value(profile, "cnss")),
+    ]
+    legal_lines = []
+    for values in (legal_values[:3], legal_values[3:]):
+        line = "   ".join(f"{label}: {value}" for label, value in values if value)
+        if line:
+            legal_lines.append(line)
+    bank_parts = [
+        ("BANQUE", _profile_value(profile, "bank name")),
+        ("COMPTE N°", _profile_value(profile, "bank account")),
+        ("AGENCE", _profile_value(profile, "bank agency")),
+    ]
+    client_rows = [
+        ("Mr / Société :", str(facture.get("client_name") or "")),
+        ("Adresse / Ville :", " ".join(filter(None, (
+            str(facture.get("client_address") or ""), str(facture.get("client_city") or ""),
+        )))),
+        ("ICE :", str(facture.get("client_ice") or "")),
+    ]
+    if facture.get("source_devis"):
+        client_rows.append(("Devis N° :", str(facture["source_devis"])))
+    references = []
+    for payment in payments:
+        if not (payment.get("reference") or payment.get("method") == "Chèque"):
+            continue
+        label = "CHQ" if payment.get("method") == "Chèque" else str(payment.get("method") or "Règlement").upper()
+        reference = f" {payment['reference']}" if payment.get("reference") else ""
+        payment_date = f" DU {_display_date(payment['date'])}" if payment.get("date") else ""
+        references.append(f"{label}{reference} : {money(payment.get('amount') or 0)} {currency}{payment_date}")
+    items = []
+    # A balance invoice must show the original Devis Products/Services, not a
+    # synthetic line, while its accounting total stays the balance amount.
+    source_items = facture.get("source_items") or []
+    if source_items:
+        devis_labels = {
+            source.get("sale_id"): source.get("devis")
+            for source in (facture.get("sources") or [])
+        }
+        current_source = object()
+        for source_item in source_items:
+            sale_id = source_item.get("source_sale_id")
+            if sale_id != current_source:
+                current_source = sale_id
+                devis = devis_labels.get(sale_id) or ""
+                items.append({
+                    "section": True,
+                    "designation": f"DEVIS N° {devis}" if devis else "DEVIS",
+                })
+            if str(source_item.get("item_type") or "") == "section":
+                items.append({"section": True, "designation": str(source_item.get("designation") or "")})
+                continue
+            total = calculate_line_subtotal(
+                source_item.get("quantity") or 0,
+                source_item.get("unit_price") or 0,
+                source_item.get("discount_percentage") or 0,
+            )
+            items.append({
+                "section": False,
+                "designation": str(source_item.get("designation") or ""),
+                "information": str(source_item.get("information") or ""),
+                "unit": str(source_item.get("unit") or ""),
+                "quantity": quantity(source_item.get("quantity")),
+                "price": money(source_item.get("unit_price") or 0),
+                "total": money(total),
+            })
+    else:
+        for item in facture["items"]:
+            if item["item_type"] == "section":
+                items.append({"section": True, "designation": str(item["designation"])})
+                continue
+            total = calculate_line_subtotal(
+                item.get("quantity") or 0, item.get("unit_price") or 0, item.get("discount_percentage") or 0
+            )
+            items.append({
+                "section": False,
+                "designation": str(item["designation"]),
+                "information": str(item.get("information") or ""),
+                "unit": str(item.get("unit") or ""),
+                "quantity": quantity(item.get("quantity")),
+                "price": money(item.get("unit_price") or 0),
+                "total": money(total),
+            })
+    paid = Decimal(str(facture.get("paid") or 0))
+    remaining = Decimal(str(facture.get("remaining") or 0))
+    invoice_type = facture.get("facture_type")
+    # Project (selected Devis) figures vs. this invoice's own accounting value.
+    # The backend is authoritative for both; the renderer only formats them.
+    project_ht = Decimal(str(facture.get("selected_total_ht") or facture["total_ht"]))
+    project_vat = Decimal(str(facture.get("selected_vat_amount") or facture["vat_amount"]))
+    project_ttc = Decimal(str(facture.get("selected_total_ttc") or facture["total_ttc"]))
+    previous_paid = Decimal(str(facture.get("previous_paid_ttc") or 0))
+    current_paid = Decimal(str(facture.get("current_paid_ttc") if
+                              facture.get("current_paid_ttc") is not None else paid))
+    project_remaining = Decimal(str(
+        facture.get("project_remaining_to_pay")
+        if facture.get("project_remaining_to_pay") is not None
+        else max(Decimal("0"), project_ttc - previous_paid - current_paid)
+    ))
+
+    total_rows = []
+    if invoice_type == "balance":
+        # A balance invoice displays the FULL Devis value; the payment lines
+        # below explain what is still owed on the project.
+        total_rows = [
+            ("Total HT", f"{money(project_ht)} {currency}", False),
+            ("Total TVA", f"{money(project_vat)} {currency}", False),
+            ("Total TTC", f"{money(project_ttc)} {currency}", True),
+            ("DÉJÀ PAYÉ", f"{money(previous_paid)} {currency}", False),
+            ("PAYÉ", f"{money(current_paid)} {currency}", False),
+            ("RESTE À PAYER", f"{money(project_remaining)} {currency}", True),
+        ]
+    elif invoice_type == "advance":
+        # An advance is a PART of the project: the project value is shown as the
+        # global amount, while the advance itself stays the invoiced amount.
+        total_rows = [
+            ("TOTAL HT", f"{money(project_ht)} {currency}", False),
+            ("TOTAL TVA", f"{money(project_vat)} {currency}", False),
+            ("MONTANT GLOBAL", f"{money(project_ttc)} {currency}", False),
+            ("AVANCE À PAYER", f"{money(facture['total_ttc'])} {currency}", True),
+        ]
+    else:
+        total_rows = [
+            ("Total HT", f"{money(facture['total_ht'])} {currency}", False),
+            ("Total TVA", f"{money(facture['vat_amount'])} {currency}", False),
+            ("MONTANT GLOBAL", f"{money(facture['total_ttc'])} {currency}", True),
+        ]
+        if paid > 0:
+            total_rows.append(("PAYÉ", f"{money(paid)} {currency}", False))
+        if remaining > 0:
+            total_rows.append(("NET À PAYER", f"{money(remaining)} {currency}", True))
+        elif paid > 0:
+            total_rows.append(("RESTE À PAYER", f"{money(remaining)} {currency}", True))
+    data = {
+        "contact": "\n".join(part for part in contact if part),
+        "client_rows": client_rows,
+        "number": str(facture["facture_number"]),
+        "date": _display_date(facture.get("date")),
+        "items": items,
+        "total_rows": total_rows,
+        "words": str(facture.get("amount_in_words") or ""),
+        "references": references,
+        "notes": str(facture.get("notes") or "").strip(),
+        "website": website,
+        "company_contact": " - ".join(part for part in (company, f"Email : {email}" if email else "") if part),
+        "legal_lines": legal_lines,
+        "bank_line": " - ".join(f"{label}: {value}" for label, value in bank_parts if value),
+        "report_footer": report_footer,
+        "logo": QImage(resource_path("report", "lamidap_logo.png")),
+    }
+    return data
+
+
+def _font(size, bold=False):
+    font = QFont("Arial")
+    font.setPointSizeF(size)
+    font.setBold(bold)
+    return font
+
+
+def _text_height(text, width_mm, size, bold=False, minimum=0.0):
+    """Measure wrapped painter text in physical millimetres for page planning."""
+    if not text:
+        return minimum
+    pixels_per_mm = 96 / 25.4
+    bounds = QFontMetricsF(_font(size, bold)).boundingRect(
+        QRectF(0, 0, width_mm * pixels_per_mm, 100000), Qt.TextWordWrap, text
+    )
+    return max(minimum, bounds.height() / pixels_per_mm)
+
+
+def _item_height(item):
+    if item.get("section"):
+        return MIN_ITEM_ROW_HEIGHT
+    description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
+    return max(MIN_ITEM_ROW_HEIGHT, _text_height(description, 94.28, 9.5, minimum=8) + 1)
+
+
+def _footer_height(data):
+    """Keep all legal content inside a fixed, bottom-anchored reserved area."""
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 7, minimum=5)
+    return max(
+        27,
+        1 + 5 + 5 + legal_height + 5 + _text_height(data["report_footer"], 182, 6.5, minimum=4.5) + 1,
+    )
+
+
+def _settlement_height(data):
+    """Measure the unsplittable final settlement block, including all left-side text."""
+    left_height = 5 + 1 + _text_height(data["words"], 98, 9, bold=True, minimum=11)
+    if data["notes"]:
+        left_height += 2 + _text_height(data["notes"], 98, 9.5, bold=True, minimum=5)
+    if data["references"]:
+        left_height += 2 + _text_height("\n".join(data["references"]), 98, 7.5, minimum=4)
+    return max(left_height, len(data["total_rows"]) * TOTAL_ROW_HEIGHT)
+
+
+def _table_y(is_first):
+    return 78 if is_first else 12
+
+
+def _final_page_plan(items, data, printable_height, is_first):
+    """Return a safe final-page plan, or None when its content cannot fit."""
+    footer_height = _footer_height(data)
+    footer_y = printable_height - footer_height
+    settlement_height = _settlement_height(data)
+    settlement_limit = footer_y - FINAL_SAFE_GAP - settlement_height
+    table_y = _table_y(is_first)
+    row_heights = [_item_height(item) for item in items]
+    table_bottom = table_y + TABLE_HEADER_HEIGHT + sum(row_heights)
+    if table_bottom + 5 > settlement_limit:
+        return None
+
+    # Preserve the familiar short-invoice table while never consuming reserved final space.
+    padding_capacity = int((settlement_limit - (table_bottom + 5)) // MIN_ITEM_ROW_HEIGHT)
+    padding = min(max(0, MIN_TABLE_ROWS - len(row_heights)), max(0, padding_capacity))
+    row_heights.extend([MIN_ITEM_ROW_HEIGHT] * padding)
+    return {
+        "items": list(items), "row_heights": row_heights, "is_first": is_first,
+        "is_final": True, "table_y": table_y, "footer_y": footer_y,
+        "footer_height": footer_height, "settlement_y": table_y + TABLE_HEADER_HEIGHT + sum(row_heights) + 5,
+    }
+
+
+def plan_facture_pages(data, printable_height=271):
+    """Plan all pages from measured content; used unchanged by preview, PDF, and print."""
+    remaining = list(data["items"])
+    first_final = _final_page_plan(remaining, data, printable_height, True)
+    if first_final is not None:
+        return [first_final]
+
+    pages = []
+    is_first = True
+    while True:
+        final = _final_page_plan(remaining, data, printable_height, False)
+        if final is not None:
+            pages.append(final)
+            return pages
+
+        table_y = _table_y(is_first)
+        capacity = printable_height - table_y - TABLE_HEADER_HEIGHT - 2
+        used = 0
+        count = 0
+        for item in remaining:
+            height = _item_height(item)
+            # A non-final page must leave at least one item with the final settlement.
+            if count and (used + height > capacity or count == len(remaining) - 1):
+                break
+            if height > capacity:
+                raise ValueError("Une ligne de facture dépasse la zone imprimable A4.")
+            used += height
+            count += 1
+        if not count:
+            raise ValueError("La section finale de la facture dépasse la zone imprimable A4.")
+        pages.append({
+            "items": remaining[:count], "row_heights": [_item_height(item) for item in remaining[:count]],
+            "is_first": is_first, "is_final": False, "table_y": table_y,
+        })
+        remaining = remaining[count:]
+        is_first = False
+
+
+def _draw_text(painter, rect, text, size, flags=Qt.AlignLeft | Qt.AlignVCenter, bold=False, color=Qt.black):
+    painter.save()
+    painter.setFont(_font(size, bold))
+    painter.setPen(color)
+    painter.drawText(rect, flags | Qt.TextWordWrap, text)
+    painter.restore()
+
+
+def _draw_box(painter, rect, fill=None, width=0.35):
+    painter.save()
+    painter.setPen(QPen(QColor("#222222"), width))
+    painter.setBrush(QColor(fill) if fill else Qt.NoBrush)
+    painter.drawRect(rect)
+    painter.restore()
+
+
+def _draw_facture_page(painter, printable_rect, data, page, page_number, page_count):
+    scale = printable_rect.width() / PRINTABLE_WIDTH_MM
+
+    def rect(x, y, width, height):
+        return QRectF(printable_rect.x() + x * scale, printable_rect.y() + y * scale, width * scale, height * scale)
+
+    def line(x1, y1, x2, y2, width=0.35):
+        painter.save(); painter.setPen(QPen(QColor("#222222"), width)); painter.drawLine(
+            printable_rect.x() + x1 * scale, printable_rect.y() + y1 * scale,
+            printable_rect.x() + x2 * scale, printable_rect.y() + y2 * scale,
+        ); painter.restore()
+
+    is_first = page["is_first"]
+    is_final = page["is_final"]
+    if is_first:
+        logo_rect = rect(0, 0, 52, 28)
+        if not data["logo"].isNull():
+            image = data["logo"].scaled(logo_rect.size().toSize(), Qt.KeepAspectRatio, Qt.SmoothTransformation)
+            painter.drawImage(QRectF(logo_rect.x(), logo_rect.y(), image.width(), image.height()), image)
+        _draw_text(painter, rect(0, 30, 88, 35), data["contact"], 9.5, Qt.AlignLeft | Qt.AlignTop)
+        _draw_text(painter, rect(100, 0, 82, 14), "FACTURE", 26, Qt.AlignCenter, bold=True)
+        info = rect(100, 16, 82, 19)
+        _draw_box(painter, info)
+        line(141, 16, 141, 35)
+        line(100, 24, 182, 24)
+        _draw_text(painter, rect(102, 17, 37, 6), "Numéro", 9, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(143, 17, 37, 6), "Date", 9, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(102, 25, 37, 8), data["number"], 12, Qt.AlignCenter, bold=True)
+        _draw_text(painter, rect(143, 25, 37, 8), data["date"], 12, Qt.AlignCenter, bold=True)
+        client = rect(100, 40, 82, 33)
+        _draw_box(painter, client)
+        row_height = 33 / len(data["client_rows"])
+        for index, (label, value) in enumerate(data["client_rows"]):
+            y = 40 + index * row_height
+            if index:
+                line(100, y, 182, y, 0.25)
+            _draw_text(painter, rect(102, y + 0.5, 27, row_height - 1), label, 8, bold=True)
+            _draw_text(painter, rect(130, y + 0.5, 50, row_height - 1), value, 9.5, Qt.AlignCenter, bold=True)
+        if page_count > 1:
+            _draw_text(painter, rect(100, 36, 82, 3), f"Page {page_number} / {page_count}", 7, Qt.AlignRight)
+    else:
+        _draw_text(painter, rect(0, 0, 182, 8), f"FACTURE {data['number']}    Page {page_number} / {page_count}", 9, Qt.AlignRight, bold=True)
+
+    table_y = page["table_y"]
+    header_height = TABLE_HEADER_HEIGHT
+    table_width = 182
+    columns = (0, 98.28, 114.66, 131.04, 156.52, 182)
+    _draw_box(painter, rect(0, table_y, table_width, header_height), "#303030")
+    headers = ("Désignation", "Unité", "Qté", "Prix HT", "Total HT")
+    for index, label in enumerate(headers):
+        x = columns[index]
+        width = columns[index + 1] - x
+        if index:
+            line(x, table_y, x, table_y + header_height)
+        align = Qt.AlignLeft if index == 0 else Qt.AlignCenter
+        _draw_text(painter, rect(x + 1.5, table_y, width - 3, header_height), label, 8.5, align, bold=True, color=Qt.white)
+
+    rows_to_draw = list(page["items"]) + [None] * (len(page["row_heights"]) - len(page["items"]))
+    y = table_y + header_height
+    for item, row_height in zip(rows_to_draw, page["row_heights"]):
+        row_rect = rect(0, y, table_width, row_height)
+        _draw_box(painter, row_rect, "#e8e8e8" if item and item.get("section") else None, 0.25)
+        for boundary in columns[1:-1]:
+            line(boundary, y, boundary, y + row_height, 0.25)
+        if not item:
+            y += row_height
+            continue
+        if item["section"]:
+            _draw_text(painter, rect(2, y, 178, row_height), item["designation"], 8.5, bold=True)
+            y += row_height
+            continue
+        description = item["designation"] + (f"\n{item['information']}" if item["information"] else "")
+        _draw_text(
+            painter, rect(2, y + .5, columns[1] - 4, row_height - 1), description, 9.5,
+            Qt.AlignCenter, bold="\n" in item["designation"],
+        )
+        values = (item["unit"], item["quantity"], item["price"], item["total"])
+        for value_index, value in enumerate(values, 1):
+            x = columns[value_index]
+            width = columns[value_index + 1] - x
+            numeric = value_index in (2, 3, 4)
+            alignment = Qt.AlignCenter if numeric or value_index == 1 else Qt.AlignRight
+            _draw_text(painter, rect(x + 1, y, width - 2, row_height), value, 10 if numeric else 9, alignment)
+        y += row_height
+
+    if not is_final:
+        return
+    settlement_y = page["settlement_y"]
+    totals_x = 105
+    _draw_text(painter, rect(0, settlement_y, 98, 5), "Arrêtée la présente Facture à la somme de :", 8)
+    words_height = _text_height(data["words"], 98, 9, bold=True, minimum=11)
+    _draw_text(painter, rect(0, settlement_y + 6, 98, words_height), data["words"], 9, Qt.AlignLeft | Qt.AlignTop, bold=True)
+    footer_y = page["footer_y"]
+    lower_left_y = settlement_y + 6 + words_height
+    if data["notes"]:
+        note_height = _text_height(data["notes"], 98, 9.5, bold=True, minimum=5)
+        lower_left_y += 2
+        _draw_text(painter, rect(0, lower_left_y, 98, note_height), data["notes"], 9.5, Qt.AlignLeft | Qt.AlignTop, bold=True)
+        lower_left_y += note_height
+    if data["references"]:
+        reference_height = _text_height("\n".join(data["references"]), 98, 7.5, minimum=4)
+        lower_left_y += 2
+        _draw_text(painter, rect(0, lower_left_y, 98, reference_height), "\n".join(data["references"]), 7.5, Qt.AlignLeft | Qt.AlignTop)
+    for index, (label, value, emphasized) in enumerate(data["total_rows"]):
+        y = settlement_y + index * TOTAL_ROW_HEIGHT
+        fill = "#303030" if emphasized else "#eeeeee"
+        _draw_box(painter, rect(totals_x, y, 77, TOTAL_ROW_HEIGHT), fill, 0.25)
+        line(totals_x + 46, y, totals_x + 46, y + TOTAL_ROW_HEIGHT, 0.25)
+        color = Qt.white if emphasized else Qt.black
+        _draw_text(painter, rect(totals_x + 2, y, 42, TOTAL_ROW_HEIGHT), label, 8, bold=emphasized, color=color)
+        _draw_text(painter, rect(totals_x + 48, y, 27, TOTAL_ROW_HEIGHT), value, 8, Qt.AlignRight, emphasized, color)
+    line(0, footer_y, 182, footer_y)
+    footer_text_y = footer_y + 1
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["website"], 9, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["company_contact"], 7.5, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    legal_height = _text_height("\n".join(data["legal_lines"]), 182, 7, minimum=5)
+    _draw_text(painter, rect(0, footer_text_y, 182, legal_height), "\n".join(data["legal_lines"]), 7, Qt.AlignCenter | Qt.AlignTop)
+    footer_text_y += legal_height
+    _draw_text(painter, rect(0, footer_text_y, 182, 5), data["bank_line"], 7, Qt.AlignCenter, bold=True)
+    footer_text_y += 5
+    report_height = _text_height(data["report_footer"], 182, 6.5, minimum=4.5)
+    _draw_text(painter, rect(0, footer_text_y, 182, report_height), data["report_footer"], 6.5, Qt.AlignCenter | Qt.AlignTop)
+
+
+def render_facture_to_printer(printer, facture, payments, profile=None):
+    """Render a Facture to a QPrinter using only physical QPageLayout coordinates."""
+    layout = configure_facture_page(printer)
+    geometry = facture_page_geometry(layout, printer.resolution())
+    _print_layout_debug("printer", geometry)
+    painter = QPainter(printer)
+    printer_rect = geometry["printable_px"].translated(-geometry["printable_px"].topLeft())
+    print(f"printer painter viewport px = {painter.viewport()}")
+    data = _document_data(facture, payments, profile)
+    printable_height = printer_rect.height() / (printer_rect.width() / PRINTABLE_WIDTH_MM)
+    pages = plan_facture_pages(data, printable_height)
+    for index, page in enumerate(pages):
+        if index:
+            printer.newPage()
+        painter.fillRect(printer_rect, Qt.white)
+        _draw_facture_page(painter, printer_rect, data, page, index + 1, len(pages))
+    painter.end()
+    return geometry
+
+
+def render_facture_preview_pages(facture, payments, profile=None, dpi=PREVIEW_DPI):
+    """Render the same physical pages to preview images without QTextDocument."""
+    layout = QPageLayout(QPageSize(QPageSize.A4), QPageLayout.Portrait, PAGE_MARGINS_MM, QPageLayout.Millimeter)
+    geometry = facture_page_geometry(layout, dpi)
+    _print_layout_debug("preview", geometry)
+    data = _document_data(facture, payments, profile)
+    pages = []
+    printable_height = geometry["printable_px"].height() / (geometry["printable_px"].width() / PRINTABLE_WIDTH_MM)
+    plans = plan_facture_pages(data, printable_height)
+    for index, page in enumerate(plans):
+        image = QImage(geometry["page_px"].size(), QImage.Format_ARGB32_Premultiplied)
+        image.fill(Qt.white)
+        painter = QPainter(image)
+        _draw_facture_page(painter, geometry["printable_px"], data, page, index + 1, len(plans))
+        painter.end()
+        pages.append(image)
+    return pages, geometry

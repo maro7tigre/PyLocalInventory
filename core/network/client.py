@@ -3,18 +3,47 @@ Client-side drop-in stand-in for core.database.Database, backed by a network
 connection to a host running core.network.server.DatabaseServer.
 
 Exposes the same attribute surface used throughout the app - add_item,
-update_item, get_items, get_items_by_operation_id, delete_item, transactions,
+update_item, get_items, get_items_by_operation_id, get_items_by_operation_ids, delete_item, transactions,
 plus .cursor/.conn proxies for the raw-SQL call sites - so MainWindow can set
 self.database to either a real Database or a RemoteDatabase and every tab/
 dialog/domain class keeps working unmodified.
 """
 import json
+import socket
 import urllib.error
 import urllib.request
+import time
+import os
+import zipfile
+import logging
+import threading
+from collections import OrderedDict
+from decimal import Decimal
 
 from core.network.protocol import (
     AuthError, ConnectionFailedError, PermissionDeniedError, RemoteError, DEFAULT_PORT
 )
+from core.user_manager import SECTION_GROUP
+from core.build_info import APP_BUILD_ID
+from core.cache_policies import ENABLE_SQLITE_CACHE
+from core import diagnostics
+
+logger = logging.getLogger(__name__)
+
+# Thumbnails are small (the host caps them at 160 px), but a client may browse
+# many clients/sales. Keep the most recently used payloads in memory so a table
+# refresh or reopening the same attachment view does not re-download them.
+_ATTACHMENT_THUMBNAIL_CACHE_LIMIT = 512
+
+
+class RemoteProfile:
+    """Read-only report branding supplied by the connected host."""
+
+    def __init__(self, values=None):
+        self._values = dict(values or {})
+
+    def get_value(self, key):
+        return self._values.get(key)
 
 
 class RemoteCursor:
@@ -82,9 +111,70 @@ class RemoteDatabase:
         self._token = None
         self.permissions = {}
         self.is_superadmin = False
+        self.current_user_id = None
+        self.remote_profile = None
+        # ``None`` means an older host did not provide a login snapshot, so
+        # callers can retain the legacy RPC fallback for compatibility.
+        self.sale_catalog = None
+        # ``None`` means the host we connected to is running a build from
+        # before build-id reporting existed - i.e. it predates this fix.
+        self.host_build_id = None
+
+        # On-disk SQLite cache of fetched records, keyed by this client
+        # identity (host|port|username). Created on a successful login so it is
+        # never shared across users on a shared PC. Falls back to None if the
+        # cache cannot be opened - the cache is display-only, never critical.
+        self.cache = None
+
+        # In-memory, metadata-only thumbnail cache (attachment id -> base64
+        # PNG). This is a display cache; file bytes are still downloaded only
+        # through download_attachment() for Preview/Open/Export/Print.
+        self._attachment_thumbnail_cache = OrderedDict()
+        self._attachment_thumbnail_lock = threading.RLock()
+
+        # Offline/read-only flag: set by the background sync when the host is
+        # unreachable so tabs stop firing network refreshes that hang on a
+        # dead connection and just render what the cache already holds.
+        self.offline = False
 
         self.cursor = RemoteCursor(self)
         self.conn = RemoteConnection(self)
+
+    def has_permission(self, section, action='read'):
+        """Check the logged-in user's role permissions for a section (or a
+        child table that rolls up into one, e.g. 'Sales_Items' -> 'Sales'),
+        without making a network round-trip."""
+        if self.is_superadmin:
+            return True
+        mapped = SECTION_GROUP.get(section, section)
+        return bool(self.permissions.get(mapped, {}).get(action, False))
+
+    def get_items_by_operation_id(self, operation_id, section):
+        return self._call('get_items_by_operation_id', [operation_id, section])
+
+    def get_items_by_operation_ids(self, operation_ids, section):
+        return self._call('get_items_by_operation_ids', [operation_ids, section])
+
+    def get_sale_catalog(self, include_products=True, include_services=True,
+                          include_clients=False, include_suppliers=False):
+        return self._call(
+            'get_sale_catalog', [include_products, include_services],
+            {'include_clients': include_clients, 'include_suppliers': include_suppliers},
+        )
+
+    # Dedicated Facture API mirrors the local Database surface. Keeping these
+    # explicit avoids raw SQL fallbacks in the LAN client.
+    def get_next_facture_preview(self, date=None): return self._call('get_next_facture_preview', [date])
+    def get_facture(self, facture_id): return self._call('get_facture', [facture_id])
+    def list_factures(self): return self._call('list_factures', [])
+    def get_facture_payments(self, facture_id): return self._call('get_facture_payments', [facture_id])
+    def get_facture_draft_from_sales(self, sale_ids, facture_type='normal', date=None, exclude_facture_id=None): return self._call('get_facture_draft_from_sales', [sale_ids, facture_type, date, exclude_facture_id])
+    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, strict=True): return self._call('get_invoiced_total_for_sources', [sale_ids, exclude_facture_id], {'strict': strict})
+    def save_facture_with_items(self, data, items, facture_id=None): return self._call('save_facture_with_items', [data, items, facture_id])
+    def add_facture_payment(self, *args): return self._call('add_facture_payment', list(args))
+    def update_facture_payment(self, *args): return self._call('update_facture_payment', list(args))
+    def delete_facture_payment(self, facture_id, payment_id): return self._call('delete_facture_payment', [facture_id, payment_id])
+    def delete_facture(self, facture_id): return self._call('delete_facture', [facture_id])
 
     def register_class(self, cls):
         """Mirrors Database.register_class - only needs the section name
@@ -112,27 +202,77 @@ class RemoteDatabase:
             if e.code == 401:
                 raise AuthError("Invalid username or password")
             raise RemoteError(f"Host rejected the connection ({e.code})")
-        except Exception as e:
-            raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
+        except (TimeoutError, socket.timeout):
+            logger.warning("Login timed out host=%s port=%s", self.host, self.port)
+            raise ConnectionFailedError("Connection timed out")
+        except urllib.error.URLError as e:
+            logger.warning(
+                "Login connection failure host=%s port=%s error=%s",
+                self.host, self.port, getattr(e, "reason", e),
+            )
+            reason = getattr(e, "reason", None)
+            if isinstance(reason, (TimeoutError, socket.timeout)):
+                raise ConnectionFailedError("Connection timed out")
+            if isinstance(reason, ConnectionRefusedError):
+                raise ConnectionFailedError("Server unavailable")
+            raise ConnectionFailedError("Unable to reach host")
+        except (json.JSONDecodeError, KeyError):
+            raise RemoteError("Server returned an invalid response")
+        except Exception:
+            logger.exception(
+                "Unexpected login network error host=%s port=%s",
+                self.host, self.port,
+            )
+            raise ConnectionFailedError("Network error")
 
         self._token = data['token']
+        self._password = None
         self.permissions = data.get('permissions', {})
         self.is_superadmin = data.get('is_superadmin', False)
+        self.current_user_id = data.get('user_id')
+        self.username = data.get('username') or self.username
+        self.remote_profile = RemoteProfile(data.get("profile") or {})
+        self.sale_catalog = data.get("sale_catalog")
+        # Absent on a host running a build from before build-id reporting -
+        # i.e. that host has not been redeployed with this fix.
+        self.host_build_id = data.get('build_id')
+        self._open_cache()
+        diagnostics.set_mode('client')
+        logger.info(
+            "client_connected host=%s port=%s host_build_id=%s",
+            self.host, self.port, self.host_build_id,
+        )
+        if self.host_build_id != APP_BUILD_ID:
+            logger.warning(
+                "Build mismatch: this client build_id=%s host=%s port=%s reports "
+                "host_build_id=%s - if a fix isn't taking effect, redeploy "
+                "the host and/or this client to matching builds.",
+                APP_BUILD_ID, self.host, self.port, self.host_build_id,
+            )
+        else:
+            logger.info(
+                "Build match: client and host=%s:%s both on build_id=%s",
+                self.host, self.port, APP_BUILD_ID,
+            )
         return True
 
-    def _call(self, method, args=None, kwargs=None):
+    def _call(self, method, args=None, kwargs=None, timeout=10):
         if not self._token:
             raise AuthError("Not connected")
+        diagnostics.network_call(method)
 
         url = f"http://{self.host}:{self.port}/rpc"
-        payload = json.dumps({'method': method, 'args': args or [], 'kwargs': kwargs or {}}).encode('utf-8')
+        safe_args = self._json_safe(args or [])
+        safe_kwargs = self._json_safe(kwargs or {})
+        payload = json.dumps({'method': method, 'args': safe_args, 'kwargs': safe_kwargs}).encode('utf-8')
         req = urllib.request.Request(
             url, data=payload,
             headers={'Content-Type': 'application/json', 'Authorization': f'Bearer {self._token}'},
             method='POST'
         )
+        started = time.perf_counter()
         try:
-            with urllib.request.urlopen(req, timeout=10) as resp:
+            with urllib.request.urlopen(req, timeout=timeout) as resp:
                 data = json.loads(resp.read().decode('utf-8'))
         except urllib.error.HTTPError as e:
             try:
@@ -147,18 +287,385 @@ class RemoteDatabase:
         except (AuthError, PermissionDeniedError, RemoteError):
             raise
         except Exception as e:
+            logger.warning(
+                "LAN RPC connection failure method=%s host=%s port=%s category=%s",
+                method, self.host, self.port, type(e).__name__,
+            )
             raise ConnectionFailedError(f"Could not reach {self.host}:{self.port}: {e}")
 
-        return data.get('result')
+        elapsed_ms = (time.perf_counter() - started) * 1000
+        logger.log(
+            logging.WARNING if elapsed_ms >= 500 else logging.INFO,
+            "LAN RPC method=%s host=%s port=%s duration_ms=%.1f build_id=%s host_build_id=%s",
+            method, self.host, self.port, elapsed_ms, APP_BUILD_ID, self.host_build_id,
+        )
+        result = data.get('result')
+        return result
+
+    def download_backup(self, destination):
+        """Stream a host-generated backup to this PC using an atomic rename."""
+        if not self._token:
+            raise AuthError("Not connected")
+        destination = os.path.abspath(os.fspath(destination))
+        parent = os.path.dirname(destination)
+        if not os.path.isdir(parent):
+            raise ValueError("Choose an existing destination folder")
+        partial = destination + ".part"
+        req = urllib.request.Request(
+            f"http://{self.host}:{self.port}/backup",
+            headers={"Authorization": f"Bearer {self._token}"},
+            method="GET",
+        )
+        try:
+            with urllib.request.urlopen(req, timeout=300) as response:
+                with open(partial, "wb") as stream:
+                    while True:
+                        chunk = response.read(1024 * 1024)
+                        if not chunk:
+                            break
+                        stream.write(chunk)
+            if not os.path.isfile(partial) or os.path.getsize(partial) <= 0:
+                raise RuntimeError("The host returned an empty backup")
+            if not zipfile.is_zipfile(partial):
+                raise RuntimeError("The downloaded backup archive is invalid")
+            with zipfile.ZipFile(partial) as archive:
+                dumps = [
+                    item for item in archive.infolist()
+                    if item.filename.lower().endswith((".backup", ".dump"))
+                    and item.file_size > 0
+                ]
+                if not dumps:
+                    raise RuntimeError(
+                        "The downloaded archive does not contain a database backup"
+                    )
+                bad_member = archive.testzip()
+                if bad_member:
+                    raise RuntimeError(
+                        f"The downloaded backup is corrupted at {bad_member}"
+                    )
+            os.replace(partial, destination)
+            return destination
+        except urllib.error.HTTPError as error:
+            try:
+                message = json.loads(error.read().decode("utf-8")).get(
+                    "error", str(error)
+                )
+            except Exception:
+                message = str(error)
+            if error.code == 401:
+                raise AuthError(message)
+            if error.code == 403:
+                raise PermissionDeniedError(message)
+            raise RemoteError(message)
+        except (AuthError, PermissionDeniedError, RemoteError):
+            raise
+        except Exception:
+            if os.path.exists(partial):
+                try:
+                    os.remove(partial)
+                except OSError:
+                    pass
+            raise
+
+    @classmethod
+    def _json_safe(cls, value):
+        """Convert database/UI values to JSON primitives without losing decimals."""
+        if isinstance(value, Decimal):
+            return format(value, 'f')
+        if isinstance(value, dict):
+            return {str(key): cls._json_safe(item) for key, item in value.items()}
+        if isinstance(value, (list, tuple)):
+            return [cls._json_safe(item) for item in value]
+        if isinstance(value, (str, int, float, bool)) or value is None:
+            return value
+        return str(value)
 
     def __getattr__(self, name):
         # Reached only for attributes not set in __init__: add_item, update_item,
-        # get_items, get_items_by_operation_id, delete_item, begin_transaction,
+        # get_items, get_items_by_operation_id, get_items_by_operation_ids, delete_item, begin_transaction,
         # commit_transaction, rollback_transaction - forwarded generically so the
         # server-side allow-list is the single source of truth for what's exposed.
         def _proxy(*args, **kwargs):
             return self._call(name, list(args), kwargs)
         return _proxy
 
+    def list_attachments(self, entity_type, entity_id, scope=None):
+        """Return attachment metadata for one entity.
+
+        Online: asks the host (authoritative) exactly like before. Offline:
+        renders from the synced local cache so the attachment panel still
+        works - rows carry only metadata (id, names, size, mime, relative
+        path), never file bytes or absolute paths.
+        """
+        entity_id = int(entity_id)
+        if bool(getattr(self, 'offline', False)):
+            cache = getattr(self, 'cache', None)
+            if cache is not None:
+                records = cache.get_records('attachments') or {}
+                if entity_type != 'client':
+                    return [
+                        record for record in records.values()
+                        if record.get('entity_type') == entity_type
+                        and int(record.get('entity_id')) == entity_id
+                    ]
+
+                clients = cache.get_records('Clients') or {}
+                selected = next(
+                    (record for record in clients.values()
+                     if int(record.get('id', 0) or 0) == entity_id),
+                    {},
+                )
+                username = " ".join(str(selected.get('username') or '').split()).casefold()
+                sales = cache.get_records('Sales') or {}
+                sale_ids = {
+                    int(record.get('id', 0) or 0)
+                    for record in sales.values()
+                    if int(record.get('client_id', 0) or 0) == entity_id
+                    or (username and " ".join(
+                        str(record.get('client_username') or '').split()
+                    ).casefold() == username)
+                }
+                return [
+                    record for record in records.values()
+                    if (
+                        record.get('entity_type') == 'client'
+                        and int(record.get('client_id') or record.get('entity_id') or 0) == entity_id
+                    ) or int(
+                        record.get('sale_id')
+                        or (record.get('entity_id') if record.get('entity_type') == 'sale' else 0)
+                        or 0
+                    ) in sale_ids
+                ]
+        args = [entity_type, entity_id]
+        if scope is not None:
+            args.append(scope)
+        return self._call('list_attachments', args)
+
+    def _thumbnail_cache(self):
+        """Return the per-connection thumbnail cache, even for test doubles
+        created with ``RemoteDatabase.__new__``."""
+        cache = self.__dict__.get('_attachment_thumbnail_cache')
+        if cache is None:
+            cache = OrderedDict()
+            self.__dict__['_attachment_thumbnail_cache'] = cache
+        return cache
+
+    def _thumbnail_lock(self):
+        lock = self.__dict__.get('_attachment_thumbnail_lock')
+        if lock is None:
+            lock = threading.RLock()
+            self.__dict__['_attachment_thumbnail_lock'] = lock
+        return lock
+
+    def _remember_thumbnail(self, attachment_id, payload):
+        if not payload:
+            return
+        try:
+            attachment_id = int(attachment_id)
+        except (TypeError, ValueError):
+            return
+        with self._thumbnail_lock():
+            cache = self._thumbnail_cache()
+            cache[attachment_id] = payload
+            cache.move_to_end(attachment_id)
+            while len(cache) > _ATTACHMENT_THUMBNAIL_CACHE_LIMIT:
+                cache.popitem(last=False)
+
+    def get_attachment_thumbnail(self, attachment_id):
+        """Fetch one cached/small thumbnail through the authenticated RPC.
+
+        Offline clients return a cached payload (or None) without touching the
+        network. Thumbnails are never read from a host-local path here.
+        """
+        try:
+            attachment_id = int(attachment_id)
+        except (TypeError, ValueError):
+            return None
+        with self._thumbnail_lock():
+            cached = self._thumbnail_cache().get(attachment_id)
+        if cached:
+            with self._thumbnail_lock():
+                cache = self._thumbnail_cache()
+                if attachment_id in cache:
+                    cache.move_to_end(attachment_id)
+            return cached
+        if bool(self.__dict__.get('offline', False)):
+            return None
+        try:
+            payload = self._call('get_attachment_thumbnail', [attachment_id])
+        except ConnectionFailedError:
+            logger.warning(
+                "Thumbnail RPC interrupted attachment_id=%s host=%s port=%s",
+                attachment_id, self.host, self.port,
+            )
+            return None
+        self._remember_thumbnail(attachment_id, payload)
+        return payload
+
+    def get_attachment_thumbnails_bulk(self, attachment_ids):
+        """Fetch thumbnails for many attachments in one RPC round-trip.
+
+        JSON object keys always arrive as strings, so they are normalized back
+        to the integer attachment ids used by the UI. Cached ids are omitted
+        from the request and returned directly; an interrupted RPC keeps the
+        already-known previews instead of clearing them.
+        """
+        requested = []
+        for raw_id in attachment_ids or []:
+            try:
+                attachment_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if attachment_id not in requested:
+                requested.append(attachment_id)
+
+        result = {}
+        missing = []
+        with self._thumbnail_lock():
+            cache = self._thumbnail_cache()
+            for attachment_id in requested:
+                payload = cache.get(attachment_id)
+                if payload:
+                    result[attachment_id] = payload
+                    cache.move_to_end(attachment_id)
+                else:
+                    missing.append(attachment_id)
+
+        if not missing or bool(self.__dict__.get('offline', False)):
+            return result
+
+        try:
+            payloads = self._call('get_attachment_thumbnails_bulk', [missing]) or {}
+        except PermissionDeniedError:
+            # Hosts built before the attachment-permission fix can still deny
+            # thumbnail RPCs. download_attachment() was already allowed for
+            # those roles, so use it as a compatibility path instead of
+            # leaving every preview blank.
+            logger.warning(
+                "Host denied bulk thumbnail RPC; using attachment downloads "
+                "count=%d host=%s port=%s",
+                len(missing), self.host, self.port,
+            )
+            return self._download_legacy_thumbnails(missing, result)
+        except ConnectionFailedError:
+            logger.warning(
+                "Bulk thumbnail RPC interrupted count=%d host=%s port=%s",
+                len(missing), self.host, self.port,
+            )
+            return result
+
+        if not isinstance(payloads, dict):
+            return result
+        for raw_id, payload in payloads.items():
+            try:
+                attachment_id = int(raw_id)
+            except (TypeError, ValueError):
+                continue
+            if not payload:
+                continue
+            result[attachment_id] = payload
+            self._remember_thumbnail(attachment_id, payload)
+        return result
+
+    def _download_legacy_thumbnails(self, attachment_ids, result):
+        """Fetch full files for hosts that still deny thumbnail RPCs.
+
+        The worker decodes and scales these payloads to thumbnail size before
+        the GUI sees them. They are intentionally not stored in the small
+        thumbnail LRU, which must not retain full attachment bytes.
+        """
+        downloaded = 0
+        for attachment_id in attachment_ids:
+            try:
+                payload = self._call('download_attachment', [attachment_id])
+            except (PermissionDeniedError, ConnectionFailedError):
+                break
+            except RemoteError:
+                continue
+            if payload:
+                result[attachment_id] = payload
+                downloaded += 1
+        logger.info(
+            "Legacy attachment preview fallback downloaded=%d requested=%d host=%s port=%s",
+            downloaded, len(attachment_ids), self.host, self.port,
+        )
+        return result
+
+    def get_changes(self, section, since_seq=0, limit=500, timeout=4):
+        """Fetch incremental changes for ``section`` since sequence
+        ``since_seq``. Returns {'changes': [...], 'last_seq': N}."""
+        return self._call(
+            'get_changes', [section],
+            {'since_seq': since_seq, 'limit': limit},
+            timeout=timeout,
+        )
+
+    def sync_section(self, section, limit=500, timeout=4):
+        """Pull and apply incremental changes for one section into the local
+        SQLite cache, advancing the stored sync cursor.
+
+        Returns None when the on-disk cache is unavailable. Otherwise returns
+        {'applied': n, 'last_seq': m, 'has_more': bool} where ``has_more``
+        means the caller should loop with the returned ``last_seq`` until it
+        is False.
+        """
+        cache = self.cache
+        if cache is None:
+            return None
+        since_seq = cache.get_sync_state(section) or 0
+        data = self.get_changes(
+            section, since_seq=since_seq, limit=limit, timeout=timeout
+        )
+        changes = data.get('changes') or []
+        upserts = []
+        deletes = []
+        for change in changes:
+            row_id = change.get('row_id')
+            if row_id is None:
+                continue
+            if change.get('operation') == 'delete':
+                deletes.append(row_id)
+            elif change.get('payload'):
+                upserts.append(change['payload'])
+        if deletes:
+            cache.delete_records(section, deletes)
+        if upserts:
+            cache.store_records(section, upserts)
+        if deletes or upserts:
+            cache.invalidate_views(section)
+        last_seq = data.get('last_seq', since_seq)
+        if last_seq != since_seq:
+            cache.set_sync_state(section, last_seq)
+        return {
+            'applied': len(changes),
+            'last_seq': last_seq,
+            'has_more': len(changes) >= limit,
+        }
+
+    def _open_cache(self):
+        if not ENABLE_SQLITE_CACHE:
+            self.cache = None
+            return
+        from core.cache_manager import CacheManager
+        try:
+            self.cache = CacheManager(
+                host=self.host, port=str(self.port), username=self.username
+            )
+        except Exception:
+            logger.exception(
+                "Failed to open local cache host=%s port=%s",
+                self.host, self.port,
+            )
+            self.cache = None
+
     def close(self):
+        if self.cache is not None:
+            try:
+                self.cache.close()
+            except Exception:
+                logger.exception("Failed to close local cache")
+            self.cache = None
+        with self._thumbnail_lock():
+            self._thumbnail_cache().clear()
+        logger.info("client_disconnected host=%s port=%s", self.host, self.port)
         self._token = None

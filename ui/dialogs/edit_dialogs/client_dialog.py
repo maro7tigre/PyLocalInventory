@@ -48,7 +48,7 @@ class ClientEditDialog(BaseEditDialog):
         
         # Initialize base dialog
         super().__init__(self.client, ui_config, parent)
-        
+
         # Set specific window title
         self.setWindowTitle(window_title)
     

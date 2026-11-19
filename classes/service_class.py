@@ -41,6 +41,28 @@ class ServiceClass(BaseClass):
                 "options": [],
                 "type": "string"
             },
+            "unit_price": {
+                "value": 0.0,
+                "display_name": {"en": "Service Price", "fr": "Prix du Service", "es": "Precio del Servicio"},
+                "required": True,
+                "default": 0.0,
+                "options": [],
+                "type": "float",
+                "min": 0.0,
+                "unit": "MAD"
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
             "door_type_id": {
                 "value": 0,
                 "display_name": {"en": "Door Type ID", "fr": "ID du Type de Porte", "es": "ID del Tipo de Puerta"},
@@ -158,14 +180,19 @@ class ServiceClass(BaseClass):
             },
             "dialog": {
                 "name": "rw",
+                "unit_price": "rw",
                 "description": "rw",
                 "keywords": "rw"
             },
             "database": {
                 "service_type": "rw",
                 "name": "rw",
+                "unit_price": "rw",
                 "description": "rw",
-                "keywords": "rw"
+                "keywords": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r"
             },
             "report": {
                 "service_type": "r",

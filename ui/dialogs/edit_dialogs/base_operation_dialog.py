@@ -6,12 +6,157 @@ Replaces the complex manual layout calculations with clean auto-sizing
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel, 
                                QPushButton, QMessageBox, QScrollArea, QWidget,
                                QFormLayout, QSizePolicy)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QThread, QObject, Signal, Slot, QTimer
 from PySide6.QtGui import QFont
 from ui.widgets.themed_widgets import GreenButton, RedButton
+from ui.widgets.workspace_dialog import maximize_workspace_dialog
 from ui.widgets.operations_table import OperationsTableWidget
 from ui.widgets.parameters_widgets import ParameterWidgetFactory
+from ui.dialogs.edit_dialogs.unknown_item_review_dialog import UnknownItemReviewDialog
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
+from core.calculations import (
+    calculate_line_discount, calculate_operation_totals, to_decimal,
+)
+import os
+import uuid
+import shiboken6
+
+_active_background_threads = set()
+import logging
+from core.runtime_paths import user_data_root
+
+logger = logging.getLogger(__name__)
+
+# QDoubleSpinBox clamps setValue() to its configured range.  Financial fields
+# need an explicit business-sized range instead of NumericWidget's deliberately
+# conservative generic default (999999), which is also used by quantities and
+# other unrelated numeric parameters.
+FINANCIAL_WIDGET_MAX = 999_999_999_999.99
+
+class SaveWorker(QObject):
+    finished = Signal(object)
+    error = Signal(str)
+    
+    def __init__(self, database, is_import, save_kwargs):
+        super().__init__()
+        self.database = database
+        self.is_import = is_import
+        self.save_kwargs = save_kwargs
+        
+    @Slot()
+    def process(self):
+        worker_db = self.database
+        is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
+        token = (self.save_kwargs.get('sale_data') or self.save_kwargs.get('import_data') or {}).get('operation_token')
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+
+            if is_local:
+                from core.database import Database
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect(initialize_schema=False):
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+
+            if self.is_import:
+                res = worker_db.save_import_with_items(**self.save_kwargs)
+                if not isinstance(res, dict) or res.get("transaction") != "committed":
+                    raise RuntimeError(f"Host returned an invalid import-save result: {res!r}")
+                res['expected'] = len(self.save_kwargs.get('items', []))
+            else:
+                res = worker_db.save_sale_with_items(**self.save_kwargs)
+                if not isinstance(res, dict) or res.get('transaction') != 'committed':
+                    raise RuntimeError(f"Host returned an invalid sale-save result: {res!r}")
+                res['expected'] = len(self.save_kwargs.get('items', []))
+            self.finished.emit(res)
+        except Exception as e:
+            self.error.emit(str(e))
+        finally:
+            if is_local and worker_db and worker_db != self.database:
+                worker_db.close()
+
+class LoadWorker(QObject):
+    finished = Signal()
+    loaded = Signal(object)
+    error = Signal(str)
+
+    def __init__(self, operation_obj, database, fetch_catalog, fetch_devis_preview=False,
+                 fetch_bl_preview=False):
+        super().__init__()
+        self.operation_obj = operation_obj
+        self.database = database
+        self.fetch_catalog = fetch_catalog
+        self.fetch_devis_preview = fetch_devis_preview
+        self.fetch_bl_preview = fetch_bl_preview
+        self.devis_preview = None
+        self.bl_preview = None
+        self.catalog = None
+
+    @Slot()
+    def process(self):
+        worker_db = self.database
+        is_local = self.database is not None and self.database.__class__.__name__ != 'RemoteDatabase'
+        old_db = getattr(self.operation_obj, 'database', None) if self.operation_obj else None
+
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                return
+
+            if is_local:
+                from core.database import Database
+                worker_db = Database(self.database.profile_manager)
+                worker_db.language = getattr(self.database, 'language', 'en')
+                worker_db.registered_classes = self.database.registered_classes
+                if not worker_db.connect(initialize_schema=False):
+                    raise RuntimeError(f"Worker could not connect to database: {worker_db.last_error}")
+
+            if self.operation_obj:
+                self.operation_obj.database = worker_db
+                self.operation_obj.load_database_data()
+
+            if self.fetch_catalog and getattr(worker_db, 'get_sale_catalog', None):
+                self.catalog = worker_db.get_sale_catalog(
+                    include_clients=worker_db.has_permission('Clients', 'read'),
+                    include_suppliers=worker_db.has_permission('Suppliers', 'read'),
+                )
+
+            # Advisory Devis preview for a NEW sale. Off-thread so the dialog
+            # never blocks on the network; the host re-validates on save.
+            if self.fetch_devis_preview and getattr(worker_db, 'get_next_devis_preview', None):
+                try:
+                    self.devis_preview = worker_db.get_next_devis_preview()
+                except Exception:
+                    self.devis_preview = None
+
+            # Advisory Bon de Livraison preview for a NEW import. Off-thread so
+            # the dialog never blocks on the network; the host re-allocates and
+            # validates uniqueness transactionally on save (same pattern as the
+            # Devis preview).
+            if self.fetch_bl_preview and getattr(worker_db, 'get_next_bl_preview', None):
+                try:
+                    self.bl_preview = worker_db.get_next_bl_preview()
+                except Exception:
+                    self.bl_preview = None
+            # Emit plain data before cleanup. The GUI must never dereference a
+            # worker which may already have received deleteLater().
+            self.loaded.emit({
+                'catalog': self.catalog,
+                'devis_preview': self.devis_preview,
+                'bl_preview': self.bl_preview,
+            })
+            self.finished.emit()
+        except Exception as e:
+            logger.exception("Operation load worker failed")
+            self.error.emit(str(e))
+        finally:
+            if self.operation_obj:
+                self.operation_obj.database = old_db
+            if is_local and worker_db and worker_db != self.database:
+                worker_db.close()
+
 
 
 class BaseOperationDialog(QDialog):
@@ -28,11 +173,17 @@ class BaseOperationDialog(QDialog):
         self.operation_id = operation_id
         self.database = database
         self.parameter_widgets = {}
+        self.pending_entities = []
+        self.operation_token = uuid.uuid4().hex
+        self._saving = False
+        self._manual_remise_adjustment = Decimal("0")
+        self._line_discount_total = Decimal("0")
+        self._loaded_final_remise = None
+        self._updating_remise_display = False
         
         # Create or load operation object
         if operation_id:
             self.operation_obj = operation_class(operation_id, database)
-            self.operation_obj.load_database_data()
             self.setWindowTitle(f"Edit {self.operation_obj.section[:-1]} - ID {operation_id}")
         else:
             self.operation_obj = operation_class(0, database)
@@ -43,18 +194,137 @@ class BaseOperationDialog(QDialog):
         
         # Setup UI
         self.setup_ui()
-        self.load_data()
         self.apply_theme()
+        
+        self.setEnabled(False)
+        self.setWindowTitle(self.windowTitle() + " (Loading...)")
+
+        self.load_thread = QThread()
+        # Always re-fetch (off-thread, so it never blocks the UI): the
+        # catalog holds product/service prices and stock, which can change
+        # between dialog opens. Reusing a session-long snapshot here used to
+        # show stale prices until the app was restarted.
+        self.load_worker = LoadWorker(
+            self.operation_obj if operation_id else None,
+            database,
+            fetch_catalog=True,
+            fetch_devis_preview=(not operation_id and 'devis' in self.operation_obj.parameters),
+            fetch_bl_preview=(not operation_id and 'bl_number' in self.operation_obj.parameters),
+        )
+        self.load_worker.moveToThread(self.load_thread)
+        self.load_thread.started.connect(self.load_worker.process)
+        
+        # Safe thread cleanup lifecycle
+        self.load_worker.finished.connect(self.load_thread.quit)
+        self.load_worker.finished.connect(self.load_worker.deleteLater)
+        self.load_thread.finished.connect(self.load_thread.deleteLater)
+        self.load_worker.error.connect(self.load_thread.quit)
+        self.load_worker.error.connect(self.load_worker.deleteLater)
+        
+        # Business logic callbacks
+        self.load_worker.loaded.connect(self._on_load_finished)
+        self.load_worker.error.connect(self._on_load_error)
+        
+        _active_background_threads.add(self.load_thread)
+        self.load_thread.finished.connect(self._on_load_thread_finished)
+        self.load_thread.start()
         
         # Auto-size dialog
         self.resize(900, 700)
+        maximize_workspace_dialog(self)
+
         self.setMinimumSize(600, 500)
+    def _on_load_finished(self, loaded=None):
+        loaded = loaded or {}
+        catalog = loaded.get('catalog')
+        _preview = loaded.get('devis_preview')
+        _preview_bl = loaded.get('bl_preview')
+        try:
+            if catalog is not None:
+                self.database.sale_catalog = catalog
+            self.setEnabled(True)
+            title = self.windowTitle().replace(" (Loading...)", "")
+            self.setWindowTitle(title)
+            self.load_data()
+            if _preview is not None:
+                self._apply_devis_preview(_preview)
+            if _preview_bl is not None:
+                self._apply_bl_preview(_preview_bl)
+            
+            if hasattr(self, 'items_table') and self.items_table:
+                self.items_table.refresh_table()
+                self.update_totals()
+        except RuntimeError:
+            pass
+
+    def _apply_devis_preview(self, preview):
+        """Fill the Devis field with the host advisory preview (new Sales only)."""
+        if not self.operation_obj or 'devis' not in self.operation_obj.parameters:
+            return
+        widget = self.parameter_widgets.get('devis')
+        if widget is None:
+            return
+        try:
+            ParameterWidgetFactory.set_widget_value(widget, preview)
+        except Exception:
+            pass
+
+    def _apply_bl_preview(self, preview):
+        """Fill the Bon de Livraison field with the host advisory preview
+        (new Imports only). Editable, so the user can override it; the host
+        re-validates uniqueness and re-allocates on save."""
+        if not self.operation_obj or 'bl_number' not in self.operation_obj.parameters:
+            return
+        widget = self.parameter_widgets.get('bl_number')
+        if widget is None:
+            return
+        try:
+            ParameterWidgetFactory.set_widget_value(widget, preview)
+        except Exception:
+            pass
+
+    def _on_load_error(self, err_msg):
+        try:
+            QMessageBox.warning(self, "Load Error", f"Error loading data: {err_msg}")
+            self.setEnabled(True)
+            title = self.windowTitle().replace(" (Loading...)", "")
+            self.setWindowTitle(title)
+            self.load_data()
+        except RuntimeError:
+            pass
+
+    def _on_load_thread_finished(self):
+        """Queued (bound-method) handler for load_thread.finished. Fires only
+        after the load worker's OS thread has fully stopped, so it is now safe
+        to drop the last references to the thread/worker without a QThread
+        being destroyed while its native thread is still running."""
+        close_after_load = getattr(self, "_close_after_load", False)
+        try:
+            _active_background_threads.discard(self.load_thread)
+        except RuntimeError:
+            pass
+        self.load_worker = None
+        self.load_thread = None
+        if close_after_load:
+            self._close_after_load = False
+            QTimer.singleShot(0, self.reject)
+
         
     def setup_ui(self):
-        """Setup clean auto-sizing UI"""
+        """Keep the financial/action footer visible while the workspace scrolls."""
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
         layout.setSpacing(15)
+        self.workspace_scroll = QScrollArea()
+        self.workspace_scroll.setWidgetResizable(True)
+        self.workspace_scroll.setHorizontalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        self.workspace_scroll.setVerticalScrollBarPolicy(Qt.ScrollBarAsNeeded)
+        workspace = QWidget()
+        workspace_layout = QVBoxLayout(workspace)
+        workspace_layout.setContentsMargins(0, 0, 0, 0)
+        workspace_layout.setSpacing(15)
+        self.workspace_scroll.setWidget(workspace)
+        layout.addWidget(self.workspace_scroll, 1)
         
         # ID display (if existing)
         if self.operation_id:
@@ -64,19 +334,24 @@ class BaseOperationDialog(QDialog):
             id_label.setStyleSheet("font-weight: bold; color: #4CAF50;")
             id_layout.addWidget(id_label)
             id_layout.addStretch()
-            layout.addLayout(id_layout)
+            workspace_layout.addLayout(id_layout)
         
         # Operation parameters (auto-sized form)
-        self.setup_parameters_section(layout)
+        self.setup_parameters_section(workspace_layout)
         
         # Items section
-        self.setup_items_section(layout)
+        self.setup_items_section(workspace_layout)
         
-        # Totals section
-        self.setup_totals_section(layout)
-        
-        # Buttons
-        self.setup_buttons(layout)
+        # The footer stays outside the scroll area and therefore remains in
+        # the dialog's available work area when Windows maximizes it.
+        footer = QWidget()
+        footer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+        footer_layout = QVBoxLayout(footer)
+        footer_layout.setContentsMargins(0, 0, 0, 0)
+        footer_layout.setSpacing(6)
+        self.setup_totals_section(footer_layout)
+        self.setup_buttons(footer_layout)
+        layout.addWidget(footer, 0)
     
     def setup_parameters_section(self, parent_layout):
         """Setup operation parameters with auto-sizing form"""
@@ -107,6 +382,55 @@ class BaseOperationDialog(QDialog):
             )
             
             self.parameter_widgets[param_key] = widget
+            
+            # Historical-operation flag: one labelled checkbox, no extra form
+            # label. Label text is part of the product requirement.
+            if param_key == 'is_historical':
+                checkbox = getattr(widget, 'checkbox', None)
+                if checkbox is not None:
+                    section = getattr(self.operation_obj, 'section', 'Sales')
+                    if section == 'Imports':
+                        checkbox.setText(
+                            "Historical Import \u2014 Do not affect current stock"
+                        )
+                    else:
+                        checkbox.setText(
+                            "Historical Sale \u2014 Do not affect current stock"
+                        )
+                    try:
+                        checkbox.stateChanged.connect(
+                            lambda _state: self._sync_stock_checkbox_state()
+                        )
+                    except Exception:
+                        pass
+                form_layout.addRow(widget)
+                continue
+
+            # Explicit stock decision for a Sale. A historical Sale is
+            # books-only, so this is forced off and disabled while Historical
+            # is on; unchecking Historical re-enables it WITHOUT checking it,
+            # so the user always makes the stock decision explicitly.
+            if param_key == 'affect_stock':
+                checkbox = getattr(widget, 'checkbox', None)
+                if checkbox is not None:
+                    if getattr(self.operation_obj, 'section', 'Sales') == 'Sales':
+                        checkbox.setText(
+                            "Affect current stock \u2014 Deduct product quantities "
+                            "from inventory"
+                        )
+                        try:
+                            checkbox.stateChanged.connect(
+                                lambda _state: self._sync_stock_checkbox_state()
+                            )
+                        except Exception:
+                            pass
+                    else:
+                        # Imports keep their own historical/stock behaviour and
+                        # never gain this Sale-only control.
+                        self.parameter_widgets.pop(param_key, None)
+                        continue
+                form_layout.addRow(widget)
+                continue
 
             # If this is the TVA field, refresh totals live when it changes
             if param_key == 'tva':
@@ -135,15 +459,26 @@ class BaseOperationDialog(QDialog):
             
             form_layout.addRow(QLabel(display_name + ":"), widget)
         
+        # Apply the Historical -> Affect current stock rule once the widgets
+        # exist, so the control is never left in a wrong initial state even if
+        # the data load is slow or fails (load_data() re-applies it).
+        self._sync_stock_checkbox_state()
+
         parent_layout.addWidget(form_widget)
     
     def setup_items_section(self, parent_layout):
         """Setup items table with auto-sizing"""
-        # Items label
+        # Items heading and the existing Sales-only Section affordance.
+        items_header = QHBoxLayout()
         items_label = QLabel(f"{self.operation_obj.section[:-1]} Items")
         items_label.setFont(QFont("Arial", 12, QFont.Weight.Bold))
         items_label.setStyleSheet("color: #ffffff; margin: 5px 0;")
-        parent_layout.addWidget(items_label)
+        items_header.addWidget(items_label)
+        items_header.addStretch()
+        if getattr(self.operation_obj, 'section', '') == 'Sales':
+            self.add_section_btn = QPushButton("Add Section")
+            items_header.addWidget(self.add_section_btn)
+        parent_layout.addLayout(items_header)
         
         # Items table (auto-sizing with proper policies)
         self.items_table = OperationsTableWidget(
@@ -161,6 +496,8 @@ class BaseOperationDialog(QDialog):
         
         # Connect to update totals
         self.items_table.items_changed.connect(self.update_totals)
+        if getattr(self, 'add_section_btn', None) is not None:
+            self.add_section_btn.clicked.connect(self.items_table.add_section_row)
         
         parent_layout.addWidget(self.items_table, 1)  # Give it stretch factor
     
@@ -177,16 +514,48 @@ class BaseOperationDialog(QDialog):
         
         # Create total widgets
         self.subtotal_widget = self.create_total_widget("Subtotal", "MAD")
+        
+        # Remise is an editable input for Sales operations
+        if getattr(self.operation_obj, 'section', '') == 'Sales':
+            from PySide6.QtWidgets import QDoubleSpinBox
+            self.remise_spinbox = QDoubleSpinBox()
+            self.remise_spinbox.setRange(0.0, FINANCIAL_WIDGET_MAX)
+            self.remise_spinbox.setDecimals(2)
+            self.remise_spinbox.setSuffix(" MAD")
+            self.remise_spinbox.setMinimumHeight(30)
+            self.remise_spinbox.setStyleSheet("""
+                QDoubleSpinBox {
+                    background-color: #2D2D2D;
+                    color: white;
+                    border: 1px solid #555555;
+                    padding: 5px;
+                }
+                QDoubleSpinBox:focus {
+                    border: 1px solid #4CAF50;
+                }
+            """)
+            self.remise_spinbox.valueChanged.connect(self._on_remise_edited)
+        else:
+            self.remise_spinbox = None
+        
+        self.total_ht_widget = self.create_total_widget("Total HT", "MAD")
         self.vat_widget = self.create_total_widget("VAT Amount", "MAD") 
-        self.total_widget = self.create_total_widget("Total Price", "MAD")
+        self.total_ttc_widget = self.create_total_widget("Total TTC", "MAD")
         
         # Add to layout
         totals_layout.addWidget(QLabel("Subtotal:"))
         totals_layout.addWidget(self.subtotal_widget)
-        totals_layout.addWidget(QLabel("VAT:"))
+        
+        if self.remise_spinbox is not None:
+            totals_layout.addWidget(QLabel("Remise:"))
+            totals_layout.addWidget(self.remise_spinbox)
+        
+        totals_layout.addWidget(QLabel("Total HT:"))
+        totals_layout.addWidget(self.total_ht_widget)
+        totals_layout.addWidget(QLabel("TVA:"))
         totals_layout.addWidget(self.vat_widget)
-        totals_layout.addWidget(QLabel("Total:"))
-        totals_layout.addWidget(self.total_widget)
+        totals_layout.addWidget(QLabel("Total TTC:"))
+        totals_layout.addWidget(self.total_ttc_widget)
         totals_layout.addStretch()
         
         parent_layout.addWidget(totals_widget)
@@ -197,7 +566,13 @@ class BaseOperationDialog(QDialog):
     def create_total_widget(self, label, unit):
         """Create a read-only total display widget"""
         widget = ParameterWidgetFactory.create_widget(
-            {'type': 'float', 'unit': unit}, {}, None, editable=False
+            {
+                'type': 'float',
+                'unit': unit,
+                'min': -FINANCIAL_WIDGET_MAX,
+                'max': FINANCIAL_WIDGET_MAX,
+            },
+            {}, None, editable=False,
         )
         ParameterWidgetFactory.set_widget_value(widget, 0.0)
         return widget
@@ -238,34 +613,97 @@ class BaseOperationDialog(QDialog):
         for param_key, widget in self.parameter_widgets.items():
             current_value = self.operation_obj.get_value(param_key)
             ParameterWidgetFactory.set_widget_value(widget, current_value)
+
+        # Apply the Historical -> Affect current stock rule to the loaded
+        # values, so editing an existing historical Sale shows the stock
+        # checkbox unchecked and disabled.
+        self._sync_stock_checkbox_state()
+        
+        # sales.remise is the final value for new records. Legacy records used
+        # it as an extra amount beyond their line discounts.
+        if self.remise_spinbox is not None:
+            self._loaded_final_remise = to_decimal(
+                self.operation_obj.get_value('remise') or 0
+            )
+
+    def _on_remise_edited(self, value):
+        """Keep a user-entered final remise stable across line recalculation."""
+        if self._updating_remise_display:
+            return
+        self._manual_remise_adjustment = to_decimal(value) - self._line_discount_total
+        logger.info(
+            "[REMISE DEBUG] user edit value=%s automatic=%s adjustment=%s",
+            value, self._line_discount_total, self._manual_remise_adjustment,
+        )
+        self.update_totals()
     
     def update_totals(self):
         """Update total calculation displays"""
         try:
-            # Get current items
-            items = self.items_table.get_items_data()
-            
-            # Calculate subtotal
-            subtotal = sum(item.get_value('subtotal') or 0 for item in items)
+            # Read the visible cells directly. Building model objects here used
+            # to resolve every product/service against PostgreSQL whenever a
+            # quantity changed, which made rapid editing feel frozen.
+            rows = self.items_table.get_current_table_data()
+            gross_subtotal = Decimal("0")
+            line_discount_total = Decimal("0")
+            for row in rows:
+                if str(row.get("item_type") or "").casefold() == "section":
+                    continue
+                quantity = row.get("quantity") or 0
+                unit_price = row.get("unit_price") or 0
+                discount_percent = row.get("discount_percentage") or 0
+                gross_subtotal += to_decimal(quantity) * to_decimal(unit_price)
+                line_discount_total += calculate_line_discount(
+                    quantity, unit_price, discount_percent
+                )
+            self._line_discount_total = line_discount_total
+            if self._loaded_final_remise is not None:
+                if self.operation_obj.get_value('remise_includes_line_discounts'):
+                    self._manual_remise_adjustment = (
+                        self._loaded_final_remise - line_discount_total
+                    )
+                else:
+                    self._manual_remise_adjustment = self._loaded_final_remise
+                self._loaded_final_remise = None
+            final_remise = max(
+                Decimal("0"), line_discount_total + self._manual_remise_adjustment
+            )
+            before = self.remise_spinbox.value() if self.remise_spinbox is not None else None
+            if self.remise_spinbox is not None:
+                self._updating_remise_display = True
+                try:
+                    self.remise_spinbox.setValue(float(final_remise))
+                finally:
+                    self._updating_remise_display = False
             
             # Get VAT percentage
-            vat_percent = 0
+            vat_percent = Decimal("0")
             if 'tva' in self.parameter_widgets:
                 try:
-                    vat_percent = float(
+                    vat_percent = Decimal(str(
                         ParameterWidgetFactory.get_widget_value(self.parameter_widgets['tva']) or 0
-                    )
-                except Exception:
-                    vat_percent = 0
+                    ))
+                except (InvalidOperation, ValueError, TypeError):
+                    vat_percent = Decimal("0")
             
-            # Calculate totals
-            vat_amount = subtotal * (vat_percent / 100)
-            total = subtotal + vat_amount
+            totals = calculate_operation_totals(
+                gross_subtotal, final_remise, vat_percent
+            )
+            logger.info(
+                "[REMISE DEBUG] update_totals module=%s gross_subtotal=%s "
+                "line_discount_total=%s manual_adjustment=%s final_remise=%s "
+                "bottom_before=%s bottom_after=%s total_ht=%s tva=%s total_ttc=%s",
+                __file__, gross_subtotal, line_discount_total,
+                self._manual_remise_adjustment, final_remise, before,
+                self.remise_spinbox.value() if self.remise_spinbox is not None else None,
+                totals['total_ht'], totals['vat_amount'], totals['total_ttc'],
+            )
             
             # Update displays
-            ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
-            ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
-            ParameterWidgetFactory.set_widget_value(self.total_widget, total)
+            ParameterWidgetFactory.set_widget_value(self.subtotal_widget, totals['original_subtotal'])
+            ParameterWidgetFactory.set_widget_value(self.total_ht_widget, totals['total_ht'])
+            ParameterWidgetFactory.set_widget_value(self.vat_widget, totals['vat_amount'])
+            ParameterWidgetFactory.set_widget_value(self.total_ttc_widget, totals['total_ttc'])
             
         except Exception as e:
             print(f"Error updating totals: {e}")
@@ -285,6 +723,7 @@ class BaseOperationDialog(QDialog):
                     errors.append(f"{display_name} is required")
         
         # Check if we have at least one entered row (even if product not yet created)
+        raw_rows = []
         try:
             raw_rows = self.items_table.get_current_table_data()
             if not raw_rows:
@@ -294,10 +733,53 @@ class BaseOperationDialog(QDialog):
             items = self.items_table.get_items_data()
             if not items:
                 errors.append("Please add at least one item")
+
+        # Validate Remise for Sales operations
+        if (getattr(self.operation_obj, 'section', '') == 'Sales'
+                and self.remise_spinbox is not None):
+            remise = self.remise_spinbox.value()
+            if remise < 0:
+                errors.append("Remise cannot be negative")
+            raw_subtotal = sum(
+                Decimal(str(row.get("quantity") or 0))
+                * Decimal(str(row.get("unit_price") or 0))
+                for row in raw_rows
+            )
+            if remise > 0 and raw_subtotal > 0 and Decimal(str(remise)) > raw_subtotal:
+                errors.append(
+                    f"Remise ({remise:,.2f}) cannot exceed the subtotal ({float(raw_subtotal):,.2f})"
+                )
+
+        # Validate the Devis reference for Sales operations
+        if (getattr(self.operation_obj, 'section', '') == 'Sales'
+                and 'devis' in self.operation_obj.parameters):
+            devis_widget = self.parameter_widgets.get('devis')
+            raw_devis = ParameterWidgetFactory.get_widget_value(devis_widget) if devis_widget else None
+            if raw_devis is not None:
+                devis_value = str(raw_devis).strip()
+                if devis_value:
+                    if len(devis_value) > 40:
+                        errors.append("Devis N° must be at most 40 characters")
         
         return errors
     
     def save_changes(self):
+        """Prevent double-clicks from starting the same transaction twice."""
+        if self._saving:
+            return
+        self._saving = True
+        self.save_btn.setEnabled(False)
+        self.save_btn.setText("Saving...")
+        try:
+            self._save_changes_impl()
+        finally:
+            if self.result() == QDialog.Rejected and not (hasattr(self, 'save_thread') and self.save_thread):
+                self._saving = False
+                if getattr(self, 'save_btn', None):
+                    self.save_btn.setEnabled(True)
+                    self.save_btn.setText("Save")
+
+    def _save_changes_impl(self):
         """Save operation and items to database (simple, reliable)"""
         # Validate first
         errors = self.validate_data()
@@ -321,6 +803,16 @@ class BaseOperationDialog(QDialog):
             for param_key, widget in self.parameter_widgets.items():
                 value = ParameterWidgetFactory.get_widget_value(widget)
                 self.operation_obj.set_value(param_key, value)
+            
+            # Set remise value from spinbox if it exists
+            if getattr(self, 'remise_spinbox', None) is not None:
+                self.operation_obj.set_value('remise', float(self.remise_spinbox.value()))
+                self.operation_obj.set_value('remise_includes_line_discounts', True)
+                logger.info(
+                    "[REMISE DEBUG] save sale_id=%s final_remise=%s marker=True",
+                    self.operation_id, self.remise_spinbox.value(),
+                )
+            
             # For snapshots: if client_name/supplier_name empty set from username
             try:
                 if getattr(self.operation_obj, 'section', '') == 'Sales':
@@ -333,6 +825,133 @@ class BaseOperationDialog(QDialog):
                 pass
             
             # Save operation to database first (ensures ID exists)
+            if self.operation_obj.section in ('Sales', 'Imports'):
+                is_import = (self.operation_obj.section == 'Imports')
+                
+                if not is_import:
+                    items_objects = self.items_table.get_items_data()
+                    # Only a Sale that explicitly affects current stock is
+                    # validated against available inventory. Sale state and the
+                    # Historical flag no longer decide this.
+                    if self._affects_stock():
+                        stock_errors = self._validate_stock(items_objects)
+                        mw = self._get_main_window()
+                        warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                        if stock_errors and warn_stock:
+                            reply = QMessageBox.warning(
+                                self, "Insufficient Stock",
+                                "Not enough stock for:\n\n" +
+                                "\n".join(f"  • {e}" for e in stock_errors) +
+                                "\n\nSave anyway?",
+                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                                QMessageBox.StandardButton.No
+                            )
+                            if reply != QMessageBox.StandardButton.Yes:
+                                return
+                    if not self._confirm_sale_summary():
+                        return
+                        
+                # BUILD PAYLOAD ON GUI THREAD
+                raw_items = self.items_table.get_current_table_data()
+                prepared = []
+                if is_import:
+                    for raw in raw_items:
+                        item = dict(raw)
+                        item.pop("row_index", None)
+                        prepared.append(item)
+                else:
+                    for index, raw in enumerate(raw_items, start=1):
+                        item = dict(raw)
+                        item.pop('row_index', None)
+                        product_id = item.get('product_id')
+                        service_id = item.get('service_id')
+                        item['product_id'] = product_id
+                        item['service_id'] = service_id
+                        item['item_type'] = str(
+                            item.get('item_type')
+                            or ('product' if product_id else ('service' if service_id else ''))
+                        ).casefold()
+                        item['is_new'] = not bool(item.get('id'))
+                        prepared.append(item)
+
+                header = {
+                    key: self.operation_obj.get_value(key)
+                    for key in self.operation_obj.get_visible_parameters('database')
+                    if not self.operation_obj.is_parameter_calculated(key)
+                }
+                header["operation_token"] = (
+                    self.operation_obj.get_value("operation_token") or self.operation_token
+                )
+                
+                save_kwargs = {}
+                if is_import:
+                    save_kwargs = {
+                        'import_data': header,
+                        'items': prepared,
+                        'import_id': self.operation_id,
+                        'visible_row_count': len(raw_items)
+                    }
+                else:
+                    header["is_historical"] = bool(self.operation_obj.get_value("is_historical"))
+                    # Send a real Python bool: the column is BOOLEAN and the
+                    # host normalizes/forces it again. A historical Sale can
+                    # never claim stock impact.
+                    header["affect_stock"] = self._affects_stock()
+                    save_kwargs = {
+                        'sale_data': header,
+                        'items': prepared,
+                        'sale_id': self.operation_id,
+                        'visible_row_count': len(raw_items),
+                        'pending_entities': getattr(self, 'pending_entities', [])
+                    }
+
+                action = "updated" if self.operation_id else "created"
+
+                self.save_thread = QThread()
+                self.save_worker = SaveWorker(self.database, is_import, save_kwargs)
+                self.save_worker.moveToThread(self.save_thread)
+                self.save_thread.started.connect(self.save_worker.process)
+
+                # Safe thread cleanup lifecycle
+                self.save_worker.finished.connect(self.save_thread.quit)
+                self.save_worker.finished.connect(self.save_worker.deleteLater)
+                self.save_thread.finished.connect(self.save_thread.deleteLater)
+                self.save_worker.error.connect(self.save_thread.quit)
+                self.save_worker.error.connect(self.save_worker.deleteLater)
+
+                # Business logic callbacks.
+                #
+                # PROVEN ROOT CAUSE (2026-08-07 hang investigation): Qt/PySide6's
+                # AutoConnection picks Direct vs Queued by inspecting the
+                # *receiver*'s thread affinity - and that inspection only works
+                # when the slot is a genuine bound method of a QObject. A lambda
+                # has no thread affinity of its own, so PySide6 cannot resolve it
+                # and falls back to invoking the lambda directly, synchronously,
+                # ON THE EMITTING THREAD - confirmed empirically in this exact
+                # PySide6 build (and confirmed live in
+                # logs/sale_save_hang_diagnostic.log: SAVE_GUI_CALLBACK and
+                # DIALOG_ACCEPT both logged thread=Dummy-1, the SaveWorker
+                # thread, not MainThread). Passing an explicit
+                # Qt.QueuedConnection to a lambda-wrapped connect() does NOT
+                # fix this (also verified empirically) - only connecting
+                # directly to a real bound method does. That means
+                # self.accept() and _refresh_related_tabs() (QWidget/QDialog
+                # calls) were running off the GUI thread, which is illegal in
+                # Qt and is what wedges the window into a permanent
+                # "Not Responding" state.
+                #
+                # Fix: connect directly to a real bound method (no lambda) and
+                # stash the extra `action` context on self instead of
+                # capturing it in a closure.
+                self._pending_save_action = action
+                self.save_worker.finished.connect(self._on_save_worker_finished)
+                self.save_worker.error.connect(self._on_save_error)
+                
+                _active_background_threads.add(self.save_thread)
+                self.save_thread.finished.connect(self._on_save_thread_finished)
+                self.save_thread.start()
+                return
+
             success = self.operation_obj.save_to_database()
             action = "updated" if self.operation_id else "created"
             self.operation_id = self.operation_obj.id
@@ -363,48 +982,23 @@ class BaseOperationDialog(QDialog):
                 except Exception:
                     pass
 
-                # Attempt final resolution for any missing product_ids
-                unresolved_names = []
-                for itm in items_objects:
-                    try:
-                        if hasattr(itm, 'get_value') and not itm.get_value('product_id'):
-                            pname = itm.get_value('product_name') or "(unknown)"
-                            # Try resolve again from DB (in case created just now)
-                            if self.database and hasattr(self.database, 'cursor') and self.database.cursor:
-                                try:
-                                    self.database.cursor.execute("SELECT ID FROM Products WHERE name = ?", (pname,))
-                                    res = self.database.cursor.fetchone()
-                                    if res and res[0]:
-                                        itm.set_value('product_id', res[0])
-                                except Exception:
-                                    pass
-                            if not itm.get_value('product_id'):
-                                unresolved_names.append(pname)
-                    except Exception:
-                        pass
-
-                if unresolved_names and not allow_unresolved:
-                    QMessageBox.critical(self, "Error", "Could not resolve product IDs for: " + ", ".join(unresolved_names) + "\nAborting save.")
-                    return
-
-                # Stock validation for sales (skip on_hold — those don't deduct stock)
-                if self.operation_obj.section == 'Sales':
-                    sale_state = self.operation_obj.get_value('state') or 'pending'
-                    if sale_state != 'on_hold':
-                        stock_errors = self._validate_stock(items_objects)
-                        mw = self._get_main_window()
-                        warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
-                        if stock_errors and warn_stock:
-                            reply = QMessageBox.warning(
-                                self, "Insufficient Stock",
-                                "Not enough stock for:\n\n" +
-                                "\n".join(f"  \u2022 {e}" for e in stock_errors) +
-                                "\n\nSave anyway?",
-                                QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
-                                QMessageBox.StandardButton.No
-                            )
-                            if reply != QMessageBox.StandardButton.Yes:
-                                return
+                # Stock validation for sales - only when this Sale actually
+                # consumes inventory (explicit affect_stock, never historical).
+                if self.operation_obj.section == 'Sales' and self._affects_stock():
+                    stock_errors = self._validate_stock(items_objects)
+                    mw = self._get_main_window()
+                    warn_stock = getattr(mw, 'warn_insufficient_stock', True) if mw else True
+                    if stock_errors and warn_stock:
+                        reply = QMessageBox.warning(
+                            self, "Insufficient Stock",
+                            "Not enough stock for:\n\n" +
+                            "\n".join(f"  • {e}" for e in stock_errors) +
+                            "\n\nSave anyway?",
+                            QMessageBox.StandardButton.Yes | QMessageBox.StandardButton.No,
+                            QMessageBox.StandardButton.No
+                        )
+                        if reply != QMessageBox.StandardButton.Yes:
+                            return
 
                 items_saved = 0
                 for item in items_objects:
@@ -421,8 +1015,223 @@ class BaseOperationDialog(QDialog):
                 QMessageBox.critical(self, "Error", "Failed to save operation")
                 
         except Exception as e:
+            logger.exception(
+                "Operation save failed section=%s operation_id=%s",
+                getattr(self.operation_obj, "section", "unknown"),
+                self.operation_id,
+            )
             QMessageBox.critical(self, "Error", f"Failed to save: {str(e)}")
-    
+
+    def _on_save_worker_finished(self, result):
+        """Real bound-method slot for SaveWorker.finished (see the comment at
+        the connect() call site) - MUST stay a genuine method, never a
+        lambda, or Qt loses the ability to dispatch it onto the GUI thread."""
+        self._on_save_finished(result, self._pending_save_action)
+
+    def _on_save_finished(self, result, action):
+        # NOTE: self.save_thread / self.save_worker are intentionally NOT
+        # cleared here. The worker's OS thread may still be winding down when
+        # this queued callback runs; dropping the last references here lets the
+        # QThread be garbage-collected while its native thread is still
+        # running, which crashes with a native access violation under load.
+        # Refs are cleared in _on_save_thread_finished, queued to fire only
+        # after save_thread.finished (i.e. the thread has fully stopped).
+
+        try:
+            self._saving = False
+            if hasattr(self, 'save_btn') and self.save_btn:
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
+
+            if getattr(self.operation_obj, 'section', '') == 'Sales':
+                self.operation_id = result['sale_id']
+                self.operation_obj.id = result['sale_id']
+                self.operation_obj.set_value('id', result['sale_id'])
+                expected = result.get('expected', 0)
+                saved = result.get('saved', 0)
+                if saved != expected:
+                    QMessageBox.critical(self, "Error", 
+                        f"Sale was not saved: {expected} visible items were found, "
+                        f"but the server confirmed {saved} saved items."
+                    )
+                    return
+                QMessageBox.information(
+                    self, "Success",
+                    f"Operation {action} successfully. {saved} items saved.\n"
+                    f"Inserted: {result.get('inserted', 0)}, updated: {result.get('updated', 0)}, "
+                    f"deleted: {result.get('deleted', 0)}."
+                )
+                self.accept()
+                self._refresh_related_tabs("Sales", "Products", "Clients")
+
+            elif getattr(self.operation_obj, 'section', '') == 'Imports':
+                self.operation_id = result["import_id"]
+                self.operation_obj.id = result["import_id"]
+                self.operation_obj.set_value("id", result["import_id"])
+                QMessageBox.information(
+                    self,
+                    "Success",
+                    f"Import {action} successfully. {result.get('saved', 0)} items saved.\n"
+                    f"Products created: {result.get('created_products', 0)}.",
+                )
+                self.accept()
+                self._refresh_related_tabs("Imports", "Products")
+        except RuntimeError:
+            pass
+
+    def _on_save_error(self, err_msg):
+        # Refs are cleared in _on_save_thread_finished (see _on_save_finished).
+
+        try:
+            self._saving = False
+            if hasattr(self, 'save_btn') and self.save_btn:
+                self.save_btn.setEnabled(True)
+                self.save_btn.setText("Save")
+        
+            QMessageBox.critical(self, "Error", f"Failed to save operation: {err_msg}")
+        except RuntimeError:
+            pass
+
+    def _on_save_thread_finished(self):
+        """Queued (bound-method) handler for save_thread.finished. Fires only
+        after the save worker's OS thread has fully stopped, so it is now safe
+        to drop the last references to the thread/worker without a QThread
+        being destroyed while its native thread is still running."""
+        try:
+            _active_background_threads.discard(self.save_thread)
+        except RuntimeError:
+            pass
+        self.save_worker = None
+        self.save_thread = None
+
+    def _sync_stock_checkbox_state(self):
+        """Keep "Affect current stock" consistent with "Historical Sale".
+
+        Historical is a hard exclusion: while it is on, the stock checkbox is
+        unchecked and disabled. Turning Historical off only re-enables the
+        checkbox - it is never auto-checked, because opting into inventory is
+        an explicit decision the user must make.
+        """
+        if getattr(self.operation_obj, 'section', '') != 'Sales':
+            return
+        historical = self._checkbox_is_checked('is_historical')
+        stock = self._checkbox_for('affect_stock')
+        if stock is None:
+            return
+        if historical:
+            if stock.isChecked():
+                stock.setChecked(False)
+            stock.setEnabled(False)
+            stock.setToolTip(
+                "A historical Sale is recorded for the books only and never "
+                "affects current stock."
+            )
+        else:
+            stock.setEnabled(True)
+            stock.setToolTip(
+                "Check to deduct this Sale's product quantities from current "
+                "stock. Leave unchecked to create the Sale without touching "
+                "inventory."
+            )
+
+    def _checkbox_for(self, param_key):
+        widget = self.parameter_widgets.get(param_key)
+        return getattr(widget, 'checkbox', None) if widget is not None else None
+
+    def _checkbox_is_checked(self, param_key):
+        checkbox = self._checkbox_for(param_key)
+        return bool(checkbox is not None and checkbox.isChecked())
+
+    def _affects_stock(self):
+        """Single source of truth for the GUI stock decision (Sales only)."""
+        if getattr(self.operation_obj, 'section', '') != 'Sales':
+            return False
+        if self._checkbox_is_checked('is_historical'):
+            return False
+        return self._checkbox_is_checked('affect_stock')
+
+    def _confirm_sale_summary(self):
+        """Show the required pre-save summary and ask for confirmation."""
+        try:
+            is_historical = self._checkbox_is_checked('is_historical')
+            affect_stock = self._affects_stock()
+            new_products = sum(
+                1 for e in self.pending_entities
+                if str(e.get("type") or "").casefold() == "product"
+            )
+            new_services = sum(
+                1 for e in self.pending_entities
+                if str(e.get("type") or "").casefold() == "service"
+            )
+            kept_only = 0
+            try:
+                rows = self.items_table.get_current_table_data()
+                kept_only = sum(
+                    1 for row in rows
+                    if str(row.get("item_type") or "").casefold() == "manual"
+                )
+            except Exception:
+                pass
+            lines = [
+                "Please review this sale before saving:",
+                "",
+                f"  \u2022 Devis N°: {self.operation_obj.get_value('devis') or '(allocated on save)'}",
+                f"  \u2022 Historical Sale: {'Yes' if is_historical else 'No'}",
+                f"  \u2022 Affect current stock: {'Yes' if affect_stock else 'No'}",
+                (
+                    "  \u2022 Stock impact: Will deduct product quantities from current stock"
+                    if affect_stock
+                    else "  \u2022 Stock impact: No stock deduction"
+                ),
+                f"  \u2022 New Products to create: {new_products}",
+                f"  \u2022 New Services to create: {new_services}",
+                f"  \u2022 Items kept only in this Sale: {kept_only}",
+                "",
+                "Save this sale?",
+            ]
+            return (
+                QMessageBox.question(
+                    self, "Confirm Sale", "\n".join(lines),
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                )
+                == QMessageBox.Yes
+            )
+        except Exception:
+            return True
+
+    def _refresh_related_tabs(self, *sections):
+        main_window = self._get_main_window()
+        tab_widget = getattr(main_window, "tab_widget", None) if main_window else None
+        if not tab_widget:
+            return
+        wanted = set(sections)
+        current_tab = tab_widget.currentWidget()
+        for index in range(tab_widget.count()):
+            tab = tab_widget.widget(index)
+            if getattr(tab, "section", None) not in wanted:
+                continue
+            if tab is current_tab and hasattr(tab, "refresh_table"):
+                tab.refresh_table(force=True)
+            elif hasattr(tab, "mark_dirty"):
+                tab.mark_dirty()
+
+    def closeEvent(self, event):
+        load_thread = getattr(self, "load_thread", None)
+        if load_thread is not None:
+            try:
+                if shiboken6.isValid(load_thread) and load_thread.isRunning():
+                    # Closing the dialog drops its worker/thread references. A
+                    # captured production crash proved that doing so while the
+                    # initial LoadWorker was still connecting can destroy the
+                    # running QThread and abort the process. Keep the dialog
+                    # alive until QThread.finished, then reject it normally.
+                    self._close_after_load = True
+                    event.ignore()
+                    return
+            except RuntimeError:
+                pass
+        super().closeEvent(event)
+
     def apply_theme(self):
         """Apply dark theme"""
         self.setStyleSheet("""
@@ -452,116 +1261,206 @@ class BaseOperationDialog(QDialog):
 
     # -------------------- Missing References Handling -------------------- #
     def _handle_missing_references(self):
-        """Detect missing client/supplier or products and prompt user to create them.
+        """Collect confirmed missing entities without writing them yet.
 
-        Returns True if it's OK to proceed with saving (after creating if user agreed),
-        False if the user cancelled.
+        The backend creates these pending records in the same transaction as
+        the sale. Cancelling the dialog therefore leaves no orphan records.
         """
         try:
             if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
-                return True, True  # Can't verify without DB
+                return True, False
 
-            mw = self._get_main_window()
-
-            missing_clients = []
-            missing_suppliers = []
-            missing_products = []
-
-            # Determine operation type
+            self.pending_entities = []
             op_section = getattr(self.operation_obj, 'section', '')
+            if op_section == "Imports":
+                supplier = self._safe_widget_value("supplier_username")
+                if not supplier or not self._entity_exists("Suppliers", supplier):
+                    QMessageBox.warning(
+                        self, "Unknown Supplier",
+                        f"Supplier '{supplier or ''}' does not exist. Create the supplier first."
+                    )
+                    return False, False
+                return True, False
 
-            # Check main entity username (respecting per-type warning flags)
-            if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
-                if getattr(mw, 'warn_missing_client', True) if mw else True:
-                    client_username = self._safe_widget_value('client_username')
-                    if client_username and not self._entity_exists('Clients', client_username):
-                        missing_clients.append(client_username)
-            elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
-                if getattr(mw, 'warn_missing_supplier', True) if mw else True:
-                    supplier_username = self._safe_widget_value('supplier_username')
-                    if supplier_username and not self._entity_exists('Suppliers', supplier_username):
-                        missing_suppliers.append(supplier_username)
+            if op_section != "Sales":
+                return True, False
 
-            # Check products from items table (only those not already present)
-            if getattr(mw, 'warn_missing_product', True) if mw else True:
-                try:
-                    raw_names = self.items_table.get_all_entered_product_names()
-                    for product_name in raw_names:
-                        if product_name and not self._product_exists(product_name):
-                            if product_name not in missing_products:
-                                missing_products.append(product_name)
-                except Exception as e:
-                    print(f"Error collecting raw product names: {e}")
+            client_value = " ".join(str(self._safe_widget_value("client_username") or "").split())
+            if not client_value:
+                QMessageBox.warning(self, "Missing Client", "A client is required.")
+                return False, False
+            if not self._entity_exists("Clients", client_value):
+                if not self.database.has_permission("Clients", "write"):
+                    QMessageBox.warning(
+                        self, "Permission Denied",
+                        "You don't have permission to create clients."
+                    )
+                    return False, False
+                if QMessageBox.question(
+                    self, "Create Client",
+                    f"This client does not exist:\n{client_value}\n\nCreate it?",
+                    QMessageBox.Yes | QMessageBox.No, QMessageBox.No,
+                ) != QMessageBox.Yes:
+                    return False, False
+                from PySide6.QtWidgets import QInputDialog
+                display_name, ok = QInputDialog.getText(
+                    self, "Client Details", "Client name:", text=client_value
+                )
+                display_name = " ".join(display_name.split())
+                if not ok or not display_name:
+                    return False, False
+                self.pending_entities.append({
+                    "type": "client", "username": client_value, "name": display_name,
+                    "client_type": "individual",
+                })
 
-            if not (missing_clients or missing_suppliers or missing_products):
-                return True, True  # Nothing missing
+            rows = self.items_table.get_current_table_data()
+            unknown_items = []
+            for row_index, item in enumerate(rows):
+                name = " ".join(str(item.get("product_name") or "").split())
+                if not name:
+                    QMessageBox.warning(self, "Missing Item", "Every sale line needs a name.")
+                    return False, False
+                item_type = str(item.get("item_type") or "").casefold()
+                if item_type not in ("product", "service", "manual", "section"):
+                    item_type = ""
+                # Keep-only lines are snapshots and Sections are structural:
+                # neither needs a catalog link or creation.
+                if item_type in ("manual", "section"):
+                    continue
+                if item_type == "product" and self._catalog_entity_exists("product", name):
+                    continue
+                if item_type == "service" and self._catalog_entity_exists("service", name):
+                    continue
+                if not item_type and (
+                    self._catalog_entity_exists("product", name)
+                    or self._catalog_entity_exists("service", name)
+                ):
+                    continue
+                unknown_items.append({
+                    "name": name,
+                    "item_type": item_type,
+                    "quantity": item.get("quantity", 0),
+                    "unit_price": item.get("unit_price", 0),
+                    "table_row": int(item.get("row_index", row_index + 1)) - 1,
+                })
 
-            # Build message
-            msg_lines = ["Some referenced entries do not exist:"]
-            if missing_clients:
-                msg_lines.append(f" - Clients: {', '.join(missing_clients)}")
-            if missing_suppliers:
-                msg_lines.append(f" - Suppliers: {', '.join(missing_suppliers)}")
-            if missing_products:
-                msg_lines.append(f" - Products: {', '.join(missing_products)}")
-            msg_lines.append("")
-            msg_lines.append("Choose an action:")
-            msg_lines.append(" - Create & Continue: auto-create missing entries")
-            msg_lines.append(" - Ignore: continue without creating (snapshots stored)")
-            msg_lines.append(" - Cancel: go back and edit")
+            if unknown_items:
+                dialog = UnknownItemReviewDialog(unknown_items, self)
+                if dialog.exec() != QDialog.Accepted:
+                    return False, False
+                decisions = dialog.get_decisions()
+                for decision, unknown in zip(decisions, unknown_items):
+                    name = decision["name"]
+                    action = decision["action"]
+                    if action == "cancel":
+                        QMessageBox.warning(
+                            self, "Editing Required",
+                            f"Edit '{name}' before saving the sale, then try again.",
+                        )
+                        return False, False
+                    self._set_row_item_type(unknown["table_row"], action)
+                    # Manual lines remain financial snapshots. Sections are
+                    # structural rows; changing the table selector clears and
+                    # disables their financial cells through the existing
+                    # Section row handling.
+                    if action in ("manual", "section"):
+                        continue
+                    section = "Products" if action == "product" else "Services"
+                    if not self.database.has_permission(section, "write"):
+                        QMessageBox.warning(
+                            self, "Permission Denied",
+                            f"You don't have permission to create {section.lower()}."
+                        )
+                        return False, False
 
-            from PySide6.QtWidgets import QMessageBox
-            box = QMessageBox(self)
-            box.setIcon(QMessageBox.Warning)
-            box.setWindowTitle("Missing References")
-            box.setText("\n".join(msg_lines))
-            create_btn = box.addButton("Create & Continue", QMessageBox.AcceptRole)
-            ignore_btn = box.addButton("Ignore", QMessageBox.DestructiveRole)
-            box.addButton(QMessageBox.Cancel)
-            box.exec()
-
-            clicked = box.clickedButton()
-            if clicked == create_btn:
-                # Create missing ones
-                for username in missing_clients:
-                    self._create_client(username)
-                for username in missing_suppliers:
-                    self._create_supplier(username)
-                for product_name in missing_products:
-                    self._create_product(product_name)
-            elif clicked == ignore_btn:
-                # Ensure snapshots for client/supplier name reflect entered username (even if entity absent)
-                try:
-                    if op_section == 'Sales' and 'client_username' in self.parameter_widgets:
-                        uname = self._safe_widget_value('client_username')
-                        # set client_name parameter value directly on operation object
-                        self.operation_obj.set_value('client_name', uname)
-                    elif op_section == 'Imports' and 'supplier_username' in self.parameter_widgets:
-                        uname = self._safe_widget_value('supplier_username')
-                        self.operation_obj.set_value('supplier_name', uname)
-                except Exception as e:
-                    print(f"Error setting snapshot names on ignore: {e}")
-                # For products, product_name already captured in item rows; nothing extra needed
-                # Allow unresolved product IDs (they stay NULL) -> second flag True
-                return True, True
-            else:
-                return False, False  # Cancel
-
-            # After creation path: unresolved not allowed (we created them)
-            return True, True
+                    try:
+                        price = Decimal(str(unknown.get("unit_price", 0)))
+                        quantity = Decimal(str(unknown.get("quantity", 0)))
+                    except InvalidOperation:
+                        QMessageBox.warning(
+                            self, "Invalid Item", f"Invalid quantity or price for {name}."
+                        )
+                        return False, False
+                    if price < 0 or quantity <= 0:
+                        QMessageBox.warning(
+                            self, "Invalid Item",
+                            f"{name}: quantity must be greater than zero and price cannot be negative."
+                        )
+                        return False, False
+                    pending = {
+                        "type": action, "name": name, "unit_price": str(price),
+                        "sale_price": str(price),
+                    }
+                    if action == "product":
+                        # A product created from a Sale only needs opening stock
+                        # that covers the Sale when that Sale actually consumes
+                        # inventory. Otherwise the Sale leaves stock alone, so
+                        # the opening quantity may legitimately be 0.
+                        consumes_stock = self._affects_stock()
+                        from PySide6.QtWidgets import QInputDialog
+                        initial, ok = QInputDialog.getDouble(
+                            self, "Initial Product Stock",
+                            f"Initial stock for '{name}':",
+                            float(quantity) if consumes_stock else 0.0,
+                            0.001 if consumes_stock else 0.0,
+                            999999999.0, 3,
+                        )
+                        if not ok:
+                            return False, False
+                        if consumes_stock and Decimal(str(initial)) < quantity:
+                            QMessageBox.warning(
+                                self, "Insufficient Initial Stock",
+                                "Initial stock must cover the quantity in this sale."
+                            )
+                            return False, False
+                        purchase_price, ok = QInputDialog.getDouble(
+                            self, "Product Purchase Price",
+                            f"Purchase cost for '{name}':", 0.0, 0.0, 999999999.0, 2,
+                        )
+                        if not ok:
+                            return False, False
+                        pending.update({
+                            "initial_quantity": str(initial),
+                            "purchase_price": str(purchase_price),
+                        })
+                    self.pending_entities.append(pending)
+            return True, False
         except Exception as e:
             print(f"Error handling missing references: {e}")
-            return True, True  # Fail-open so user can still save
+            QMessageBox.critical(self, "Validation Error", str(e))
+            return False, False
+
+    def _set_row_item_type(self, row, item_type):
+        try:
+            column = self.items_table.data_manager.table_columns.index("item_type")
+            selector = self.items_table.table.cellWidget(row, column)
+            if selector:
+                selector.setCurrentIndex(selector.findData(item_type))
+        except (ValueError, AttributeError):
+            pass
+
+    def _catalog_entity_exists(self, item_type, name):
+        target = self._normalize_name(name)
+        catalog = getattr(self.database, 'sale_catalog', None)
+        if catalog:
+            entities = catalog.get(item_type + "s", [])
+            for e in entities:
+                if self._normalize_name(e.get("name", "")) == target:
+                    return True
+            return False
+
+        # GUI thread must NOT block to query the database over RPC.
+        # Catalog wasn't prefetched - assume it exists; the backend
+        # re-validates at save time (matches _entity_exists/_validate_stock).
+        return True
 
     def _validate_stock(self, items_objects):
-        """Return a list of error strings for any sale item that exceeds available stock.
-
-        Excludes the current sale's own existing items from the deduction so that editing
-        a sale and changing quantities is checked correctly (not double-counted).
-        """
+        """Return a list of error strings for any sale item that exceeds available stock."""
         errors = []
         current_sale_id = self.operation_id or 0
-        cursor = self.database.cursor
+        catalog = getattr(self.database, 'sale_catalog', None)
+        
         for item in items_objects:
             try:
                 product_id = item.get_value('product_id')
@@ -571,29 +1470,20 @@ class BaseOperationDialog(QDialog):
                 new_qty = float(item.get_value('quantity') or 0)
                 if new_qty <= 0:
                     continue
-
-                cursor.execute(
-                    "SELECT COALESCE(SUM(quantity), 0) FROM Import_Items WHERE product_id = ?",
-                    (product_id,)
-                )
-                total_imports = cursor.fetchone()[0] or 0
-
-                # Exclude the current sale so editing doesn't double-count its own items
-                cursor.execute("""
-                    SELECT COALESCE(SUM(si.quantity), 0)
-                    FROM Sales_Items si
-                    JOIN Sales s ON si.sales_id = s.ID
-                    WHERE si.product_id = ?
-                      AND (s.state IS NULL OR s.state != 'on_hold')
-                      AND si.sales_id != ?
-                """, (product_id, current_sale_id))
-                sold_elsewhere = cursor.fetchone()[0] or 0
-
-                available = total_imports - sold_elsewhere
-                if new_qty > available:
-                    errors.append(
-                        f"'{product_name}': need {int(new_qty)}, only {max(0, int(available))} available"
-                    )
+                
+                available = 0
+                if catalog:
+                    for p in catalog.get("products", []):
+                        if p.get("id") == product_id:
+                            available = p.get("stock", 0)
+                            break
+                else:
+                    # GUI thread must NOT block to query database over RPC.
+                    # Skip early warning; let SaveWorker and backend validate stock.
+                    continue
+                    
+                if new_qty > float(available):
+                    errors.append(f"{product_name} (Requested: {new_qty}, Available: {available})")
             except Exception as e:
                 print(f"Stock check error: {e}")
         return errors
@@ -607,33 +1497,60 @@ class BaseOperationDialog(QDialog):
 
     def _entity_exists(self, table, username):
         try:
-            self.database.cursor.execute(f"SELECT COUNT(*) FROM {table} WHERE username = ?", (username,))
-            res = self.database.cursor.fetchone()
-            return res and res[0] > 0
+            target = self._normalize_name(username)
+            catalog = getattr(self.database, 'sale_catalog', None)
+            catalog_key = table.lower()  # "clients" / "suppliers"
+            if catalog and catalog_key in catalog:
+                return any(
+                    target in (self._normalize_name(e.get('username')), self._normalize_name(e.get('name')))
+                    for e in catalog.get(catalog_key, [])
+                )
+            # GUI thread must NOT block to query the database over RPC.
+            # The catalog wasn't prefetched (or doesn't cover this table) -
+            # assume it exists; the backend re-validates at save time and
+            # _handle_missing_references' own pending-entity flow still
+            # covers genuinely-new names.
+            return True
         except Exception as e:
             print(f"Error checking existence in {table}: {e}")
             return True  # Avoid blocking
 
     def _product_exists(self, name):
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Products WHERE name = ?", (name,))
-            res = self.database.cursor.fetchone()
-            if res and res[0] > 0:
+            target = self._normalize_name(name)
+            
+            # Use local catalog if available (removes O(N) blocking RPC queries)
+            catalog = getattr(self.database, 'sale_catalog', None)
+            if catalog:
+                if any(self._normalize_name(p['name']) == target for p in catalog.get('products', [])):
+                    return True
+                for s in catalog.get('services', []):
+                    candidates = [s['name'], *self._split_keywords(s.get('keywords') or "")]
+                    if any(target == self._normalize_name(c) for c in candidates if c):
+                        return True
+                return False
+
+            self.database.cursor.execute("SELECT name FROM Products WHERE name IS NOT NULL")
+            if any(self._normalize_name(row[0]) == target for row in self.database.cursor.fetchall()):
                 return True
 
             self.database.cursor.execute(
                 "SELECT name, keywords FROM Services WHERE name IS NOT NULL AND name != ''"
             )
-            name_clean = (name or '').strip().lower()
+            name_clean = target
             for service_name, keywords in self.database.cursor.fetchall():
                 candidates = [service_name, *self._split_keywords(keywords or "")]
-                if any(name_clean == str(candidate).strip().lower() for candidate in candidates if candidate):
+                if any(name_clean == self._normalize_name(candidate) for candidate in candidates if candidate):
                     return True
 
             return False
         except Exception as e:
             print(f"Error checking product existence: {e}")
             return True
+
+    @staticmethod
+    def _normalize_name(value):
+        return " ".join(str(value or "").split()).casefold()
 
     @staticmethod
     def _split_keywords(value):
@@ -673,3 +1590,14 @@ class BaseOperationDialog(QDialog):
             product.save_to_database()
         except Exception as e:
             print(f"Error auto-creating product '{name}': {e}")
+
+    def _create_service(self, name):
+        try:
+            from classes.service_class import ServiceClass
+            service = ServiceClass(0, self.database, name=name)
+            code = "SRV-" + "-".join(str(name).upper().split())[:40]
+            service.set_value('service_code', code or 'SRV-NEW')
+            service.set_value('service_type', 'Custom Service')
+            service.save_to_database()
+        except Exception as e:
+            print(f"Error auto-creating service '{name}': {e}")

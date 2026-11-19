@@ -1,140 +1,465 @@
 """
-Database System - Updated to support multi-item operations with foreign keys
+Database System - PostgreSQL backed, supports multi-item operations with foreign keys.
+
+Each profile gets its own schema in one shared Postgres database (schema-per-tenant),
+selected via `SET search_path`. All identifiers created here are left UNQUOTED so
+Postgres folds them to lowercase - this matches the many raw-SQL call sites elsewhere
+in the app (classes/*.py, ui/**/*.py) that already reference table/column names
+unquoted, so they keep working unchanged against the folded lowercase names.
 """
-import sqlite3
-import os
+import re
+import json
+import logging
+import traceback
+from datetime import datetime
+from decimal import Decimal
+# haitam
+import psycopg2
+from psycopg2 import OperationalError
+
+from core.pg_config import load_server_config
+from core import diagnostics
+from core.calculations import calculate_operation_totals, calculate_line_subtotal, round_money, to_decimal
+
+logger = logging.getLogger(__name__)
+
+# Sort columns allowed to appear directly in ORDER BY / keyset WHERE clauses.
+# UI-generated text must be validated against this set before it ever reaches
+# SQL - never interpolate arbitrary user input into ORDER BY.
+_ORDER_COLUMNS = {
+    'id', 'username', 'name', 'description', 'keywords', 'client_username',
+    'client_name', 'supplier_username', 'supplier_name', 'date',
+    'unit_price', 'sale_price', 'quantity', 'category', 'ice',
+    'subtotal', 'total_price', 'total_ht', 'total_ttc', 'vat_amount',
+    'information', 'total_quantity',
+    'total_production', 'department', 'report_type', 'created_by',
+    'created_at', 'report', 'is_historical', 'state', 'notes',
+}
+
+# Subset of _ORDER_COLUMNS whose values are numeric. Sort expressions for
+# these are wrapped in COALESCE(..., 0) (text columns in COALESCE(..., ''))
+# so the composite keyset row comparison (sort_expr, id) never hits NULL,
+# which would silently drop rows sharing a NULL sort value.
+_ORDER_NUMERIC_COLUMNS = {
+    'id', 'unit_price', 'sale_price', 'quantity', 'ice', 'subtotal',
+    'total_price', 'total_ht', 'total_ttc', 'vat_amount',
+    'total_quantity', 'total_production', 'created_by',
+}
+
+# Canonical Client Account schema.
+#
+# get_client_account() joins Sales + Sales_Items and returns every field as a
+# named value. Every layer that consumes a client account - the LAN RPC server,
+# the RemoteDatabase client, the ClientDetailsDialog worker, the Purchases /
+# Payment History tables and the print workers - must use these exact names.
+# Never let a consumer unpack these rows by position; the column count has
+# grown before and the fragile positional unpacking is what crashed View
+# Client ("too many values to unpack (expected 9, got 14)").
+CLIENT_ACCOUNT_PURCHASE_FIELDS = (
+    "sale_id", "date", "state", "item_id", "product", "quantity",
+    "unit_price", "vat", "remise", "information", "production",
+    "notes", "is_historical", "created_by_username",
+)
+CLIENT_ACCOUNT_PAYMENT_FIELDS = (
+    "payment_id", "sale_id", "item_id", "date", "amount",
+)
+
+# Canonical Supplier Account schemas - the single data contract shared by the
+# host GUI, the LAN RPC layer and the View Supplier dialog / statement report.
+# Mirrors the Client Account fields so the same widget pipeline can render
+# either side. One row per Import x Import_Items join in the "imports" view
+# and one row per payment in the "payments" view.
+SUPPLIER_ACCOUNT_IMPORT_FIELDS = (
+    "import_id", "date", "item_id", "product", "quantity",
+    "unit_price", "vat", "notes", "is_historical", "created_by_username",
+)
+SUPPLIER_ACCOUNT_PAYMENT_FIELDS = (
+    "payment_id", "import_id", "item_id", "date", "amount",
+)
+# Canonical per-Import summary schema returned by
+# get_supplier_import_summaries(). One row per Import (never one per item).
+SUPPLIER_ACCOUNT_IMPORT_SUMMARY_FIELDS = (
+    "import_id", "date", "bl_number", "is_historical", "total", "paid",
+    "remaining",
+)
+
+# Canonical per-Sale summary schema returned by get_client_sale_summaries().
+# One row per Sale (never one per item) so the Sales History table never needs
+# to download every Sale Item. ``devis`` is the display string DE-YEAR-N.
+CLIENT_ACCOUNT_SALE_FIELDS = (
+    "sale_id", "date", "state", "is_historical", "devis", "total", "paid",
+    "remaining",
+)
+
+# Single authoritative predicate for "this Sale participates in current stock".
+#
+# Current stock is derived from stored operations (imports minus eligible sales),
+# so no second physical deduction exists. A Sale is only subtracted when the
+# user explicitly opted in via affect_stock, and never when it is a historical
+# (books-only) record - that exclusion is a hard safety net even if legacy data
+# ever contains the impossible historical + affect_stock combination.
+#
+# Sale state is deliberately NOT part of this predicate: workflow state and the
+# inventory decision are separate concepts, so moving a Sale from pending to
+# confirmed (or to on_hold) must never move stock on its own.
+SALE_STOCK_ELIGIBILITY_SQL = (
+    "COALESCE(s.affect_stock, FALSE) = TRUE "
+    "AND COALESCE(s.is_historical, FALSE) = FALSE"
+)
+
+# Year a Devis number is scoped to: the first 4-digit group in the sale date,
+# falling back to created_at, then 0. Kept as a single SQL expression so the
+# per-year backfill and the summaries query always agree on the same year.
+_DEVIS_YEAR_EXPR = (
+    "COALESCE("
+    "NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{4}'), ''), "
+    "NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{4}'), ''), "
+    "'0')"
+)
+
+# Maximum length of the canonical Devis reference (e.g. "DE-2026-525-A").
+# The GUI and the host-side resolver both enforce this bound.
+DEVIS_MAX_LENGTH = 40
+
+# Matches an unmodified, machine-generated reference (e.g. "DE-2026-32"), as
+# opposed to a manually customized one (e.g. "DE-2026-525-A"). Used by
+# _resolve_sale_devis to recover devis_number from a verbatim value that
+# happens to still be in the exact generator format - see its docstring.
+_DEVIS_TEXT_NUMBER_RE = re.compile(r"^DE-\d{4}-(\d+)$", re.IGNORECASE)
+
+
+def format_devis_display(devis):
+    """Human-readable Devis reference with an explicit ``N°`` marker, e.g.
+    ``"DE-2026-31"`` -> ``"DE N°-2026-31"``.
+
+    Presentation only - the persisted ``sales.devis`` value is never touched.
+    Use this wherever only the bare reference would otherwise be shown with
+    no adjacent "Devis N°" label, so the user is never left wondering
+    whether ``DE-2026-31`` is a generic ID.
+    """
+    text = str(devis or "").strip()
+    if not text:
+        return ""
+    prefix, sep, rest = text.partition("-")
+    if not sep:
+        return text
+    return f"{prefix} N°-{rest}"
+
+# Year a Bon de Livraison number is scoped to: the first 4-digit group in the
+# import date, falling back to created_at, then 0. Mirrors _DEVIS_YEAR_EXPR
+# (the importing alias is "s", matching the backfill/allocator call sites).
+_BL_YEAR_EXPR = (
+    "COALESCE("
+    "NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{4}'), ''), "
+    "NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{4}'), ''), "
+    "'0')"
+)
+
+# Maximum length of the persistent Bon de Livraison reference (BL-YEAR-N).
+# Enforced by the host-side resolver only - the value is never user-editable.
+BL_MAX_LENGTH = 40
+
+
+def normalize_client_sale_summaries(sale_rows, payment_rows):
+    """Convert raw summaries/payment rows to the sale-level account contract.
+
+    ``sale_rows`` follow ``CLIENT_ACCOUNT_SALE_FIELDS`` and ``payment_rows``
+    follow ``CLIENT_ACCOUNT_PAYMENT_FIELDS`` (both are already in the named
+    order used by the dialog and the report workers).
+    """
+    sales = [dict(zip(CLIENT_ACCOUNT_SALE_FIELDS, row)) for row in sale_rows]
+    payments = [
+        dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"sales": sales, "payments": payments}
+
+
+def normalize_client_account(purchase_rows, payment_rows):
+    """Convert raw Sales/Sales_Items and Payments rows to canonical dicts.
+
+    ``purchase_rows`` follow ``CLIENT_ACCOUNT_PURCHASE_FIELDS`` (the 14-column
+    Sales x Sales_Items join) and ``payment_rows`` follow
+    ``CLIENT_ACCOUNT_PAYMENT_FIELDS``. The returned structure is the single
+    Client Account data contract shared by the host GUI, the LAN RPC layer and
+    the View Client dialog / reports.
+    """
+    purchases = [
+        dict(zip(CLIENT_ACCOUNT_PURCHASE_FIELDS, row)) for row in purchase_rows
+    ]
+    payments = [
+        dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"purchases": purchases, "payments": payments}
+
+
+def normalize_supplier_account(import_rows, payment_rows):
+    """Convert raw Imports/Import_Items and Payments rows to canonical dicts.
+
+    ``import_rows`` follow ``SUPPLIER_ACCOUNT_IMPORT_FIELDS`` and
+    ``payment_rows`` follow ``SUPPLIER_ACCOUNT_PAYMENT_FIELDS``. The returned
+    structure is the single Supplier Account data contract shared by the host
+    GUI, the LAN RPC layer and the View Supplier dialog / reports.
+    """
+    imports = [
+        dict(zip(SUPPLIER_ACCOUNT_IMPORT_FIELDS, row)) for row in import_rows
+    ]
+    payments = [
+        dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+    ]
+    return {"imports": imports, "payments": payments}
 
 
 class Database:
     """Database that integrates with parameter class system"""
-    
+
     def __init__(self, profile_manager=None):
         self.profile_manager = profile_manager
         self.registered_classes = {}  # section_name -> class
         self.conn = None
         self.cursor = None
+        self.database_name = None
+        self.schema_name = None
+        self.last_error = None
         # Current UI language; allows parameter classes to localize display names
         self.language = 'en'
-        
+
+    def has_permission(self, section, action='read'):
+        """Local database - this is the host's own data, always fully accessible.
+        Only RemoteDatabase (network clients) is actually gated by role permissions."""
+        return True
+
     def register_class(self, cls):
         """Register a parameter class with the database"""
         try:
             # Create temporary instance to get metadata
             temp_obj = cls(0, None)  # Pass None for database to avoid circular dependency
             section_name = temp_obj.section
-            
+
             self.registered_classes[section_name] = cls
-            
+
             # Create/update database table for this class if connected
             if self.cursor:
                 self._create_table_for_class(cls, section_name)
-                
+
             print(f"✓ Registered parameter class: {section_name}")
             return True
-            
+
         except Exception as e:
             print(f"✗ Failed to register {cls.__name__}: {e}")
             return False
-    
-    def connect(self):
-        """Establish database connection using profile manager"""
+
+    @staticmethod
+    def _sanitize_schema_name(name):
+        """Turn a free-text profile name into a safe, unquoted Postgres identifier."""
+        sanitized = re.sub(r'[^a-z0-9_]', '_', (name or '').lower())
+        if not sanitized or sanitized[0].isdigit():
+            sanitized = f"p_{sanitized}"
+        return sanitized
+
+    @staticmethod
+    def _profile_schema_name(company_name):
+        """Build the per-profile schema name from the company name."""
+        return Database._sanitize_schema_name(f"DB_{company_name or ''}")
+
+    @staticmethod
+    def _profile_database_name(company_name):
+        """Build the per-profile database name from the company name."""
+        return Database._sanitize_schema_name(f"DB_{company_name or ''}")
+
+    @staticmethod
+    def _maintenance_database_name(pg_config):
+        return pg_config.get('maintenance_database') or pg_config.get('database') or 'postgres'
+
+    def _connect_admin(self, pg_config):
+        return psycopg2.connect(
+            host=pg_config.get('host'),
+            port=pg_config.get('port'),
+            dbname=self._maintenance_database_name(pg_config),
+            user=pg_config.get('user'),
+            password=pg_config.get('password'),
+            connect_timeout=5,
+            application_name="PyLocalInventory",
+        )
+
+    def _ensure_profile_database(self, pg_config, database_name):
+        """Create the profile database if it does not already exist."""
+        admin_conn = self._connect_admin(pg_config)
+        admin_conn.autocommit = True
+        try:
+            admin_cur = admin_conn.cursor()
+            admin_cur.execute("SELECT 1 FROM pg_database WHERE datname = %s", (database_name,))
+            if not admin_cur.fetchone():
+                admin_cur.execute(f"CREATE DATABASE {database_name}")
+        finally:
+            admin_conn.close()
+
+    def connect(self, initialize_schema=True):
+        """Establish a database connection for the selected profile.
+
+        Only the application's startup connection initializes tables and
+        migrations. Background readers use an already-initialized production
+        database and must not contend on DDL before serving a query.
+        """
+        self.last_error = None
         if not self.profile_manager or not self.profile_manager.selected_profile:
-            print("No profile selected, cannot connect to database")
+            self.last_error = "No profile selected, cannot connect to database"
+            print(self.last_error)
             return False
-            
+
         # Close existing connection
         if self.conn:
             self.conn.close()
             self.conn = None
             self.cursor = None
-        
+
         try:
-            # Get database path from profile
-            db_path = self.profile_manager.selected_profile.database_path
-            
-            # Ensure directory exists
-            db_dir = os.path.dirname(db_path)
-            if db_dir and not os.path.exists(db_dir):
-                os.makedirs(db_dir)
-            
-            # Connect to database
-            self.conn = sqlite3.connect(db_path)
-            self.cursor = self.conn.cursor()
+            pg_config = load_server_config()
+            profile = self.profile_manager.selected_profile
+            database_name = profile.database_name or self._profile_database_name(
+                profile.get_value('company name') or profile.name
+            )
 
-            # Enable foreign key support in SQLite
-            self.cursor.execute("PRAGMA foreign_keys = ON")
-            # WAL mode: allows concurrent reads alongside one writer (safe on network shares)
-            self.conn.execute("PRAGMA journal_mode=WAL")
-            # Wait up to 5 s when the DB is locked instead of failing immediately
-            self.conn.execute("PRAGMA busy_timeout=5000")
-            
-            # Create tables for all registered classes
-            self._create_all_tables()
+            if profile.database_name or not profile.schema_name:
+                profile.database_name = database_name
+                if initialize_schema:
+                    self._ensure_profile_database(pg_config, database_name)
+                self.conn = psycopg2.connect(
+                    host=pg_config.get('host'),
+                    port=pg_config.get('port'),
+                    dbname=database_name,
+                    user=pg_config.get('user'),
+                    password=pg_config.get('password'),
+                    connect_timeout=5,
+                    application_name="PyLocalInventory",
+                )
+                self.cursor = diagnostics.track_cursor(self.conn.cursor())
+                self.database_name = database_name
+                self.schema_name = None
 
-            # Ensure meta/migrations and run one-time tasks
-            self._ensure_meta_table()
-            self._ensure_user_tables()
-            self._run_one_time_migrations()
-            
-            print(f"✓ Connected to database: {db_path}")
+                if initialize_schema:
+                    self._initialize_schema()
+
+                print(f"✓ Connected to database: {database_name}")
+                diagnostics.db_connection_opened(kind="local")
+                return True
+
+            schema_name = profile.schema_name or self._profile_schema_name(
+                profile.get_value('company name') or profile.name
+            )
+            profile.schema_name = schema_name
+
+            self.conn = psycopg2.connect(
+                host=pg_config.get('host'),
+                port=pg_config.get('port'),
+                dbname=pg_config.get('database'),
+                user=pg_config.get('user'),
+                password=pg_config.get('password'),
+                connect_timeout=5,
+                application_name="PyLocalInventory",
+            )
+            self.cursor = diagnostics.track_cursor(self.conn.cursor())
+
+            if initialize_schema:
+                self.cursor.execute(f"CREATE SCHEMA IF NOT EXISTS {schema_name}")
+                self.conn.commit()
+            self.cursor.execute(f"SET search_path TO {schema_name}")
+            self.database_name = None
+            self.schema_name = schema_name
+
+            if initialize_schema:
+                self._initialize_schema()
+
+            print(f"✓ Connected to database schema: {schema_name}")
+            diagnostics.db_connection_opened(kind="local")
             return True
-            
-        except Exception as e:
+
+        except OperationalError as e:
+            self.last_error = str(e)
+            logger.exception("PostgreSQL connection failed")
             print(f"✗ Failed to connect to database: {e}")
             return False
-    
+        except Exception as e:
+            self.last_error = str(e)
+            logger.exception("Database initialization failed")
+            print(f"✗ Failed to connect to database: {e}")
+            return False
+
+    def _initialize_schema(self):
+        """Run controlled schema initialization on the startup connection only."""
+        self._create_all_tables()
+        self._ensure_meta_table()
+        self._ensure_user_tables()
+        self._ensure_attachment_tables()
+        self._ensure_payments_table()
+        self._ensure_facture_tables()
+        self._ensure_change_log_table()
+        self._run_one_time_migrations()
+
+    @staticmethod
+    def _sql_type_for(param_type):
+        """Map a parameter's declared 'type' to a Postgres column type.
+
+        'bool' is deliberately mapped to a numeric type, not TEXT: the only
+        two 'bool'-typed parameters in this app (Sales/Imports 'tva') are
+        numeric percentage toggles (true_value/false_value are floats like
+        20.0/0.0), not genuine True/False text - raw SQL elsewhere does
+        arithmetic on them (e.g. `s.tva/100`), which Postgres (unlike SQLite)
+        refuses to do implicitly against a TEXT column.
+        """
+        if param_type == 'int':
+            return "INTEGER"
+        if param_type == 'decimal':
+            return "NUMERIC(15, 3)"
+        if param_type in ('float', 'bool'):
+            return "DOUBLE PRECISION"
+        return "TEXT"  # string, image, date, text
+
     def _create_table_for_class(self, cls, section_name):
         """Create database table for a parameter class with foreign key support"""
         try:
             # Create temporary instance to get parameter info
             temp_obj = cls(0, None)
-            
+
             # Get parameters that should be stored in database
             db_params = temp_obj.get_visible_parameters("database")
-            
+
             if not db_params:
                 print(f"No database parameters defined for {section_name}")
                 return
-            
+
             # Build column definitions
-            columns = ["ID INTEGER PRIMARY KEY AUTOINCREMENT"]
+            columns = ["id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY"]
             foreign_keys = []
-            
+
             for param_key in db_params:
                 if param_key in temp_obj.parameters:
                     param_info = temp_obj.parameters[param_key]
-                    
+
                     # Skip calculated parameters (they're computed, not stored)
                     if temp_obj.is_parameter_calculated(param_key):
                         continue
-                    
+
                     # Determine SQL type based on parameter type
-                    param_type = param_info.get('type', 'string')
-                    if param_type == 'int':
-                        sql_type = "INTEGER"
-                    elif param_type == 'float':
-                        sql_type = "REAL"
-                    else:  # string, image, date, text
-                        sql_type = "TEXT"
-                    
-                    # Add column with proper quoting
-                    columns.append(f"'{param_key}' {sql_type}")
-                    
+                    sql_type = self._sql_type_for(param_info.get('type', 'string'))
+
+                    # Add column (unquoted - folds to lowercase)
+                    columns.append(f"{param_key} {sql_type}")
+
                     # Add foreign key constraints for ID fields
                     if param_key.endswith('_id') and param_key != 'id':
                         # Only enforce cascading on child item links; allow deletion of base entities freely
                         if param_key == 'sales_id':
-                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Sales'(ID) ON DELETE CASCADE")
+                            foreign_keys.append(f"FOREIGN KEY ({param_key}) REFERENCES sales(id) ON DELETE CASCADE")
                         elif param_key == 'import_id':
-                            foreign_keys.append(f"FOREIGN KEY ('{param_key}') REFERENCES 'Imports'(ID) ON DELETE CASCADE")
-            
+                            foreign_keys.append(f"FOREIGN KEY ({param_key}) REFERENCES imports(id) ON DELETE CASCADE")
+
             # Combine columns and foreign keys
             all_constraints = columns + foreign_keys
             constraints_str = ",\n    ".join(all_constraints)
-            
+
             # Create table if not exists
             sql = f"""
-                CREATE TABLE IF NOT EXISTS '{section_name}' (
+                CREATE TABLE IF NOT EXISTS {section_name} (
                     {constraints_str}
                 )
             """
@@ -143,34 +468,35 @@ class Database:
 
             # --- Migration: ensure all expected columns exist (add missing) ---
             try:
-                self.cursor.execute(f"PRAGMA table_info('{section_name}')")
-                existing_cols = {row[1] for row in self.cursor.fetchall()}
+                self.cursor.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s",
+                    (section_name.lower(),)
+                )
+                existing_cols = {row[0] for row in self.cursor.fetchall()}
                 for param_key in db_params:
                     if param_key in temp_obj.parameters and param_key not in existing_cols:
                         pinfo = temp_obj.parameters[param_key]
                         if temp_obj.is_parameter_calculated(param_key):
                             continue
-                        ptype = pinfo.get('type', 'string')
-                        if ptype == 'int':
-                            sql_type = 'INTEGER'
-                        elif ptype == 'float':
-                            sql_type = 'REAL'
-                        else:
-                            sql_type = 'TEXT'
+                        sql_type = self._sql_type_for(pinfo.get('type', 'string'))
                         try:
-                            self.cursor.execute(f"ALTER TABLE '{section_name}' ADD COLUMN '{param_key}' {sql_type}")
+                            self.cursor.execute(f"ALTER TABLE {section_name} ADD COLUMN {param_key} {sql_type}")
                             self.conn.commit()
                             print(f"✓ Added missing column '{param_key}' to {section_name}")
                         except Exception as mig_e:
+                            self.conn.rollback()
                             print(f"⚠️ Failed adding column {param_key} to {section_name}: {mig_e}")
             except Exception as e_cols:
+                self.conn.rollback()
                 print(f"⚠️ Column migration check failed for {section_name}: {e_cols}")
 
             print(f"✓ Created/verified table: {section_name}")
-            
+
         except Exception as e:
+            self.conn.rollback()
             print(f"✗ Error creating table for {section_name}: {e}")
-    
+
     def _create_all_tables(self):
         """Create tables for all registered classes in proper order"""
         # Create tables in order to respect foreign key dependencies
@@ -179,13 +505,13 @@ class Database:
             'Sales', 'Imports',                   # Operation tables
             'Sales_Items', 'Import_Items'         # Item tables last
         ]
-        
+
         # Create tables in order if they exist in registered classes
         for section_name in creation_order:
             if section_name in self.registered_classes:
                 cls = self.registered_classes[section_name]
                 self._create_table_for_class(cls, section_name)
-        
+
         # Create any remaining tables not in the order list
         for section_name, cls in self.registered_classes.items():
             if section_name not in creation_order:
@@ -194,86 +520,269 @@ class Database:
         # Ensure new snapshot columns exist (idempotent)
         self._ensure_additional_columns()
 
+        # Persist the per-year Devis reference for any sale that still lacks
+        # one (legacy data and sales created since the last startup). Runs on
+        # the trusted host only - never part of Sale Save logic.
+        self._ensure_devis_numbers()
+        # Persist the canonical TEXT reference for rows that only have a number.
+        self._ensure_devis_text()
+
+        # Persist per-year Bon de Livraison references for any import that
+        # still lacks one (legacy data and imports created since the last
+        # startup). Idempotent - allocated numbers are never renumbered.
+        self._ensure_bl_numbers()
+
     def _ensure_additional_columns(self):
         """Ensure newly introduced snapshot columns exist in existing databases."""
         required = {
-            'Sales': {'client_name': 'TEXT', 'state': 'TEXT'},
-            'Imports': {'supplier_name': 'TEXT'},
-            'Sales_Items': {'product_name': 'TEXT'},
-            'Import_Items': {'product_name': 'TEXT'}
+            'clients': {
+                'ice': 'TEXT', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'products': {
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT', 'created_at': 'TEXT',
+                # Read by get_dashboard_snapshot()'s low-stock query - used to
+                # live only behind HomeTab's local-refresh code path, so a
+                # database that never ran that exact path could hit it as an
+                # undefined column.
+                'stock_alert': 'INTEGER',
+            },
+            'services': {
+                'unit_price': 'DOUBLE PRECISION', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'sales': {
+                'client_id': 'INTEGER', 'client_name': 'TEXT', 'state': 'TEXT',
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT',
+                'created_at': 'TEXT', 'operation_token': 'TEXT',
+                # Historical sales are books-only: they never touch stock.
+                # Default FALSE so every existing sale stays a normal sale.
+                'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
+                # Explicit, user-chosen stock decision for a Sale. Declared
+                # BOOLEAN here (and deliberately NOT as a "bool" parameter) so
+                # the generic class-driven migration loop - which maps bool to
+                # DOUBLE PRECISION for the numeric tva toggle - can never create
+                # it with the wrong type. Added nullable first so the one-time
+                # backfill can distinguish legacy rows; _migrate_sales_affect_stock
+                # then backfills and tightens it to NOT NULL DEFAULT FALSE.
+                'affect_stock': 'BOOLEAN',
+                'remise': 'DOUBLE PRECISION',
+                'remise_includes_line_discounts': 'BOOLEAN NOT NULL DEFAULT FALSE',
+                # Persistent per-year sequential Devis reference (DE-YEAR-N).
+                # NULL until the one-time/on-read backfill assigns it - see
+                # _ensure_devis_numbers(). Never part of Sale Save logic.
+                'devis_number': 'INTEGER',
+                # Canonical, user-editable Devis reference (e.g. DE-2026-525-A).
+                # Backfilled once from devis_number for legacy rows, then this
+                # TEXT is authoritative: manual values are stored verbatim and
+                # never silently renumbered. Enforced unique by
+                # sales_devis_uidx; the host allocates/validates on save.
+                'devis': 'TEXT',
+            },
+            'imports': {
+                'supplier_name': 'TEXT', 'supplier_id': 'INTEGER',
+                'created_by': 'INTEGER', 'created_by_username': 'TEXT',
+                'created_at': 'TEXT', 'operation_token': 'TEXT',
+                # Persistent per-year sequential Bon de Livraison reference
+                # (BL-YEAR-N). NULL until backfilled or allocated on first
+                # print/save. Allocated by the host only - never part of the
+                # client Import payload. Enforced unique by imports_bl_uidx.
+                'bl_number': 'TEXT',
+                # Historical imports are books-only: they never touch stock.
+                # Mirrors sales.is_historical above. Also the canonical creation
+                # path when the column is absent - the class-driven migration
+                # loop would otherwise add it as DOUBLE PRECISION (see the
+                # type-normalization block below).
+                'is_historical': 'BOOLEAN NOT NULL DEFAULT FALSE',
+            },
+            'reports': {
+                'report_type': 'TEXT', 'created_by': 'INTEGER',
+                'created_by_username': 'TEXT', 'created_at': 'TEXT',
+            },
+            'sales_items': {
+                'product_name': 'TEXT', 'service_id': 'INTEGER', 'item_type': 'TEXT',
+                'sort_order': 'INTEGER', 'discount_percentage': 'DOUBLE PRECISION NOT NULL DEFAULT 0',
+            },
+            'import_items': {'product_name': 'TEXT'}
         }
         for table, cols in required.items():
             try:
-                self.cursor.execute(f"PRAGMA table_info('{table}')")
-                existing = {r[1] for r in self.cursor.fetchall()}
+                self.cursor.execute(
+                    "SELECT column_name FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s",
+                    (table,)
+                )
+                existing = {r[0] for r in self.cursor.fetchall()}
                 for col, ctype in cols.items():
                     if col not in existing:
                         try:
-                            self.cursor.execute(f"ALTER TABLE '{table}' ADD COLUMN '{col}' {ctype}")
+                            self.cursor.execute(f"ALTER TABLE {table} ADD COLUMN {col} {ctype}")
                             self.conn.commit()
-                            print(f"✓ Added missing column '{col}' to {table}")
+                            print(f"Added missing column '{col}' to {table}")
                         except Exception as e_add:
-                            print(f"⚠️ Could not add column {col} to {table}: {e_add}")
+                            self.conn.rollback()
+                            print(f"Warning: could not add column {col} to {table}: {e_add}")
             except Exception as e_tab:
-                print(f"⚠️ Snapshot column check failed for {table}: {e_tab}")
-        # Legacy FK relaxation now handled in one-time migrations
+                self.conn.rollback()
+                print(f"Warning: snapshot column check failed for {table}: {e_tab}")
 
-    def _relax_legacy_item_product_fk(self, table_name, op_fk_col):
-        """Rebuild legacy item table if it still enforces a foreign key on product_id.
-        Keeps existing data. Leaves only the operation FK (cascade) and drops product_id FK.
-        Safe & idempotent: checks if product_id FK exists first.
-        """
-        # Detect existing foreign keys
-        self.cursor.execute(f"PRAGMA foreign_key_list('{table_name}')")
-        fk_rows = self.cursor.fetchall()
-        has_product_fk = any(r[3] == 'product_id' for r in fk_rows)  # r[3] = from column
-        if not has_product_fk:
-            return  # already relaxed
-        print(f"↺ Rebuilding {table_name} to drop product_id foreign key constraint…")
-        # Get existing columns
-        self.cursor.execute(f"PRAGMA table_info('{table_name}')")
-        cols_info = self.cursor.fetchall()
-        col_names = [c[1] for c in cols_info]
-        # Build column definitions preserving types (except we re-spec with generic mapping)
-        def map_type(t):
-            t_low = (t or '').lower()
-            if 'int' in t_low:
-                return 'INTEGER'
-            if 'real' in t_low or 'floa' in t_low or 'doub' in t_low:
-                return 'REAL'
-            return 'TEXT'
-        columns_def = []
-        for c in cols_info:
-            name = c[1]
-            if name == 'ID':
-                columns_def.append('ID INTEGER PRIMARY KEY AUTOINCREMENT')
-            else:
-                columns_def.append(f"'{name}' {map_type(c[2])}")
-        # We will add only the operation foreign key
-        if op_fk_col in col_names:
-            if table_name == 'Sales_Items':
-                columns_def.append(f"FOREIGN KEY ('{op_fk_col}') REFERENCES 'Sales'(ID) ON DELETE CASCADE")
-            elif table_name == 'Import_Items':
-                columns_def.append(f"FOREIGN KEY ('{op_fk_col}') REFERENCES 'Imports'(ID) ON DELETE CASCADE")
-        # Drop any leftover temp table from previous failed attempt
+        # imports.is_historical must be BOOLEAN, not DOUBLE PRECISION. Databases
+        # that added the column through the class-driven migration loop before
+        # this fix got it as DOUBLE PRECISION because _sql_type_for maps the
+        # 'bool' type to DOUBLE PRECISION (deliberate for the numeric tva
+        # toggle). sales.is_historical is never affected - it is intentionally
+        # absent from SalesClass's "database" section, so it is only ever
+        # created here as BOOLEAN. Normalize the type so every consumer works:
+        # COALESCE(i.is_historical, FALSE) and NOT i.is_historical both require
+        # a boolean. Existing values are preserved - NULL stays NULL, 0 becomes
+        # FALSE, any other number becomes TRUE. Idempotent: skipped once the
+        # column is already BOOLEAN.
+        for col_table in ("imports", "sales"):
+            try:
+                self.cursor.execute(
+                    "SELECT data_type FROM information_schema.columns "
+                    "WHERE table_schema = current_schema() AND table_name = %s "
+                    "AND column_name = 'is_historical'",
+                    (col_table,),
+                )
+                type_row = self.cursor.fetchone()
+                if type_row and type_row[0] != "boolean":
+                    self.cursor.execute(
+                        f"ALTER TABLE {col_table} ALTER COLUMN is_historical "
+                        "TYPE BOOLEAN USING (is_historical <> 0)"
+                    )
+                    self.conn.commit()
+                    print(f"✓ Normalized {col_table}.is_historical to BOOLEAN")
+            except Exception as e_type:
+                self.conn.rollback()
+                print(
+                    f"Warning: could not normalize {col_table}.is_historical "
+                    f"to BOOLEAN: {e_type}"
+                )
+
+        # sales.affect_stock must be BOOLEAN, never DOUBLE PRECISION: the stock
+        # predicate uses COALESCE(s.affect_stock, FALSE) = TRUE, which needs a
+        # real boolean. Only relevant if some other path ever added the column
+        # through the bool->DOUBLE PRECISION mapping.
         try:
-            self.cursor.execute(f"DROP TABLE IF EXISTS '{table_name}_new'")
-        except Exception:
-            pass
-        create_sql = f"CREATE TABLE '{table_name}_new' (\n    " + ",\n    ".join(columns_def) + "\n)"
-        try:
-            self.cursor.execute(create_sql)
-            # Copy data (product_id values copied as-is; SQLite will accept NULL or orphan integers now)
-            cols_joined_insert = ", ".join(col_names)  # no quoting needed
-            cols_joined_select = ", ".join(col_names)
-            self.cursor.execute(f"INSERT INTO '{table_name}_new' ({cols_joined_insert}) SELECT {cols_joined_select} FROM '{table_name}'")
-            self.cursor.execute(f"DROP TABLE '{table_name}'")
-            self.cursor.execute(f"ALTER TABLE '{table_name}_new' RENAME TO '{table_name}'")
-            self.conn.commit()
-            print(f"✓ Relaxed product_id FK on {table_name}")
-        except Exception as e_rebuild:
+            self.cursor.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'sales' "
+                "AND column_name = 'affect_stock'"
+            )
+            type_row = self.cursor.fetchone()
+            if type_row and type_row[0] != "boolean":
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock "
+                    "TYPE BOOLEAN USING (COALESCE(affect_stock, 0) <> 0)"
+                )
+                self.conn.commit()
+                print("✓ Normalized sales.affect_stock to BOOLEAN")
+        except Exception as e_type:
             self.conn.rollback()
-            print(f"✗ Failed rebuilding {table_name} to relax product_id FK: {e_rebuild}")
+            print(f"Warning: could not normalize sales.affect_stock to BOOLEAN: {e_type}")
+
+        try:
+            self.cursor.execute(
+                "SELECT data_type FROM information_schema.columns "
+                "WHERE table_schema = current_schema() AND table_name = 'sales' "
+                "AND column_name = 'remise_includes_line_discounts'"
+            )
+            type_row = self.cursor.fetchone()
+            if type_row and type_row[0] != "boolean":
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN remise_includes_line_discounts "
+                    "TYPE BOOLEAN USING (COALESCE(remise_includes_line_discounts, 0) <> 0)"
+                )
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN remise_includes_line_discounts SET DEFAULT FALSE"
+                )
+                self.conn.commit()
+                print("Normalized sales.remise_includes_line_discounts to BOOLEAN")
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not normalize sales remise marker to BOOLEAN: {exc}")
+
+        try:
+            index_statements = (
+                "CREATE INDEX IF NOT EXISTS sales_created_by_idx ON sales(created_by)",
+                "CREATE INDEX IF NOT EXISTS imports_created_by_idx ON imports(created_by)",
+                "CREATE INDEX IF NOT EXISTS reports_created_by_idx ON reports(created_by)",
+                "CREATE INDEX IF NOT EXISTS reports_report_type_idx ON reports(report_type)",
+                "CREATE INDEX IF NOT EXISTS sales_items_sales_id_idx ON sales_items(sales_id)",
+                "CREATE INDEX IF NOT EXISTS sales_items_service_id_idx ON sales_items(service_id)",
+                "CREATE INDEX IF NOT EXISTS import_items_import_id_idx ON import_items(import_id)",
+                "CREATE INDEX IF NOT EXISTS import_items_product_id_idx ON import_items(product_id)",
+                "CREATE INDEX IF NOT EXISTS sales_items_product_id_idx ON sales_items(product_id)",
+                "CREATE INDEX IF NOT EXISTS imports_supplier_id_idx ON imports(supplier_id)",
+                "CREATE INDEX IF NOT EXISTS products_normalized_name_idx "
+                "ON products (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS products_normalized_username_idx "
+                "ON products (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS services_normalized_name_idx "
+                "ON services (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS clients_normalized_username_idx "
+                "ON clients (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS clients_normalized_name_idx "
+                "ON clients (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS suppliers_normalized_username_idx "
+                "ON suppliers (LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')))",
+                "CREATE INDEX IF NOT EXISTS suppliers_normalized_name_idx "
+                "ON suppliers (LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')))",
+                "CREATE UNIQUE INDEX IF NOT EXISTS sales_operation_token_uidx "
+                "ON sales(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS sales_devis_uidx "
+                "ON sales (LOWER(BTRIM(devis))) "
+                "WHERE devis IS NOT NULL AND BTRIM(devis) <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS imports_bl_uidx "
+                "ON imports (LOWER(BTRIM(bl_number))) "
+                "WHERE bl_number IS NOT NULL AND BTRIM(bl_number) <> ''",
+                "CREATE UNIQUE INDEX IF NOT EXISTS imports_operation_token_uidx "
+                "ON imports(operation_token) WHERE operation_token IS NOT NULL AND operation_token <> ''",
+            )
+            for statement in index_statements:
+                self.cursor.execute(statement)
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not create workflow indexes: {exc}")
+
+        # Existing installations created these columns as INTEGER.
+        # PostgreSQL's cast keeps all old values intact. Check first to avoid
+        # taking an unnecessary table lock on every startup.
+        for table in ("sales_items", "import_items"):
+            try:
+                self.cursor.execute(
+                    "SELECT data_type, numeric_precision, numeric_scale "
+                    "FROM information_schema.columns WHERE table_schema=current_schema() "
+                    "AND table_name=%s AND column_name='quantity'",
+                    (table,),
+                )
+                column = self.cursor.fetchone()
+                if column and column != ('numeric', 15, 3):
+                    self.cursor.execute(
+                        f"ALTER TABLE {table} ALTER COLUMN quantity "
+                        "TYPE NUMERIC(15, 3) USING quantity::NUMERIC(15, 3)"
+                    )
+                self.conn.commit()
+            except Exception as exc:
+                self.conn.rollback()
+                print(
+                    f"Warning: could not migrate {table}.quantity to decimal: {exc}"
+                )
+
+        # Client IDs were historically only resolved in memory. Backfill the
+        # stable relation from usernames once, then index it for client views.
+        try:
+            self.cursor.execute(
+                "UPDATE sales s SET client_id=c.id FROM clients c "
+                "WHERE s.client_id IS NULL AND s.client_username=c.username"
+            )
+            self.cursor.execute("CREATE INDEX IF NOT EXISTS sales_client_id_idx ON sales(client_id)")
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not backfill sales.client_id: {exc}")
 
     def _ensure_user_tables(self):
         """Create the Users/Roles/RolePermissions tables used for LAN network access.
@@ -284,164 +793,1762 @@ class Database:
         """
         try:
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS Roles (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                CREATE TABLE IF NOT EXISTS roles (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                     name TEXT UNIQUE NOT NULL
                 )
             """)
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS RolePermissions (
+                CREATE TABLE IF NOT EXISTS rolepermissions (
                     role_id INTEGER NOT NULL,
                     section TEXT NOT NULL,
                     can_read INTEGER NOT NULL DEFAULT 0,
                     can_write INTEGER NOT NULL DEFAULT 0,
                     can_delete INTEGER NOT NULL DEFAULT 0,
                     UNIQUE(role_id, section),
-                    FOREIGN KEY (role_id) REFERENCES Roles(id) ON DELETE CASCADE
+                    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE CASCADE
                 )
             """)
             self.cursor.execute("""
-                CREATE TABLE IF NOT EXISTS Users (
-                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
                     username TEXT UNIQUE NOT NULL,
                     password_hash TEXT NOT NULL,
                     salt TEXT NOT NULL,
                     role_id INTEGER,
                     is_superadmin INTEGER NOT NULL DEFAULT 0,
-                    FOREIGN KEY (role_id) REFERENCES Roles(id) ON DELETE SET NULL
+                    FOREIGN KEY (role_id) REFERENCES roles(id) ON DELETE SET NULL
                 )
             """)
             self.conn.commit()
         except Exception as e:
+            self.conn.rollback()
             print(f"Warning: could not create user/role tables: {e}")
+
+    def _ensure_attachment_tables(self):
+        """Create generic attachment metadata; document bytes are disk-backed."""
+        try:
+            from core.attachments import AttachmentService
+            AttachmentService(self).ensure_tables()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create attachment tables: {e}")
+
+    def _ensure_payments_table(self):
+        """Create the client/supplier-account payment table during trusted host startup."""
+        try:
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS payments (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    sale_id INTEGER,
+                    sales_item_id INTEGER,
+                    import_id INTEGER,
+                    import_item_id INTEGER,
+                    amount DOUBLE PRECISION,
+                    date TEXT,
+                    FOREIGN KEY (sale_id) REFERENCES sales(id) ON DELETE CASCADE,
+                    FOREIGN KEY (sales_item_id) REFERENCES sales_items(id) ON DELETE CASCADE,
+                    FOREIGN KEY (import_id) REFERENCES imports(id) ON DELETE CASCADE,
+                    FOREIGN KEY (import_item_id) REFERENCES import_items(id) ON DELETE CASCADE
+                )
+                """
+            )
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS sales_item_id INTEGER"
+            )
+            # Supplier side of the same table: an Import-level payment recorded
+            # against a supplier account. Idempotent for legacy databases.
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS import_id INTEGER"
+            )
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS import_item_id INTEGER"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS payments_import_id_idx "
+                "ON payments(import_id) WHERE import_id IS NOT NULL"
+            )
+            # General/unallocated client payment: recorded directly against a
+            # client (client_id set, sale_id NULL) when the payment isn't tied
+            # to one specific Sale. Additive/idempotent for legacy databases -
+            # existing Sale-linked payments (sale_id set, client_id NULL) are
+            # untouched and keep working exactly as before.
+            self.cursor.execute(
+                "ALTER TABLE payments ADD COLUMN IF NOT EXISTS client_id INTEGER"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS payments_client_id_idx "
+                "ON payments(client_id) WHERE client_id IS NOT NULL"
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create Payments table: {e}")
+
+    def _ensure_facture_tables(self):
+        """Create additive, independent invoice storage and payment links.
+
+        A Facture snapshots a Sale/Devis at issuance. It deliberately has no
+        cascading relationship to Sales so a later Devis edit cannot mutate an
+        issued document. Payment rows remain in the existing shared ledger.
+        """
+        try:
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS factures (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    facture_number TEXT NOT NULL,
+                    invoice_year INTEGER NOT NULL,
+                    source_sale_id INTEGER,
+                    source_devis TEXT,
+                    client_id INTEGER,
+                    client_username TEXT,
+                    client_name TEXT NOT NULL,
+                    client_address TEXT,
+                    client_city TEXT,
+                    client_ice TEXT,
+                    date TEXT NOT NULL,
+                    facture_type TEXT NOT NULL DEFAULT 'normal',
+                    tva_rate NUMERIC(7, 3) NOT NULL DEFAULT 0,
+                    notes TEXT,
+                    operation_token TEXT,
+                    created_by INTEGER,
+                    created_by_username TEXT,
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    CHECK (facture_type IN ('normal', 'advance', 'balance'))
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS facture_items (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    facture_id INTEGER NOT NULL REFERENCES factures(id) ON DELETE RESTRICT,
+                    source_sale_item_id INTEGER,
+                    item_type TEXT NOT NULL DEFAULT 'manual',
+                    designation TEXT NOT NULL,
+                    information TEXT,
+                    unit TEXT,
+                    quantity NUMERIC(15, 3),
+                    unit_price NUMERIC(15, 2),
+                    discount_percentage NUMERIC(7, 3),
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS facture_sources (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    facture_id INTEGER NOT NULL REFERENCES factures(id) ON DELETE RESTRICT,
+                    sale_id INTEGER NOT NULL,
+                    source_devis TEXT,
+                    allocated_ttc NUMERIC(15, 2),
+                    created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+                    UNIQUE(facture_id, sale_id)
+                )
+            """)
+            # Invoice-time DISPLAY snapshot of the source Devis lines.
+            #
+            # A Facture de solde must show the original Products/Services on the
+            # document while its own accounting value stays the balance amount.
+            # Keeping the two apart is why this is a separate table: facture_items
+            # (and therefore _facture_totals / payments / status) is untouched, so
+            # no historical accounting amount is ever rewritten for presentation.
+            # The snapshot is taken when the invoice is issued, so a later edit of
+            # the Devis cannot silently change an already-issued document.
+            self.cursor.execute("""
+                CREATE TABLE IF NOT EXISTS facture_source_items (
+                    id INTEGER GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    facture_id INTEGER NOT NULL REFERENCES factures(id) ON DELETE CASCADE,
+                    source_sale_id INTEGER,
+                    source_sale_item_id INTEGER,
+                    item_type TEXT NOT NULL DEFAULT 'manual',
+                    designation TEXT NOT NULL,
+                    information TEXT,
+                    unit TEXT,
+                    quantity NUMERIC(15, 3),
+                    unit_price NUMERIC(15, 2),
+                    discount_percentage NUMERIC(7, 3),
+                    sort_order INTEGER NOT NULL DEFAULT 0
+                )
+            """)
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS facture_source_items_facture_id_idx "
+                "ON facture_source_items(facture_id)"
+            )
+            # Supplement a table created by an earlier pre-release build,
+            # without dropping, recreating, or rewriting existing data.
+            for column, sql_type in (
+                ("invoice_year", "INTEGER"), ("source_sale_id", "INTEGER"), ("source_devis", "TEXT"),
+                ("client_id", "INTEGER"), ("client_username", "TEXT"),
+                ("client_address", "TEXT"), ("client_city", "TEXT"),
+                ("client_ice", "TEXT"), ("tva_rate", "NUMERIC(7, 3)"),
+                ("remise", "NUMERIC(15, 2)"), ("remise_includes_line_discounts", "BOOLEAN"),
+                ("selected_total_ttc", "NUMERIC(15, 2)"), ("previous_advance_ttc", "NUMERIC(15, 2)"),
+                ("operation_token", "TEXT"), ("created_by", "INTEGER"),
+                ("created_by_username", "TEXT"), ("created_at", "TEXT"),
+                ("updated_at", "TEXT"),
+            ):
+                self.cursor.execute(
+                    f"ALTER TABLE factures ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+                )
+            self.cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS factures_number_uidx "
+                "ON factures(LOWER(BTRIM(facture_number))) "
+                "WHERE BTRIM(COALESCE(facture_number, '')) <> ''"
+            )
+            self.cursor.execute(
+                "CREATE UNIQUE INDEX IF NOT EXISTS factures_operation_token_uidx "
+                "ON factures(operation_token) WHERE operation_token IS NOT NULL "
+                "AND BTRIM(operation_token) <> ''"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS facture_items_facture_id_idx ON facture_items(facture_id)"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS facture_sources_sale_id_idx ON facture_sources(sale_id)"
+            )
+            self.cursor.execute("ALTER TABLE facture_sources ADD COLUMN IF NOT EXISTS source_devis TEXT")
+            # New invoices persist an explicit source allocation.  Existing
+            # rows remain NULL: their historical split cannot be recovered
+            # safely and must never be invented for a later partial Devis use.
+            self.cursor.execute("ALTER TABLE facture_sources ADD COLUMN IF NOT EXISTS allocated_ttc NUMERIC(15, 2)")
+            # Preserve every pre-existing single-Devis invoice as a source row.
+            # The old header columns remain intact for backwards compatibility.
+            self.cursor.execute(
+                "INSERT INTO facture_sources (facture_id, sale_id, source_devis) "
+                "SELECT id, source_sale_id, source_devis FROM factures WHERE source_sale_id IS NOT NULL "
+                "ON CONFLICT (facture_id, sale_id) DO NOTHING"
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS factures_client_id_idx ON factures(client_id)"
+            )
+            # Existing payments are the financial ledger. These additive fields
+            # let a payment be allocated to an invoice without duplicating it.
+            for column, sql_type in (
+                ("facture_id", "INTEGER"), ("method", "TEXT"),
+                ("reference", "TEXT"), ("notes", "TEXT"),
+                ("created_by", "INTEGER"), ("created_by_username", "TEXT"),
+            ):
+                self.cursor.execute(
+                    f"ALTER TABLE payments ADD COLUMN IF NOT EXISTS {column} {sql_type}"
+                )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS payments_facture_id_idx "
+                "ON payments(facture_id) WHERE facture_id IS NOT NULL"
+            )
+            self.conn.commit()
+        except Exception as exc:
+            self.conn.rollback()
+            print(f"Warning: could not create Facture tables: {exc}")
+
+    @staticmethod
+    def _facture_year(date_value):
+        match = re.search(r"\d{4}", str(date_value or ""))
+        return int(match.group(0)) if match else datetime.now().year
+
+    def _allocate_facture_number(self, date_value):
+        """Allocate FA-NNN/YEAR inside the caller's write transaction."""
+        year = self._facture_year(date_value)
+        # The unique index is the hard concurrency backstop. SERIALIZABLE
+        # callers retry at the RPC boundary if their host elects to do so.
+        self.cursor.execute("SELECT pg_advisory_xact_lock(%s)", (year,))
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(SPLIT_PART(facture_number, '/', 1) "
+            "FROM 3) AS INTEGER)), 0) + 1 FROM factures WHERE invoice_year=%s "
+            "AND facture_number ~ '^FA[0-9]+/[0-9]{4}$'",
+            (year,),
+        )
+        sequence = int(self.cursor.fetchone()[0])
+        return f"FA{sequence:03d}/{year}", year
+
+    def _facture_source_sale_ids(self, facture_id):
+        """Source Devis IDs linked to this invoice, from facture_sources."""
+        self.cursor.execute(
+            "SELECT sale_id FROM facture_sources WHERE facture_id=%s ORDER BY sale_id",
+            (int(facture_id),),
+        )
+        return [int(row[0]) for row in self.cursor.fetchall()]
+
+    def _facture_project_totals(self, facture_id, facture=None):
+        """Authoritative HT / VAT / TTC of the selected Devis scope.
+
+        These are the Devis' own Sales totals, read from the same place Sales
+        computes them - never recomputed from the invoice lines, so an advance
+        or balance invoice can display the real project value without touching
+        its own accounting total.
+        """
+        source_ids = self._facture_source_sale_ids(facture_id)
+        total_ht = vat_amount = total_ttc = Decimal("0")
+        for sale_id in source_ids:
+            try:
+                draft = self._sale_invoice_draft(sale_id)
+            except ValueError:
+                continue  # a source Devis was deleted: keep the invoice printable
+            total_ht += to_decimal(draft.get("total_ht") or 0)
+            vat_amount += to_decimal(draft.get("vat_amount") or 0)
+            total_ttc += to_decimal(draft.get("selected_total_ttc") or 0)
+        if not source_ids or total_ttc <= 0:
+            # No usable Devis (or a plain normal invoice): the invoice's own
+            # totals are the only meaningful project figures.
+            base = facture or {}
+            total_ht = to_decimal(base.get("total_ht") or 0)
+            vat_amount = to_decimal(base.get("vat_amount") or 0)
+            total_ttc = to_decimal(base.get("total_ttc") or 0)
+        return {
+            "selected_total_ht": round_money(total_ht),
+            "selected_vat_amount": round_money(vat_amount),
+            "selected_total_ttc": round_money(total_ttc),
+        }
+
+    def _facture_payment_scope(self, facture_id):
+        """Split actual payments into prior-project and current-invoice totals.
+
+        DÉJÀ PAYÉ counts payments made against OTHER invoices that share at
+        least one source Devis with this one, so an unrelated Devis for the same
+        client is never included. PAYÉ counts only this invoice's payments.
+        """
+        facture_id = int(facture_id)
+        current = self._facture_payment_total(facture_id)
+        source_ids = self._facture_source_sale_ids(facture_id)
+        previous = Decimal("0")
+        if source_ids:
+            placeholders = ",".join(["%s"] * len(source_ids))
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(p.amount), 0) FROM payments p "
+                "JOIN facture_sources fs ON fs.facture_id = p.facture_id "
+                f"WHERE p.facture_id <> %s AND fs.sale_id IN ({placeholders})",
+                [facture_id, *source_ids],
+            )
+            previous = self.cursor.fetchone()[0] or 0
+        return {
+            "previous_paid_ttc": round_money(previous),
+            "current_paid_ttc": round_money(current),
+        }
+
+    def _facture_source_items(self, facture_id):
+        """Display lines for the document: the invoice-time Devis snapshot.
+
+        Falls back to the live Devis lines for legacy invoices issued before
+        the snapshot existed, and finally to the invoice's own items, so every
+        historical Facture stays printable.
+        """
+        self.cursor.execute(
+            "SELECT source_sale_id, source_sale_item_id, item_type, designation, information, unit, "
+            "quantity, unit_price, discount_percentage, sort_order "
+            "FROM facture_source_items WHERE facture_id=%s ORDER BY sort_order, id",
+            (int(facture_id),),
+        )
+        rows = [
+            {"source_sale_id": row[0], "source_sale_item_id": row[1], "item_type": row[2],
+             "designation": row[3], "information": row[4] or "", "unit": row[5] or "",
+             "quantity": row[6], "unit_price": row[7], "discount_percentage": row[8],
+             "sort_order": row[9]}
+            for row in self.cursor.fetchall()
+        ]
+        if rows:
+            return rows
+        legacy = []
+        for sale_id in self._facture_source_sale_ids(facture_id):
+            try:
+                draft = self._sale_invoice_draft(sale_id)
+            except ValueError:
+                continue
+            for item in draft.get("items", []):
+                legacy.append({
+                    "source_sale_id": sale_id,
+                    "source_sale_item_id": item.get("source_sale_item_id"),
+                    "item_type": item.get("item_type") or "manual",
+                    "designation": item.get("designation") or "",
+                    "information": item.get("information") or "",
+                    "unit": item.get("unit") or "",
+                    "quantity": item.get("quantity"), "unit_price": item.get("unit_price"),
+                    "discount_percentage": item.get("discount_percentage") or 0,
+                    "sort_order": item.get("sort_order") or 0,
+                })
+        return legacy
+
+    def _snapshot_facture_source_items(self, facture_id, source_ids, user=None):
+        """Store the Devis display lines for this invoice (idempotent per save)."""
+        self.cursor.execute(
+            "DELETE FROM facture_source_items WHERE facture_id=%s", (int(facture_id),)
+        )
+        for sale_id in source_ids:
+            try:
+                draft = self._sale_invoice_draft(sale_id)
+            except ValueError:
+                continue
+            for item in draft.get("items", []):
+                self.cursor.execute(
+                    "INSERT INTO facture_source_items (facture_id, source_sale_id, "
+                    "source_sale_item_id, item_type, designation, information, unit, quantity, "
+                    "unit_price, discount_percentage, sort_order) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)",
+                    (
+                        int(facture_id), sale_id, item.get("source_sale_item_id"),
+                        item.get("item_type") or "manual", item.get("designation") or "",
+                        item.get("information") or "", item.get("unit") or "",
+                        item.get("quantity"), item.get("unit_price"),
+                        item.get("discount_percentage") or 0, item.get("sort_order") or 0,
+                    ),
+                )
+
+    def _facture_totals(self, facture_id):
+        """Return Decimal totals calculated from immutable invoice line snapshots."""
+        self.cursor.execute(
+            "SELECT quantity, unit_price, discount_percentage FROM facture_items "
+            "WHERE facture_id=%s AND item_type <> 'section' ORDER BY sort_order, id",
+            (int(facture_id),),
+        )
+        gross = Decimal("0")
+        line_discounts = Decimal("0")
+        for quantity, unit_price, discount in self.cursor.fetchall():
+            gross += to_decimal(quantity or 0) * to_decimal(unit_price or 0)
+            line_discounts += (to_decimal(quantity or 0) * to_decimal(unit_price or 0)
+                               - calculate_line_subtotal(quantity or 0, unit_price or 0, discount or 0))
+        self.cursor.execute(
+            "SELECT tva_rate, COALESCE(remise, 0), COALESCE(remise_includes_line_discounts, FALSE) "
+            "FROM factures WHERE id=%s", (int(facture_id),)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            raise ValueError(f"Facture {facture_id} does not exist")
+        remise = to_decimal(row[1] or 0) if row[2] else to_decimal(row[1] or 0) + line_discounts
+        return calculate_operation_totals(gross, remise, row[0] or 0)
+
+    def _sale_invoice_draft(self, sale_id, date=None, user=None):
+        """Load a Devis snapshot and its Sales-authoritative final TTC."""
+        sale_id = int(sale_id)
+        self.cursor.execute(
+            "SELECT s.id, s.client_id, s.client_username, s.client_name, s.date, s.tva, s.notes, s.devis, "
+            "COALESCE(s.remise, 0), COALESCE(s.remise_includes_line_discounts, FALSE) "
+            "FROM sales s WHERE s.id=%s", (sale_id,)
+        )
+        sale = self.cursor.fetchone()
+        if not sale or not sale[1]:
+            raise ValueError("Sale must have a persisted client before invoicing")
+        self.cursor.execute(
+            "SELECT id, item_type, product_name, information, '' AS unit, quantity, unit_price, "
+            "discount_percentage, sort_order FROM sales_items WHERE sales_id=%s ORDER BY sort_order, id",
+            (sale_id,),
+        )
+        items = [{"source_sale_item_id": row[0], "item_type": row[1], "designation": row[2],
+                  "information": row[3], "unit": row[4], "quantity": row[5], "unit_price": row[6],
+                  "discount_percentage": row[7], "sort_order": row[8]} for row in self.cursor.fetchall()]
+        raw_subtotal = sum((to_decimal(item["quantity"] or 0) * to_decimal(item["unit_price"] or 0)
+                            for item in items if item["item_type"] != "section"), Decimal("0"))
+        remise = to_decimal(sale[8] or 0)
+        if not sale[9]:
+            remise += sum((calculate_line_subtotal(item["quantity"] or 0, item["unit_price"] or 0, 0)
+                           - calculate_line_subtotal(item["quantity"] or 0, item["unit_price"] or 0,
+                                                     item["discount_percentage"] or 0)
+                           for item in items if item["item_type"] != "section"), Decimal("0"))
+        totals = calculate_operation_totals(raw_subtotal, remise, sale[5] or 0)
+        return {"client_id": sale[1], "source_sale_id": sale[0], "date": date or sale[4],
+                "tva_rate": sale[5] or 0, "notes": sale[6] or "", "source_devis": sale[7] or "",
+                "items": items, "selected_total_ttc": totals["total_ttc"],
+                # Authoritative HT/TVA of the Devis itself, so invoice documents
+                # can display the project value without recomputing it.
+                "total_ht": totals["total_ht"], "vat_amount": totals["vat_amount"],
+                "sale_remise": remise, "sale_remise_includes_line_discounts": bool(sale[9])}
+
+    @staticmethod
+    def _proportional_allocations(source_totals, amount):
+        """Allocate a TTC amount deterministically, preserving cents exactly."""
+        amount = round_money(amount)
+        total = sum(source_totals.values(), Decimal("0"))
+        if amount < 0 or amount > total:
+            raise ValueError("Le montant à facturer dépasse le reste disponible des devis.")
+        allocations, assigned = {}, Decimal("0")
+        source_ids = sorted(source_totals)
+        for source_id in source_ids[:-1]:
+            allocation = round_money(amount * source_totals[source_id] / total) if total else Decimal("0")
+            allocations[source_id] = allocation
+            assigned += allocation
+        if source_ids:
+            allocations[source_ids[-1]] = round_money(amount - assigned)
+        return allocations
+
+    # Message for a NEW billing calculation that cannot be done safely. Reads
+    # never raise this - an old invoice must stay viewable no matter what.
+    AMBIGUOUS_ALLOCATION_MESSAGE = (
+        "Impossible de calculer automatiquement le reste à facturer pour ce devis : "
+        "une ancienne facture liée à plusieurs devis ne contient pas de répartition "
+        "détaillée. Créez la nouvelle facture depuis les devis complets concernés, "
+        "ou saisissez le montant manuellement."
+    )
+
+    def _backfill_unambiguous_source_allocations(self):
+        """Give legacy invoices an allocation when it is mathematically certain.
+
+        An invoice linked to exactly ONE Devis cannot be ambiguous: its whole
+        accounting amount belongs to that Devis. The amount comes from the
+        authoritative _facture_totals(), so the Remise/TVA rules are never
+        re-implemented here. Idempotent (guarded on allocated_ttc IS NULL) and
+        non-destructive: a multi-Devis invoice keeps an unknown split and is
+        never given invented numbers.
+
+        Called from the one-time migration, not from a read path, so reading
+        invoices never performs a write.
+        """
+        self.cursor.execute(
+            "SELECT facture_id, sale_id FROM facture_sources "
+            "WHERE allocated_ttc IS NULL ORDER BY facture_id, sale_id"
+        )
+        pending = {}
+        for facture_id, sale_id in self.cursor.fetchall():
+            pending.setdefault(int(facture_id), []).append(int(sale_id))
+        filled = 0
+        for facture_id, sale_ids in pending.items():
+            if len(sale_ids) != 1:
+                continue
+            try:
+                total = self._facture_totals(facture_id)["total_ttc"]
+            except Exception:
+                continue
+            self.cursor.execute(
+                "UPDATE facture_sources SET allocated_ttc=%s "
+                "WHERE facture_id=%s AND sale_id=%s AND allocated_ttc IS NULL",
+                (total, facture_id, sale_ids[0]),
+            )
+            filled += self.cursor.rowcount or 0
+        self.conn.commit()
+        if filled:
+            print(
+                f"Migrated facture_sources.allocated_ttc: {filled} unambiguous "
+                "single-Devis link(s) resolved; multi-Devis invoices left unknown"
+            )
+        return filled
+
+    def _source_allocation_rows(self, source_ids, exclude_facture_id=None):
+        placeholders = ",".join(["%s"] * len(source_ids))
+        params = list(source_ids)
+        query = (
+            "SELECT fs.sale_id, fs.allocated_ttc, fs.facture_id FROM facture_sources fs "
+            f"WHERE fs.sale_id IN ({placeholders})"
+        )
+        if exclude_facture_id:
+            query += " AND fs.facture_id <> %s"
+            params.append(int(exclude_facture_id))
+        self.cursor.execute(query + " ORDER BY fs.facture_id, fs.sale_id", params)
+        return [(int(row[0]), row[1], int(row[2])) for row in self.cursor.fetchall()]
+
+    def get_invoiced_total_for_sources(self, sale_ids, exclude_facture_id=None, user=None,
+                                        strict=True):
+        """Issued TTC allocated to each requested Devis, never payments.
+
+        ``strict=True`` (new billing calculation only) refuses to guess when an
+        older invoice spanning several Devis has no stored per-Devis split.
+        ``strict=False`` is the READ path: it reports what is known and flags
+        the ambiguity instead of raising, so listing, previewing, printing and
+        payment history of an existing invoice can never fail.
+
+        ``ambiguous_facture_ids`` is a sorted list of ids, not a set, so the
+        result stays JSON-safe over the RPC layer.
+        """
+        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
+        if not source_ids:
+            return {"total_ttc": Decimal("0"), "by_source": {},
+                    "ambiguous_facture_ids": [], "group_level": False}
+        rows = self._source_allocation_rows(source_ids, exclude_facture_id)
+        by_source = {source_id: Decimal("0") for source_id in source_ids}
+        ambiguous = {}
+        for source_id, allocated_ttc, facture_id in rows:
+            if allocated_ttc is None:
+                ambiguous.setdefault(facture_id, set()).add(source_id)
+                continue
+            by_source[source_id] += to_decimal(allocated_ttc)
+        by_source = {source_id: round_money(value) for source_id, value in by_source.items()}
+
+        if ambiguous and strict:
+            # A group that covers the ambiguous invoice's Devis exactly is safe:
+            # the group total is known even though its internal split is not.
+            requested = set(source_ids)
+            grouped_total = sum(by_source.values(), Decimal("0"))
+            sources_of = {}
+            for facture_id in ambiguous:
+                self.cursor.execute(
+                    "SELECT sale_id FROM facture_sources WHERE facture_id=%s", (facture_id,)
+                )
+                sources_of[facture_id] = {int(r[0]) for r in self.cursor.fetchall()}
+            unresolved = [fid for fid, srcs in sources_of.items() if srcs != requested]
+            if unresolved:
+                raise ValueError(self.AMBIGUOUS_ALLOCATION_MESSAGE)
+            # Exact same Devis group: each ambiguous invoice's group total is
+            # known even though its internal split is not, so every one of them
+            # is added. The new invoice's own split is computed fresh from the
+            # remaining amounts by the caller.
+            for facture_id in ambiguous:
+                grouped_total = grouped_total + self._facture_totals(facture_id)["total_ttc"]
+            return {
+                "total_ttc": round_money(grouped_total), "by_source": by_source,
+                "ambiguous_facture_ids": sorted(ambiguous),
+                "group_level": True,
+            }
+
+        return {
+            "total_ttc": round_money(sum(by_source.values(), Decimal("0"))),
+            "by_source": by_source,
+            "ambiguous_facture_ids": sorted(ambiguous),
+            "group_level": bool(ambiguous),
+        }
+
+    def _facture_payment_total(self, facture_id):
+        self.cursor.execute(
+            "SELECT COALESCE(SUM(amount), 0) FROM payments WHERE facture_id=%s",
+            (int(facture_id),),
+        )
+        return round_money(self.cursor.fetchone()[0] or 0)
+
+    def get_next_facture_preview(self, date=None, user=None):
+        """Advisory number preview; allocation happens in the save transaction."""
+        year = self._facture_year(date)
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(SPLIT_PART(facture_number, '/', 1) "
+            "FROM 3) AS INTEGER)), 0) + 1 FROM factures WHERE invoice_year=%s "
+            "AND facture_number ~ '^FA[0-9]+/[0-9]{4}$'",
+            (year,),
+        )
+        return f"FA{int(self.cursor.fetchone()[0]):03d}/{year}"
+
+    def save_facture_with_items(self, facture_data, items, facture_id=None, user=None):
+        """Atomically persist an independent invoice and its full line snapshot."""
+        if not isinstance(facture_data, dict) or not isinstance(items, list):
+            raise ValueError("Facture header and items must be objects and an array")
+        valid_types = {"normal", "advance", "balance"}
+        facture_type = str(facture_data.get("facture_type") or "normal").casefold()
+        if facture_type not in valid_types:
+            raise ValueError("Invalid facture type")
+        date_value = str(facture_data.get("date") or datetime.now().strftime("%Y-%m-%d"))
+        client_id = int(facture_data.get("client_id") or 0)
+        if not client_id:
+            raise ValueError("Client is required")
+        tva_rate = to_decimal(facture_data.get("tva_rate", facture_data.get("tva", 0)))
+        if not Decimal("0") <= tva_rate <= Decimal("100"):
+            raise ValueError("TVA rate must be between 0 and 100")
+
+        validated = []
+        for order, raw in enumerate(items, 1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item {order} must be an object")
+            designation = str(raw.get("designation") or raw.get("product_name") or "").strip()
+            item_type = str(raw.get("item_type") or "manual").casefold()
+            if item_type not in {"product", "service", "manual", "section"}:
+                item_type = "manual"
+            if not designation:
+                raise ValueError(f"Item {order}: designation is required")
+            if item_type == "section":
+                quantity = unit_price = discount = None
+            else:
+                quantity = self._sale_decimal(raw.get("quantity"), f"item {order} quantity", "0.001")
+                unit_price = self._sale_decimal(raw.get("unit_price"), f"item {order} unit price", "0")
+                discount = self._sale_decimal(raw.get("discount_percentage", 0), f"item {order} discount", "0")
+                if quantity < 0 or unit_price < 0 or not Decimal("0") <= discount <= Decimal("100"):
+                    raise ValueError(f"Item {order}: invalid quantity, price, or discount")
+            validated.append((
+                raw.get("source_sale_item_id") or raw.get("id"), item_type, designation,
+                str(raw.get("information") or "").strip(), str(raw.get("unit") or "").strip(),
+                quantity, unit_price, discount, int(raw.get("sort_order") or order),
+            ))
+        if not validated:
+            raise ValueError("A facture requires at least one item")
+
+        try:
+            existing_snapshot = None
+            if facture_id:
+                self.cursor.execute(
+                    "SELECT client_id, client_username, client_name, client_address, client_city, client_ice "
+                    "FROM factures WHERE id=%s FOR UPDATE", (int(facture_id),)
+                )
+                existing_snapshot = self.cursor.fetchone()
+                if not existing_snapshot:
+                    raise ValueError(f"Facture {facture_id} does not exist")
+            self.cursor.execute(
+                "SELECT id, username, name, address, ice FROM clients WHERE id=%s", (client_id,)
+            )
+            client = self.cursor.fetchone()
+            # An issued invoice remains a legal document even if the original
+            # client record was later removed. Only retain that exact stored
+            # identity; a newly selected client must always exist live.
+            if not client and existing_snapshot and client_id == existing_snapshot[0]:
+                client = (existing_snapshot[0], existing_snapshot[1], existing_snapshot[2],
+                          existing_snapshot[3], existing_snapshot[5])
+            if not client:
+                raise ValueError("Selected client does not exist")
+            actor = self._actor_fields(user)
+            raw_source_ids = facture_data.get("source_sale_ids")
+            if raw_source_ids is None:
+                raw_source_ids = [facture_data.get("source_sale_id") or facture_data.get("devis_id")]
+            source_ids = sorted({int(value) for value in raw_source_ids if value})
+            source_devis_values = []
+            if source_ids:
+                placeholders = ",".join(["%s"] * len(source_ids))
+                self.cursor.execute(
+                    f"SELECT id, client_id, devis FROM sales WHERE id IN ({placeholders})", source_ids
+                )
+                source_rows = self.cursor.fetchall()
+                if len(source_rows) != len(source_ids):
+                    raise ValueError("One or more selected Devis no longer exist")
+                if any(int(row[1] or 0) != client_id for row in source_rows):
+                    raise ValueError("Les devis sélectionnés doivent appartenir au même client.")
+                devis_by_id = {int(row[0]): str(row[2] or "") for row in source_rows}
+                source_devis_values = [devis_by_id[source_id] for source_id in source_ids]
+            source_sale_id = source_ids[0] if len(source_ids) == 1 else None
+            source_devis = " / ".join(value for value in source_devis_values if value)
+            notes = str(facture_data.get("notes") or "")
+            selected_total_ttc = round_money(facture_data.get("selected_total_ttc") or 0)
+            previous_advance_ttc = round_money(facture_data.get("previous_advance_ttc") or 0)
+            remise = round_money(facture_data.get("remise") or 0)
+            remise_includes_line_discounts = self._parse_bool_flag(
+                facture_data.get("remise_includes_line_discounts", False)
+            )
+            address = str(facture_data.get("client_address") if "client_address" in facture_data else client[3] or "")
+            city = str(facture_data.get("client_city") if "client_city" in facture_data else (
+                existing_snapshot[4] if existing_snapshot else "") or "")
+            ice = str(facture_data.get("client_ice") if "client_ice" in facture_data else client[4] or "")
+
+            invoice_gross = sum((quantity * unit_price for _, item_type, _, _, _, quantity, unit_price, _, _ in validated
+                                 if item_type != "section"), Decimal("0"))
+            invoice_line_discounts = sum((quantity * unit_price - calculate_line_subtotal(quantity, unit_price, discount)
+                                          for _, item_type, _, _, _, quantity, unit_price, discount, _ in validated
+                                          if item_type != "section"), Decimal("0"))
+            invoice_remise = remise if remise_includes_line_discounts else remise + invoice_line_discounts
+            invoice_total_ttc = calculate_operation_totals(invoice_gross, invoice_remise, tva_rate)["total_ttc"]
+            allocations = {}
+            if facture_id and source_ids:
+                self.cursor.execute(
+                    "SELECT sale_id, allocated_ttc FROM facture_sources WHERE facture_id=%s", (int(facture_id),)
+                )
+                existing_allocations = {int(source_id): to_decimal(amount) for source_id, amount in self.cursor.fetchall()
+                                        if amount is not None}
+                if set(existing_allocations) == set(source_ids) and round_money(sum(existing_allocations.values(), Decimal("0"))) == invoice_total_ttc:
+                    allocations = existing_allocations
+            if source_ids and not allocations:
+                source_drafts = [self._sale_invoice_draft(source_id, date_value, user) for source_id in source_ids]
+                if any(to_decimal(draft["tva_rate"] or 0) != tva_rate for draft in source_drafts):
+                    raise ValueError("Les devis sélectionnés doivent utiliser le même taux de TVA.")
+                source_totals = {draft["source_sale_id"]: draft["selected_total_ttc"] for draft in source_drafts}
+                already = self.get_invoiced_total_for_sources(source_ids, facture_id, user)["by_source"]
+                available = {source_id: max(Decimal("0"), source_totals[source_id] - already[source_id])
+                             for source_id in source_ids}
+                available_total = round_money(sum(available.values(), Decimal("0")))
+                if invoice_total_ttc > available_total:
+                    raise ValueError("Le montant à facturer dépasse le reste disponible des devis.")
+                if facture_type == "balance" and invoice_total_ttc != available_total:
+                    raise ValueError("Une facture de solde doit facturer exactement le reste disponible.")
+                allocations = self._proportional_allocations(available, invoice_total_ttc)
+
+            if facture_id:
+                facture_id = int(facture_id)
+                self.cursor.execute(
+                    "UPDATE factures SET client_id=%s, client_username=%s, client_name=%s, "
+                    "client_address=%s, client_city=%s, client_ice=%s, date=%s, facture_type=%s, "
+                    "source_sale_id=%s, source_devis=%s, tva_rate=%s, remise=%s, remise_includes_line_discounts=%s, selected_total_ttc=%s, previous_advance_ttc=%s, notes=%s, updated_at=CURRENT_TIMESTAMP WHERE id=%s",
+                    (client[0], client[1], client[2], address, city, ice, date_value,
+                      facture_type, source_sale_id, source_devis, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, facture_id),
+                )
+                self.cursor.execute("DELETE FROM facture_items WHERE facture_id=%s", (facture_id,))
+                if "source_sale_ids" in facture_data:
+                    self.cursor.execute("DELETE FROM facture_sources WHERE facture_id=%s", (facture_id,))
+            else:
+                token = str(facture_data.get("operation_token") or "").strip()
+                if token:
+                    self.cursor.execute("SELECT id FROM factures WHERE operation_token=%s", (token,))
+                    duplicate = self.cursor.fetchone()
+                    if duplicate:
+                        return {"facture_id": int(duplicate[0]), "duplicate": True}
+                number, year = self._allocate_facture_number(date_value)
+                self.cursor.execute(
+                    "INSERT INTO factures (facture_number, invoice_year, source_sale_id, source_devis, client_id, "
+                    "client_username, client_name, client_address, client_city, client_ice, date, "
+                    "facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, operation_token, created_by, created_by_username, created_at) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                    (number, year, source_sale_id, source_devis, client[0], client[1], client[2], address, city,
+                      ice, date_value, facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, token,
+                     actor["created_by"], actor["created_by_username"], actor["created_at"]),
+                )
+                facture_id = int(self.cursor.fetchone()[0])
+            if source_ids:
+                for source_id in source_ids:
+                    self.cursor.execute(
+                        "INSERT INTO facture_sources (facture_id, sale_id, source_devis, allocated_ttc) VALUES (%s,%s,%s,%s) "
+                        "ON CONFLICT (facture_id, sale_id) DO UPDATE SET source_devis=EXCLUDED.source_devis, allocated_ttc=EXCLUDED.allocated_ttc",
+                        (facture_id, source_id, devis_by_id.get(source_id, ""), allocations[source_id])
+                    )
+                # Freeze the Devis display lines for this document. The balance
+                # invoice keeps its own accounting amount in facture_items; this
+                # snapshot only supplies what the PDF shows.
+                self._snapshot_facture_source_items(facture_id, source_ids, user)
+            for line in validated:
+                self.cursor.execute(
+                    "INSERT INTO facture_items (facture_id, source_sale_item_id, item_type, designation, "
+                    "information, unit, quantity, unit_price, discount_percentage, sort_order) "
+                    "VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s,%s)", (facture_id, *line),
+                )
+            self.conn.commit()
+            return {"facture_id": facture_id, "facture_number": self.get_facture(facture_id)["facture_number"]}
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_facture_draft_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
+        """Return an editable, unsaved independent Facture draft from a Devis."""
+        draft = self._sale_invoice_draft(sale_id, date, user)
+        draft["facture_type"] = facture_type
+        draft["remise"] = draft["sale_remise"]
+        draft["remise_includes_line_discounts"] = True
+        return draft
+
+    def get_facture_draft_from_sales(self, sale_ids, facture_type="normal", date=None,
+                                     exclude_facture_id=None, user=None):
+        """Build one immutable invoice draft from one or more same-client Devis."""
+        source_ids = sorted({int(value) for value in (sale_ids or []) if value})
+        if not source_ids:
+            raise ValueError("Sélectionnez au moins un devis.")
+        drafts = [self.get_facture_draft_from_sale(source_id, "normal", date, user) for source_id in source_ids]
+        client_ids = {draft["client_id"] for draft in drafts}
+        if len(client_ids) != 1:
+            raise ValueError("Les devis sélectionnés doivent appartenir au même client.")
+        tva_rates = {to_decimal(draft["tva_rate"] or 0) for draft in drafts}
+        if len(tva_rates) != 1:
+            raise ValueError("Les devis sélectionnés doivent utiliser le même taux de TVA.")
+        source_totals = {draft["source_sale_id"]: round_money(draft["selected_total_ttc"]) for draft in drafts}
+        source_total_ttc = sum(source_totals.values(), Decimal("0"))
+        source_devis = [draft.get("source_devis") for draft in drafts if draft.get("source_devis")]
+        tva_rate = drafts[0]["tva_rate"]
+        result = {
+            "client_id": drafts[0]["client_id"], "date": date or drafts[0]["date"],
+            "tva_rate": tva_rate, "notes": "", "facture_type": facture_type,
+            "source_sale_ids": source_ids, "source_devis": " / ".join(source_devis),
+            "selected_total_ttc": round_money(source_total_ttc),
+            "source_totals_ttc": source_totals,
+            # Store the final Sales remise as one invoice-level value. This
+            # exactly preserves each source's displayed Sales total without
+            # applying line discounts a second time.
+            "remise": sum((to_decimal(draft["sale_remise"]) for draft in drafts), Decimal("0")),
+            "remise_includes_line_discounts": True,
+            "items": [item for draft in drafts for item in draft["items"]],
+        }
+        if facture_type in ("advance", "balance"):
+            invoiced = self.get_invoiced_total_for_sources(source_ids, exclude_facture_id, user)
+            result["previous_advance_ttc"] = invoiced["total_ttc"]
+            result["invoiced_by_source"] = invoiced["by_source"]
+            result["remaining_ttc"] = max(Decimal("0"), result["selected_total_ttc"] - invoiced["total_ttc"])
+        return result
+
+    def get_previous_advance_total(self, sale_ids, exclude_facture_id=None):
+        """Compatibility name retained for callers; includes every invoice type."""
+        return self.get_invoiced_total_for_sources(sale_ids, exclude_facture_id)["total_ttc"]
+
+    def create_facture_from_sale(self, sale_id, facture_type="normal", date=None, user=None):
+        """Persist a Devis snapshot for non-interactive callers."""
+        draft = self.get_facture_draft_from_sale(sale_id, facture_type, date, user)
+        items = draft.pop("items")
+        return self.save_facture_with_items(draft, items, user=user)
+
+    def get_facture(self, facture_id, user=None):
+        """Load an invoice snapshot with derived totals, payment history, and status."""
+        facture_id = int(facture_id)
+        self.cursor.execute(
+            "SELECT id, facture_number, source_sale_id, source_devis, client_id, client_username, client_name, "
+            "client_address, client_city, client_ice, date, facture_type, tva_rate, remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, "
+            "created_at, updated_at FROM factures WHERE id=%s", (facture_id,)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            raise ValueError(f"Facture {facture_id} does not exist")
+        fields = ("id", "facture_number", "source_sale_id", "source_devis", "client_id", "client_username", "client_name",
+                  "client_address", "client_city", "client_ice", "date", "facture_type", "tva_rate", "remise", "remise_includes_line_discounts", "selected_total_ttc", "previous_advance_ttc", "notes",
+                  "created_at", "updated_at")
+        result = dict(zip(fields, row))
+        self.cursor.execute(
+            "SELECT id, source_sale_item_id, item_type, designation, information, unit, quantity, "
+            "unit_price, discount_percentage, sort_order FROM facture_items WHERE facture_id=%s "
+            "ORDER BY sort_order, id", (facture_id,),
+        )
+        item_fields = ("id", "source_sale_item_id", "item_type", "designation", "information", "unit",
+                       "quantity", "unit_price", "discount_percentage", "sort_order")
+        result["items"] = [dict(zip(item_fields, item)) for item in self.cursor.fetchall()]
+        self.cursor.execute(
+            "SELECT fs.sale_id, COALESCE(NULLIF(fs.source_devis, ''), s.devis), fs.allocated_ttc FROM facture_sources fs LEFT JOIN sales s ON s.id=fs.sale_id "
+            "WHERE fs.facture_id=%s ORDER BY fs.id", (facture_id,)
+        )
+        result["sources"] = [{"sale_id": row[0], "devis": row[1], "allocated_ttc": row[2]} for row in self.cursor.fetchall()]
+        if result["sources"]:
+            result["source_devis"] = " / ".join(str(row["devis"] or "") for row in result["sources"] if row["devis"])
+        totals = self._facture_totals(facture_id)
+        paid = self._facture_payment_total(facture_id)
+        remaining = max(Decimal("0"), totals["total_ttc"] - paid)
+        result.update(totals)
+        result.update({"paid": paid, "remaining": remaining,
+                       "status": "Payée" if paid >= totals["total_ttc"] else (
+                           "Partiellement payée" if paid else "Non payée")})
+        result["amount_in_words"] = __import__(
+            "core.moroccan_dirham_words", fromlist=["amount_to_words"]
+        ).amount_to_words(totals["total_ttc"])
+
+        # ---- Authoritative document values -------------------------------
+        # The renderer only draws these; it never recomputes cross-invoice
+        # money. `total_ht` / `vat_amount` / `total_ttc` above stay the invoice's
+        # OWN accounting value (what payments/status are based on), while the
+        # selected_* values describe the Devis/project behind the invoice.
+        project = self._facture_project_totals(facture_id, facture=result)
+        scope = self._facture_payment_scope(facture_id)
+        result.update(project)
+        result.update(scope)
+        result["project_remaining_to_pay"] = max(
+            Decimal("0"),
+            project["selected_total_ttc"] - scope["previous_paid_ttc"] - scope["current_paid_ttc"],
+        )
+        # Informational only, and deliberately tolerant: reading an existing
+        # invoice must never compute (or refuse) a new billing balance. The
+        # strict per-Devis allocation check belongs to the new-invoice path
+        # only (get_facture_draft_from_sales / save_facture_with_items).
+        source_sale_ids = [source["sale_id"] for source in result["sources"]]
+        result["already_invoiced_ttc"] = (
+            self.get_invoiced_total_for_sources(
+                source_sale_ids, facture_id, strict=False
+            )["total_ttc"] if source_sale_ids else Decimal("0")
+        )
+        result["source_items"] = (
+            self._facture_source_items(facture_id)
+            if str(result.get("facture_type")) == "balance" else []
+        )
+        return result
+
+    def _facture_header_fallback(self, facture_id):
+        """Minimal invoice row built only from persisted header values.
+
+        Used by list_factures() so an invoice whose optional derived data
+        cannot be rebuilt is still listed (and can still be opened) instead of
+        disappearing from the table. No cross-invoice money is computed here.
+        """
+        self.cursor.execute(
+            "SELECT id, facture_number, source_sale_id, source_devis, client_id, client_username, "
+            "client_name, client_address, client_city, client_ice, date, facture_type, tva_rate, "
+            "remise, remise_includes_line_discounts, selected_total_ttc, previous_advance_ttc, notes, "
+            "created_at, updated_at FROM factures WHERE id=%s", (int(facture_id),)
+        )
+        row = self.cursor.fetchone()
+        if not row:
+            return None
+        fields = ("id", "facture_number", "source_sale_id", "source_devis", "client_id",
+                  "client_username", "client_name", "client_address", "client_city", "client_ice",
+                  "date", "facture_type", "tva_rate", "remise", "remise_includes_line_discounts",
+                  "selected_total_ttc", "previous_advance_ttc", "notes", "created_at", "updated_at")
+        result = dict(zip(fields, row))
+        result["read_error"] = True
+        result["already_invoiced_ttc"] = to_decimal(result.get("previous_advance_ttc") or 0)
+        return result
+
+    def list_factures(self, user=None):
+        """List invoice headers with status derived from items and ledger rows.
+
+        Each invoice is read independently. If one invoice's optional derived
+        data cannot be rebuilt, it is still listed from its persisted header
+        values rather than aborting the whole query, so the Factures tab always
+        shows every invoice.
+        """
+        self.cursor.execute("SELECT id FROM factures ORDER BY date DESC, id DESC")
+        factures = []
+        for row in self.cursor.fetchall():
+            facture_id = int(row[0])
+            try:
+                factures.append(self.get_facture(facture_id))
+            except Exception as exc:
+                logger.exception("Facture id=%s listed from persisted header: %s", facture_id, exc)
+                try:
+                    fallback = self._facture_header_fallback(facture_id)
+                except Exception:
+                    self.conn.rollback()
+                    logger.exception("Facture id=%s header fallback failed", facture_id)
+                    fallback = None
+                if fallback:
+                    factures.append(fallback)
+        return factures
+
+    def add_facture_payment(self, facture_id, amount, date, method="Autre", reference="", notes="", user=None):
+        """Add a ledger payment allocation without creating a second transaction."""
+        facture_id = int(facture_id)
+        amount = round_money(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        allowed_methods = {"Espèces", "Chèque", "Virement", "Carte", "Autre"}
+        if method not in allowed_methods:
+            raise ValueError("Unsupported payment method")
+        try:
+            facture = self.get_facture(facture_id)
+            if amount > facture["remaining"]:
+                raise ValueError("Payment exceeds the remaining invoice balance")
+            actor = self._actor_fields(user)
+            self.cursor.execute(
+                "INSERT INTO payments (facture_id, client_id, amount, date, method, reference, notes, "
+                "created_by, created_by_username) VALUES (%s,%s,%s,%s,%s,%s,%s,%s,%s) RETURNING id",
+                (facture_id, facture["client_id"], amount, str(date), method, str(reference or ""),
+                 str(notes or ""), actor["created_by"], actor["created_by_username"]),
+            )
+            payment_id = int(self.cursor.fetchone()[0])
+            self.conn.commit()
+            return payment_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def get_facture_payments(self, facture_id, user=None):
+        self.cursor.execute(
+            "SELECT id, date, amount, method, reference, notes, created_by_username "
+            "FROM payments WHERE facture_id=%s ORDER BY date, id", (int(facture_id),)
+        )
+        fields = ("id", "date", "amount", "method", "reference", "notes", "created_by_username")
+        return [dict(zip(fields, row)) for row in self.cursor.fetchall()]
+
+    def update_facture_payment(self, facture_id, payment_id, amount, date, method="Autre", reference="", notes="", user=None):
+        """Edit one invoice payment without allowing the invoice to be overpaid."""
+        facture_id = int(facture_id)
+        payment_id = int(payment_id)
+        amount = round_money(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        allowed_methods = {"Espèces", "Chèque", "Virement", "Carte", "Autre"}
+        if method not in allowed_methods:
+            raise ValueError("Unsupported payment method")
+        try:
+            self.cursor.execute(
+                "SELECT amount FROM payments WHERE id=%s AND facture_id=%s", (payment_id, facture_id)
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            facture = self.get_facture(facture_id)
+            adjusted_paid = to_decimal(facture["paid"]) - to_decimal(row[0]) + amount
+            if adjusted_paid > to_decimal(facture["total_ttc"]):
+                raise ValueError("Payment exceeds the remaining invoice balance")
+            self.cursor.execute(
+                "UPDATE payments SET amount=%s, date=%s, method=%s, reference=%s, notes=%s "
+                "WHERE id=%s AND facture_id=%s RETURNING id",
+                (amount, str(date), method, str(reference or ""), str(notes or ""), payment_id, facture_id),
+            )
+            updated = self.cursor.fetchone()
+            if not updated:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            self.conn.commit()
+            return int(updated[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_facture_payment(self, facture_id, payment_id, user=None):
+        """Delete one payment allocation; Facture totals remain derived from the ledger."""
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id=%s AND facture_id=%s RETURNING id",
+                (int(payment_id), int(facture_id)),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not belong to this invoice")
+            self.conn.commit()
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_facture(self, facture_id, user=None):
+        """Delete only an unpaid invoice; financial history is never deleted."""
+        facture_id = int(facture_id)
+        try:
+            if self._facture_payment_total(facture_id):
+                raise ValueError("An invoice with payments cannot be deleted")
+            self.cursor.execute("DELETE FROM facture_items WHERE facture_id=%s", (facture_id,))
+            self.cursor.execute("DELETE FROM facture_sources WHERE facture_id=%s", (facture_id,))
+            self.cursor.execute("DELETE FROM factures WHERE id=%s RETURNING id", (facture_id,))
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Facture {facture_id} does not exist")
+            self.conn.commit()
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def _ensure_devis_numbers(self, sale_ids=None):
+        """Assign persistent per-year Devis numbers (DE-YEAR-N) to sales.
+
+        The number is stored on ``sales.devis_number`` so it is stable across
+        restarts, refreshes, other PCs and report printing. Legacy sales and
+        sales created since the last host startup are backfilled in ascending
+        ``sales.id`` order within each year, starting after the highest number
+        already assigned for that year. Already-assigned rows are never
+        touched, so the backfill is idempotent and renumbering never happens.
+
+        ``sale_ids`` optionally restricts the backfill to a subset (used by the
+        read path when a sale is about to be displayed but has no number yet).
+        When ``sale_ids`` is omitted every missing number is assigned in one
+        statement.
+
+        Returns the number of sales that were assigned a Devis number.
+        """
+        try:
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS sales_devis_number_idx ON sales(devis_number)"
+            )
+            extra = ""
+            params = []
+            if sale_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(sale_id) for sale_id in sale_ids])
+            sql = f"""
+                WITH year_map AS (
+                    SELECT s.id AS sale_id,
+                           {_DEVIS_YEAR_EXPR} AS y
+                    FROM sales s
+                    WHERE s.devis_number IS NULL {extra}
+                ),
+                grouped AS (
+                    SELECT ym.sale_id, ym.y,
+                           ROW_NUMBER() OVER (PARTITION BY ym.y ORDER BY ym.sale_id) AS rn
+                    FROM year_map ym
+                ),
+                base AS (
+                    SELECT COALESCE(NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{{4}}'), ''),
+                                    NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{{4}}'), ''),
+                                    '0') AS y,
+                           MAX(s.devis_number) AS m
+                    FROM sales s
+                    WHERE s.devis_number IS NOT NULL
+                    GROUP BY 1
+                )
+                UPDATE sales s
+                SET devis_number = g.rn + COALESCE(b.m, 0)
+                FROM grouped g
+                LEFT JOIN base b ON b.y = g.y
+                WHERE s.id = g.sale_id
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "Devis backfill assigned=%s restricted=%s",
+                    assigned, bool(sale_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("Devis backfill failed: %s", exc)
+            return 0
+
+    def _ensure_devis_text(self, sale_ids=None):
+        """Persist the canonical ``sales.devis`` TEXT reference from the
+        per-year ``devis_number`` for any sale that has a number but no text.
+
+        Legacy rows and rows created before the TEXT column existed get
+        ``DE-YEAR-N`` written once; afterwards the text is authoritative and
+        the backfill never touches a non-empty value. ``sale_ids`` optionally
+        restricts the backfill (read path). Returns rows updated.
+        """
+        try:
+            extra = ""
+            params = []
+            if sale_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(sale_id) for sale_id in sale_ids])
+            sql = f"""
+                UPDATE sales s
+                SET devis = 'DE-' || {_DEVIS_YEAR_EXPR} || '-' || s.devis_number
+                WHERE (s.devis IS NULL OR BTRIM(s.devis) = '')
+                  AND s.devis_number IS NOT NULL {extra}
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "Devis text backfill assigned=%s restricted=%s",
+                    assigned, bool(sale_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("Devis text backfill failed: %s", exc)
+            return 0
+
+    @staticmethod
+    def _devis_year_from_date(date_value):
+        """First 4-digit group of a date string, else the current year."""
+        if date_value:
+            match = re.search(r"\d{4}", str(date_value))
+            if match:
+                return match.group(0)
+        return str(datetime.now().year)
+
+    def _allocate_devis_number(self, sale_id, header):
+        """Allocate the next per-year Devis number and store it on ``header``.
+
+        Runs inside the sale-save transaction on the host - never on a GUI
+        thread - so two clients cannot race a SELECT MAX+1. The unique index
+        ``sales_devis_uidx`` remains the hard backstop.
+        """
+        year = self._devis_year_from_date(header.get("date"))
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(devis_number), 0) + 1 FROM ("
+            f"SELECT s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year "
+            "FROM sales s) sub WHERE sub.devis_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        header["devis"] = f"DE-{year}-{next_num}"
+        header["devis_number"] = next_num
+
+    def _resolve_sale_devis(self, sale_id, header):
+        """Host-side Devis resolution for creates and edits.
+
+        Mutates ``header`` with the authoritative ``devis`` (and
+        ``devis_number`` when one was allocated or recovered). Rules:
+
+        * A provided reference is stored verbatim (never silently changed)
+          and must be unique (case-insensitive) among all other sales.
+        * An empty reference on a create allocates the next per-year number.
+        * An empty reference on an edit preserves the stored reference, or
+          allocates one for legacy rows that have none yet.
+
+        The New/Edit Sale dialog pre-fills the Devis field with the advisory
+        preview from ``get_next_devis_preview()`` so the user can see (and
+        optionally override) it before saving - that pre-filled text is
+        submitted here exactly like a manually-typed one, so it always hits
+        the "provided reference" branch below, never the auto-allocate one.
+        Without recovering ``devis_number`` from it too, ``devis_number``
+        would stay NULL on every normally-created sale, so
+        ``_allocate_devis_number()``'s ``MAX(devis_number)`` would never
+        advance past whatever it was before this ran - stuck proposing the
+        same (already-used) number to every subsequent new Sale. Recovering
+        the number here (only when the text is still in the exact
+        unmodified "DE-YEAR-N" generator format - a genuinely customized
+        reference like "DE-2026-525-A" is left alone) keeps the allocator in
+        sync and self-heals any sale whose number was previously lost this
+        way, without touching its stored ``devis`` text at all.
+
+        Raises ValueError for over-length or duplicate references.
+        """
+        raw_devis = ""
+        if "devis" in header:
+            raw_devis = " ".join(str(header["devis"] or "").split())
+        if len(raw_devis) > DEVIS_MAX_LENGTH:
+            raise ValueError(
+                f"Devis must be at most {DEVIS_MAX_LENGTH} characters"
+            )
+        if raw_devis:
+            header["devis"] = raw_devis
+            dup_params = [self._normalize_exact(raw_devis)]
+            dup_sql = (
+                "SELECT id FROM sales WHERE LOWER(BTRIM(devis)) = %s "
+                "AND devis IS NOT NULL AND BTRIM(devis) <> ''"
+            )
+            if sale_id:
+                dup_sql += " AND id != %s"
+                dup_params.append(int(sale_id))
+            self.cursor.execute(dup_sql, dup_params)
+            if self.cursor.fetchone():
+                raise ValueError(
+                    f"Devis '{raw_devis}' is already used by another sale"
+                )
+            match = _DEVIS_TEXT_NUMBER_RE.match(raw_devis)
+            if match:
+                header["devis_number"] = int(match.group(1))
+        elif sale_id:
+            self.cursor.execute(
+                "SELECT devis FROM sales WHERE id = %s", (int(sale_id),)
+            )
+            stored_row = self.cursor.fetchone()
+            stored_devis = (stored_row[0] or "").strip() if stored_row else ""
+            if stored_devis:
+                header["devis"] = stored_devis
+            else:
+                self._allocate_devis_number(sale_id, header)
+        else:
+            self._allocate_devis_number(None, header)
+        return header
+
+    def get_next_devis_preview(self, date=None):
+        """Propose the next per-year Devis reference (DE-YEAR-N) for the UI.
+
+        Read-only and advisory: the definitive allocation/validation happens in
+        ``_resolve_sale_devis`` inside ``save_sale_with_items`` at commit time.
+        """
+        year = self._devis_year_from_date(date)
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(devis_number), 0) + 1 FROM ("
+            f"SELECT s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year "
+            "FROM sales s) sub WHERE sub.devis_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        return f"DE-{year}-{next_num}"
+
+    def _ensure_bl_numbers(self, import_ids=None):
+        """Assign persistent per-year Bon de Livraison references (BL-YEAR-N).
+
+        Backfills ``imports.bl_number`` for any import that still has none, in
+        ascending ``imports.id`` order within each year, starting after the
+        highest number already assigned for that year. Already-assigned rows
+        are never touched, so the backfill is idempotent and renumbering never
+        happens. ``import_ids`` optionally restricts the backfill (read path).
+
+        Returns the number of imports that were assigned a BL reference.
+        """
+        try:
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS imports_bl_number_idx ON imports(bl_number)"
+            )
+            extra = ""
+            params = []
+            if import_ids:
+                extra = "AND s.id = ANY(%s)"
+                params.append([int(import_id) for import_id in import_ids])
+            sql = f"""
+                WITH year_map AS (
+                    SELECT s.id AS import_id,
+                           {_BL_YEAR_EXPR} AS y
+                    FROM imports s
+                    WHERE (s.bl_number IS NULL OR BTRIM(s.bl_number) = '') {extra}
+                ),
+                grouped AS (
+                    SELECT ym.import_id, ym.y,
+                           ROW_NUMBER() OVER (PARTITION BY ym.y ORDER BY ym.import_id) AS rn
+                    FROM year_map ym
+                ),
+                base AS (
+                    SELECT COALESCE(NULLIF(SUBSTRING(COALESCE(s.date, '') FROM '\\d{{4}}'), ''),
+                                    NULLIF(SUBSTRING(COALESCE(s.created_at::text, '') FROM '\\d{{4}}'), ''),
+                                    '0') AS y,
+                           MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{{4}}-(\\d+)') AS INTEGER)) AS m
+                    FROM imports s
+                    WHERE s.bl_number IS NOT NULL
+                      AND BTRIM(s.bl_number) <> ''
+                      AND s.bl_number ~ '^BL-\\d{{4}}-\\d+$'
+                    GROUP BY 1
+                )
+                UPDATE imports s
+                SET bl_number = 'BL-' || g.y || '-' || (g.rn + COALESCE(b.m, 0))
+                FROM grouped g
+                LEFT JOIN base b ON b.y = g.y
+                WHERE s.id = g.import_id
+            """
+            self.cursor.execute(sql, tuple(params))
+            assigned = self.cursor.rowcount
+            self.conn.commit()
+            if assigned:
+                logger.info(
+                    "BL backfill assigned=%s restricted=%s",
+                    assigned, bool(import_ids),
+                )
+            return assigned or 0
+        except Exception as exc:
+            self.conn.rollback()
+            logger.warning("BL backfill failed: %s", exc)
+            return 0
+
+    def _allocate_bl_number(self, import_id, header):
+        """Allocate the next per-year Bon de Livraison number and store it on
+        ``header``.
+
+        Runs inside the import-save transaction on the host - never on a GUI
+        thread - so two clients cannot race a SELECT MAX+1. The unique index
+        ``imports_bl_uidx`` remains the hard backstop.
+        """
+        year = self._devis_year_from_date(header.get("date"))
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{4}-(\\d+)') "
+            "AS INTEGER)), 0) + 1 FROM ("
+            f"SELECT s.bl_number, {_BL_YEAR_EXPR} AS bl_year "
+            "FROM imports s) s WHERE s.bl_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        header["bl_number"] = f"BL-{year}-{next_num}"
+
+    def _resolve_import_bl(self, import_id, header):
+        """Host-side Bon de Livraison reference resolution for creates/edits.
+
+        Mutates ``header`` with the authoritative ``bl_number``. Rules:
+
+        * A provided reference is stored verbatim (never silently changed)
+          and must be unique (case-insensitive) among all other imports.
+        * An empty reference on a create allocates the next per-year number.
+        * An empty reference on an edit preserves the stored reference, or
+          allocates one for legacy rows that have none yet.
+
+        Raises ValueError for over-length or duplicate references.
+        """
+        raw_bl = ""
+        if "bl_number" in header:
+            raw_bl = " ".join(str(header["bl_number"] or "").split())
+        if len(raw_bl) > BL_MAX_LENGTH:
+            raise ValueError(
+                f"Bon de livraison must be at most {BL_MAX_LENGTH} characters"
+            )
+        if raw_bl:
+            header["bl_number"] = raw_bl
+            dup_params = [self._normalize_exact(raw_bl)]
+            dup_sql = (
+                "SELECT id FROM imports WHERE LOWER(BTRIM(bl_number)) = %s "
+                "AND bl_number IS NOT NULL AND BTRIM(bl_number) <> ''"
+            )
+            if import_id:
+                dup_sql += " AND id != %s"
+                dup_params.append(int(import_id))
+            self.cursor.execute(dup_sql, dup_params)
+            if self.cursor.fetchone():
+                raise ValueError(
+                    f"Bon de livraison '{raw_bl}' is already used by another import"
+                )
+        elif import_id:
+            self.cursor.execute(
+                "SELECT bl_number FROM imports WHERE id = %s", (int(import_id),)
+            )
+            stored_row = self.cursor.fetchone()
+            stored_bl = (stored_row[0] or "").strip() if stored_row else ""
+            if stored_bl:
+                header["bl_number"] = stored_bl
+            else:
+                self._allocate_bl_number(import_id, header)
+        else:
+            self._allocate_bl_number(None, header)
+        return header
+
+    def get_next_bl_preview(self, date=None):
+        """Propose the next per-year Bon de Livraison reference (BL-YEAR-N).
+
+        Read-only and advisory: the definitive allocation/validation happens in
+        ``_resolve_import_bl`` inside ``save_import_with_items`` at commit time.
+        """
+        year = self._devis_year_from_date(date)
+        self.cursor.execute(
+            "SELECT COALESCE(MAX(CAST(SUBSTRING(s.bl_number FROM 'BL-\\d{4}-(\\d+)') "
+            "AS INTEGER)), 0) + 1 FROM ("
+            f"SELECT s.bl_number, {_BL_YEAR_EXPR} AS bl_year "
+            "FROM imports s) s WHERE s.bl_year = %s",
+            (year,),
+        )
+        row = self.cursor.fetchone()
+        next_num = int(row[0]) if row else 1
+        return f"BL-{year}-{next_num}"
+
+    def get_import_bl_number(self, import_id):
+        """Return the persistent Bon de Livraison reference for an import.
+
+        Allocates and persists ``BL-YEAR-N`` on first access for legacy rows,
+        so reprinting the same import always keeps the same number. Host-side
+        only (never runs in the GUI thread); the unique index
+        ``imports_bl_uidx`` remains the concurrency backstop.
+        """
+        import_id = int(import_id)
+        self.cursor.execute(
+            "SELECT bl_number FROM imports WHERE id = %s", (import_id,)
+        )
+        row = self.cursor.fetchone()
+        if row is None:
+            raise ValueError(f"Import {import_id} does not exist")
+        stored = (row[0] or "").strip()
+        if stored:
+            return stored
+        self.cursor.execute(
+            "SELECT date FROM imports WHERE id = %s", (import_id,)
+        )
+        date_row = self.cursor.fetchone()
+        header = {"date": date_row[0] if date_row else None}
+        self._allocate_bl_number(import_id, header)
+        self.cursor.execute(
+            "UPDATE imports SET bl_number = %s WHERE id = %s",
+            (header["bl_number"], import_id),
+        )
+        self.conn.commit()
+        return header["bl_number"]
 
     # ---------------- Migration & Meta Helpers -----------------
     def _ensure_meta_table(self):
         try:
-            self.cursor.execute("CREATE TABLE IF NOT EXISTS Meta (key TEXT PRIMARY KEY, value TEXT)")
+            self.cursor.execute("CREATE TABLE IF NOT EXISTS meta (key TEXT PRIMARY KEY, value TEXT)")
             self.conn.commit()
         except Exception as e:
+            self.conn.rollback()
             print(f"Warning: could not create Meta table: {e}")
+
+    def _ensure_change_log_table(self):
+        """Create the per-schema change log used for incremental client sync.
+
+        Every write path that a remote client should hear about calls
+        ``record_change`` after committing; clients poll ``get_changes`` with
+        their stored ``last_seq`` and apply only the new rows to their local
+        SQLite cache. The log is display-data metadata, never the source of
+        truth - PostgreSQL tables remain authoritative.
+        """
+        try:
+            self.cursor.execute(
+                """
+                CREATE TABLE IF NOT EXISTS change_log (
+                    seq BIGINT GENERATED BY DEFAULT AS IDENTITY PRIMARY KEY,
+                    section TEXT NOT NULL,
+                    row_id INTEGER NOT NULL,
+                    operation TEXT NOT NULL,
+                    payload TEXT,
+                    created_at TIMESTAMPTZ NOT NULL DEFAULT now()
+                )
+                """
+            )
+            self.cursor.execute(
+                "CREATE INDEX IF NOT EXISTS change_log_section_seq_idx "
+                "ON change_log(section, seq)"
+            )
+            self.conn.commit()
+        except Exception as e:
+            self.conn.rollback()
+            print(f"Warning: could not create change log table: {e}")
+
+    def record_change(self, section, row_id, operation, payload=None):
+        """Append one row to the change log for a committed write.
+
+        ``operation`` is 'upsert' (create or update) or 'delete'. ``payload``
+        is the full record dict for upserts so clients can replace their
+        cached row without re-fetching. Returns the new sequence number, or
+        None if the write failed (never raises - sync is best-effort).
+        """
+        try:
+            payload_json = None
+            if payload is not None:
+                payload_json = json.dumps(payload, default=str)
+            self.cursor.execute(
+                "INSERT INTO change_log (section, row_id, operation, payload) "
+                "VALUES (%s, %s, %s, %s) RETURNING seq",
+                (str(section), int(row_id), operation, payload_json),
+            )
+            seq = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return int(seq)
+        except Exception:
+            self.conn.rollback()
+            logger.exception("record_change failed section=%s row_id=%s", section, row_id)
+            return None
+
+    def get_changes(self, section, since_seq=0, limit=500):
+        """Return incremental changes for ``section`` with seq > ``since_seq``.
+
+        Result: {'changes': [{seq, row_id, operation, payload}], 'last_seq': N}.
+        Payloads are None for deletes; upserts carry the full record dict. The
+        host's own window is unaffected - this is only for remote clients.
+        """
+        try:
+            self.cursor.execute(
+                "SELECT seq, row_id, operation, payload FROM change_log "
+                "WHERE section=%s AND seq > %s ORDER BY seq LIMIT %s",
+                (str(section), int(since_seq), int(limit)),
+            )
+            rows = self.cursor.fetchall()
+            self.conn.commit()
+        except Exception:
+            self.conn.rollback()
+            logger.exception("get_changes failed section=%s", section)
+            return {'changes': [], 'last_seq': int(since_seq)}
+        changes = []
+        last_seq = int(since_seq)
+        for seq, row_id, operation, payload in rows:
+            last_seq = max(last_seq, int(seq))
+            try:
+                parsed_payload = json.loads(payload) if payload else None
+            except (ValueError, TypeError):
+                parsed_payload = None
+            changes.append({
+                'seq': int(seq),
+                'row_id': int(row_id),
+                'operation': operation,
+                'payload': parsed_payload,
+            })
+        return {'changes': changes, 'last_seq': last_seq}
 
     def _get_meta(self, key, default=None):
         try:
-            self.cursor.execute("SELECT value FROM Meta WHERE key=?", (key,))
+            self.cursor.execute("SELECT value FROM meta WHERE key=%s", (key,))
             row = self.cursor.fetchone()
             return row[0] if row else default
         except Exception:
+            self.conn.rollback()
             return default
 
     def _set_meta(self, key, value):
         try:
-            self.cursor.execute("INSERT INTO Meta(key,value) VALUES(?,?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, str(value)))
+            self.cursor.execute(
+                "INSERT INTO meta(key,value) VALUES(%s,%s) ON CONFLICT(key) DO UPDATE SET value=excluded.value",
+                (key, str(value))
+            )
             self.conn.commit()
         except Exception as e:
+            self.conn.rollback()
             print(f"Warning: could not set meta {key}: {e}")
 
     def _run_one_time_migrations(self):
-        """Run gated migrations using Meta flags so they execute only once per database.
+        """Run gated migrations using Meta flags so they execute only once per schema.
 
-        Multi-instance safety: an exclusive SQLite lock is acquired before checking flags
-        so that only one app instance can run migrations at a time. The second instance
-        waits (covered by busy_timeout=5000) then re-checks — finding flags already set
-        and skipping without doing any work.
+        Multi-instance safety: a Postgres advisory lock scoped to this schema is
+        acquired before checking flags so that only one app instance can run
+        migrations at a time. A second instance blocks on the lock, then
+        re-checks - finding flags already set and skipping without doing any work.
         """
-        # Fast path: if both flags are already set, nothing to do (no lock needed)
+        # Fast path: if all flags are already set, nothing to do (no lock needed)
         if (self._get_meta('fk_relaxed', '0') == '1' and
-                self._get_meta('backfill_product_name_done', '0') == '1'):
+                self._get_meta('backfill_product_name_done', '0') == '1' and
+                self._get_meta('sales_affect_stock_backfill_done', '0') == '1' and
+                self._get_meta('facture_allocation_backfill_done', '0') == '1'):
             return
 
-        # Acquire exclusive lock — serializes concurrent migration attempts
+        lock_target = self.database_name or self.schema_name
+        lock_key = f"lamidap_migrate_{lock_target}"
         try:
-            self.cursor.execute("BEGIN EXCLUSIVE")
+            self.cursor.execute("SELECT pg_advisory_lock(hashtext(%s))", (lock_key,))
         except Exception as e:
-            print(f"Migration: could not acquire exclusive lock ({e}), skipping this session")
+            print(f"Migration: could not acquire advisory lock ({e}), skipping this session")
             return
 
-        # Re-read flags inside the lock (another instance may have finished while we waited)
         try:
-            self.cursor.execute(
-                "SELECT key, value FROM Meta WHERE key IN ('fk_relaxed','backfill_product_name_done')"
-            )
-            flags = {row[0]: row[1] for row in self.cursor.fetchall()}
-        except Exception as e:
+            # Re-read flags inside the lock (another instance may have finished while we waited)
             try:
+                self.cursor.execute(
+                    "SELECT key, value FROM meta WHERE key IN "
+                    "('fk_relaxed','backfill_product_name_done','sales_affect_stock_backfill_done','facture_allocation_backfill_done')"
+                )
+                flags = {row[0]: row[1] for row in self.cursor.fetchall()}
+            except Exception as e:
                 self.conn.rollback()
+                print(f"Migration: could not read Meta flags: {e}")
+                return
+
+            fk_done = flags.get('fk_relaxed', '0') == '1'
+            backfill_done = flags.get('backfill_product_name_done', '0') == '1'
+            affect_stock_done = flags.get('sales_affect_stock_backfill_done', '0') == '1'
+            facture_allocation_done = flags.get('facture_allocation_backfill_done', '0') == '1'
+
+            # 1) Legacy product_id FK relaxation: fresh Postgres schemas are
+            # created without that FK to begin with (see _create_table_for_class),
+            # so there's nothing to relax here - just mark it done.
+            if not fk_done:
+                self._set_meta('fk_relaxed', '1')
+
+            # 2) Backfill missing product_name where product_id still exists
+            if not backfill_done:
+                try:
+                    self.cursor.execute("""
+                        UPDATE sales_items
+                        SET product_name = (
+                            SELECT name FROM products p WHERE p.id = sales_items.product_id
+                        )
+                        WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
+                    """)
+                    self.cursor.execute("""
+                        UPDATE import_items
+                        SET product_name = (
+                            SELECT name FROM products p WHERE p.id = import_items.product_id
+                        )
+                        WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
+                    """)
+                    self.conn.commit()
+                    self._set_meta('backfill_product_name_done', '1')
+                    print("✓ Backfilled missing product_name snapshots where possible")
+                except Exception as e:
+                    self.conn.rollback()
+                    print(f"Backfill product_name migration failed: {e}")
+
+            # 3) One-time sales.affect_stock backfill. Existing sales already
+            # influence current stock under the OLD rule (not historical AND
+            # state != on_hold); without this their displayed stock would all
+            # change the moment the column appears. Only rows still NULL are
+            # touched, and the meta flag stops it running again, so a Sale the
+            # user later saves with affect_stock = FALSE can never be re-enabled.
+            if not affect_stock_done:
+                try:
+                    self.cursor.execute("""
+                        UPDATE sales
+                        SET affect_stock = TRUE
+                        WHERE affect_stock IS NULL
+                          AND COALESCE(is_historical, FALSE) = FALSE
+                          AND (state IS NULL OR state <> 'on_hold')
+                    """)
+                    enabled = self.cursor.rowcount or 0
+                    self.cursor.execute("""
+                        UPDATE sales
+                        SET affect_stock = FALSE
+                        WHERE affect_stock IS NULL
+                    """)
+                    self.conn.commit()
+                    self._set_meta('sales_affect_stock_backfill_done', '1')
+                    print(
+                        f"Migrated sales.affect_stock: {enabled} existing sale(s) keep "
+                        "their previous stock effect, all others default to FALSE"
+                    )
+                except Exception as e:
+                    self.conn.rollback()
+                    print(f"sales.affect_stock backfill migration failed: {e}")
+
+            # The column is tightened only after the legacy rows were converted,
+            # so every future insert relies on the NOT NULL DEFAULT FALSE.
+            try:
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock SET DEFAULT FALSE"
+                )
+                self.cursor.execute(
+                    "ALTER TABLE sales ALTER COLUMN affect_stock SET NOT NULL"
+                )
+                self.conn.commit()
+            except Exception as e:
+                self.conn.rollback()
+                print(f"Warning: could not finalize sales.affect_stock: {e}")
+
+            # Legacy invoices that predate per-Devis allocations. Only an
+            # invoice linked to exactly ONE Devis is mathematically certain, so
+            # only those get a stored split; multi-Devis invoices keep an
+            # unknown split instead of invented numbers. Runs here (not in the
+            # read path) so simply listing invoices never writes.
+            if not facture_allocation_done:
+                try:
+                    self._backfill_unambiguous_source_allocations()
+                    self._set_meta('facture_allocation_backfill_done', '1')
+                except Exception as e:
+                    self.conn.rollback()
+                    print(f"facture allocation backfill migration failed: {e}")
+        finally:
+            try:
+                self.cursor.execute("SELECT pg_advisory_unlock(hashtext(%s))", (lock_key,))
             except Exception:
                 pass
-            print(f"Migration: could not read Meta flags: {e}")
-            return
 
-        fk_done = flags.get('fk_relaxed', '0') == '1'
-        backfill_done = flags.get('backfill_product_name_done', '0') == '1'
-
-        # Release exclusive lock before FK rebuild (it manages its own transactions)
-        try:
-            self.conn.commit()
-        except Exception:
-            pass
-
-        # 1) Relax product_id FK if not already done
-        if not fk_done:
-            try:
-                self._relax_legacy_item_product_fk('Sales_Items', 'sales_id')
-                self._relax_legacy_item_product_fk('Import_Items', 'import_id')
-                self._set_meta('fk_relaxed', '1')
-            except Exception as e:
-                print(f"Migration fk_relaxed failed: {e}")
-
-        # 2) Backfill missing product_name where product_id still exists
-        if not backfill_done:
-            try:
-                self.cursor.execute("""
-                    UPDATE Sales_Items
-                    SET product_name = (
-                        SELECT name FROM Products p WHERE p.ID = Sales_Items.product_id
-                    )
-                    WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
-                """)
-                self.cursor.execute("""
-                    UPDATE Import_Items
-                    SET product_name = (
-                        SELECT name FROM Products p WHERE p.ID = Import_Items.product_id
-                    )
-                    WHERE (product_name IS NULL OR product_name = '') AND product_id IS NOT NULL
-                """)
-                self.conn.commit()
-                self._set_meta('backfill_product_name_done', '1')
-                print("✓ Backfilled missing product_name snapshots where possible")
-            except Exception as e:
-                print(f"Backfill product_name migration failed: {e}")
-    
     def save(self, obj):
         """Save any parameter object to database"""
         if not self.cursor:
             print("Database not connected")
             return False
-            
+
         try:
             # Use the object's built-in save method
             if hasattr(obj, 'save_to_database'):
                 return obj.save_to_database()
-            
+
             # Fallback: manual save
             return self._manual_save(obj)
-            
+
         except Exception as e:
             print(f"Error saving {obj.section} object: {e}")
             return False
-    
+
     def _manual_save(self, obj):
         """Manual save implementation as fallback"""
         section_name = obj.section
         data = obj.get_value(destination="database")
-        
+
         # Filter out calculated parameters
         filtered_data = {}
         for key, value in data.items():
             if not obj.is_parameter_calculated(key):
                 filtered_data[key] = value
-        
+
         if hasattr(obj, 'id') and obj.id and obj.id > 0:
             # Update existing
             return self.update_item(obj.id, filtered_data, section_name)
@@ -453,40 +2560,37 @@ class Database:
                 obj.set_value('id', new_id)
                 return True
             return False
-    
+
     def load(self, cls, obj_id):
         """Load and return a parameter object"""
         if not self.cursor:
             print("Database not connected")
             return None
-            
+
         try:
             # Create new instance
             obj = cls(obj_id, self)
-            
+
             # Use the object's built-in load method
             if hasattr(obj, 'load_database_data'):
                 if obj.load_database_data():
                     return obj
                 else:
                     return None
-            
+
             return None
-            
+
         except Exception as e:
             print(f"Error loading {cls.__name__} with ID {obj_id}: {e}")
             return None
-    
+
     def delete(self, cls_or_obj, obj_id=None):
         """Delete an object and its related items (cascading)"""
         if not self.cursor:
             print("Database not connected")
             return False
-        
+
         try:
-            # Begin transaction for cascading deletes
-            self.cursor.execute("BEGIN")
-            
             if obj_id is None:
                 # Object instance passed
                 obj = cls_or_obj
@@ -497,69 +2601,1034 @@ class Database:
                 cls = cls_or_obj
                 temp_obj = cls(0, None)
                 section_name = temp_obj.section
-            
+
             # Pre-delete handling for base entities referenced by items
             try:
                 if section_name == 'Products':
                     # Nullify references in item tables to allow deletion while keeping name snapshots
-                    self.cursor.execute("UPDATE 'Sales_Items' SET product_id = NULL WHERE product_id = ?", (obj_id,))
-                    self.cursor.execute("UPDATE 'Import_Items' SET product_id = NULL WHERE product_id = ?", (obj_id,))
+                    self.cursor.execute("UPDATE sales_items SET product_id = NULL WHERE product_id = %s", (obj_id,))
+                    self.cursor.execute("UPDATE import_items SET product_id = NULL WHERE product_id = %s", (obj_id,))
                 # (Clients/Suppliers not stored via *_id in operations currently)
             except Exception as pre_e:
                 print(f"Warning: pre-delete reference cleanup failed: {pre_e}")
 
             # Delete from database (foreign key constraints will handle cascading for child ops)
-            self.cursor.execute(f"DELETE FROM '{section_name}' WHERE ID = ?", (obj_id,))
-            
+            self.cursor.execute(f"DELETE FROM {section_name} WHERE id = %s", (obj_id,))
+
             # Commit transaction
             self.conn.commit()
-            
+
             return self.cursor.rowcount > 0
-            
+
         except Exception as e:
             # Rollback on error
             self.conn.rollback()
             print(f"Error deleting object: {e}")
             return False
-    
+
     def begin_transaction(self):
-        """Begin a database transaction"""
-        if self.cursor:
-            self.cursor.execute("BEGIN")
-    
+        """No-op under psycopg2 - a transaction is already implicitly open
+        after connect()/commit(); kept for interface parity with callers."""
+        pass
+
     def commit_transaction(self):
         """Commit the current transaction"""
         if self.conn:
             self.conn.commit()
-    
+
     def rollback_transaction(self):
         """Rollback the current transaction"""
         if self.conn:
             self.conn.rollback()
-    
+
+    @staticmethod
+    def _sale_decimal(value, field, minimum=None):
+        from decimal import Decimal
+        from core.calculations import to_decimal
+        try:
+            number = to_decimal(value)
+        except Exception:
+            raise ValueError(f"Invalid numeric value for {field}: {value!r}")
+        if minimum is not None and number < Decimal(str(minimum)):
+            raise ValueError(f"{field} must be at least {minimum}")
+        return number
+
+    @staticmethod
+    def _normalize_exact(value):
+        return " ".join(str(value or "").split()).casefold()
+
+    @staticmethod
+    def _parse_bool_flag(value):
+        """Interpret a boolean flag that may arrive as bool, 0/1, or a string."""
+        if isinstance(value, bool):
+            return value
+        if value is None:
+            return False
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value).strip().lower() in ("1", "true", "yes", "on", "y", "t")
+
+    def _find_named_record(self, table, name, record_id=None):
+        if record_id not in (None, "", 0, "0"):
+            self.cursor.execute(f"SELECT id, name FROM {table} WHERE id = %s", (int(record_id),))
+            row = self.cursor.fetchone()
+            if row:
+                return int(row[0]), row[1]
+        self.cursor.execute(
+            f"SELECT id, name FROM {table} "
+            "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+            "ORDER BY id LIMIT 1",
+            (self._normalize_exact(name),),
+        )
+        row = self.cursor.fetchone()
+        return (int(row[0]), row[1]) if row else (None, None)
+
+    @staticmethod
+    def _actor_fields(user):
+        user = user or {}
+        return {
+            "created_by": user.get("id"),
+            "created_by_username": user.get("username") or "Local Admin",
+            "created_at": datetime.now().isoformat(timespec="seconds"),
+        }
+
+    def _create_pending_sale_entities(self, pending_entities, user):
+        resolved = {}
+        actor = self._actor_fields(user)
+        for entity in pending_entities or []:
+            if not isinstance(entity, dict):
+                raise ValueError("Pending entity data must be an object")
+            kind = str(entity.get("type") or "").strip().casefold()
+            name = " ".join(str(entity.get("name") or "").split())
+            if kind not in ("client", "product", "service") or not name:
+                raise ValueError("Pending entity type and name are required")
+            key = (kind, self._normalize_exact(name))
+            if key in resolved:
+                continue
+            self.cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"{kind}:{self._normalize_exact(name)}",),
+            )
+
+            if kind == "client":
+                username = " ".join(str(entity.get("username") or name).split())
+                self.cursor.execute(
+                    "SELECT id, name FROM clients "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = %s "
+                    "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+                    "ORDER BY id LIMIT 1",
+                    (self._normalize_exact(username), self._normalize_exact(name)),
+                )
+                row = self.cursor.fetchone()
+                if row:
+                    resolved[key] = int(row[0])
+                    continue
+                self.cursor.execute(
+                    "INSERT INTO clients "
+                    "(username, name, client_type, created_by, created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        username, name, entity.get("client_type") or "individual",
+                        actor["created_by"], actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                resolved[key] = int(self.cursor.fetchone()[0])
+                resolved[("client", self._normalize_exact(username))] = resolved[key]
+                continue
+
+            table = "products" if kind == "product" else "services"
+            record_id, _ = self._find_named_record(table, name)
+            if record_id:
+                resolved[key] = record_id
+                continue
+
+            sale_price = self._sale_decimal(
+                entity.get("sale_price", entity.get("unit_price")),
+                f"{kind} {name} price",
+                "0",
+            )
+            if kind == "product":
+                purchase_price = self._sale_decimal(
+                    entity.get("purchase_price", 0), f"product {name} purchase price", "0"
+                )
+                self.cursor.execute(
+                    "INSERT INTO products "
+                    "(name, username, unit_price, sale_price, category, description, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        name, str(entity.get("sku") or name), purchase_price, sale_price,
+                        str(entity.get("category") or ""), str(entity.get("description") or ""),
+                        actor["created_by"], actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                product_id = int(self.cursor.fetchone()[0])
+                initial_quantity = self._sale_decimal(
+                    entity.get("initial_quantity", 0),
+                    f"product {name} initial quantity",
+                    "0",
+                )
+                if initial_quantity:
+                    self.cursor.execute(
+                        "INSERT INTO imports "
+                        "(supplier_username, supplier_name, date, tva, notes, "
+                        "created_by, created_by_username, created_at) "
+                        "VALUES ('', 'Opening Stock', %s, 0, %s, %s, %s, %s) RETURNING id",
+                        (
+                            datetime.now().strftime("%Y-%m-%d"),
+                            f"Opening stock for {name}",
+                            actor["created_by"], actor["created_by_username"], actor["created_at"],
+                        ),
+                    )
+                    opening_import_id = int(self.cursor.fetchone()[0])
+                    self.cursor.execute(
+                        "INSERT INTO import_items "
+                        "(import_id, product_id, product_name, quantity, unit_price) "
+                        "VALUES (%s, %s, %s, %s, %s)",
+                        (opening_import_id, product_id, name, initial_quantity, purchase_price),
+                    )
+                resolved[key] = product_id
+            else:
+                self.cursor.execute(
+                    "INSERT INTO services "
+                    "(service_type, name, unit_price, description, keywords, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('Custom Service', %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        name, sale_price, str(entity.get("description") or ""),
+                        str(entity.get("keywords") or ""), actor["created_by"],
+                        actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                resolved[key] = int(self.cursor.fetchone()[0])
+        return resolved
+
+    def save_product_with_opening_stock(self, product_data, initial_quantity=0, user=None):
+        """Create a product and its opening-stock ledger entry atomically."""
+        if not isinstance(product_data, dict):
+            raise ValueError("Product data must be an object")
+
+        quantity = self._sale_decimal(
+            initial_quantity, "initial product quantity", "0"
+        )
+        product_cls = self.registered_classes.get("Products")
+        if product_cls is None:
+            raise ValueError("Products are not registered")
+
+        product_obj = product_cls(0, None)
+        allowed = product_obj.get_visible_parameters("database")
+        data = {
+            key: product_data[key]
+            for key in allowed
+            if key in product_data and not product_obj.is_parameter_calculated(key)
+        }
+        name = " ".join(str(data.get("name") or "").split())
+        username = " ".join(str(data.get("username") or name).split())
+        if not name:
+            raise ValueError("Product name is required")
+        if not username:
+            raise ValueError("Product username is required")
+        data["name"] = name
+        data["username"] = username
+
+        try:
+            self.cursor.execute(
+                "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                (f"product-username:{self._normalize_exact(username)}",),
+            )
+            self.cursor.execute(
+                "SELECT 1 FROM products "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "LIMIT 1",
+                (self._normalize_exact(username),),
+            )
+            if self.cursor.fetchone():
+                raise ValueError(f"Product username '{username}' already exists")
+
+            actor = self._actor_fields(user)
+            for key, value in actor.items():
+                if key in allowed and not data.get(key):
+                    data[key] = value
+
+            columns = list(data)
+            self.cursor.execute(
+                f"INSERT INTO products ({', '.join(columns)}) "
+                f"VALUES ({', '.join('%s' for _ in columns)}) RETURNING id",
+                list(data.values()),
+            )
+            product_id = int(self.cursor.fetchone()[0])
+
+            if quantity > 0:
+                self.cursor.execute(
+                    "INSERT INTO imports "
+                    "(supplier_username, supplier_name, date, tva, notes, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('', 'Opening Stock', %s, 0, %s, %s, %s, %s) RETURNING id",
+                    (
+                        datetime.now().strftime("%Y-%m-%d"),
+                        f"Opening stock for {name}",
+                        actor["created_by"], actor["created_by_username"],
+                        actor["created_at"],
+                    ),
+                )
+                opening_import_id = int(self.cursor.fetchone()[0])
+                self.cursor.execute(
+                    "INSERT INTO import_items "
+                    "(import_id, product_id, product_name, quantity, unit_price) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        opening_import_id, product_id, name, quantity,
+                        self._sale_decimal(data.get("unit_price"), "unit price", "0"),
+                    ),
+                )
+
+            self.conn.commit()
+            return {
+                "product_id": product_id,
+                "opening_quantity": str(quantity),
+                "transaction": "committed",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_product_with_stock(self, product_id, product_data, target_quantity, user=None):
+        """Update a product and set its ledger-derived stock in one transaction.
+
+        Product stock is intentionally not duplicated in ``products``.  A
+        stock-adjustment import records only the difference between the
+        requested quantity and the current imports-minus-sales balance.
+        """
+        if not isinstance(product_data, dict):
+            raise ValueError("Product data must be an object")
+        try:
+            product_id = int(product_id)
+        except (TypeError, ValueError):
+            raise ValueError("Product ID must be an integer")
+        quantity = self._sale_decimal(
+            target_quantity, "product stock quantity", "0"
+        )
+
+        product_cls = self.registered_classes.get("Products")
+        if product_cls is None:
+            raise ValueError("Products are not registered")
+        product_obj = product_cls(0, None)
+        allowed = product_obj.get_visible_parameters("database")
+        data = {
+            key: product_data[key]
+            for key in allowed
+            if key in product_data and not product_obj.is_parameter_calculated(key)
+        }
+        name = " ".join(str(data.get("name") or "").split())
+        username = " ".join(str(data.get("username") or name).split())
+        if not name:
+            raise ValueError("Product name is required")
+        if not username:
+            raise ValueError("Product username is required")
+        data["name"] = name
+        data["username"] = username
+
+        try:
+            # This row lock serializes quantity edits with concurrent sales,
+            # whose stock validation locks the same product rows below.
+            self.cursor.execute(
+                "SELECT id FROM products WHERE id=%s FOR UPDATE", (product_id,)
+            )
+            if not self.cursor.fetchone():
+                raise ValueError(f"Product {product_id} does not exist")
+            self.cursor.execute(
+                "SELECT 1 FROM products "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "AND id<>%s LIMIT 1",
+                (self._normalize_exact(username), product_id),
+            )
+            if self.cursor.fetchone():
+                raise ValueError(f"Product username '{username}' already exists")
+
+            assignments = ", ".join(f"{key}=%s" for key in data)
+            self.cursor.execute(
+                f"UPDATE products SET {assignments} WHERE id=%s",
+                [*data.values(), product_id],
+            )
+            if self.cursor.rowcount != 1:
+                raise ValueError(f"Product {product_id} does not exist")
+
+            self.cursor.execute(
+                "SELECT COALESCE(SUM(ii.quantity), 0) "
+                "FROM import_items ii "
+                "JOIN imports i ON i.id = ii.import_id "
+                "WHERE ii.product_id=%s "
+                "  AND (i.is_historical IS NULL OR NOT i.is_historical)",
+                (product_id,),
+            )
+            imported = self.cursor.fetchone()[0] or 0
+            self.cursor.execute(
+                f"""
+                SELECT COALESCE(SUM(si.quantity), 0)
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE si.product_id=%s
+                  AND {SALE_STOCK_ELIGIBILITY_SQL}
+                """,
+                (product_id,),
+            )
+            sold = self.cursor.fetchone()[0] or 0
+            current = imported - sold
+            adjustment = quantity - current
+
+            if adjustment:
+                actor = self._actor_fields(user)
+                self.cursor.execute(
+                    "INSERT INTO imports "
+                    "(supplier_username, supplier_name, date, tva, notes, "
+                    "created_by, created_by_username, created_at) "
+                    "VALUES ('', 'Stock Adjustment', %s, 0, %s, %s, %s, %s) "
+                    "RETURNING id",
+                    (
+                        datetime.now().strftime("%Y-%m-%d"),
+                        f"Stock adjusted from {current} to {quantity} for {name}",
+                        actor["created_by"], actor["created_by_username"],
+                        actor["created_at"],
+                    ),
+                )
+                adjustment_import_id = int(self.cursor.fetchone()[0])
+                self.cursor.execute(
+                    "INSERT INTO import_items "
+                    "(import_id, product_id, product_name, quantity, unit_price) "
+                    "VALUES (%s, %s, %s, %s, %s)",
+                    (
+                        adjustment_import_id, product_id, name, adjustment,
+                        self._sale_decimal(data.get("unit_price"), "unit price", "0"),
+                    ),
+                )
+
+            self.conn.commit()
+            return {
+                "product_id": product_id,
+                "previous_quantity": str(current),
+                "quantity": str(quantity),
+                "adjustment": str(adjustment),
+                "transaction": "committed",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_sale_with_items(
+        self, sale_data, items, sale_id=None, visible_row_count=None,
+        pending_entities=None, user=None,
+    ):
+        """Atomically save one sale header and its complete visible line set."""
+        if not isinstance(sale_data, dict):
+            raise ValueError("sale_data must be an object")
+        if not isinstance(items, list):
+            raise ValueError("items must be an array")
+        visible_count = int(visible_row_count if visible_row_count is not None else len(items))
+        if visible_count > 0 and not items:
+            raise ValueError(
+                f"Sale was not saved: {visible_count} visible items were found, but the server received 0 valid items."
+            )
+
+        validated = []
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item {index} must be an object")
+            name = str(raw.get('product_name') or raw.get('designation') or '').strip()
+            if not name:
+                raise ValueError(f"Item {index}: designation is required")
+            requested_type = str(raw.get("item_type") or "").strip().casefold()
+            is_section = requested_type == "section"
+            quantity = None if is_section else self._sale_decimal(
+                raw.get('quantity'), f"item {index} quantity", '0.001'
+            )
+            unit_price = None if is_section else self._sale_decimal(
+                raw.get('unit_price'), f"item {index} unit price", '0'
+            )
+            discount_percentage = None if is_section else self._sale_decimal(
+                raw.get('discount_percentage', 0), f"item {index} remise percent", '0'
+            )
+            if discount_percentage is not None and not 0 <= discount_percentage <= 100:
+                raise ValueError(f"Item {index}: remise percent must be between 0 and 100")
+            item_id = raw.get('id')
+            product_id = raw.get('product_id')
+            service_id = raw.get('service_id')
+            try:
+                item_id = int(item_id) if item_id not in (None, '', 0, '0') else None
+                product_id = int(product_id) if product_id not in (None, '', 0, '0') else None
+                service_id = int(service_id) if service_id not in (None, '', 0, '0') else None
+            except (TypeError, ValueError):
+                raise ValueError(f"Item {index}: IDs must be integers when present")
+            if is_section:
+                product_id = None
+                service_id = None
+
+            if requested_type not in ("product", "service", "manual", "section"):
+                requested_type = "product" if product_id else ("service" if service_id else "")
+            validated.append({
+                'id': item_id,
+                'product_id': product_id,
+                'service_id': service_id,
+                'product_name': name,
+                'information': '' if is_section else str(raw.get('information') or '').strip(),
+                'quantity': quantity,
+                'unit_price': unit_price,
+                'discount_percentage': discount_percentage,
+                'production': None if is_section else int(raw.get('production') or 0),
+                'item_type': requested_type,
+                'sort_order': int(raw.get('sort_order') or index),
+            })
+
+        try:
+            header_token = str(sale_data.get("operation_token") or "").strip()
+            if not sale_id and header_token:
+                self.cursor.execute(
+                    "SELECT id FROM sales WHERE operation_token = %s", (header_token,)
+                )
+                duplicate = self.cursor.fetchone()
+                if duplicate:
+                    self.cursor.execute(
+                        "SELECT COUNT(*) FROM sales_items WHERE sales_id = %s",
+                        (int(duplicate[0]),),
+                    )
+                    return {
+                        "sale_id": int(duplicate[0]), "saved": int(self.cursor.fetchone()[0]),
+                        "inserted": 0, "updated": 0, "deleted": 0,
+                        "items": [], "transaction": "committed", "duplicate": True,
+                    }
+
+            is_historical = self._parse_bool_flag(sale_data.get("is_historical"))
+            # affect_stock is the explicit, user-chosen inventory decision and
+            # the ONLY thing that makes a Sale consume current stock. A
+            # historical Sale is books-only, so it can never affect stock -
+            # enforced here so a remote client cannot bypass it.
+            affect_stock = self._parse_bool_flag(sale_data.get("affect_stock"))
+            if is_historical:
+                affect_stock = False
+
+            resolved_pending = self._create_pending_sale_entities(pending_entities, user)
+
+            # Resolve only in the explicitly selected catalog.
+            for item in validated:
+                kind = item["item_type"]
+                if not kind:
+                    product_match = self._find_named_record(
+                        "products", item["product_name"], item["product_id"]
+                    )
+                    service_match = self._find_named_record(
+                        "services", item["product_name"], item["service_id"]
+                    )
+                    if product_match[0] and service_match[0]:
+                        raise ValueError(
+                            f"Choose Product or Service for '{item['product_name']}'"
+                        )
+                    if product_match[0]:
+                        kind = item["item_type"] = "product"
+                        item["product_id"] = product_match[0]
+                    elif service_match[0]:
+                        kind = item["item_type"] = "service"
+                        item["service_id"] = service_match[0]
+                    elif item["id"] is not None:
+                        kind = item["item_type"] = "manual"
+                    else:
+                        raise ValueError(
+                            f"Choose Product or Service for '{item['product_name']}'"
+                        )
+                if kind in ("manual", "section"):
+                    # Snapshot-only line ("Keep only in this Sale"): the typed
+                    # name is stored with no Product/Service link. Section rows
+                    # additionally have NULL financial fields. Neither kind
+                    # affects stock or creates catalog records.
+                    continue
+                table = "products" if kind == "product" else "services"
+                selected_id = item["product_id"] if kind == "product" else item["service_id"]
+                record_id, canonical_name = self._find_named_record(
+                    table, item["product_name"], selected_id
+                )
+                if not record_id:
+                    record_id = resolved_pending.get(
+                        (kind, self._normalize_exact(item["product_name"]))
+                    )
+                if not record_id:
+                    raise ValueError(
+                        f"{kind.title()} '{item['product_name']}' does not exist"
+                    )
+                item["product_id"] = record_id if kind == "product" else None
+                item["service_id"] = record_id if kind == "service" else None
+                if canonical_name:
+                    item["product_name"] = canonical_name
+
+            sale_cls = self.registered_classes['Sales']
+            sale_obj = sale_cls(0, None)
+            header = {
+                key: sale_data[key]
+                for key in sale_obj.get_visible_parameters('database')
+                if key in sale_data and not sale_obj.is_parameter_calculated(key)
+            }
+            if not header:
+                raise ValueError("Sale header contains no storable fields")
+            # is_historical lives on a real BOOLEAN column that is not managed
+            # by the parameter-class schema builder; inject it explicitly so
+            # creates and edits persist (and can switch) the flag.
+            if "is_historical" in sale_data:
+                header["is_historical"] = self._parse_bool_flag(sale_data["is_historical"])
+            # Same treatment for affect_stock: a real BOOLEAN column that is not
+            # managed by the parameter-class schema builder, so it is injected
+            # explicitly and normalized to a Python bool for PostgreSQL.
+            header["affect_stock"] = affect_stock
+            # PostgreSQL requires a real bool for this BOOLEAN column. Older
+            # parameter mappings could supply numeric 0/1 values here.
+            if "remise_includes_line_discounts" in header:
+                header["remise_includes_line_discounts"] = self._parse_bool_flag(
+                    header["remise_includes_line_discounts"]
+                )
+            if sale_id:
+                for protected in (
+                    "created_by", "created_by_username", "created_at", "operation_token"
+                ):
+                    header.pop(protected, None)
+
+            # Host-side Devis resolution (create & edit): validates or allocates
+            # the canonical per-sale reference before anything is written.
+            self._resolve_sale_devis(sale_id, header)
+
+            # Resolve the relational client ID server-side for every create and
+            # edit. The name remains a historical snapshot, but all client-sale
+            # views filter exclusively on this immutable database ID.
+            username = " ".join(str(header.get('client_username') or '').split())
+            if username:
+                self.cursor.execute(
+                    "SELECT id, name, username FROM clients "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g')) = %s "
+                    "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g')) = %s "
+                    "ORDER BY id LIMIT 1",
+                    (self._normalize_exact(username), self._normalize_exact(username)),
+                )
+                client_row = self.cursor.fetchone()
+                if not client_row:
+                    pending_id = resolved_pending.get(("client", self._normalize_exact(username)))
+                    if pending_id:
+                        self.cursor.execute(
+                            "SELECT id, name, username FROM clients WHERE id=%s", (pending_id,)
+                        )
+                        client_row = self.cursor.fetchone()
+                if not client_row:
+                    raise ValueError(f"Client '{username}' does not exist")
+                header['client_id'] = int(client_row[0])
+                header['client_username'] = client_row[2] or username
+                if client_row:
+                    header['client_name'] = client_row[1] or username
+            else:
+                raise ValueError("Client is required")
+
+            actor = self._actor_fields(user)
+            if not sale_id:
+                header.update(actor)
+
+            if sale_id:
+                sale_id = int(sale_id)
+                # Editing is gated solely by the caller's Sales:write permission
+                # (enforced by the RPC layer in core/network/server.py before this
+                # method is ever called) - who originally created the sale does not
+                # additionally restrict who may edit it.
+                assignments = ', '.join(f"{key} = %s" for key in header)
+                self.cursor.execute(
+                    f"UPDATE sales SET {assignments} WHERE id = %s",
+                    [*header.values(), sale_id],
+                )
+                if self.cursor.rowcount != 1:
+                    raise ValueError(f"Sale {sale_id} does not exist")
+            else:
+                columns = ', '.join(header)
+                placeholders = ', '.join('%s' for _ in header)
+                self.cursor.execute(
+                    f"INSERT INTO sales ({columns}) VALUES ({placeholders}) RETURNING id",
+                    list(header.values()),
+                )
+                row = self.cursor.fetchone()
+                if not row:
+                    raise RuntimeError("Host database did not return the new sale ID")
+                sale_id = int(row[0])
+
+            self.cursor.execute("SELECT id FROM sales_items WHERE sales_id = %s", (sale_id,))
+            existing_ids = {int(row[0]) for row in self.cursor.fetchall()}
+            retained_ids = set()
+            inserted = updated = 0
+            for item in validated:
+                values = (
+                    item['product_id'], item['service_id'], item['item_type'],
+                    item['product_name'], item['information'],
+                    item['quantity'], item['unit_price'], item['production'],
+                    item['sort_order'], item['discount_percentage'],
+                )
+                if item['id'] is not None:
+                    if item['id'] not in existing_ids:
+                        raise ValueError(f"Item ID {item['id']} does not belong to sale {sale_id}")
+                    self.cursor.execute(
+                        "UPDATE sales_items SET product_id=%s, service_id=%s, item_type=%s, "
+                        "product_name=%s, information=%s, quantity=%s, unit_price=%s, "
+                        "production=%s, sort_order=%s, discount_percentage=%s WHERE id=%s AND sales_id=%s",
+                        (*values, item['id'], sale_id),
+                    )
+                    retained_ids.add(item['id'])
+                    updated += 1
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO sales_items "
+                        "(sales_id, product_id, service_id, item_type, product_name, "
+                        "information, quantity, unit_price, production, sort_order, discount_percentage) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (sale_id, *values),
+                    )
+                    row = self.cursor.fetchone()
+                    if not row:
+                        raise RuntimeError(f"Item {item['product_name']!r} was not inserted")
+                    retained_ids.add(int(row[0]))
+                    inserted += 1
+
+            delete_ids = existing_ids - retained_ids
+            if delete_ids:
+                self.cursor.execute(
+                    "DELETE FROM sales_items WHERE sales_id = %s AND id = ANY(%s)",
+                    (sale_id, list(delete_ids)),
+                )
+            deleted = len(delete_ids)
+
+            # Stock availability is only validated when this Sale actually
+            # consumes inventory. Sale state plays no part in this decision.
+            if affect_stock:
+                requested_by_product = {}
+                for item in validated:
+                    if item["item_type"] == "product":
+                        requested_by_product[item["product_id"]] = (
+                            requested_by_product.get(item["product_id"], 0) + item["quantity"]
+                        )
+                # Stable lock order prevents two multi-product sales from
+                # deadlocking when their line order differs.
+                for product_id in sorted(requested_by_product):
+                    requested = requested_by_product[product_id]
+                    # Serialize stock checks for the same product. Without this
+                    # lock, two client PCs could both validate against the same
+                    # pre-sale balance and oversell it.
+                    self.cursor.execute(
+                        "SELECT id FROM products WHERE id=%s FOR UPDATE",
+                        (product_id,),
+                    )
+                    if not self.cursor.fetchone():
+                        raise ValueError(f"Product {product_id} does not exist")
+                    self.cursor.execute(
+                        "SELECT COALESCE(SUM(ii.quantity), 0) "
+                        "FROM import_items ii "
+                        "JOIN imports i ON i.id = ii.import_id "
+                        "WHERE ii.product_id=%s "
+                        "  AND (i.is_historical IS NULL OR NOT i.is_historical)",
+                        (product_id,),
+                    )
+                    imported = self.cursor.fetchone()[0] or 0
+                    self.cursor.execute(
+                        f"""
+                        SELECT COALESCE(SUM(si.quantity), 0)
+                        FROM sales_items si JOIN sales s ON s.id=si.sales_id
+                        WHERE si.product_id=%s AND si.sales_id<>%s
+                          AND {SALE_STOCK_ELIGIBILITY_SQL}
+                        """,
+                        (product_id, sale_id),
+                    )
+                    sold_elsewhere = self.cursor.fetchone()[0] or 0
+                    if requested > imported - sold_elsewhere:
+                        raise ValueError(
+                            f"Insufficient stock for product ID {product_id}: "
+                            f"requested {requested}, available {imported - sold_elsewhere}"
+                        )
+            self.conn.commit()
+            return {
+                'sale_id': sale_id,
+                'saved': len(validated),
+                'inserted': inserted,
+                'updated': updated,
+                'deleted': deleted,
+                'items': [
+                    {'item_type': item['item_type'], 'product_id': item['product_id'],
+                     'service_id': item['service_id'], 'designation': item['product_name']}
+                    for item in validated
+                ],
+                'transaction': 'committed',
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def save_import_with_items(
+        self, import_data, items, import_id=None, visible_row_count=None, user=None
+    ):
+        """Atomically save a supplier purchase and its stock ledger entries."""
+        if not isinstance(import_data, dict) or not isinstance(items, list):
+            raise ValueError("Import header and items must be objects")
+        visible_count = int(
+            visible_row_count if visible_row_count is not None else len(items)
+        )
+        if visible_count > 0 and not items:
+            raise ValueError(
+                f"Import was not saved: {visible_count} visible items were found, "
+                "but the server received 0 valid items."
+            )
+
+        validated = []
+        for index, raw in enumerate(items, start=1):
+            if not isinstance(raw, dict):
+                raise ValueError(f"Item {index} must be an object")
+            name = " ".join(str(raw.get("product_name") or "").split())
+            if not name:
+                raise ValueError(f"Item {index}: product name is required")
+            quantity = self._sale_decimal(
+                raw.get("quantity"), f"item {index} quantity", "0.001"
+            )
+            unit_price = self._sale_decimal(
+                raw.get("unit_price"), f"item {index} unit price", "0"
+            )
+            try:
+                item_id = int(raw["id"]) if raw.get("id") not in (None, "", 0, "0") else None
+                product_id = (
+                    int(raw["product_id"])
+                    if raw.get("product_id") not in (None, "", 0, "0") else None
+                )
+            except (TypeError, ValueError):
+                raise ValueError(f"Item {index}: IDs must be integers when present")
+            validated.append({
+                "id": item_id, "product_id": product_id, "product_name": name,
+                "quantity": quantity, "unit_price": unit_price,
+                "category": str(raw.get("category") or ""),
+                "description": str(raw.get("description") or ""),
+                "sku": str(raw.get("sku") or raw.get("reference") or ""),
+            })
+
+        try:
+            token = str(import_data.get("operation_token") or "").strip()
+            if not import_id and token:
+                self.cursor.execute(
+                    "SELECT id FROM imports WHERE operation_token=%s", (token,)
+                )
+                duplicate = self.cursor.fetchone()
+                if duplicate:
+                    self.cursor.execute(
+                        "SELECT COUNT(*) FROM import_items WHERE import_id=%s",
+                        (int(duplicate[0]),),
+                    )
+                    return {
+                        "import_id": int(duplicate[0]),
+                        "saved": int(self.cursor.fetchone()[0]),
+                        "inserted": 0, "updated": 0, "deleted": 0,
+                        "created_products": 0, "transaction": "committed",
+                        "duplicate": True,
+                    }
+
+            actor = self._actor_fields(user)
+            created_products = 0
+            for item in validated:
+                product_id = canonical = None
+                if item["product_id"]:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"], item["product_id"]
+                    )
+                if not product_id and item["sku"]:
+                    self.cursor.execute(
+                        "SELECT id, name FROM products "
+                        "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                        "ORDER BY id LIMIT 1",
+                        (self._normalize_exact(item["sku"]),),
+                    )
+                    row = self.cursor.fetchone()
+                    if row:
+                        product_id, canonical = int(row[0]), row[1]
+                if not product_id:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"]
+                    )
+                if not product_id:
+                    self.cursor.execute(
+                        "SELECT pg_advisory_xact_lock(hashtext(%s))",
+                        (
+                            f"product-sku:{self._normalize_exact(item['sku'])}"
+                            if item["sku"]
+                            else f"product-name:{self._normalize_exact(item['product_name'])}",
+                        ),
+                    )
+                    if item["sku"]:
+                        self.cursor.execute(
+                            "SELECT id, name FROM products "
+                            "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                            "ORDER BY id LIMIT 1",
+                            (self._normalize_exact(item["sku"]),),
+                        )
+                        row = self.cursor.fetchone()
+                        if row:
+                            product_id, canonical = int(row[0]), row[1]
+                if not product_id:
+                    product_id, canonical = self._find_named_record(
+                        "products", item["product_name"]
+                    )
+                if not product_id:
+                    self.cursor.execute(
+                        "INSERT INTO products "
+                        "(name, username, unit_price, sale_price, category, description, "
+                        "created_by, created_by_username, created_at) "
+                        "VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                        (
+                            item["product_name"], item["sku"] or item["product_name"],
+                            item["unit_price"], item["unit_price"], item["category"],
+                            item["description"], actor["created_by"],
+                            actor["created_by_username"], actor["created_at"],
+                        ),
+                    )
+                    product_id = int(self.cursor.fetchone()[0])
+                    canonical = item["product_name"]
+                    created_products += 1
+                else:
+                    # Purchase price follows the latest supplier transaction;
+                    # preserve sale price and all unrelated product fields.
+                    self.cursor.execute(
+                        "UPDATE products SET unit_price=%s WHERE id=%s",
+                        (item["unit_price"], product_id),
+                    )
+                item["product_id"] = product_id
+                item["product_name"] = canonical or item["product_name"]
+
+            import_cls = self.registered_classes["Imports"]
+            import_obj = import_cls(0, None)
+            header = {
+                key: import_data[key]
+                for key in import_obj.get_visible_parameters("database")
+                if key in import_data and not import_obj.is_parameter_calculated(key)
+            }
+            # is_historical lives on a real BOOLEAN column. Normalize here so the
+            # INSERT/UPDATE always sends Python True/False regardless of whether
+            # the payload arrives as bool, 0/1 or a string (mirrors the Sale
+            # save path). Never persists 1/0 into the boolean column.
+            if "is_historical" in header:
+                header["is_historical"] = self._parse_bool_flag(header["is_historical"])
+            supplier_username = " ".join(
+                str(header.get("supplier_username") or "").split()
+            )
+            if not supplier_username:
+                raise ValueError("Supplier is required")
+            self.cursor.execute(
+                "SELECT id, name, username FROM suppliers "
+                "WHERE LOWER(REGEXP_REPLACE(BTRIM(username), '\\s+', ' ', 'g'))=%s "
+                "OR LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                "ORDER BY id LIMIT 1",
+                (
+                    self._normalize_exact(supplier_username),
+                    self._normalize_exact(supplier_username),
+                ),
+            )
+            supplier = self.cursor.fetchone()
+            if not supplier:
+                raise ValueError(f"Supplier '{supplier_username}' does not exist")
+            header["supplier_id"] = int(supplier[0])
+            header["supplier_name"] = supplier[1] or supplier_username
+            header["supplier_username"] = supplier[2] or supplier_username
+
+            # Allocate/preserve the persistent Bon de Livraison reference on
+            # the host inside this transaction (never in the GUI thread).
+            self._resolve_import_bl(import_id, header)
+
+            if import_id:
+                import_id = int(import_id)
+                # Editing is gated solely by the caller's Imports:write permission
+                # (enforced by the RPC layer in core/network/server.py before this
+                # method is ever called) - who originally created the import does
+                # not additionally restrict who may edit it.
+                for protected in (
+                    "created_by", "created_by_username", "created_at", "operation_token"
+                ):
+                    header.pop(protected, None)
+                assignments = ", ".join(f"{key}=%s" for key in header)
+                self.cursor.execute(
+                    f"UPDATE imports SET {assignments} WHERE id=%s",
+                    [*header.values(), import_id],
+                )
+                if self.cursor.rowcount != 1:
+                    raise ValueError(f"Import {import_id} does not exist")
+            else:
+                header.update(actor)
+                columns = ", ".join(header)
+                placeholders = ", ".join("%s" for _ in header)
+                self.cursor.execute(
+                    f"INSERT INTO imports ({columns}) VALUES ({placeholders}) RETURNING id",
+                    list(header.values()),
+                )
+                import_id = int(self.cursor.fetchone()[0])
+
+            self.cursor.execute(
+                "SELECT id FROM import_items WHERE import_id=%s", (import_id,)
+            )
+            existing_ids = {int(row[0]) for row in self.cursor.fetchall()}
+            retained_ids = set()
+            inserted = updated = 0
+            for item in validated:
+                values = (
+                    item["product_id"], item["product_name"],
+                    item["quantity"], item["unit_price"],
+                )
+                if item["id"] is not None:
+                    if item["id"] not in existing_ids:
+                        raise ValueError(
+                            f"Item ID {item['id']} does not belong to import {import_id}"
+                        )
+                    self.cursor.execute(
+                        "UPDATE import_items SET product_id=%s, product_name=%s, "
+                        "quantity=%s, unit_price=%s WHERE id=%s AND import_id=%s",
+                        (*values, item["id"], import_id),
+                    )
+                    retained_ids.add(item["id"])
+                    updated += 1
+                else:
+                    self.cursor.execute(
+                        "INSERT INTO import_items "
+                        "(import_id, product_id, product_name, quantity, unit_price) "
+                        "VALUES (%s, %s, %s, %s, %s) RETURNING id",
+                        (import_id, *values),
+                    )
+                    retained_ids.add(int(self.cursor.fetchone()[0]))
+                    inserted += 1
+            delete_ids = existing_ids - retained_ids
+            if delete_ids:
+                self.cursor.execute(
+                    "DELETE FROM import_items WHERE import_id=%s AND id=ANY(%s)",
+                    (import_id, list(delete_ids)),
+                )
+            self.conn.commit()
+            return {
+                "import_id": import_id, "saved": len(validated),
+                "inserted": inserted, "updated": updated, "deleted": len(delete_ids),
+                "created_products": created_products, "transaction": "committed",
+            }
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def query(self, cls, **filters):
         """Query objects with optional filters"""
         if not self.cursor:
             print("Database not connected")
             return []
-        
+
         try:
             temp_obj = cls(0, None)
             section_name = temp_obj.section
-            
+
             # Build query
             if filters:
-                where_clause = " AND ".join([f"'{k}' = ?" for k in filters.keys()])
-                sql = f"SELECT * FROM '{section_name}' WHERE {where_clause}"
+                where_clause = " AND ".join([f"{k} = %s" for k in filters.keys()])
+                sql = f"SELECT * FROM {section_name} WHERE {where_clause}"
                 params = list(filters.values())
             else:
-                sql = f"SELECT * FROM '{section_name}'"
+                sql = f"SELECT * FROM {section_name}"
                 params = []
-            
+
             # Execute query
             self.cursor.execute(sql, params)
             rows = self.cursor.fetchall()
-            
+
             # Convert to objects
             objects = []
             for row in rows:
@@ -567,119 +3636,1034 @@ class Database:
                 obj = self.load(cls, obj_id)
                 if obj:
                     objects.append(obj)
-            
+
             return objects
-            
+
         except Exception as e:
+            self.conn.rollback()
             print(f"Error querying {cls.__name__}: {e}")
             return []
-    
+
     def get_all(self, cls):
         """Get all objects of a given class"""
         return self.query(cls)
-    
+
     # Updated legacy methods for backward compatibility
     def add_item(self, data, section):
         """Add item to database and return the new ID"""
         if not self.cursor or section not in self.registered_classes:
             return None
-        
+
         try:
             # Get parameters that should be stored
             cls = self.registered_classes[section]
             temp_obj = cls(0, None)
             db_params = temp_obj.get_visible_parameters("database")
-            
+
             # Filter data to only include storable parameters
             filtered_data = {}
             for key in db_params:
-                if (key in data and 
-                    not temp_obj.is_parameter_calculated(key)):
+                if (key in data and
+                        not temp_obj.is_parameter_calculated(key)):
                     filtered_data[key] = data[key]
-            
+
             if not filtered_data:
                 return None
-            
+
             # Build INSERT query
             columns = list(filtered_data.keys())
-            placeholders = ['?' for _ in columns]
-            columns_str = "', '".join(columns)
+            placeholders = ['%s' for _ in columns]
+            columns_str = ", ".join(columns)
             placeholders_str = ", ".join(placeholders)
-            
-            sql = f"INSERT INTO '{section}' ('{columns_str}') VALUES ({placeholders_str})"
+
+            sql = f"INSERT INTO {section} ({columns_str}) VALUES ({placeholders_str}) RETURNING id"
             values = list(filtered_data.values())
-            
+
             self.cursor.execute(sql, values)
             self.conn.commit()
-            
+
             # Return the ID of the inserted record
-            return self.cursor.lastrowid
-            
+            row = self.cursor.fetchone()
+            new_id = row[0] if row else None
+            if new_id is not None:
+                self.record_change(
+                    section, int(new_id), 'upsert',
+                    self._row_snapshot(section, new_id),
+                )
+            return new_id
+
         except Exception as e:
+            self.conn.rollback()
             print(f"Error adding item to {section}: {e}")
             return None
-    
+
+    def _row_snapshot(self, section, item_id):
+        """Return the full row for ``item_id`` as a dict, or None on error."""
+        try:
+            self.cursor.execute(f"SELECT * FROM {section} WHERE id = %s", (item_id,))
+            col_names = (
+                [d[0] for d in self.cursor.description]
+                if self.cursor.description else []
+            )
+            row = self.cursor.fetchone()
+            if row is None:
+                return None
+            return dict(zip(col_names, row))
+        except Exception:
+            return None
+
     def update_item(self, item_id, data, section):
         """Update item in database"""
         if not self.cursor or section not in self.registered_classes:
             return False
-        
+
         try:
             # Get parameters that should be stored
             cls = self.registered_classes[section]
             temp_obj = cls(0, None)
             db_params = temp_obj.get_visible_parameters("database")
-            
+
             # Filter data to only include storable parameters
             filtered_data = {}
             for key in db_params:
-                if (key in data and 
-                    not temp_obj.is_parameter_calculated(key)):
+                if (key in data and
+                        not temp_obj.is_parameter_calculated(key)):
                     filtered_data[key] = data[key]
-            
+
             if not filtered_data:
                 return False
-            
+
             # Build UPDATE query
-            set_clauses = [f"'{key}' = ?" for key in filtered_data.keys()]
+            set_clauses = [f"{key} = %s" for key in filtered_data.keys()]
             set_clause = ", ".join(set_clauses)
             values = list(filtered_data.values())
             values.append(item_id)
-            
-            sql = f"UPDATE '{section}' SET {set_clause} WHERE ID = ?"
-            
+
+            sql = f"UPDATE {section} SET {set_clause} WHERE id = %s"
+
             self.cursor.execute(sql, values)
             self.conn.commit()
+            self.record_change(
+                section, int(item_id), 'upsert',
+                self._row_snapshot(section, item_id),
+            )
             return True
-            
+
         except Exception as e:
+            self.conn.rollback()
             print(f"Error updating item in {section}: {e}")
             return False
-    
-    def get_items(self, section):
-        """Get all items from section"""
+
+    @staticmethod
+    def _order_column_expression(order_by, prefix=''):
+        """Resolve a validated sort column to a SQL expression (None for id).
+
+        ``prefix`` scopes a plain column name for join-based queries (e.g. 's.'
+        for sales) but the date sort is special-cased to a CASE expression.
+        Returned expressions are NULL-safe so composite keyset comparisons
+        never evaluate against a NULL sort value.
+        """
+        if not order_by or str(order_by).casefold() == 'id':
+            return None
+        column = str(order_by)
+        if column not in _ORDER_COLUMNS:
+            return None
+        if column == 'date':
+            return Database._date_sort_expression(prefix)
+        expr = f"{prefix}{column}"
+        if column in _ORDER_NUMERIC_COLUMNS:
+            return f"COALESCE({expr}, 0)"
+        return f"COALESCE({expr}, '')"
+
+    @staticmethod
+    def _date_sort_expression(prefix=''):
+        """Order expression parsing the dd-mm-yyyy / yyyy-mm-dd date text stored
+        in the ``date`` column into a real Postgres date for correct ordering.
+        Unparseable/empty dates sort to 1900-01-01 so the keyset cursor value
+        stays type-compatible with the comparison expression."""
+        col = f"{prefix}date"
+        return (
+            "CASE "
+            f"WHEN {col} ~ '^\\d{{2}}-\\d{{2}}-\\d{{4}}$' THEN TO_DATE({col}, 'DD-MM-YYYY') "
+            f"WHEN {col} ~ '^\\d{{4}}-\\d{{2}}-\\d{{2}}$' THEN TO_DATE({col}, 'YYYY-MM-DD') "
+            f"WHEN {col} ~ '^\\d{{2}}/\\d{{2}}/\\d{{4}}$' THEN TO_DATE({col}, 'DD/MM/YYYY') "
+            "ELSE DATE '1900-01-01' END"
+        )
+
+    @staticmethod
+    def _keyset_sort_value(order_by, after_sort):
+        """Normalize a keyset cursor value so it can be cast to the same type as
+        the ORDER BY expression (dates are stored as display text)."""
+        if order_by != 'date' or after_sort is None:
+            return after_sort
+        text = str(after_sort).strip()
+        for fmt in ('%d-%m-%Y', '%Y-%m-%d', '%d/%m/%Y'):
+            try:
+                return datetime.strptime(text, fmt).date().isoformat()
+            except ValueError:
+                continue
+        return '1900-01-01'
+
+    @staticmethod
+    def _keyset_condition(order_expr, direction, after_id, after_sort):
+        """Build (sql_fragment, params) for keyset pagination on (order_expr, id).
+
+        Uses a composite row comparison so duplicate sort values still page
+        deterministically through the unique ``id`` tie-breaker. Returns a
+        fragment of ``None`` when no cursor is supplied (first batch).
+        """
+        if after_id is None:
+            return None, []
+        op = '>' if str(direction).casefold().startswith('a') else '<'
+        last_id = int(after_id)
+        if order_expr and order_expr != 'id':
+            fragment = f"({order_expr}, id) {op} (%s, %s)"
+            return fragment, [after_sort, last_id]
+        return f"id {op} %s", [last_id]
+
+    @staticmethod
+    def _summary_order_expression(order_by):
+        """Resolve a validated sort column to a SQL expression usable both in
+        ORDER BY and in the keyset WHERE clause for the Sales/Imports summary
+        query (SELECT aliases are not visible inside WHERE)."""
+        if not order_by or str(order_by).casefold() == 'id':
+            return None
+        column = str(order_by)
+        if column not in _ORDER_COLUMNS:
+            return None
+        summary_columns = {
+            'subtotal': 'COALESCE(summary.subtotal, 0)',
+            'total_price': 'COALESCE(summary.total_price, 0)',
+            'total_ht': 'COALESCE(summary.subtotal - COALESCE(s.remise, 0), 0)',
+            'total_ttc': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (1 + COALESCE(s.tva, 0) / 100.0), 0)',
+            'vat_amount': 'COALESCE((summary.subtotal - COALESCE(s.remise, 0)) * (COALESCE(s.tva, 0) / 100.0), 0)',
+            'information': "COALESCE(summary.information, '')",
+            'total_quantity': 'COALESCE(summary.total_quantity, 0)',
+            'total_production': 'COALESCE(summary.total_production, 0)',
+        }
+        if column in summary_columns:
+            return summary_columns[column]
+        return Database._order_column_expression(column, prefix='s.')
+
+    def get_items(
+        self, section, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None
+    ):
+        """Get items from section, optionally filtered, sorted, and paginated.
+
+        ``after_id`` / ``after_sort`` implement keyset (seek) pagination: the
+        next batch is the first batch of rows after the previous batch's last
+        row in the same stable ORDER BY (sort column, id). This avoids the
+        deep-OFFSET slowdown and duplicate/skipped rows on large tables.
+        """
         if not self.cursor or section not in self.registered_classes:
             return []
-        
+
         try:
-            self.cursor.execute(f"SELECT * FROM '{section}'")
+            query = f"SELECT * FROM {section}"
+            params = []
+            conditions = []
+
+            if search_text and search_columns:
+                search_term = f"%{search_text.lower()}%"
+                clauses = []
+                for col in search_columns:
+                    clauses.append(
+                        f"LOWER(COALESCE(CAST({col} AS text), '')) LIKE %s"
+                    )
+                    params.append(search_term)
+                if clauses:
+                    conditions.append("(" + " OR ".join(clauses) + ")")
+
+            direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+            order_expr = self._order_column_expression(order_by)
+            cursor_value = self._keyset_sort_value(order_by, after_sort)
+            keyset_fragment, keyset_params = self._keyset_condition(
+                order_expr, direction, after_id, cursor_value
+            )
+            if keyset_fragment:
+                conditions.append(keyset_fragment)
+                params.extend(keyset_params)
+
+            if conditions:
+                query += " WHERE " + " AND ".join(conditions)
+
+            if order_expr:
+                query += f" ORDER BY {order_expr} {direction}, id {direction}"
+            else:
+                query += " ORDER BY id"
+
+            if limit is not None:
+                query += " LIMIT %s"
+                params.append(int(limit))
+                if offset is not None:
+                    query += " OFFSET %s"
+                    params.append(int(offset))
+
+            self.cursor.execute(query, params)
             rows = self.cursor.fetchall()
-            
-            # Get column names
+
+            # Get column names - Postgres folds unquoted columns to lowercase,
+            # so restore the PK's original 'ID' casing that callers throughout
+            # the app expect (classes/base_class.py etc. do item.get('ID')).
             columns = [description[0] for description in self.cursor.description]
-            
-            # Convert to list of dictionaries
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+
             return [dict(zip(columns, row)) for row in rows]
-            
+
         except Exception as e:
+            self.conn.rollback()
             print(f"Error getting items from {section}: {e}")
             return []
-    
+
+    def get_operation_summary_items(
+        self, section, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None,
+        user=None,
+    ):
+        """Get Sales and Imports rows with precomputed totals and summaries.
+
+        Sales are company-wide, not per-creator: this must return the exact
+        same rows get_items_for_user('Sales', ...) does (no created_by
+        filter) - see get_client_sales()/get_client_account() for the same
+        policy and why an inconsistent filter here previously made this
+        summary query silently return zero rows for any non-superadmin user
+        viewing sales someone else created, forced through the
+        get_items(...) fallback in ui/tabs/base_tab.py's fetch().
+        """
+        if section not in ('Sales', 'Imports'):
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+
+        base_table = section.lower()
+        item_table = 'sales_items' if section == 'Sales' else 'import_items'
+        foreign_key = 'sales_id' if section == 'Sales' else 'import_id'
+
+        # Remise only exists on the sales table (discounts); imports have no
+        # discount column, so their computed totals reduce to the raw sums.
+        remise_expr = 'COALESCE(s.remise, 0)' if section == 'Sales' else '0'
+        # Authoritative table totals, matching calculate_sale_totals():
+        #   Total HT = Original Subtotal - Remise
+        #   VAT      = Total HT * tva / 100
+        #   Total TTC = Total HT + VAT
+        total_ht_expr = f'COALESCE(summary.subtotal - {remise_expr}, 0)'
+        vat_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (COALESCE(s.tva, 0) / 100.0), 0)'
+        total_ttc_expr = f'COALESCE((summary.subtotal - {remise_expr}) * (1 + COALESCE(s.tva, 0) / 100.0), 0)'
+
+        if section == 'Sales':
+            information_select = (
+                "COALESCE(STRING_AGG(COALESCE(si.information, ''), "
+                "', ' ORDER BY si.id), '')"
+            )
+            production_select = "COALESCE(SUM(si.production), 0)"
+        else:
+            information_select = "''"
+            production_select = "0"
+
+        select_list = (
+            f"SELECT s.*, "
+            f"COALESCE(summary.subtotal, 0) AS subtotal, "
+            f"COALESCE(summary.total_price, 0) AS total_price, "
+            f"{total_ht_expr} AS total_ht, "
+            f"{total_ttc_expr} AS total_ttc, "
+            f"{vat_expr} AS vat_amount, "
+            f"COALESCE(summary.information, '') AS information, "
+            f"COALESCE(summary.total_quantity, 0) AS total_quantity, "
+            f"COALESCE(summary.total_production, 0) AS total_production"
+        )
+        if section == 'Sales':
+            # The persisted devis reference wins; legacy rows (or rows saved
+            # before the TEXT column backfill) fall back to a computed
+            # DE-YEAR-N so the Sales table always shows a stable reference.
+            # The later duplicate "devis" key overrides s.* in the row dict.
+            select_list += (
+                f", COALESCE(NULLIF(BTRIM(s.devis), ''), "
+                f"'DE-' || {_DEVIS_YEAR_EXPR} || '-' || COALESCE(s.devis_number::text, '')) AS devis"
+            )
+        summary_columns = (
+            f"SUM(si.quantity * si.unit_price) AS subtotal, "
+            f"SUM(si.quantity * si.unit_price * (1 + COALESCE({{tva}}, 0) / 100.0)) AS total_price, "
+            f"{information_select} AS information, "
+            f"COALESCE(SUM(si.quantity), 0) AS total_quantity, "
+            f"{production_select} AS total_production "
+        )
+        params = []
+        conditions = []
+        # Filtering or sorting on a computed column needs every operation's
+        # totals before the page can be chosen.
+        needs_all_summaries = False
+
+        if search_text and search_columns:
+            search_term = f"%{search_text.lower()}%"
+            clauses = []
+            for col in search_columns:
+                if col == 'information':
+                    needs_all_summaries = True
+                    clauses.append("LOWER(COALESCE(summary.information, '')) LIKE %s")
+                else:
+                    clauses.append(
+                        f"LOWER(COALESCE(CAST(s.{col} AS text), '')) LIKE %s"
+                    )
+                params.append(search_term)
+            if clauses:
+                conditions.append("(" + " OR ".join(clauses) + ")")
+
+        direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+        order_expr = self._summary_order_expression(order_by)
+        if order_expr and 'summary.' in order_expr:
+            needs_all_summaries = True
+        cursor_value = self._keyset_sort_value(order_by, after_sort)
+        keyset_fragment, keyset_params = self._keyset_condition(
+            order_expr, direction, after_id, cursor_value
+        )
+        if keyset_fragment:
+            conditions.append(keyset_fragment)
+            params.extend(keyset_params)
+
+        where_clause = " WHERE " + " AND ".join(conditions) if conditions else ""
+        if order_expr:
+            order_clause = f" ORDER BY {order_expr} {direction}, s.id {direction}"
+        else:
+            order_clause = " ORDER BY s.id"
+        limit_clause = ""
+        if limit is not None:
+            limit_clause = " LIMIT %s"
+            params.append(int(limit))
+            if offset is not None:
+                limit_clause += " OFFSET %s"
+                params.append(int(offset))
+
+        if needs_all_summaries or limit is None:
+            # One pass over the item table, grouped per operation. The inner
+            # join to base_table (alias "i") supplies each line's tva; "s" is
+            # only in scope in the outer query.
+            query = (
+                f"{select_list} FROM {base_table} s "
+                f"LEFT JOIN ("
+                f"  SELECT si.{foreign_key}, {summary_columns.format(tva='i.tva')}"
+                f"  FROM {item_table} si "
+                f"  JOIN {base_table} i ON i.id = si.{foreign_key} "
+                f"  GROUP BY si.{foreign_key} "
+                f") summary ON summary.{foreign_key} = s.id"
+                f"{where_clause}{order_clause}{limit_clause}"
+            )
+        else:
+            # Choose the page from the operation table alone, then total only
+            # those operations through the item table's foreign-key index.
+            # The grouped form above sums every line of every operation on
+            # each page request, so its cost grows with the whole history
+            # while this one stays proportional to the page.
+            query = (
+                f"{select_list} FROM ("
+                f"  SELECT s.* FROM {base_table} s{where_clause}{order_clause}{limit_clause}"
+                f") s "
+                f"LEFT JOIN LATERAL ("
+                f"  SELECT {summary_columns.format(tva='s.tva')}"
+                f"  FROM {item_table} si WHERE si.{foreign_key} = s.id"
+                f") summary ON TRUE"
+                f"{order_clause}"
+            )
+
+        mode = 'remote' if user is not None else 'local'
+        try:
+            self.cursor.execute(query, params)
+            rows = self.cursor.fetchall()
+            columns = [description[0] for description in self.cursor.description]
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+            result = [dict(zip(columns, row)) for row in rows]
+        except Exception as error:
+            self.conn.rollback()
+            logger.error(
+                "get_operation_summary_items failed: mode=%s section=%s "
+                "parameter_count=%s category=%s stack=\n%s",
+                mode, section, len(params), type(error).__name__,
+                ''.join(traceback.format_tb(error.__traceback__)),
+            )
+            return []
+        logger.info(
+            "get_operation_summary_items: mode=%s section=%s "
+            "parameter_count=%s row_count=%s",
+            mode, section, len(params), len(result),
+        )
+        return result
+
+    def get_items_for_user(
+        self, section, user, owner_id=None, date_from=None, date_to=None,
+        report_type=None, search_text=None, search_columns=None,
+        order_by=None, order_dir='asc', limit=None, offset=None,
+        after_id=None, after_sort=None,
+    ):
+        """Return ownership-filtered Sales or Reports rows.
+
+        Regular users are always pinned to their authenticated session ID.
+        Super admins may request one owner or leave it empty for all rows.
+        Legacy rows with no owner remain visible only in the all-user admin view.
+        """
+        if section == "Sales_Items":
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+        if section == "Sales":
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+        if section not in ("Sales", "Reports"):
+            return self.get_items(
+                section,
+                search_text=search_text,
+                search_columns=search_columns,
+                order_by=order_by,
+                order_dir=order_dir,
+                limit=limit,
+                offset=offset,
+                after_id=after_id,
+                after_sort=after_sort,
+            )
+        user = user or {}
+        is_superadmin = bool(user.get("is_superadmin"))
+        effective_owner = owner_id if is_superadmin else user.get("id")
+        if not is_superadmin and effective_owner is None:
+            return []
+
+        query = f"SELECT * FROM {section}"
+        params = []
+        conditions = []
+
+        if effective_owner not in (None, "", "all"):
+            conditions.append("created_by=%s")
+            params.append(int(effective_owner))
+
+        if section == "Reports":
+            if report_type not in (None, "", "all"):
+                conditions.append("COALESCE(NULLIF(report_type, ''), 'General')=%s")
+                params.append(str(report_type))
+            date_expression = (
+                "CASE "
+                "WHEN date ~ '^\\d{2}-\\d{2}-\\d{4}$' THEN TO_DATE(date, 'DD-MM-YYYY') "
+                "WHEN date ~ '^\\d{4}-\\d{2}-\\d{2}$' THEN TO_DATE(date, 'YYYY-MM-DD') "
+                "WHEN date ~ '^\\d{2}/\\d{2}/\\d{4}$' THEN TO_DATE(date, 'DD/MM/YYYY') "
+                "ELSE NULL END"
+            )
+            if date_from:
+                conditions.append(f"{date_expression} >= %s::date")
+                params.append(str(date_from))
+            if date_to:
+                conditions.append(f"{date_expression} <= %s::date")
+                params.append(str(date_to))
+
+        if search_text and search_columns:
+            search_term = f"%{search_text.lower()}%"
+            clauses = []
+            for col in search_columns:
+                clauses.append(
+                    f"LOWER(COALESCE(CAST({col} AS text), '')) LIKE %s"
+                )
+                params.append(search_term)
+            if clauses:
+                conditions.append("(" + " OR ".join(clauses) + ")")
+
+        direction = 'DESC' if str(order_dir).lower().startswith('d') else 'ASC'
+        order_expr = self._order_column_expression(order_by)
+        cursor_value = self._keyset_sort_value(order_by, after_sort)
+        keyset_fragment, keyset_params = self._keyset_condition(
+            order_expr, direction, after_id, cursor_value
+        )
+        if keyset_fragment:
+            conditions.append(keyset_fragment)
+            params.extend(keyset_params)
+
+        if conditions:
+            query += " WHERE " + " AND ".join(conditions)
+
+        if order_expr:
+            query += f" ORDER BY {order_expr} {direction}, id {direction}"
+        else:
+            query += " ORDER BY id"
+
+        if limit is not None:
+            query += " LIMIT %s"
+            params.append(int(limit))
+            if offset is not None:
+                query += " OFFSET %s"
+                params.append(int(offset))
+
+        self.cursor.execute(query, params)
+        rows = self.cursor.fetchall()
+        columns = [description[0] for description in self.cursor.description]
+        if columns and columns[0].lower() == "id":
+            columns[0] = "ID"
+        return [dict(zip(columns, row)) for row in rows]
+
+    def get_product_stock_levels(self):
+        self.cursor.execute(
+            f"""
+            SELECT p.id,
+                   COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
+            FROM products p
+            LEFT JOIN (
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii
+                JOIN imports i ON i.id = ii.import_id
+                WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                GROUP BY ii.product_id
+            ) imported ON imported.product_id=p.id
+            LEFT JOIN (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+                GROUP BY si.product_id
+            ) sold ON sold.product_id=p.id
+            """
+        )
+        return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    def get_product_stock_levels_for_product_ids(self, product_ids):
+        if not product_ids:
+            return {}
+        # The id filter is repeated inside both aggregates: PostgreSQL does
+        # not push the outer p.id filter through GROUP BY on its own, and
+        # without it every import and sale line is summed to answer for one
+        # page of products.
+        self.cursor.execute(
+            f"""
+            SELECT p.id,
+                   COALESCE(imported.quantity, 0) - COALESCE(sold.quantity, 0)
+            FROM products p
+            LEFT JOIN (
+                SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                FROM import_items ii
+                JOIN imports i ON i.id = ii.import_id
+                WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                  AND ii.product_id = ANY(%s)
+                GROUP BY ii.product_id
+            ) imported ON imported.product_id=p.id
+            LEFT JOIN (
+                SELECT si.product_id, SUM(si.quantity) AS quantity
+                FROM sales_items si
+                JOIN sales s ON s.id=si.sales_id
+                WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+                  AND si.product_id = ANY(%s)
+                GROUP BY si.product_id
+            ) sold ON sold.product_id=p.id
+            WHERE p.id = ANY(%s)
+            """,
+            (product_ids, product_ids, product_ids)
+        )
+        return {int(row[0]): row[1] or 0 for row in self.cursor.fetchall()}
+
+    def get_sale_catalog(self, include_products=True, include_services=True, exclude_sale_id=None,
+                          include_clients=False, include_suppliers=False):
+        """Return the sale-entry catalog and stock in a small number of queries.
+
+        include_clients/include_suppliers are opt-in and deliberately cheap
+        (just username+name, no other columns) - they exist so the New/Edit
+        Sale and Import dialogs can prefetch client/supplier existence data
+        once, off the GUI thread, instead of firing a live query the moment
+        the user clicks Save (see BaseOperationDialog._entity_exists).
+        """
+        catalog = {"products": [], "services": []}
+        if include_products:
+            if exclude_sale_id:
+                self.cursor.execute(
+                    f"""
+                    SELECT p.id, p.name, p.sale_price, p.preview_image,
+                           COALESCE(imported.quantity, 0)
+                           - COALESCE(sold.quantity, 0) AS stock
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                        FROM import_items ii
+                        JOIN imports i ON i.id = ii.import_id
+                        WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                        GROUP BY ii.product_id
+                    ) imported ON imported.product_id=p.id
+                    LEFT JOIN (
+                        SELECT si.product_id, SUM(si.quantity) AS quantity
+                        FROM sales_items si
+                        JOIN sales s ON s.id=si.sales_id
+                        WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+                          AND s.id != %s
+                        GROUP BY si.product_id
+                    ) sold ON sold.product_id=p.id
+                    WHERE p.name IS NOT NULL AND p.name<>''
+                    ORDER BY LOWER(p.name), p.id
+                    """,
+                    (exclude_sale_id,)
+                )
+            else:
+                self.cursor.execute(
+                    f"""
+                    SELECT p.id, p.name, p.sale_price, p.preview_image,
+                           COALESCE(imported.quantity, 0)
+                           - COALESCE(sold.quantity, 0) AS stock
+                    FROM products p
+                    LEFT JOIN (
+                        SELECT ii.product_id, SUM(ii.quantity) AS quantity
+                        FROM import_items ii
+                        JOIN imports i ON i.id = ii.import_id
+                        WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+                        GROUP BY ii.product_id
+                    ) imported ON imported.product_id=p.id
+                    LEFT JOIN (
+                        SELECT si.product_id, SUM(si.quantity) AS quantity
+                        FROM sales_items si
+                        JOIN sales s ON s.id=si.sales_id
+                        WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+                        GROUP BY si.product_id
+                    ) sold ON sold.product_id=p.id
+                    WHERE p.name IS NOT NULL AND p.name<>''
+                    ORDER BY LOWER(p.name), p.id
+                    """
+                )
+            catalog["products"] = [
+                {
+                    "id": int(row[0]), "name": row[1],
+                    "price": str(row[2] or 0), "preview_image": row[3],
+                    "stock": str(row[4] or 0),
+                }
+                for row in self.cursor.fetchall()
+            ]
+        if include_services:
+            self.cursor.execute(
+                "SELECT id, name, unit_price, keywords FROM services "
+                "WHERE name IS NOT NULL AND name<>'' ORDER BY LOWER(name), id"
+            )
+            catalog["services"] = [
+                {
+                    "id": int(row[0]), "name": row[1],
+                    "price": str(row[2] or 0), "keywords": row[3] or "",
+                }
+                for row in self.cursor.fetchall()
+            ]
+        if include_clients:
+            self.cursor.execute(
+                "SELECT id, username, name, address, ice FROM clients "
+                "WHERE username IS NOT NULL OR name IS NOT NULL "
+                "ORDER BY LOWER(COALESCE(name, username)), id"
+            )
+            catalog["clients"] = [
+                {"id": int(row[0]), "username": row[1] or "", "name": row[2] or "",
+                 "address": row[3] or "", "ice": row[4] or ""}
+                for row in self.cursor.fetchall()
+            ]
+        if include_suppliers:
+            self.cursor.execute(
+                "SELECT username, name FROM suppliers WHERE username IS NOT NULL OR name IS NOT NULL"
+            )
+            catalog["suppliers"] = [
+                {"username": row[0] or "", "name": row[1] or ""}
+                for row in self.cursor.fetchall()
+            ]
+        return catalog
+
+    def get_dashboard_snapshot(self):
+        """Return dashboard data in three bounded queries for LAN clients."""
+        self.cursor.execute(
+            """
+            SELECT
+              (SELECT COALESCE(SUM(si.quantity * si.unit_price * (1 + s.tva/100)), 0)
+               FROM sales s JOIN sales_items si ON si.sales_id=s.id
+               WHERE (s.state IS NULL OR s.state<>'on_hold')
+                 AND LEFT(s.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
+              (SELECT COALESCE(SUM(ii.quantity * ii.unit_price * (1 + i.tva/100)), 0)
+               FROM imports i JOIN import_items ii ON ii.import_id=i.id
+               WHERE LEFT(i.date, 7)=TO_CHAR(CURRENT_DATE, 'YYYY-MM')),
+              (SELECT COUNT(*) FROM products),
+              (SELECT COUNT(*) FROM clients),
+              (SELECT COUNT(*) FROM suppliers)
+            """
+        )
+        totals = self.cursor.fetchone() or (0, 0, 0, 0, 0)
+        self.cursor.execute(
+            f"""
+            WITH imported AS (
+              SELECT ii.product_id, SUM(ii.quantity) quantity
+              FROM import_items ii
+              JOIN imports i ON i.id = ii.import_id
+              WHERE (i.is_historical IS NULL OR NOT i.is_historical)
+              GROUP BY ii.product_id
+            ), sold AS (
+              SELECT si.product_id, SUM(si.quantity) quantity
+              FROM sales_items si JOIN sales s ON s.id=si.sales_id
+              WHERE {SALE_STOCK_ELIGIBILITY_SQL}
+              GROUP BY si.product_id
+            ), stock AS (
+              SELECT p.name, p.username,
+                     COALESCE(imported.quantity,0)-COALESCE(sold.quantity,0) quantity,
+                     COALESCE(p.stock_alert,0) alert
+              FROM products p
+              LEFT JOIN imported ON imported.product_id=p.id
+              LEFT JOIN sold ON sold.product_id=p.id
+            )
+            SELECT name, username, quantity, alert, COUNT(*) OVER()
+            FROM stock
+            WHERE quantity <= CASE WHEN alert > 0 THEN alert ELSE 5 END
+            ORDER BY quantity, name
+            LIMIT 50
+            """
+        )
+        low_rows = self.cursor.fetchall()
+        self.cursor.execute(
+            """
+            SELECT activity_type, activity_date, amount, description
+            FROM (
+              SELECT 'Sales' activity_type, s.date activity_date,
+                     COALESCE(SUM(si.quantity*si.unit_price*(1+s.tva/100)),0) amount,
+                     'Sale to ' || COALESCE(s.client_username,'') description,
+                     s.id
+              FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id
+              WHERE s.state IS NULL OR s.state<>'on_hold'
+              GROUP BY s.id, s.date, s.client_username, s.tva
+              UNION ALL
+              SELECT 'Imports', i.date,
+                     COALESCE(SUM(ii.quantity*ii.unit_price*(1+i.tva/100)),0),
+                     'Import from ' || COALESCE(i.supplier_username,''), i.id
+              FROM imports i LEFT JOIN import_items ii ON ii.import_id=i.id
+              GROUP BY i.id, i.date, i.supplier_username, i.tva
+            ) activity
+            ORDER BY activity_date DESC, id DESC
+            LIMIT 5
+            """
+        )
+        activity_rows = self.cursor.fetchall()
+        self.cursor.execute(
+            """
+            SELECT month_key,
+                   COALESCE(SUM(sales_amount),0),
+                   COALESCE(SUM(import_amount),0)
+            FROM (
+              SELECT LEFT(s.date,7) month_key,
+                     SUM(si.quantity*si.unit_price*(1+s.tva/100)) sales_amount,
+                     0 import_amount
+              FROM sales s JOIN sales_items si ON si.sales_id=s.id
+              WHERE (s.state IS NULL OR s.state<>'on_hold')
+                AND LEFT(s.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+              GROUP BY LEFT(s.date,7)
+              UNION ALL
+              SELECT LEFT(i.date,7), 0,
+                     SUM(ii.quantity*ii.unit_price*(1+i.tva/100))
+              FROM imports i JOIN import_items ii ON ii.import_id=i.id
+              WHERE LEFT(i.date,7) >= TO_CHAR(CURRENT_DATE-INTERVAL '5 months','YYYY-MM')
+              GROUP BY LEFT(i.date,7)
+            ) monthly
+            GROUP BY month_key
+            ORDER BY month_key
+            """
+        )
+        monthly_rows = self.cursor.fetchall()
+        return {
+            "sales_total": str(totals[0] or 0),
+            "imports_total": str(totals[1] or 0),
+            "products_count": int(totals[2] or 0),
+            "clients_count": int(totals[3] or 0),
+            "suppliers_count": int(totals[4] or 0),
+            "low_stock_count": int(low_rows[0][4] if low_rows else 0),
+            "low_stock_products": [
+                {
+                    "name": row[0] or row[1] or "Unknown Product",
+                    "username": row[1] or "",
+                    "stock": str(row[2] or 0),
+                    "alert": str(row[3] or 0),
+                }
+                for row in low_rows
+            ],
+            "recent_activities": [
+                {
+                    "type": row[0], "date": row[1],
+                    "amount": str(row[2] or 0), "description": row[3] or "",
+                }
+                for row in activity_rows
+            ],
+            "monthly": {
+                row[0]: {"sales": str(row[1] or 0), "imports": str(row[2] or 0)}
+                for row in monthly_rows
+            },
+        }
+
+    def get_operation_items_for_user(self, operation_id, section, user):
+        return self.get_items_by_operation_id(operation_id, section)
+
+    def list_report_users(self):
+        self.cursor.execute(
+            "SELECT id, username FROM users ORDER BY LOWER(username), id"
+        )
+        return [{"id": int(row[0]), "username": row[1]} for row in self.cursor.fetchall()]
+
+    def get_reports(
+        self, owner_id=None, date_from=None, date_to=None, report_type=None,
+        search_text=None, search_columns=None, order_by=None, order_dir='asc',
+        limit=None, offset=None, after_id=None, after_sort=None,
+    ):
+        return self.get_items_for_user(
+            "Reports",
+            {"is_superadmin": True, "username": "Local Admin"},
+            owner_id,
+            date_from,
+            date_to,
+            report_type,
+            search_text=search_text,
+            search_columns=search_columns,
+            order_by=order_by,
+            order_dir=order_dir,
+            limit=limit,
+            offset=offset,
+            after_id=after_id,
+            after_sort=after_sort,
+        )
+
+    def save_report(self, report_id, data):
+        return self.save_report_for_user(
+            report_id, data, {"is_superadmin": True, "username": "Local Admin"}
+        )
+
+    def delete_report(self, report_id):
+        return self.delete_report_for_user(
+            report_id, {"is_superadmin": True, "username": "Local Admin"}
+        )
+
+    def save_report_for_user(self, report_id, data, user):
+        user = user or {}
+        actor = self._actor_fields(user)
+        payload = {
+            "department": actor["created_by_username"],
+            "date": str(data.get("date") or ""),
+            "report_type": str(data.get("report_type") or "General"),
+            "report": str(data.get("report") or "").strip(),
+        }
+        if not payload["date"] or not payload["report"]:
+            raise ValueError("Report date and text are required")
+        try:
+            if report_id:
+                params = [
+                    payload["department"], payload["date"], payload["report_type"],
+                    payload["report"], int(report_id),
+                ]
+                query = (
+                    "UPDATE reports SET department=%s, date=%s, report_type=%s, "
+                    "report=%s WHERE id=%s"
+                )
+                if not user.get("is_superadmin"):
+                    query += " AND created_by=%s"
+                    params.append(int(user.get("id") or 0))
+                self.cursor.execute(query, params)
+                if self.cursor.rowcount != 1:
+                    raise PermissionError("Report not found or belongs to another user")
+                saved_id = int(report_id)
+            else:
+                self.cursor.execute(
+                    "INSERT INTO reports "
+                    "(department, date, report_type, report, created_by, "
+                    "created_by_username, created_at) "
+                    "VALUES (%s, %s, %s, %s, %s, %s, %s) RETURNING id",
+                    (
+                        payload["department"], payload["date"], payload["report_type"],
+                        payload["report"], actor["created_by"],
+                        actor["created_by_username"], actor["created_at"],
+                    ),
+                )
+                saved_id = int(self.cursor.fetchone()[0])
+            self.conn.commit()
+            self.record_change(
+                'Reports', int(saved_id), 'upsert',
+                self._row_snapshot('Reports', int(saved_id)),
+            )
+            return saved_id
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_report_for_user(self, report_id, user):
+        params = [int(report_id)]
+        query = "DELETE FROM reports WHERE id=%s"
+        if not (user or {}).get("is_superadmin"):
+            query += " AND created_by=%s"
+            params.append(int((user or {}).get("id") or 0))
+        self.cursor.execute(query, params)
+        if self.cursor.rowcount != 1:
+            self.conn.rollback()
+            raise PermissionError("Report not found or belongs to another user")
+        self.conn.commit()
+        self.record_change('Reports', int(report_id), 'delete', None)
+        return True
+
+    def get_items_by_operation_ids(self, operation_ids, section):
+        """Get items for multiple operations (Sales_Items or Import_Items) in bulk"""
+        if not self.cursor or section not in self.registered_classes or not operation_ids:
+            return {}
+
+        try:
+            # Determine the foreign key column name based on section
+            if section == 'Sales_Items':
+                fk_column = 'sales_id'
+            elif section == 'Import_Items':
+                fk_column = 'import_id'
+            else:
+                print(f"Unknown item section: {section}")
+                return {}
+
+            format_strings = ','.join(['%s'] * len(operation_ids))
+            order_sql = (
+                " ORDER BY sales_id, COALESCE(sort_order, id), id"
+                if section == 'Sales_Items' else " ORDER BY import_id, id"
+            )
+            self.cursor.execute(
+                f"SELECT * FROM {section} WHERE {fk_column} IN ({format_strings}){order_sql}",
+                tuple(operation_ids),
+            )
+            rows = self.cursor.fetchall()
+
+            columns = [description[0] for description in self.cursor.description]
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+
+            result = {op_id: [] for op_id in operation_ids}
+            for row in rows:
+                item = dict(zip(columns, row))
+                op_id = item.get(fk_column)
+                if op_id in result:
+                    result[op_id].append(item)
+                    
+            return result
+
+        except Exception as e:
+            print(f"Error getting bulk items from {section}: {e}")
+            return {}
+
     def get_items_by_operation_id(self, operation_id, section):
         """Get items for a specific operation (Sales_Items or Import_Items)"""
         if not self.cursor or section not in self.registered_classes:
             return []
-        
+
         try:
             # Determine the foreign key column name based on section
             if section == 'Sales_Items':
@@ -689,44 +4673,1048 @@ class Database:
             else:
                 print(f"Unknown item section: {section}")
                 return []
-            
-            self.cursor.execute(f"SELECT * FROM '{section}' WHERE {fk_column} = ?", (operation_id,))
+
+            order_sql = (
+                " ORDER BY COALESCE(sort_order, id), id"
+                if section == 'Sales_Items' else " ORDER BY id"
+            )
+            self.cursor.execute(
+                f"SELECT * FROM {section} WHERE {fk_column} = %s{order_sql}",
+                (operation_id,),
+            )
             rows = self.cursor.fetchall()
-            
-            # Get column names
+
+            # Get column names (see get_items() for why 'ID' is restored)
             columns = [description[0] for description in self.cursor.description]
-            
+            if columns and columns[0].lower() == 'id':
+                columns[0] = 'ID'
+
             # Convert to list of dictionaries
             return [dict(zip(columns, row)) for row in rows]
-            
+
         except Exception as e:
+            self.conn.rollback()
             print(f"Error getting items from {section} for operation {operation_id}: {e}")
             return []
-    
+
+    def get_client_account(self, client_id, user=None):
+        """Return client account rows through one permission-gated backend API.
+
+        The LAN server exposes this method under Clients/read. This lets a user
+        view a client's account without granting broad Sales table access.
+
+        Sales are company-wide data, not per-creator data: the main Sales tab
+        (get_items_for_user) never filters Sales/Sales_Items by created_by -
+        only Reports gets that treatment. This method must return the exact
+        same authorized Sales, so it does not filter by created_by either;
+        access is controlled solely by the Clients:read permission check the
+        LAN server already enforces before calling this method.
+        """
+        client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute("SELECT id, username FROM clients WHERE id = %s", (client_id,))
+        client_row = self.cursor.fetchone()
+        if not client_row:
+            logger.warning(
+                "get_client_account: client not found client_id=%s mode=%s user_id=%s",
+                client_id, mode, user_id,
+            )
+            raise ValueError(f"Client {client_id} does not exist")
+        norm = self._normalize_exact(client_row[1]) if client_row[1] else None
+
+        # Match by client_id as well as by the client's username against
+        # sales.client_username: a sale's client_id can get zeroed out
+        # independently of its client_name/client_username snapshot (e.g.
+        # when the linked client record was temporarily unresolved) while
+        # still belonging to this client. Matching only one of the two hides
+        # real sales - see get_client_sales() for the same pattern.
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            match_params = [client_id, norm]
+        else:
+            match_clause = "s.client_id=%s"
+            match_params = [client_id]
+
+        sql = (
+            "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
+            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
+            "COALESCE(s.remise, 0), "
+            "COALESCE(si.information, ''), COALESCE(si.production, 0), "
+            "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
+            "COALESCE(s.created_by_username, '') "
+            "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
+            f"WHERE {match_clause} ORDER BY s.id, si.id"
+        )
+        self.cursor.execute(sql, tuple(match_params))
+        purchase_rows = self.cursor.fetchall()
+        sale_ids = sorted({row[0] for row in purchase_rows})
+        payment_rows = []
+        if sale_ids:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                (sale_ids,),
+            )
+            payment_rows = self.cursor.fetchall()
+        # General/unallocated client payments (not tied to any Sale) - same
+        # 5-column shape with sale_id/item_id NULL, so every existing
+        # CLIENT_ACCOUNT_PAYMENT_FIELDS consumer keeps working unchanged.
+        self.cursor.execute(
+            """
+            SELECT p.id, NULL::INTEGER, NULL::INTEGER, p.date, p.amount
+            FROM payments p
+            WHERE p.client_id = %s AND p.sale_id IS NULL
+            ORDER BY p.id DESC
+            """,
+            (client_id,),
+        )
+        payment_rows = list(payment_rows) + list(self.cursor.fetchall())
+
+        logger.info(
+            "get_client_account: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sql_params=%s sale_count=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, client_id, match_params,
+            len(sale_ids), len(purchase_rows), len(payment_rows),
+        )
+        # Canonical named schema - see normalize_client_account() above.
+        return normalize_client_account(purchase_rows, payment_rows)
+
+    def get_client_sale_summaries(self, client_id, user=None):
+        """Return one row per Sale (never one per item) plus payment history.
+
+        The Sales History table only needs sale-level facts - Sale #, date,
+        Devis, status and the financial block - so this method aggregates the
+        sale items instead of downloading them. Per-Sale TTC uses the same
+        central formulas as the Client Account dialog and ``paid`` is capped at
+        the sale total so an overpayment can never push it past Total.
+
+        Devis numbers are assigned and persisted before returning: a sale can
+        be created after the last host-startup backfill and must still show a
+        stable, sequential, per-year reference across refreshes and printing.
+        """
+        client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM clients WHERE id = %s", (client_id,)
+        )
+        client_row = self.cursor.fetchone()
+        if not client_row:
+            logger.warning(
+                "get_client_sale_summaries: client not found client_id=%s "
+                "mode=%s user_id=%s",
+                client_id, mode, user_id,
+            )
+            raise ValueError(f"Client {client_id} does not exist")
+        norm = self._normalize_exact(client_row[1]) if client_row[1] else None
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            match_params = [client_id, norm]
+        else:
+            match_clause = "s.client_id=%s"
+            match_params = [client_id]
+
+        sql = (
+            f"SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            f"COALESCE(s.is_historical, FALSE), "
+            f"COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number, "
+            f"{_DEVIS_YEAR_EXPR} AS devis_year, "
+            f"COALESCE(s.tva, 0), COALESCE(s.remise, 0), "
+            f"COALESCE(SUM(si.quantity * si.unit_price), 0) "
+            f"FROM sales s LEFT JOIN sales_items si ON si.sales_id = s.id "
+            f"WHERE {match_clause} "
+            f"GROUP BY s.id, s.date, s.state, s.is_historical, s.devis, "
+            f"s.devis_number, "
+            f"devis_year, s.tva, s.remise, s.created_at "
+            f"ORDER BY s.id"
+        )
+        self.cursor.execute(sql, tuple(match_params))
+        rows = self.cursor.fetchall()
+
+        # Persist missing Devis numbers/text (a sale may have been created
+        # after the last startup backfill), then re-read so every returned
+        # summary has a stable reference.
+        missing_num = [row[0] for row in rows if row[5] is None]
+        missing_text = [
+            row[0] for row in rows
+            if not (row[4] or "").strip() and row[5] is not None
+        ]
+        if missing_num:
+            self._ensure_devis_numbers(missing_num)
+        if missing_num or missing_text:
+            self._ensure_devis_text(missing_num + missing_text)
+            self.cursor.execute(sql, tuple(match_params))
+            rows = self.cursor.fetchall()
+
+        from core.calculations import calculate_operation_totals, to_decimal
+        sale_rows = []
+        for row in rows:
+            sale_id, date, state, is_hist, devis_text, devis_number, year, vat, remise, raw = row
+            total = calculate_operation_totals(
+                to_decimal(raw), to_decimal(remise), to_decimal(vat)
+            )["total_ttc"]
+            if devis_text:
+                devis = devis_text
+            elif devis_number is not None:
+                devis = f"DE-{year}-{devis_number}"
+            else:
+                devis = f"DE-{year}-"
+            sale_rows.append([
+                sale_id, date, state, is_hist, devis, total,
+                Decimal("0"), Decimal("0"),
+            ])
+
+        payment_rows = []
+        if sale_rows:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.sale_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                ([sale[0] for sale in sale_rows],),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        paid_by_sale = {}
+        for row in payment_rows:
+            paid_by_sale[row[1]] = paid_by_sale.get(row[1], Decimal("0")) + to_decimal(
+                row[4]
+            )
+        for sale in sale_rows:
+            total = sale[5]
+            paid = min(paid_by_sale.get(sale[0], Decimal("0")), total)
+            sale[6] = paid
+            sale[7] = max(total - paid, Decimal("0"))
+
+        # General/unallocated client payments (not tied to any Sale) - added
+        # after the per-Sale paid/remaining math above so they never affect a
+        # Sale's own totals, only the client-level payment history/total.
+        self.cursor.execute(
+            """
+            SELECT p.id, NULL::INTEGER, NULL::INTEGER, p.date, p.amount
+            FROM payments p
+            WHERE p.client_id = %s AND p.sale_id IS NULL
+            ORDER BY p.id DESC
+            """,
+            (client_id,),
+        )
+        payment_rows = list(payment_rows) + list(self.cursor.fetchall())
+
+        logger.info(
+            "get_client_sale_summaries: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sale_count=%s payment_count=%s",
+            mode, user_id, role_id, client_id, len(sale_rows), len(payment_rows),
+        )
+        return normalize_client_sale_summaries(sale_rows, payment_rows)
+
+    def get_client_sale_items(self, sale_id, user=None):
+        """Return one Sale's item rows + its payments (for single-sale PDFs).
+
+        The Sales History table never calls this - only the "Print Selected
+        Sale" report path needs the item-level detail. Returns the canonical
+        purchase rows (same named fields as ``get_client_account``) plus the
+        sale's payments and a tiny sale block carrying the Devis reference.
+        """
+        sale_id = int(sale_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+
+        sql = (
+            "SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'), "
+            "si.id, COALESCE(si.product_name, ''), COALESCE(si.quantity, 0), "
+            "COALESCE(si.unit_price, 0), COALESCE(s.tva, 0), "
+            "COALESCE(s.remise, 0), "
+            "COALESCE(si.information, ''), COALESCE(si.production, 0), "
+            "COALESCE(s.notes, ''), COALESCE(s.is_historical, FALSE), "
+            "COALESCE(s.created_by_username, '') "
+            "FROM sales s JOIN sales_items si ON si.sales_id = s.id "
+            "WHERE s.id = %s ORDER BY si.id"
+        )
+        self.cursor.execute(sql, (sale_id,))
+        purchase_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT p.id, p.sale_id, p.sales_item_id, p.date, p.amount
+            FROM payments p
+            WHERE p.sale_id = %s
+            ORDER BY p.id DESC
+            """,
+            (sale_id,),
+        )
+        payment_rows = self.cursor.fetchall()
+
+        # Sale-level block (Devis reference) used by the print worker.
+        self.cursor.execute(
+            f"""
+            SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'),
+                   COALESCE(s.is_historical, FALSE),
+                   COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number,
+                   {_DEVIS_YEAR_EXPR} AS devis_year
+            FROM sales s
+            WHERE s.id = %s
+            """,
+            (sale_id,),
+        )
+        sale_row = self.cursor.fetchone()
+        sale_block = []
+        if sale_row:
+            if sale_row[5] is None or not (sale_row[4] or "").strip():
+                self._ensure_devis_numbers([sale_row[0]])
+                self._ensure_devis_text([sale_row[0]])
+                self.cursor.execute(
+                    f"""
+                    SELECT s.id, COALESCE(s.date, ''), COALESCE(s.state, 'pending'),
+                           COALESCE(s.is_historical, FALSE),
+                           COALESCE(NULLIF(BTRIM(s.devis), ''), ''), s.devis_number,
+                           {_DEVIS_YEAR_EXPR} AS devis_year
+                    FROM sales s
+                    WHERE s.id = %s
+                    """,
+                    (sale_id,),
+                )
+                sale_row = self.cursor.fetchone()
+            if sale_row:
+                devis_text, devis_number, year = sale_row[4], sale_row[5], sale_row[6]
+                if devis_text:
+                    devis = devis_text
+                elif devis_number is not None:
+                    devis = f"DE-{year}-{devis_number}"
+                else:
+                    devis = f"DE-{year}-"
+                sale_block = [{
+                    "sale_id": sale_row[0],
+                    "date": sale_row[1],
+                    "state": sale_row[2],
+                    "is_historical": sale_row[3],
+                    "devis": devis,
+                }]
+
+        logger.info(
+            "get_client_sale_items: mode=%s user_id=%s role_id=%s sale_id=%s "
+            "item_rows=%s payment_count=%s",
+            mode, user_id, role_id, sale_id, len(purchase_rows), len(payment_rows),
+        )
+        return {
+            "purchases": [
+                dict(zip(CLIENT_ACCOUNT_PURCHASE_FIELDS, row)) for row in purchase_rows
+            ],
+            "payments": [
+                dict(zip(CLIENT_ACCOUNT_PAYMENT_FIELDS, row)) for row in payment_rows
+            ],
+            "sales": sale_block,
+        }
+
+    def get_client_sales(self, client_id, user=None):
+        """Return aggregate sale rows for a client through an ownership-safe API.
+
+        Matches sales both by client_id and by the client's username against
+        sales.client_username, since a sale's client_id can get zeroed out
+        independently of its client_name snapshot (e.g. when the linked
+        client record is temporarily unresolved) while still belonging to
+        this client. Matching only one of the two hides real sales.
+
+        Sales are company-wide data, not per-creator data: the main Sales tab
+        (get_items_for_user) never filters Sales/Sales_Items by created_by -
+        only Reports gets that treatment. This method must return the exact
+        same authorized Sales as that tab, so it does not filter by
+        created_by either; access is controlled solely by the Clients:read
+        permission check the LAN server already enforces before calling this
+        method.
+        """
+        client_id = int(client_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+
+        self.cursor.execute("SELECT username FROM clients WHERE id=%s", (client_id,))
+        cres = self.cursor.fetchone()
+        username = str(cres[0] or '').strip() if cres else ''
+        norm = self._normalize_exact(username) if username else None
+
+        if norm:
+            match_clause = (
+                "(s.client_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            params = [client_id, norm]
+        else:
+            match_clause = "s.client_id=%s"
+            params = [client_id]
+
+        sql = (
+            "SELECT s.id, COALESCE(NULLIF(BTRIM(s.devis), ''), '') AS devis_text, "
+            f"s.devis_number, {_DEVIS_YEAR_EXPR} AS devis_year, "
+            "COALESCE(s.date, ''), COALESCE(s.tva, 0), "
+            "COALESCE(SUM(si.quantity * si.unit_price), 0) AS subtotal "
+            "FROM sales s LEFT JOIN sales_items si ON si.sales_id=s.id "
+            f"WHERE {match_clause} "
+            "GROUP BY s.id, s.devis, s.devis_number, s.date, s.tva "
+            "ORDER BY s.date DESC, s.id DESC"
+        )
+        try:
+            self.cursor.execute(sql, params)
+            rows = [list(row) for row in self.cursor.fetchall()]
+
+            # Persist missing Devis numbers/text (a sale may have been
+            # created after the last startup backfill) so every returned
+            # row has a stable reference, same as get_client_sale_summaries().
+            missing_num = [row[0] for row in rows if row[2] is None]
+            missing_text = [
+                row[0] for row in rows if not (row[1] or "").strip() and row[2] is not None
+            ]
+            if missing_num:
+                self._ensure_devis_numbers(missing_num)
+            if missing_num or missing_text:
+                self._ensure_devis_text(missing_num + missing_text)
+                self.cursor.execute(sql, params)
+                rows = [list(row) for row in self.cursor.fetchall()]
+        except Exception:
+            logger.exception(
+                "get_client_sales failed: mode=%s user_id=%s role_id=%s client_id=%s sql_params=%s",
+                mode, user_id, role_id, client_id, params,
+            )
+            try:
+                self.conn.rollback()
+            except Exception:
+                logger.exception("get_client_sales: rollback after failed query also failed")
+            raise
+
+        result = []
+        for sale_id, devis_text, devis_number, year, date, vat, subtotal in rows:
+            if devis_text:
+                devis = devis_text
+            elif devis_number is not None:
+                devis = f"DE-{year}-{devis_number}"
+            else:
+                devis = f"DE-{year}-"
+            result.append([sale_id, devis, date, vat, subtotal])
+        rows = result
+
+        logger.info(
+            "get_client_sales: mode=%s user_id=%s role_id=%s client_id=%s "
+            "sql_params=%s sale_count=%s",
+            mode, user_id, role_id, client_id, params, len(rows),
+        )
+        return rows
+
+    def add_client_payment(
+        self, client_id, sale_id, sales_item_id, amount, date, user=None
+    ):
+        """Record a payment after verifying it belongs to the requested client.
+
+        ``sale_id`` may be ``None`` for a general/unallocated client-level
+        payment that is not tied to any specific Sale (a client account
+        payment, e.g. money received without allocating it to one purchase).
+        ``sales_item_id`` must then also be ``None``. A general payment is
+        stored with ``client_id`` set and ``sale_id``/``sales_item_id`` NULL -
+        it never creates or touches a Sale, and never affects stock.
+
+        When ``sale_id`` is given, ``sales_item_id`` may still be ``None`` for
+        a sale-level payment: the Sales History table is one row per Sale, so
+        payments no longer need to target a single item. When an item id is
+        given it must belong to the sale.
+        """
+        client_id = int(client_id)
+        sale_id = int(sale_id) if sale_id else None
+        sales_item_id = int(sales_item_id) if sales_item_id else None
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        if sales_item_id and not sale_id:
+            raise ValueError("A purchase-level payment must include its sale")
+
+        try:
+            self.cursor.execute(
+                "SELECT username FROM clients WHERE id=%s", (client_id,)
+            )
+            cres = self.cursor.fetchone()
+            if not cres:
+                raise ValueError(f"Client {client_id} does not exist")
+            norm = None
+            username = str(cres[0] or '').strip()
+            norm = self._normalize_exact(username) if username else None
+
+            if sale_id is None:
+                # General/unallocated client payment - no Sale to verify
+                # against, never creates one. Does not touch stock.
+                self.cursor.execute(
+                    """
+                    INSERT INTO payments (client_id, sale_id, sales_item_id, amount, date)
+                    VALUES (%s, NULL, NULL, %s, %s)
+                    RETURNING id
+                    """,
+                    (client_id, amount, str(date)),
+                )
+                payment_id = self.cursor.fetchone()[0]
+                self.conn.commit()
+                return int(payment_id)
+
+            # Adding a payment is gated solely by the caller's Sales:write
+            # permission (enforced by the RPC layer in core/network/server.py
+            # before this method is ever called) - who originally created the
+            # sale does not additionally restrict who may record a payment
+            # against it.
+            if sales_item_id:
+                self.cursor.execute(
+                    """
+                    SELECT 1
+                    FROM sales s
+                    JOIN sales_items si ON si.sales_id = s.id
+                    WHERE s.id = %s AND si.id = %s AND s.client_id = %s
+                    """,
+                    (sale_id, sales_item_id, client_id),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected purchase does not belong to this client")
+            else:
+                if norm:
+                    match_clause = (
+                        "(s.client_id=%s OR "
+                        "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(s.client_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+                    )
+                    match_params = [client_id, norm]
+                else:
+                    match_clause = "s.client_id=%s"
+                    match_params = [client_id]
+                self.cursor.execute(
+                    f"SELECT 1 FROM sales s WHERE s.id = %s AND {match_clause}",
+                    (sale_id, *match_params),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected sale does not belong to this client")
+
+            self.cursor.execute(
+                """
+                INSERT INTO payments (sale_id, sales_item_id, amount, date)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (sale_id, sales_item_id, amount, str(date)),
+            )
+            payment_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return int(payment_id)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_client_payment(self, payment_id, amount, user=None):
+        """Edit ONLY the amount of a single payment.
+
+        No other field and no other row is touched - the sale, its items,
+        stock and totals are never modified by this call. This backs the
+        Client Account "Edit Payment Amount" feature. The no-overpayment rule
+        is enforced by the dialog before this is called.
+        """
+        payment_id = int(payment_id)
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "UPDATE payments SET amount = %s WHERE id = %s RETURNING id",
+                (amount, payment_id),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "update_client_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s amount=%s",
+                mode, user_id, role_id, payment_id, amount,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_client_payment(self, payment_id, user=None):
+        """Delete ONLY a single payment record by its persisted payment ID.
+
+        No other row is touched - the sale, its items, stock, the client and
+        the Devis reference are never modified by this call. Backs the Client
+        Account "Delete Payment" feature; the user confirms before this is
+        called. Raises ValueError if the payment does not exist.
+        """
+        payment_id = int(payment_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id = %s RETURNING id",
+                (payment_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "delete_client_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s",
+                mode, user_id, role_id, payment_id,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    # ------------------------------------------------------------------
+    # Supplier Account (mirror of the Client Account API above)
+    # ------------------------------------------------------------------
+    def _supplier_match_clause(self, supplier_row):
+        """Build the imports lookup clause for one supplier.
+
+        Matches by supplier_id as well as by the supplier's username against
+        imports.supplier_username, exactly like the client account lookup.
+        Returns ``(clause, params)`` with ``clause`` carrying ``%s`` holes.
+        """
+        norm = self._normalize_exact(supplier_row[1]) if supplier_row[1] else None
+        if norm:
+            clause = (
+                "(i.supplier_id=%s OR "
+                "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(i.supplier_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+            )
+            return clause, [int(supplier_row[0]), norm]
+        return "i.supplier_id=%s", [int(supplier_row[0])]
+
+    def _supplier_import_sql(self, alias_owner=True):
+        """Shared 10-column Import x Import_Items SELECT (named-field order)."""
+        return (
+            "SELECT i.id, COALESCE(i.date, ''), "
+            "ii.id, COALESCE(ii.product_name, ''), COALESCE(ii.quantity, 0), "
+            "COALESCE(ii.unit_price, 0), COALESCE(i.tva, 0), "
+            "COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE), "
+            "COALESCE(i.created_by_username, '') "
+            "FROM imports i JOIN import_items ii ON ii.import_id = i.id "
+        )
+
+    def get_supplier_account(self, supplier_id, user=None):
+        """Return supplier account rows through one permission-gated backend API.
+
+        The LAN server exposes this method under Suppliers/read, mirroring
+        ``get_client_account`` under Clients/read. Imports are company-wide
+        data, not per-creator data: access is controlled solely by the
+        Suppliers:read permission check the LAN server already enforces before
+        calling this method (no created_by ownership filter is applied).
+        """
+        supplier_id = int(supplier_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM suppliers WHERE id = %s", (supplier_id,)
+        )
+        supplier_row = self.cursor.fetchone()
+        if not supplier_row:
+            logger.warning(
+                "get_supplier_account: supplier not found supplier_id=%s "
+                "mode=%s user_id=%s",
+                supplier_id, mode, user_id,
+            )
+            raise ValueError(f"Supplier {supplier_id} does not exist")
+
+        match_clause, match_params = self._supplier_match_clause(supplier_row)
+        sql = self._supplier_import_sql() + f"WHERE {match_clause} ORDER BY i.id, ii.id"
+        self.cursor.execute(sql, tuple(match_params))
+        import_rows = self.cursor.fetchall()
+        import_ids = sorted({row[0] for row in import_rows})
+        payment_rows = []
+        if import_ids:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.import_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                (import_ids,),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        logger.info(
+            "get_supplier_account: mode=%s user_id=%s role_id=%s supplier_id=%s "
+            "import_count=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, supplier_id,
+            len(import_ids), len(import_rows), len(payment_rows),
+        )
+        return normalize_supplier_account(import_rows, payment_rows)
+
+    def get_supplier_import_summaries(self, supplier_id, user=None):
+        """Return one row per Import (never one per item) plus payment history.
+
+        The Import History table only needs import-level facts - Import #,
+        date, BL reference, status and the financial block - so this method
+        aggregates the import items instead of downloading them. Per-Import
+        TTC uses the same central formula as the account dialog and ``paid``
+        is capped at the import total.
+        """
+        supplier_id = int(supplier_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        self.cursor.execute(
+            "SELECT id, username FROM suppliers WHERE id = %s", (supplier_id,)
+        )
+        supplier_row = self.cursor.fetchone()
+        if not supplier_row:
+            logger.warning(
+                "get_supplier_import_summaries: supplier not found "
+                "supplier_id=%s mode=%s user_id=%s",
+                supplier_id, mode, user_id,
+            )
+            raise ValueError(f"Supplier {supplier_id} does not exist")
+
+        match_clause, match_params = self._supplier_match_clause(supplier_row)
+        sql = (
+            "SELECT i.id, COALESCE(i.date, ''), "
+            "COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''), "
+            "COALESCE(i.is_historical, FALSE), "
+            "COALESCE(i.tva, 0), "
+            "COALESCE(SUM(ii.quantity * ii.unit_price), 0) "
+            "FROM imports i LEFT JOIN import_items ii ON ii.import_id = i.id "
+            f"WHERE {match_clause} "
+            "GROUP BY i.id, i.date, i.bl_number, i.is_historical, i.tva, "
+            "i.created_at ORDER BY i.id"
+        )
+        self.cursor.execute(sql, tuple(match_params))
+        rows = self.cursor.fetchall()
+
+        from core.calculations import calculate_operation_totals, to_decimal
+        import_rows = []
+        for row in rows:
+            import_id, date, bl_number, is_hist, vat, raw = row
+            total = calculate_operation_totals(
+                to_decimal(raw), to_decimal(0), to_decimal(vat)
+            )["total_ttc"]
+            import_rows.append([
+                import_id, date, bl_number, is_hist, total,
+                Decimal("0"), Decimal("0"),
+            ])
+
+        payment_rows = []
+        if import_rows:
+            self.cursor.execute(
+                """
+                SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+                FROM payments p
+                WHERE p.import_id = ANY(%s)
+                ORDER BY p.id DESC
+                """,
+                ([row[0] for row in import_rows],),
+            )
+            payment_rows = self.cursor.fetchall()
+
+        paid_by_import = {}
+        for row in payment_rows:
+            paid_by_import[row[1]] = paid_by_import.get(row[1], Decimal("0")) + to_decimal(
+                row[4]
+            )
+        for imp in import_rows:
+            total = imp[4]
+            paid = min(paid_by_import.get(imp[0], Decimal("0")), total)
+            imp[5] = paid
+            imp[6] = max(total - paid, Decimal("0"))
+
+        summaries = [
+            dict(zip(SUPPLIER_ACCOUNT_IMPORT_SUMMARY_FIELDS, row))
+            for row in import_rows
+        ]
+        payments = [
+            dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row))
+            for row in payment_rows
+        ]
+        logger.info(
+            "get_supplier_import_summaries: mode=%s user_id=%s role_id=%s "
+            "supplier_id=%s import_count=%s payment_count=%s",
+            mode, user_id, role_id, supplier_id, len(import_rows), len(payment_rows),
+        )
+        return {"imports": summaries, "payments": payments}
+
+    def get_supplier_import_items(self, import_id, user=None):
+        """Return one Import's item rows + its payments (for single-import PDFs)."""
+        import_id = int(import_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+
+        sql = self._supplier_import_sql() + "WHERE i.id = %s ORDER BY ii.id"
+        self.cursor.execute(sql, (import_id,))
+        import_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT p.id, p.import_id, p.import_item_id, p.date, p.amount
+            FROM payments p
+            WHERE p.import_id = %s
+            ORDER BY p.id DESC
+            """,
+            (import_id,),
+        )
+        payment_rows = self.cursor.fetchall()
+
+        self.cursor.execute(
+            """
+            SELECT i.id, COALESCE(i.date, ''), COALESCE(i.tva, 0),
+                   COALESCE(i.notes, ''), COALESCE(i.is_historical, FALSE),
+                   COALESCE(NULLIF(BTRIM(i.bl_number), ''), ''),
+                   COALESCE(i.supplier_username, ''), COALESCE(i.supplier_name, '')
+            FROM imports i WHERE i.id = %s
+            """,
+            (import_id,),
+        )
+        block_row = self.cursor.fetchone() or (
+            import_id, '', 0, '', False, '', '', ''
+        )
+
+        logger.info(
+            "get_supplier_import_items: mode=%s user_id=%s role_id=%s "
+            "import_id=%s item_rows=%s payment_count=%s",
+            mode, user_id, role_id, import_id, len(import_rows), len(payment_rows),
+        )
+        return {
+            "imports": [
+                dict(zip(SUPPLIER_ACCOUNT_IMPORT_FIELDS, row))
+                for row in import_rows
+            ],
+            "payments": [
+                dict(zip(SUPPLIER_ACCOUNT_PAYMENT_FIELDS, row))
+                for row in payment_rows
+            ],
+            "import": {
+                "import_id": int(block_row[0]),
+                "date": block_row[1],
+                "vat": block_row[2],
+                "notes": block_row[3],
+                "is_historical": block_row[4],
+                "bl_number": block_row[5],
+                "supplier_username": block_row[6],
+                "supplier_name": block_row[7],
+            },
+        }
+
+    def add_supplier_payment(
+        self, supplier_id, import_id, import_item_id, amount, date, user=None
+    ):
+        """Record a payment after verifying it belongs to the requested supplier.
+
+        ``import_item_id`` may be ``None`` for an import-level payment: the
+        Import History table is one row per Import, so payments no longer need
+        to target a single item. When an item id is given it must belong to
+        the import.
+        """
+        supplier_id = int(supplier_id)
+        import_id = int(import_id)
+        import_item_id = int(import_item_id) if import_item_id else None
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+
+        try:
+            self.cursor.execute(
+                "SELECT username FROM suppliers WHERE id=%s", (supplier_id,)
+            )
+            sres = self.cursor.fetchone()
+            norm = None
+            if sres:
+                username = str(sres[0] or '').strip()
+                norm = self._normalize_exact(username) if username else None
+
+            if import_item_id:
+                self.cursor.execute(
+                    """
+                    SELECT 1
+                    FROM imports i
+                    JOIN import_items ii ON ii.import_id = i.id
+                    WHERE i.id = %s AND ii.id = %s AND i.supplier_id = %s
+                    """,
+                    (import_id, import_item_id, supplier_id),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected import item does not belong to this supplier")
+            else:
+                if norm:
+                    match_clause = (
+                        "(i.supplier_id=%s OR "
+                        "LOWER(REGEXP_REPLACE(BTRIM(COALESCE(i.supplier_username, '')), '\\s+', ' ', 'g')) = LOWER(%s))"
+                    )
+                    match_params = [supplier_id, norm]
+                else:
+                    match_clause = "i.supplier_id=%s"
+                    match_params = [supplier_id]
+                self.cursor.execute(
+                    f"SELECT 1 FROM imports i WHERE i.id = %s AND {match_clause}",
+                    (import_id, *match_params),
+                )
+                if not self.cursor.fetchone():
+                    raise ValueError("The selected import does not belong to this supplier")
+
+            self.cursor.execute(
+                """
+                INSERT INTO payments (import_id, import_item_id, amount, date)
+                VALUES (%s, %s, %s, %s)
+                RETURNING id
+                """,
+                (import_id, import_item_id, amount, str(date)),
+            )
+            payment_id = self.cursor.fetchone()[0]
+            self.conn.commit()
+            return int(payment_id)
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def update_supplier_payment(self, payment_id, amount, user=None):
+        """Edit ONLY the amount of a single supplier payment.
+
+        No other field and no other row is touched - the import, its items,
+        stock and totals are never modified by this call. The no-overpayment
+        rule is enforced by the dialog before this is called.
+        """
+        payment_id = int(payment_id)
+        amount = float(amount)
+        if amount <= 0:
+            raise ValueError("Payment amount must be greater than zero")
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "UPDATE payments SET amount = %s "
+                "WHERE id = %s AND import_id IS NOT NULL RETURNING id",
+                (amount, payment_id),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "update_supplier_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s amount=%s",
+                mode, user_id, role_id, payment_id, amount,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
+    def delete_supplier_payment(self, payment_id, user=None):
+        """Delete ONLY a single supplier payment record by its persisted ID.
+
+        No other row is touched - the import, its items, stock, the supplier
+        and the BL reference are never modified by this call. Raises
+        ValueError if the payment does not exist.
+        """
+        payment_id = int(payment_id)
+        mode = 'remote' if user is not None else 'local'
+        user_id = user.get('id') if user else None
+        role_id = user.get('role_id') if user else None
+        try:
+            self.cursor.execute(
+                "DELETE FROM payments WHERE id = %s AND import_id IS NOT NULL "
+                "RETURNING id",
+                (payment_id,),
+            )
+            row = self.cursor.fetchone()
+            if not row:
+                raise ValueError(f"Payment {payment_id} does not exist")
+            self.conn.commit()
+            logger.info(
+                "delete_supplier_payment: mode=%s user_id=%s role_id=%s "
+                "payment_id=%s",
+                mode, user_id, role_id, payment_id,
+            )
+            return int(row[0])
+        except Exception:
+            self.conn.rollback()
+            raise
+
     def delete_item(self, item_id, section):
         """Delete item from section"""
         if not self.cursor or section not in self.registered_classes:
             return False
-        
+
         try:
+            if section in ('Clients', 'Sales'):
+                from core.attachments import AttachmentService
+                AttachmentService(self).delete_owner(
+                    'client' if section == 'Clients' else 'sale', int(item_id)
+                )
             # Pre-clean references if deleting a product
             if section == 'Products':
                 try:
-                    self.cursor.execute("UPDATE 'Sales_Items' SET product_id = NULL WHERE product_id = ?", (item_id,))
-                    self.cursor.execute("UPDATE 'Import_Items' SET product_id = NULL WHERE product_id = ?", (item_id,))
+                    self.cursor.execute("UPDATE sales_items SET product_id = NULL WHERE product_id = %s", (item_id,))
+                    self.cursor.execute("UPDATE import_items SET product_id = NULL WHERE product_id = %s", (item_id,))
                 except Exception as e_clean:
+                    self.conn.rollback()
                     print(f"Warning: could not nullify product references before deletion: {e_clean}")
-            self.cursor.execute(f"DELETE FROM '{section}' WHERE ID = ?", (item_id,))
+            self.cursor.execute(f"DELETE FROM {section} WHERE id = %s", (item_id,))
             self.conn.commit()
-            return self.cursor.rowcount > 0
+            deleted = self.cursor.rowcount > 0
+            if deleted:
+                self.record_change(section, int(item_id), 'delete', None)
+            return deleted
         except Exception as e:
+            self.conn.rollback()
             print(f"Error deleting item from {section}: {e}")
             return False
-    
+
+    # Attachment operations transfer bytes as base64 over LAN RPC. The host's
+    # data directory is never returned to a workstation.
+    def list_attachments(self, entity_type, entity_id, scope=None):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).list(entity_type, int(entity_id), scope)
+
+    def upload_attachment(self, entity_type, entity_id, filename, content_b64, description='', category='', sale_id=None):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).upload(entity_type, int(entity_id), filename, content_b64, description, category, sale_id)
+
+    def download_attachment(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).download(int(attachment_id))
+
+    def get_attachment_thumbnail(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).thumbnail(int(attachment_id))
+
+    def get_attachment_thumbnails_bulk(self, attachment_ids):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).thumbnails([int(aid) for aid in attachment_ids])
+
+    def update_attachment(self, attachment_id, display_name=None, description=None, category=None):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).update(int(attachment_id), display_name, description, category)
+
+    def delete_attachment(self, attachment_id):
+        from core.attachments import AttachmentService
+        return AttachmentService(self).delete(int(attachment_id))
+
     def close(self):
         """Close database connection"""
         if self.conn:
+            diagnostics.db_connection_closed(kind="local")
             self.conn.close()
             self.conn = None
             self.cursor = None
-            ## haitam 

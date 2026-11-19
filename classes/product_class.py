@@ -96,8 +96,21 @@ class ProductClass(BaseClass):
             "quantity": {
                 "display_name": {"en": "Stock Quantity", "fr": "Quantité en Stock", "es": "Cantidad en Stock"},
                 "required": False,
-                "type": "int",
+                "type": "decimal",
+                "precision": 3,
                 "method": self.calculate_quantity  # This makes it calculated
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
             },
             
         }
@@ -150,24 +163,33 @@ class ProductClass(BaseClass):
         """Calculate current stock quantity from imports and sales"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return 0
+        cached = getattr(self.database, "_product_stock_levels", None)
+        if isinstance(cached, dict) and self.id in cached:
+            return cached[self.id]
         
         try:
             # Get total imports for this product
-            self.database.cursor.execute("SELECT SUM(quantity) FROM Import_Items WHERE product_id = ?", (self.id,))
+            self.database.cursor.execute("SELECT SUM(quantity) FROM Import_Items WHERE product_id = %s", (self.id,))
             imports_result = self.database.cursor.fetchone()
             total_imports = imports_result[0] if imports_result and imports_result[0] else 0
             
-            # Get total sales for this product from Sales_Items joined to Sales excluding on_hold
-            self.database.cursor.execute("""
+            # Get total sales for this product from Sales_Items joined to Sales.
+            # Current stock is derived from stored operations, so only sales the
+            # user explicitly marked as affecting stock are subtracted - the
+            # Sale's workflow state plays no part in it.
+            from core.database import SALE_STOCK_ELIGIBILITY_SQL
+            self.database.cursor.execute(f"""
                 SELECT SUM(si.quantity)
                 FROM Sales_Items si
                 JOIN Sales s ON si.sales_id = s.ID
-                WHERE si.product_id = ? AND (s.state IS NULL OR s.state != 'on_hold')
+                WHERE si.product_id = %s AND {SALE_STOCK_ELIGIBILITY_SQL}
             """, (self.id,))
             sales_result = self.database.cursor.fetchone()
             total_sales = sales_result[0] if sales_result and sales_result[0] else 0
             
-            return int(total_imports - total_sales)
+            # Keep the database's exact numeric value. Converting to int here
+            # silently truncated legitimate decimal sale quantities.
+            return total_imports - total_sales
         except Exception as e:
             print(f"Error calculating quantity for product {self.id}: {e}")
             return 0
@@ -269,12 +291,12 @@ class ProductClass(BaseClass):
             # Check if username exists in other products (excluding current one)
             if self.id and self.id > 0:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Products WHERE username = ? AND ID != ?", 
+                    "SELECT COUNT(*) FROM Products WHERE username = %s AND ID != %s",
                     (username, self.id)
                 )
             else:
                 self.database.cursor.execute(
-                    "SELECT COUNT(*) FROM Products WHERE username = ?", 
+                    "SELECT COUNT(*) FROM Products WHERE username = %s",
                     (username,)
                 )
             
@@ -307,7 +329,13 @@ class ProductClass(BaseClass):
                 success = self.database.update_item(self.id, data, "Products")
             else:
                 # Add new product
-                success = self.database.add_item(data, "Products")
+                new_id = self.database.add_item(data, "Products")
+                if new_id:
+                    self.id = int(new_id)
+                    self.parameters["id"]["value"] = self.id
+                    success = True
+                else:
+                    success = False
                 
             return success
             

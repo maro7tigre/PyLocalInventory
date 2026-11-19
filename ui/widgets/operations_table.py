@@ -1,13 +1,20 @@
 """
 Operations Table Widget - Clean architecture with proper separation of concerns
 """
-from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView, 
-                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit, QStyledItemDelegate)
-from PySide6.QtGui import QColor, QBrush
-from PySide6.QtCore import Qt, Signal
+from PySide6.QtWidgets import (QWidget, QTableWidget, QTableWidgetItem, QAbstractItemView,
+                             QVBoxLayout, QHBoxLayout, QHeaderView, QSizePolicy, QLineEdit,
+                              QStyledItemDelegate, QComboBox, QInputDialog, QDoubleSpinBox)
+from PySide6.QtGui import QColor, QBrush, QRegularExpressionValidator
+from PySide6.QtCore import Qt, Signal, QRegularExpression, QTimer, QSignalBlocker, QPersistentModelIndex
 from ui.widgets.preview_widget import PreviewWidget
 from classes.product_class import ProductClass
 from ui.widgets.parameters_widgets import ButtonWidget
+from decimal import Decimal, InvalidOperation
+from core.calculations import (
+    InputState,
+    parse_decimal_input,
+    calculate_line_subtotal,
+)
 
 
 class TableDataManager:
@@ -29,7 +36,9 @@ class TableDataManager:
             if param_key == 'product_preview':
                 headers.append('Preview')
             elif param_key == 'product_name':
-                headers.append('Product')
+                headers.append('Name')
+            elif param_key == 'item_type':
+                headers.append('Type')
             elif param_key == 'delete_action':
                 headers.append('Delete')
             else:
@@ -69,27 +78,56 @@ class TableDataManager:
             if param_key == 'product_name' and value and value.lower() == 'product name':
                 continue
                 
-            if value:
+            if value != "":
                 row_data[param_key] = self._convert_value_type(param_key, value)
 
-        # If we have product_name but no quantity yet, set default 1 (so later logic can proceed)
-        if 'product_name' in row_data and 'quantity' not in row_data:
+        try:
+            name_col = self.table_columns.index('product_name')
+            name_widget = table.cellWidget(row, name_col)
+            if name_widget:
+                for key in ('item_id', 'product_id', 'service_id', 'item_type'):
+                    value = name_widget.property(key)
+                    if value not in (None, '', 0, '0'):
+                        row_data['id' if key == 'item_id' else key] = value
+        except (ValueError, AttributeError):
+            pass
+
+        is_section = str(row_data.get('item_type') or '').casefold() == 'section'
+        # Financial defaults apply only to actual Sale/Import lines. A Section
+        # intentionally has no quantity, price, or subtotal.
+        if 'product_name' in row_data and 'quantity' not in row_data and not is_section:
             try:
                 default_qty = self.parameter_definitions.get('quantity', {}).get('default', 1)
                 row_data['quantity'] = default_qty
             except Exception:
                 row_data['quantity'] = 1
-        # If unit_price absent, default to 0.0 (it may be filled later)
-        if 'product_name' in row_data and 'unit_price' not in row_data:
+        # If unit_price absent, default to 0 (it may be filled later)
+        if 'product_name' in row_data and 'unit_price' not in row_data and not is_section:
             row_data['unit_price'] = 0.0
+        if 'product_name' in row_data and not is_section:
+            from core.calculations import calculate_line_subtotal
+            row_data['subtotal'] = calculate_line_subtotal(
+                row_data.get('quantity', 0),
+                row_data.get('unit_price', 0),
+                row_data.get('discount_percentage', 0),
+            )
         
         return row_data
     
     def _get_cell_value(self, table, row, col):
         """Get value from table cell (widget or item)"""
         widget = table.cellWidget(row, col)
+        # Active QDoubleSpinBox editors expose formatted text such as
+        # "14.00 %". Use their numeric value so totals see the same value as
+        # the row subtotal before the editor has been committed/closed.
+        if widget and hasattr(widget, 'value'):
+            return str(widget.value())
         if widget and hasattr(widget, 'text'):
             return widget.text().strip()
+        if widget and hasattr(widget, 'currentData'):
+            return str(widget.currentData() or "").strip()
+        if widget and hasattr(widget, 'currentText'):
+            return widget.currentText().strip()
         
         cell_item = table.item(row, col)
         if cell_item:
@@ -107,11 +145,12 @@ class TableDataManager:
                 return int(value) if value else 0
             except ValueError:
                 return 0
-        elif param_type == 'float':
+        elif param_type in ('float', 'decimal'):
             try:
-                return float(value) if value else 0.0
-            except ValueError:
-                return 0.0
+                normalized = str(value).replace(" ", "").replace(",", ".")
+                return Decimal(normalized) if normalized else Decimal("0")
+            except (InvalidOperation, ValueError):
+                return Decimal("0")
         
         return value
 
@@ -127,6 +166,11 @@ class TableRowFactory:
         """Create a row with existing item data"""
         for col, param_key in enumerate(self.data_manager.table_columns):
             self._create_cell(table, row, col, param_key, item)
+        is_section = bool(
+            item and hasattr(item, 'get_value')
+            and str(item.get_value('item_type') or '').casefold() == 'section'
+        )
+        self.set_section_row_state(table, row, is_section)
     
     def create_empty_row(self, table, row):
         """Create an empty row for new data entry"""
@@ -141,17 +185,99 @@ class TableRowFactory:
             self._create_preview_cell(table, row, col, item)
         elif param_key == 'product_name':
             self._create_autocomplete_cell(table, row, col, param_key, item)
+        elif param_key == 'item_type':
+            self._create_item_type_cell(table, row, col, item)
         elif self.data_manager.parameter_definitions.get(param_key, {}).get('autocomplete'):
             self._create_autocomplete_cell(table, row, col, param_key, item)
         else:
             self._create_regular_cell(table, row, col, param_key, item)
+
+    def _create_item_type_cell(self, table, row, col, item):
+        selector = QComboBox()
+        # Build from the class options so the "Keep only in Sale" (manual)
+        # choice only appears for Sale item tables.
+        labels = {
+            "product": "Product",
+            "service": "Service",
+            "manual": "Keep only in Sale",
+            "section": "Section",
+        }
+        options = self.data_manager.parameter_definitions.get(
+            "item_type", {}
+        ).get("options", ["product", "service"])
+        for option in options:
+            selector.addItem(labels.get(option, option.title()), option)
+        selected = "product"
+        if item and hasattr(item, "get_value"):
+            selected = str(item.get_value("item_type") or "")
+            if not selected:
+                selected = "product" if item.get_value("product_id") else (
+                    "service" if item.get_value("service_id") else ""
+                )
+        index = selector.findData(selected)
+        selector.setCurrentIndex(index if index >= 0 else 0)
+        selector.setProperty("row", row)
+        table.setCellWidget(row, col, selector)
+
+    def set_section_row_state(self, table, row, is_section):
+        """Make structural Section cells visibly non-financial and non-editable."""
+        try:
+            name_col = self.data_manager.table_columns.index('product_name')
+            name_widget = table.cellWidget(row, name_col)
+            if name_widget:
+                if is_section:
+                    name_widget.setProperty('item_type', 'section')
+                    name_widget.setProperty('product_id', None)
+                    name_widget.setProperty('service_id', None)
+                name_widget.setPlaceholderText('Section title' if is_section else 'Product')
+                font = name_widget.font()
+                font.setBold(is_section)
+                name_widget.setFont(font)
+        except (ValueError, AttributeError):
+            pass
+
+        try:
+            info_col = self.data_manager.table_columns.index('information')
+            info_widget = table.cellWidget(row, info_col)
+            if info_widget:
+                info_widget.setEnabled(not is_section)
+                if is_section and hasattr(info_widget, 'setText'):
+                    info_widget.setText('')
+        except (ValueError, AttributeError):
+            pass
+
+        for param_key in ('quantity', 'unit_price', 'discount_percentage', 'subtotal'):
+            try:
+                col = self.data_manager.table_columns.index(param_key)
+            except ValueError:
+                continue
+            cell = table.item(row, col)
+            if cell is None:
+                cell = QTableWidgetItem()
+                table.setItem(row, col, cell)
+            if is_section:
+                cell.setText('')
+                cell.setFlags(cell.flags() & ~Qt.ItemIsEditable & ~Qt.ItemIsEnabled)
+                cell.setBackground(QBrush(QColor('#333333')))
+                cell.setToolTip('Not applicable to Section rows')
+            else:
+                cell.setFlags(cell.flags() | Qt.ItemIsSelectable | Qt.ItemIsEnabled | Qt.ItemIsEditable)
+                cell.setBackground(QBrush())
+                cell.setToolTip('')
+                if param_key == 'quantity' and not cell.text().strip():
+                    default_qty = self.data_manager.parameter_definitions.get(
+                        'quantity', {}
+                    ).get('default', 1)
+                    cell.setText(str(default_qty))
     
     def _create_delete_button_cell(self, table, row, col):
         """Create delete button cell"""
         button_param = {'text': '🗑️', 'color': 'red', 'size': 30}
         delete_btn = ButtonWidget(button_param)
         delete_btn.setProperty('row', row)  # Store row for callback
-        delete_btn.clicked.connect(lambda: self.delete_callback(row))
+        delete_btn.clicked.connect(
+            lambda _checked=False, btn=delete_btn: self.delete_callback(btn.property('row'))
+        )
         
         container = QWidget()
         layout = QHBoxLayout(container)
@@ -184,7 +310,7 @@ class TableRowFactory:
     
     def _create_autocomplete_cell(self, table, row, col, param_key, item):
         """Create autocomplete cell for configured string parameters."""
-        from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit
+        from ui.widgets.autocomplete_widgets import AutoCompleteLineEdit, AutoExpandingTextEdit
         
         param_info = self.data_manager.parameter_definitions.get(param_key, {})
         temp_item = self.data_manager.item_class(0, self.data_manager.database)
@@ -192,9 +318,24 @@ class TableRowFactory:
         if hasattr(temp_item, 'get_parameter_options'):
             options = lambda key=param_key: temp_item.get_parameter_options(key)
         
-        autocomplete = AutoCompleteLineEdit(options=options)
+        if param_info.get('auto_expand', param_info.get('type') == 'string'):
+            autocomplete = AutoExpandingTextEdit(
+                options=options,
+                multi_value=param_info.get('multi_value', False),
+                allow_free_text=param_info.get('allow_free_text', True),
+            )
+        else:
+            autocomplete = AutoCompleteLineEdit(
+                options=options,
+                allow_free_text=param_info.get('allow_free_text', False),
+                multi_value=param_info.get('multi_value', False),
+            )
         autocomplete.setPlaceholderText(param_info.get('display_name', {}).get('en', param_key.replace('_', ' ')))
         autocomplete.setProperty('row', row)  # Store row for callbacks
+        if hasattr(autocomplete, "setTabChangesFocus"):
+            autocomplete.setTabChangesFocus(True)
+        if hasattr(autocomplete, '_adjust_height'):
+            autocomplete._adjust_height()
         
         # Set current value if item provided
         if item:
@@ -203,6 +344,18 @@ class TableRowFactory:
             else:
                 value = item.get_value(param_key) if hasattr(item, 'get_value') else ""
             autocomplete.setText(str(value or ""))
+            autocomplete.setProperty('item_id', getattr(item, 'id', None) or item.get_value('id'))
+            autocomplete.setProperty('product_id', item.get_value('product_id'))
+            autocomplete.setProperty('service_id', item.get_value('service_id') if 'service_id' in getattr(item, 'parameters', {}) else None)
+            stored_type = str(item.get_value("item_type") or "").casefold()
+            autocomplete.setProperty(
+                'item_type',
+                stored_type or (
+                    'product' if item.get_value('product_id') else (
+                        'service' if autocomplete.property('service_id') else 'product'
+                    )
+                ),
+            )
         
         table.setCellWidget(row, col, autocomplete)
     
@@ -213,6 +366,14 @@ class TableRowFactory:
             raw_value = item.get_value(param_key)
             if param_key == 'subtotal':
                 value = f"{float(raw_value or 0):,.2f}".replace(",", " ")
+            elif param_key == 'quantity':
+                # NUMERIC(15,3) may return Decimal("4.000"). In locales where
+                # a dot is a thousands separator that looks like 4000, even
+                # though the stored value is four. Display the canonical value.
+                decimal_value = Decimal(str(raw_value or 0))
+                value = format(decimal_value, "f")
+                if "." in value:
+                    value = value.rstrip("0").rstrip(".")
             else:
                 value = str(raw_value or "")
         elif param_key == 'quantity':
@@ -222,10 +383,6 @@ class TableRowFactory:
             value = str(default_qty) if not item else value
         
         cell_item = QTableWidgetItem(value)
-        
-        # Make subtotal read-only
-        if param_key == 'subtotal':
-            cell_item.setFlags(cell_item.flags() & ~Qt.ItemIsEditable)
         
         table.setItem(row, col, cell_item)
 
@@ -239,11 +396,24 @@ class EmptyRowManager:
     
     def ensure_single_empty_row(self):
         """Ensure exactly one empty row exists at the bottom"""
-        # Remove all empty rows
-        self._remove_all_empty_rows()
-        
-        # Add one empty row at the end
-        self._add_empty_row()
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            self._remove_all_empty_rows()
+            self._add_empty_row()
+            self.reindex_row_widgets()
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+
+    def reindex_row_widgets(self):
+        """Keep widget callbacks aligned after table rows move or are deleted."""
+        for row in range(self.table.rowCount()):
+            for col in range(self.table.columnCount()):
+                widget = self.table.cellWidget(row, col)
+                if widget is None:
+                    continue
+                widget.setProperty('row', row)
+                for child in widget.findChildren(QWidget):
+                    child.setProperty('row', row)
     
     def _remove_all_empty_rows(self):
         """Remove all empty rows from table"""
@@ -264,6 +434,13 @@ class EmptyRowManager:
     
     def _is_row_empty(self, row):
         """Check if row is empty"""
+        try:
+            type_col = self.row_factory.data_manager.table_columns.index('item_type')
+            selector = self.table.cellWidget(row, type_col)
+            if selector and str(selector.currentData() or '').casefold() == 'section':
+                return False
+        except (ValueError, AttributeError):
+            pass
         # Check product name first (most important)
         product_name = self._get_product_name(row)
         if product_name:
@@ -279,6 +456,9 @@ class EmptyRowManager:
             if param_key in ['delete_action', 'product_preview', 'subtotal', 'quantity']:
                 continue
             
+            widget = self.table.cellWidget(row, col)
+            if widget and hasattr(widget, 'text') and widget.text().strip():
+                return False
             cell_item = self.table.item(row, col)
             if cell_item and cell_item.text().strip():
                 return False
@@ -306,14 +486,27 @@ class TableEventHandler:
         self.empty_row_manager = empty_row_manager
         self.items_changed_callback = items_changed_callback
         self._updating = False
+        self._empty_row_update_pending = False
+        self._stock_cache = {}
+        self._table_events_connected = False
     
     def setup_event_connections(self):
         """Setup event connections"""
-        self.table.itemChanged.connect(self._on_item_changed)
+        if not self._table_events_connected:
+            self.table.itemChanged.connect(self._on_item_changed)
+            self.table.cellClicked.connect(self._on_cell_clicked)
+            self._table_events_connected = True
         
         # Connect autocomplete widgets
         for row in range(self.table.rowCount()):
             self._connect_row_widgets(row)
+
+    def _on_cell_clicked(self, row, column):
+        try:
+            if self.data_manager.table_columns[column] == "quantity":
+                QTimer.singleShot(0, lambda r=row: self._begin_quantity_edit(r))
+        except (IndexError, ValueError):
+            pass
     
     def _connect_row_widgets(self, row):
         """Connect widgets in a specific row"""
@@ -321,9 +514,64 @@ class TableEventHandler:
             col = self.data_manager.table_columns.index('product_name')
             widget = self.table.cellWidget(row, col)
             if widget and hasattr(widget, 'textChanged'):
-                widget.textChanged.connect(lambda text, r=row: self._on_product_name_changed(r, text))
+                widget.setProperty('row', row)
+                if widget.property('operation_events_connected'):
+                    return
+                if hasattr(widget, 'toPlainText'):
+                    widget.textChanged.connect(
+                        lambda w=widget: self._on_product_name_changed(
+                            int(w.property('row')), w.text()
+                        )
+                    )
+                else:
+                    widget.textChanged.connect(
+                        lambda text, w=widget: self._on_product_name_changed(
+                            int(w.property('row')), text
+                        )
+                    )
             if widget and hasattr(widget, 'editingFinished'):
-                widget.editingFinished.connect(lambda r=row: self._on_product_selection_finished(r))
+                widget.editingFinished.connect(
+                    lambda w=widget: self._on_product_selection_finished(
+                        int(w.property('row'))
+                    )
+                )
+            if widget:
+                widget.setProperty('operation_events_connected', True)
+            try:
+                type_col = self.data_manager.table_columns.index("item_type")
+                selector = self.table.cellWidget(row, type_col)
+                if selector and not selector.property("operation_events_connected"):
+                    selector.currentIndexChanged.connect(
+                        lambda _index, s=selector: self._on_item_type_changed(
+                            int(s.property("row"))
+                        )
+                    )
+                    selector.setProperty("operation_events_connected", True)
+            except (ValueError, AttributeError):
+                pass
+        except (ValueError, AttributeError):
+            pass
+
+    def _on_item_type_changed(self, row):
+        try:
+            type_col = self.data_manager.table_columns.index("item_type")
+            selector = self.table.cellWidget(row, type_col)
+            selected_type = str(selector.currentData() or "").casefold() if selector else ""
+            name_col = self.data_manager.table_columns.index("product_name")
+            name_widget = self.table.cellWidget(row, name_col)
+            if name_widget:
+                name_widget.setProperty("product_id", None)
+                name_widget.setProperty("service_id", None)
+                name_widget.setProperty("item_type", selected_type or None)
+                self.empty_row_manager.row_factory.set_section_row_state(
+                    self.table, row, selected_type == 'section'
+                )
+                if selected_type != 'section' and name_widget.text().strip():
+                    self._handle_product_selection(row, name_widget.text().strip())
+            if selected_type == 'section':
+                self.empty_row_manager.ensure_single_empty_row()
+                self._reconnect_all_widgets()
+            self.items_changed_callback()
         except (ValueError, AttributeError):
             pass
     
@@ -338,18 +586,91 @@ class TableEventHandler:
         if col < len(self.data_manager.table_columns):
             param_key = self.data_manager.table_columns[col]
             
-            if param_key in ['quantity', 'unit_price']:
-                self._update_row_subtotal(row)
+            if param_key in ['quantity', 'unit_price', 'discount_percentage']:
+                self._updating = True
+                try:
+                    self._update_row_subtotal(row)
+                finally:
+                    self._updating = False
                 # Trigger immediate validation for quantity changes
                 if param_key == 'quantity':
                     self._validate_stock(row)
+            elif param_key == 'subtotal':
+                self._apply_subtotal_override(row)
         
         # Ensure empty row management
         if not self.empty_row_manager._is_row_empty(row):
-            self.empty_row_manager.ensure_single_empty_row()
-            self._reconnect_all_widgets()
+            self._schedule_empty_row_update()
         
         self.items_changed_callback()
+
+    def _schedule_empty_row_update(self):
+        """Normalize rows after the current itemChanged delivery has returned."""
+        if self._empty_row_update_pending:
+            return
+        self._empty_row_update_pending = True
+        QTimer.singleShot(0, self._apply_pending_empty_row_update)
+
+    def _apply_pending_empty_row_update(self):
+        self._empty_row_update_pending = False
+        if self._updating:
+            self._schedule_empty_row_update()
+            return
+        self._updating = True
+        try:
+            self.empty_row_manager.ensure_single_empty_row()
+            self._reconnect_all_widgets()
+        except RuntimeError:
+            # The owning dialog/table may have closed before the queued call.
+            pass
+        finally:
+            self._updating = False
+
+    @staticmethod
+    def _parse_number(value):
+        state, dec = parse_decimal_input(value)
+        return dec
+
+    def _apply_subtotal_override(self, row):
+        """Derive unit price when a user enters the line subtotal directly."""
+        try:
+            qty_col = self.data_manager.table_columns.index('quantity')
+            price_col = self.data_manager.table_columns.index('unit_price')
+            subtotal_col = self.data_manager.table_columns.index('subtotal')
+            qty_item = self.table.item(row, qty_col)
+            price_item = self.table.item(row, price_col)
+            subtotal_item = self.table.item(row, subtotal_col)
+            if subtotal_item is None:
+                return
+
+            qty_state, quantity = parse_decimal_input(qty_item.text() if qty_item else "")
+            sub_state, subtotal = parse_decimal_input(subtotal_item.text())
+            
+            if qty_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+               sub_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID):
+                return
+            
+            blocker = QSignalBlocker(self.table)
+            
+            if quantity <= Decimal("0"):
+                quantity = Decimal("1")
+                if qty_item is None:
+                    qty_item = QTableWidgetItem()
+                    self.table.setItem(row, qty_col, qty_item)
+                qty_item.setText("1")
+
+            unit_price = subtotal / quantity
+            if price_item is None:
+                price_item = QTableWidgetItem()
+                self.table.setItem(row, price_col, price_item)
+
+            price_item.setText(f"{unit_price:.6f}".rstrip('0').rstrip('.'))
+            if price_item.text() == "":
+                price_item.setText("0")
+                
+            subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
+        except (ValueError, AttributeError, IndexError, InvalidOperation, TypeError):
+            pass
     
     def _on_product_name_changed(self, row, text):
         """Handle product name text changes"""
@@ -374,13 +695,63 @@ class TableEventHandler:
         """Handle when product selection is completed"""
         product_name = self.empty_row_manager._get_product_name(row)
         if product_name:
-            self._handle_product_selection(row, product_name)
+            try:
+                type_col = self.data_manager.table_columns.index('item_type')
+                selector = self.table.cellWidget(row, type_col)
+                item_type = str(selector.currentData() or '').casefold() if selector else ''
+            except (ValueError, AttributeError):
+                item_type = ''
+            if item_type != 'section':
+                self._handle_product_selection(row, product_name)
             self.empty_row_manager.ensure_single_empty_row()
             self._reconnect_all_widgets()
             self.items_changed_callback()
+            # Bridge the widget-backed product name to the item-backed
+            # quantity delegate. This makes Tab and a single click reliably
+            # enter quantity editing instead of merely selecting the row.
+            if item_type != 'section':
+                QTimer.singleShot(
+                    0, lambda r=row: self._begin_quantity_edit(r, select_all=True)
+                )
+
+    def _begin_quantity_edit(self, row, select_all=False):
+        try:
+            quantity_col = self.data_manager.table_columns.index("quantity")
+            item = self.table.item(row, quantity_col)
+            if item is None or not (item.flags() & Qt.ItemIsEditable):
+                return
+            self.table.setCurrentCell(row, quantity_col)
+            delegate = self.table.itemDelegateForColumn(quantity_col)
+            editor = (
+                delegate.active_editors.get(row)
+                if hasattr(delegate, "active_editors") else None
+            )
+            if editor is None:
+                self.table.editItem(item)
+                editor = (
+                    delegate.active_editors.get(row)
+                    if hasattr(delegate, "active_editors") else None
+                )
+            if isinstance(editor, QLineEdit):
+                editor.setFocus()
+            if select_all and isinstance(editor, QLineEdit):
+                editor.selectAll()
+        except (ValueError, IndexError):
+            pass
     
     def _handle_product_selection(self, row, product_name):
         """Handle product selection and auto-fill"""
+        if "item_type" in self.data_manager.table_columns:
+            selected = self._resolve_sale_catalog_item(row, product_name)
+            self._auto_fill_quantity(row)
+            if selected is None:
+                self._update_row_subtotal(row)
+                return
+            # The typed catalog resolver already stored the immutable ID and
+            # catalog price. Do not run the legacy Product-only price lookup,
+            # which would overwrite Service prices with zero.
+            self._update_row_subtotal(row)
+            return
         temp_item = self.data_manager.item_class(0, self.data_manager.database)
         temp_item.set_value('product_name', product_name)
         
@@ -395,6 +766,121 @@ class TableEventHandler:
         
         # Update subtotal
         self._update_row_subtotal(row)
+
+    @staticmethod
+    def _normalized_name(value):
+        return " ".join(str(value or "").split()).casefold()
+
+    def _resolve_sale_catalog_item(self, row, entered_name):
+        database = self.data_manager.database
+        if not database or not getattr(database, "cursor", None):
+            return None
+        # "Keep only in this Sale" lines stay snapshot-only: never resolve or
+        # link them to a catalog record.
+        try:
+            type_col = self.data_manager.table_columns.index("item_type")
+        except ValueError:
+            type_col = None
+        if type_col is not None:
+            selector = self.table.cellWidget(row, type_col)
+            if selector and str(selector.currentData() or "") in ("manual", "section"):
+                return None
+        target = self._normalized_name(entered_name)
+        product = service = None
+        remote_catalog = getattr(database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            for record in remote_catalog.get("products", []):
+                if self._normalized_name(record.get("name")) == target:
+                    product = {
+                        "type": "product", "id": int(record["id"]),
+                        "name": record["name"], "price": record.get("price") or 0,
+                    }
+                    break
+            for record in remote_catalog.get("services", []):
+                candidates = [
+                    record.get("name"),
+                    *str(record.get("keywords") or "").replace(
+                        "\n", ","
+                    ).replace(";", ",").split(","),
+                ]
+                if any(self._normalized_name(value) == target for value in candidates):
+                    service = {
+                        "type": "service", "id": int(record["id"]),
+                        "name": record["name"], "price": record.get("price") or 0,
+                    }
+                    break
+        else:
+            try:
+                database.cursor.execute(
+                    "SELECT id, name, sale_price FROM products "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                product_row = database.cursor.fetchone()
+                if product_row:
+                    product = {
+                        "type": "product", "id": int(product_row[0]),
+                        "name": product_row[1], "price": product_row[2] or 0,
+                    }
+                database.cursor.execute(
+                    "SELECT id, name, unit_price FROM services "
+                    "WHERE LOWER(REGEXP_REPLACE(BTRIM(name), '\\s+', ' ', 'g'))=%s "
+                    "ORDER BY id LIMIT 2",
+                    (target,),
+                )
+                service_row = database.cursor.fetchone()
+                if service_row:
+                    service = {
+                        "type": "service", "id": int(service_row[0]),
+                        "name": service_row[1], "price": service_row[2] or 0,
+                    }
+            except Exception:
+                return None
+
+        type_col = self.data_manager.table_columns.index("item_type")
+        selector = self.table.cellWidget(row, type_col)
+        chosen_type = str(selector.currentData() or "") if selector else ""
+
+        if service and chosen_type == "service":
+            selected = service
+        elif product:
+            selected = product
+            chosen_type = "product"
+        elif service:
+            selected = service
+            chosen_type = "service"
+        else:
+            return None
+
+        if selector and chosen_type:
+            selector.blockSignals(True)
+            selector.setCurrentIndex(selector.findData(chosen_type))
+            selector.blockSignals(False)
+        name_col = self.data_manager.table_columns.index("product_name")
+        name_widget = self.table.cellWidget(row, name_col)
+        if name_widget:
+            name_widget.setProperty("product_id", selected["id"] if selected and chosen_type == "product" else None)
+            name_widget.setProperty("service_id", selected["id"] if selected and chosen_type == "service" else None)
+            name_widget.setProperty("item_type", chosen_type or None)
+            if selected and name_widget.text() != selected["name"]:
+                name_widget.setText(selected["name"])
+        if selected:
+            if chosen_type == "product":
+                # Stock changes outside this dialog are irrelevant while the
+                # line is being typed. Cache it to avoid synchronous SQL on
+                # every quantity keystroke.
+                self._stock_cache.pop(int(selected["id"]), None)
+            try:
+                price_col = self.data_manager.table_columns.index("unit_price")
+                price_item = self.table.item(row, price_col) or QTableWidgetItem()
+                if not self.table.item(row, price_col):
+                    self.table.setItem(row, price_col, price_item)
+                if not price_item.text().strip() or self._parse_number(price_item.text()) == 0:
+                    price_item.setText(str(selected["price"]))
+            except ValueError:
+                pass
+        return selected
     
     def _auto_fill_quantity(self, row):
         """Auto-fill quantity with default value"""
@@ -456,23 +942,36 @@ class TableEventHandler:
             
             qty_item = self.table.item(row, qty_col)
             price_item = self.table.item(row, price_col)
+            try:
+                discount_col = self.data_manager.table_columns.index('discount_percentage')
+                discount_item = self.table.item(row, discount_col)
+            except ValueError:
+                discount_item = None
             
-            quantity = float(qty_item.text()) if qty_item and qty_item.text().strip() else 0.0
-            unit_price = float(price_item.text()) if price_item and price_item.text().strip() else 0.0
-            subtotal = quantity * unit_price
+            qty_state, quantity = parse_decimal_input(qty_item.text() if qty_item else "")
+            price_state, unit_price = parse_decimal_input(price_item.text() if price_item else "")
+            discount_state, discount = parse_decimal_input(discount_item.text() if discount_item else "0")
+            
+            if qty_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+                price_state in (InputState.EMPTY, InputState.INTERMEDIATE, InputState.INVALID) or \
+                discount_state in (InputState.INTERMEDIATE, InputState.INVALID) or not Decimal('0') <= discount <= Decimal('100'):
+                return
+            
+            subtotal = calculate_line_subtotal(quantity, unit_price, discount)
+            
+            blocker = QSignalBlocker(self.table)
             
             subtotal_item = self.table.item(row, subtotal_col)
             if not subtotal_item:
                 subtotal_item = QTableWidgetItem()
                 self.table.setItem(row, subtotal_col, subtotal_item)
-                subtotal_item.setFlags(subtotal_item.flags() & ~Qt.ItemIsEditable)
             
             subtotal_item.setText(f"{subtotal:,.2f}".replace(",", " "))
 
             # After updating subtotal, validate stock and style quantity cell if exceeded
             self._validate_stock(row)
             
-        except (ValueError, AttributeError, IndexError):
+        except (ValueError, AttributeError, IndexError, InvalidOperation, TypeError):
             pass
     
     def _reconnect_all_widgets(self):
@@ -495,6 +994,16 @@ class TableEventHandler:
         product_name = product_widget.text().strip() if product_widget and hasattr(product_widget, 'text') else ''
         if not product_name:
             return None
+        item_type = str(product_widget.property("item_type") or "").casefold()
+        if "item_type" in self.data_manager.table_columns:
+            try:
+                type_col = self.data_manager.table_columns.index("item_type")
+                selector = self.table.cellWidget(row, type_col)
+                item_type = str(selector.currentData() or item_type).casefold()
+            except (ValueError, AttributeError):
+                pass
+        if item_type in ("service", "manual", "section"):
+            return None
         
         # Get quantity from either active editor or cell item
         requested_qty = 0
@@ -505,61 +1014,50 @@ class TableEventHandler:
                 row in qty_delegate.active_editors):
                 # Use editor text for real-time evaluation
                 editor = qty_delegate.active_editors[row]
-                requested_qty = float(editor.text()) if editor.text().strip() else 0
+                requested_qty = self._parse_number(editor.text())
             else:
                 # Use cell item text
                 qty_item = self.table.item(row, qty_col)
                 if qty_item:
-                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+                    requested_qty = self._parse_number(qty_item.text())
         except (ValueError, AttributeError):
             # Fallback to cell item if editor access fails
             try:
                 qty_item = self.table.item(row, qty_col)
                 if qty_item:
-                    requested_qty = float(qty_item.text()) if qty_item.text().strip() else 0
+                    requested_qty = self._parse_number(qty_item.text())
             except ValueError:
                 requested_qty = 0
-        
-        # Product ID lookup
-        product_id = None
-        try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
-            res = db.cursor.fetchone()
-            if res and res[0]:
-                product_id = res[0]
-        except Exception:
-            product_id = None
-        if not product_id:
-            return (requested_qty, None, False, product_name)
-        try:
-            product_obj = ProductClass(product_id, db)
-            stock_available = product_obj.calculate_quantity()
-        except Exception:
-            stock_available = None
-        if stock_available is None:
-            return (requested_qty, None, False, product_name)
-        exceeded = requested_qty > stock_available
-        return (requested_qty, stock_available, exceeded, product_name)
-        # Product ID
-        product_id = None
-        try:
-            db.cursor.execute("SELECT ID FROM Products WHERE name = ? LIMIT 1", (product_name,))
-            res = db.cursor.fetchone()
-            if res and res[0]:
-                product_id = res[0]
-        except Exception:
-            product_id = None
-        if not product_id:
-            return (requested_qty, None, False, product_name)
-        try:
-            product_obj = ProductClass(product_id, db)
-            stock_available = product_obj.calculate_quantity()
-        except Exception:
-            stock_available = None
-        if stock_available is None:
-            return (requested_qty, None, False, product_name)
-        exceeded = requested_qty > stock_available
-        return (requested_qty, stock_available, exceeded, product_name)
+
+        remote_catalog = getattr(db, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            product_id = product_widget.property("product_id")
+            target_name = self._normalized_name(product_name)
+            record = next(
+                (
+                    candidate
+                    for candidate in remote_catalog.get("products", [])
+                    if (
+                        product_id
+                        and int(candidate.get("id") or 0) == int(product_id)
+                    ) or self._normalized_name(candidate.get("name")) == target_name
+                ),
+                None,
+            )
+            if not record:
+                return (requested_qty, None, False, product_name)
+            product_widget.setProperty("product_id", int(record["id"]))
+            try:
+                stock_available = Decimal(str(record.get("stock") or 0))
+            except (InvalidOperation, ValueError):
+                stock_available = None
+            if stock_available is None:
+                return (requested_qty, None, False, product_name)
+            return (
+                requested_qty, stock_available,
+                Decimal(str(requested_qty)) > stock_available, product_name,
+            )
+        return (requested_qty, None, False, product_name)
 
     def _validate_stock(self, row):
         state = self.get_row_stock_state(row)
@@ -624,12 +1122,32 @@ class QuantityDelegate(QStyledItemDelegate):
 
     def createEditor(self, parent, option, index):
         editor = QLineEdit(parent)
+        editor.setValidator(QRegularExpressionValidator(
+            # Empty text must remain an intermediate valid state so users can
+            # select the default "1", delete it, and type a replacement.
+            QRegularExpression(r"^(?:|\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
+        ))
         row = index.row()
         self.active_editors[row] = editor  # Store reference
+        # Store model index for live updates
+        editor.setProperty("model_index", index)
         self._apply_style(editor, row)
-        # Connect textChanged for real-time styling only
-        editor.textChanged.connect(lambda _t, r=row, e=editor: self._apply_style(e, r))
+        # Connect textChanged for real-time styling AND live subtotal updates
+        editor.textChanged.connect(lambda _t, r=row, e=editor: self._on_editor_text_changed(r, e))
         return editor
+
+    def _on_editor_text_changed(self, row: int, editor: QLineEdit):
+        """Live update model and trigger subtotal recalculation while typing."""
+        index = editor.property("model_index")
+        if index is None:
+            return
+        # Update model data immediately (triggers itemChanged -> _on_item_changed -> _update_row_subtotal)
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "1"
+        index.model().setData(index, value, Qt.EditRole)
+        # Also update style
+        self._apply_style(editor, row)
 
     def destroyEditor(self, editor, index):
         row = index.row()
@@ -642,7 +1160,10 @@ class QuantityDelegate(QStyledItemDelegate):
         editor.setText(str(value) if value is not None else "")
 
     def setModelData(self, editor, model, index):
-        model.setData(index, editor.text(), Qt.EditRole)
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "1"
+        model.setData(index, value, Qt.EditRole)
         # After committing, trigger validation so cell styling updates
         row = index.row()
         # Small delay to ensure the editor is fully closed before validation
@@ -662,6 +1183,85 @@ class QuantityDelegate(QStyledItemDelegate):
             # Neutral style (inherit theme but ensure visible border)
             editor.setStyleSheet("QLineEdit{border:1px solid #555555; background:#2e2e2e; color:#ffffff; border-radius:4px;}")
             editor.setToolTip("")
+
+
+class UnitPriceDelegate(QStyledItemDelegate):
+    """Delegate for unit_price with live subtotal updates via QLineEdit."""
+    def __init__(self, event_handler: TableEventHandler, parent=None):
+        super().__init__(parent)
+        self.event_handler = event_handler
+        self.active_editors = {}
+
+    def createEditor(self, parent, option, index):
+        editor = QLineEdit(parent)
+        editor.setValidator(QRegularExpressionValidator(
+            QRegularExpression(r"^(?:|\d+(?:[\.,]\d{0,3})?|[\.,]\d{1,3})$"), editor
+        ))
+        row = index.row()
+        self.active_editors[row] = editor
+        editor.setProperty("model_index", index)
+        editor.textChanged.connect(lambda _t, r=row, e=editor: self._on_editor_text_changed(r, e))
+        return editor
+
+    def _on_editor_text_changed(self, row: int, editor: QLineEdit):
+        index = editor.property("model_index")
+        if index is None:
+            return
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "0"
+        index.model().setData(index, value, Qt.EditRole)
+
+    def destroyEditor(self, editor, index):
+        row = index.row()
+        if row in self.active_editors:
+            del self.active_editors[row]
+        super().destroyEditor(editor, index)
+
+    def setEditorData(self, editor, index):
+        value = index.model().data(index, Qt.EditRole)
+        editor.setText(str(value) if value is not None else "")
+
+    def setModelData(self, editor, model, index):
+        value = editor.text().strip()
+        if value in ("", ".", ","):
+            value = "0"
+        model.setData(index, value, Qt.EditRole)
+
+
+class DecimalSpinBoxDelegate(QStyledItemDelegate):
+    """Bounded decimal editor used for per-line sale discounts."""
+    def __init__(self, decimals=2, minimum=0.0, maximum=100.0, parent=None):
+        super().__init__(parent)
+        self.decimals, self.minimum, self.maximum = decimals, minimum, maximum
+
+    def createEditor(self, parent, option, index):
+        editor = QDoubleSpinBox(parent)
+        editor.setDecimals(self.decimals)
+        editor.setRange(self.minimum, self.maximum)
+        editor.setSingleStep(0.25)
+        editor.setSuffix(' %')
+        # Live update while spinning/typing
+        model_index = QPersistentModelIndex(index)
+        editor.valueChanged.connect(
+            lambda _v, e=editor, idx=model_index: self._on_spinbox_value_changed(e, idx)
+        )
+        return editor
+
+    def _on_spinbox_value_changed(self, editor, model_index):
+        if not model_index.isValid():
+            return
+        value = format(editor.value(), f'.{self.decimals}f').rstrip('0').rstrip('.')
+        model_index.model().setData(model_index, value, Qt.EditRole)
+
+    def setEditorData(self, editor, index):
+        try:
+            editor.setValue(float(str(index.data() or '0').replace(',', '.').replace(' ', '')))
+        except ValueError:
+            editor.setValue(0)
+
+    def setModelData(self, editor, model, index):
+        model.setData(index, format(editor.value(), f'.{self.decimals}f').rstrip('0').rstrip('.'), Qt.EditRole)
 
 
 class OperationsTableWidget(QWidget):
@@ -709,6 +1309,7 @@ class OperationsTableWidget(QWidget):
         # Install delegates after initial setup (only if highlighting enabled)
         if self.highlight_stock_exceed:
             self._install_delegates()
+        self._install_discount_delegate()
     
     def _setup_ui(self):
         """Setup user interface"""
@@ -730,7 +1331,8 @@ class OperationsTableWidget(QWidget):
         # Table properties
         self.table.verticalHeader().setVisible(False)
         self.table.setAlternatingRowColors(True)
-        self.table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.table.setWordWrap(True)
+        self.table.setSelectionBehavior(QAbstractItemView.SelectItems)
         self.table.setEditTriggers(QAbstractItemView.AllEditTriggers)
         self.table.verticalHeader().setDefaultSectionSize(45)
         
@@ -751,43 +1353,75 @@ class OperationsTableWidget(QWidget):
     
     def refresh_table(self):
         """Refresh table data"""
-        self.table.setRowCount(0)
-        
-        # Load existing items
-        items = self.data_manager.load_items_from_operation(self.parent_operation)
-        for item in items:
-            row = self.table.rowCount()
-            self.table.setRowCount(row + 1)
-            self.row_factory.create_data_row(self.table, row, item)
-        
-        # Ensure empty row
-        self.empty_row_manager.ensure_single_empty_row()
-        
-        # Setup events
-        self.event_handler.setup_event_connections()
+        was_blocked = self.table.blockSignals(True)
+        try:
+            self.table.setRowCount(0)
+            
+            # Load existing items
+            items = self.data_manager.load_items_from_operation(self.parent_operation)
+            for item in items:
+                row = self.table.rowCount()
+                self.table.setRowCount(row + 1)
+                self.row_factory.create_data_row(self.table, row, item)
+            
+            # Ensure empty row
+            self.empty_row_manager.ensure_single_empty_row()
+            
+            # Setup events (will not duplicate existing connections)
+            self.event_handler.setup_event_connections()
+        finally:
+            self.table.blockSignals(was_blocked)
+            
         # Initial validation so existing rows show state immediately (only if enabled)
         if self.highlight_stock_exceed:
             self.event_handler.validate_all_rows()
 
     def _install_delegates(self):
-        """Install custom delegates (quantity styling)."""
+        """Install custom delegates (quantity and unit_price styling + live updates)."""
         try:
             qty_col = self.data_manager.table_columns.index('quantity')
         except ValueError:
             return
         delegate = QuantityDelegate(self.event_handler, self.table)
         self.table.setItemDelegateForColumn(qty_col, delegate)
+        try:
+            price_col = self.data_manager.table_columns.index('unit_price')
+        except ValueError:
+            return
+        price_delegate = UnitPriceDelegate(self.event_handler, self.table)
+        self.table.setItemDelegateForColumn(price_col, price_delegate)
+
+    def _install_discount_delegate(self):
+        try:
+            discount_col = self.data_manager.table_columns.index('discount_percentage')
+        except ValueError:
+            return
+        self.table.setItemDelegateForColumn(
+            discount_col, DecimalSpinBoxDelegate(2, 0.0, 100.0, self.table)
+        )
     
     def get_current_table_data(self):
         """Get all non-empty rows as data dictionaries"""
         items_data = []
-        
+        diagnostics = []
         for row in range(self.table.rowCount()):
-            if not self.empty_row_manager._is_row_empty(row):
-                row_data = self.data_manager.extract_row_data(self.table, row)
-                if row_data.get('product_name'):
-                    items_data.append(row_data)
-        
+            if self.empty_row_manager._is_row_empty(row):
+                diagnostics.append({'row': row + 1, 'status': 'skipped', 'reason': 'empty row'})
+                continue
+            row_data = self.data_manager.extract_row_data(self.table, row)
+            row_data['row_index'] = row + 1
+            items_data.append(row_data)
+            diagnostics.append({
+                'row': row + 1,
+                'status': 'extracted',
+                'designation': row_data.get('product_name', ''),
+                'has_id': bool(row_data.get('id')),
+            })
+        self.last_extraction_diagnostics = {
+            'visible_rows': self.table.rowCount(),
+            'extracted_rows': len(items_data),
+            'rows': diagnostics,
+        }
         return items_data
 
     def get_all_entered_product_names(self):
@@ -817,6 +1451,13 @@ class OperationsTableWidget(QWidget):
         
         for item_data in items_data:
             item = self.data_manager.item_class(0, self.data_manager.database)
+            # Set the type before the name so Section titles never go through
+            # Product/Service catalog resolution.
+            if 'item_type' in item_data:
+                try:
+                    item.set_value('item_type', item_data['item_type'])
+                except Exception:
+                    pass
             # Set product_name first to trigger snapshot logic in item class
             if 'product_name' in item_data:
                 try:
@@ -825,7 +1466,7 @@ class OperationsTableWidget(QWidget):
                     pass
             # Set remaining fields except product_name
             for key, value in item_data.items():
-                if key == 'product_name':
+                if key in ('product_name', 'item_type'):
                     continue
                 try:
                     if hasattr(item, 'is_parameter_calculated') and item.is_parameter_calculated(key):
@@ -836,25 +1477,69 @@ class OperationsTableWidget(QWidget):
                     item.set_value(key, value)
                 except Exception:
                     pass
-            # Attempt resolution (non-fatal if fails); include regardless for later handling
-            if hasattr(item, 'get_value') and not item.get_value('product_id'):
+            try:
+                selected_type = str(item_data.get("item_type") or "").casefold()
+                if selected_type == "service":
+                    item.parameters["product_id"]["value"] = None
+                elif selected_type == "product" and "service_id" in item.parameters:
+                    item.parameters["service_id"]["value"] = None
+            except Exception:
+                pass
+            # Attempt resolution (non-fatal if fails); include regardless for later handling.
+            # GUI thread must NOT block to query the database over RPC here - use the
+            # prefetched catalog only. If it's unavailable, leave product_id unresolved;
+            # the backend resolves by name / pending_entities at save time.
+            if (hasattr(item, 'get_value') and not item.get_value('product_id')
+                    and str(item_data.get("item_type") or "").casefold() == "product"):
                 try:
-                    if self.data_manager.database and hasattr(self.data_manager.database, 'cursor'):
-                        self.data_manager.database.cursor.execute(
-                            "SELECT ID FROM Products WHERE name = ?", (item.get_value('product_name'),))
-                        res = self.data_manager.database.cursor.fetchone()
-                        if res and res[0]:
-                            item.set_value('product_id', res[0])
+                    catalog = getattr(self.data_manager.database, 'sale_catalog', None)
+                    if catalog:
+                        target = self.event_handler._normalized_name(item.get_value('product_name'))
+                        for p in catalog.get('products', []):
+                            if self.event_handler._normalized_name(p.get('name')) == target:
+                                item.set_value('product_id', p.get('id'))
+                                break
                 except Exception:
                     pass
             items.append(item)
         
         return items
+
+    def add_section_row(self):
+        """Append one editable structural Section before the trailing empty row."""
+        signals_were_blocked = self.table.blockSignals(True)
+        try:
+            self.empty_row_manager._remove_all_empty_rows()
+            row = self.table.rowCount()
+            self.table.setRowCount(row + 1)
+            item = self.data_manager.item_class(0, self.data_manager.database)
+            item.set_value('item_type', 'section')
+            self.row_factory.create_data_row(self.table, row, item)
+            self.empty_row_manager.ensure_single_empty_row()
+        finally:
+            self.table.blockSignals(signals_were_blocked)
+        self.event_handler._reconnect_all_widgets()
+        try:
+            name_col = self.data_manager.table_columns.index('product_name')
+            name_widget = self.table.cellWidget(row, name_col)
+            if name_widget:
+                name_widget.setFocus()
+        except (ValueError, AttributeError):
+            pass
+        self._on_items_changed()
     
     def _delete_row(self, row):
         """Delete a specific row"""
-        if row < self.table.rowCount():
-            self.table.removeRow(row)
+        try:
+            row = int(row)
+        except (TypeError, ValueError):
+            return
+        if 0 <= row < self.table.rowCount():
+            signals_were_blocked = self.table.blockSignals(True)
+            try:
+                self.table.removeRow(row)
+            finally:
+                self.table.blockSignals(signals_were_blocked)
             self.empty_row_manager.ensure_single_empty_row()
             self.event_handler._reconnect_all_widgets()
             self._on_items_changed()

@@ -64,12 +64,27 @@ class ImportEditDialog(QDialog):
     def setup_ui(self):
         """Setup dialog UI with simple, clean layout that ensures table scrolling works"""
         from PySide6.QtWidgets import QFormLayout, QWidget
-        
-        # Set reasonable default size but allow resizing
-        self.resize(900, 700)
-        # Calculate proper minimum size to prevent overlay
-        # 120 (params) + 30 (label) + 200 (table min) + 60 (totals) + 50 (buttons) + 60 (margins/spacing + buffer)
-        self.setMinimumSize(600, 520)  # Added extra 15px buffer to prevent overlay
+        from PySide6.QtGui import QGuiApplication
+
+        # --- Responsive sizing based on the screen this dialog appears on ---
+        screen = self.screen() if self.screen() else QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+
+        # Ideal size (what we'd like on a normal/large screen)
+        ideal_width, ideal_height = 900, 700
+        # Absolute minimum content needs (see minimumSizeHint for the breakdown)
+        min_needed_width, min_needed_height = 600, 520
+
+        # Never ask for more than ~92% of the available screen space
+        target_width = min(ideal_width, int(available.width() * 0.92))
+        target_height = min(ideal_height, int(available.height() * 0.92))
+        self.resize(target_width, target_height)
+
+        # The minimum size should also never exceed the available screen space,
+        # otherwise the dialog can't shrink to fit small-resolution displays
+        min_width = min(min_needed_width, int(available.width() * 0.92))
+        min_height = min(min_needed_height, int(available.height() * 0.92))
+        self.setMinimumSize(min_width, min_height)
         
         layout = QVBoxLayout(self)
         layout.setContentsMargins(15, 15, 15, 15)
@@ -85,12 +100,16 @@ class ImportEditDialog(QDialog):
             id_layout.addStretch()
             layout.addLayout(id_layout)
         
-        # Import parameters section (compact, fixed height)
+        # Import parameters section (compact; can grow slightly if labels wrap on narrow screens)
         params_widget = QWidget()
-        params_widget.setFixedHeight(120)  # Fixed height for parameters
+        params_widget.setMinimumHeight(80)
+        params_widget.setMaximumHeight(160)
         params_layout = QFormLayout(params_widget)
         params_layout.setContentsMargins(5, 5, 5, 5)
         params_layout.setSpacing(8)
+        # Stack label above field on narrow widths instead of squeezing both onto one row
+        params_layout.setRowWrapPolicy(QFormLayout.WrapLongRows)
+        params_layout.setFieldGrowthPolicy(QFormLayout.AllNonFixedFieldsGrow)
         
         # Get parameters that should be shown in dialog
         visible_params = self.import_obj.get_visible_parameters("dialog")
@@ -161,7 +180,9 @@ class ImportEditDialog(QDialog):
         self.import_items_table.items_changed.connect(self.update_totals)
         
         # Give the table most of the remaining space (stretches with dialog)
-        self.import_items_table.setMinimumHeight(200)  # Reduced minimum for better resizing
+        # Scale the floor down on small screens instead of always demanding 200px
+        table_min_height = max(120, min(200, int(available.height() * 0.22)))
+        self.import_items_table.setMinimumHeight(table_min_height)
         layout.addWidget(self.import_items_table, 1)  # Stretch factor 1 = takes extra space
         
         # Totals section (compact, fixed height) - ALWAYS AFTER TABLE
@@ -196,20 +217,29 @@ class ImportEditDialog(QDialog):
         self.apply_theme()
     
     def minimumSizeHint(self):
-        """Calculate minimum size to prevent component overlay"""
+        """Calculate minimum size to prevent component overlay, capped to the current screen"""
         from PySide6.QtCore import QSize
-        
-        # Calculate minimum height needed for all components
+        from PySide6.QtGui import QGuiApplication
+
+        screen = self.screen() if self.screen() else QGuiApplication.primaryScreen()
+        available = screen.availableGeometry()
+
+        # Same components as setup_ui, but using the same scaled table height
+        table_min_height = max(120, min(200, int(available.height() * 0.22)))
         min_height = (
-            120 +  # params section (fixed)
-            30 +   # import items label 
-            200 +  # table minimum height
+            80 +   # params section (min, can grow to 160 if wrapped)
+            30 +   # import items label
+            table_min_height +
             60 +   # totals section (fixed)
             50 +   # button section (fixed)
             60     # margins and spacing + buffer
         )
-        
-        return QSize(600, min_height)
+
+        # Never hint a size larger than the screen actually has room for
+        min_width = min(600, int(available.width() * 0.92))
+        min_height = min(min_height, int(available.height() * 0.92))
+
+        return QSize(min_width, min_height)
     
     def apply_theme(self):
         """Apply dark theme styling"""
@@ -310,13 +340,14 @@ class ImportEditDialog(QDialog):
     
     def update_totals(self):
         """Update total calculation fields"""
+        from core.calculations import calculate_operation_totals
         try:
             # Get current items
             items = self.import_items_table.get_items_data()
-            
-            # Calculate subtotal
+
+            # Calculate subtotal (sum of Decimal line totals)
             subtotal = sum(item.get_value('subtotal') or 0 for item in items)
-            
+
             # Get VAT percentage from the tva parameter widget
             vat_percent = 0
             if 'tva' in self.parameter_widgets:
@@ -324,22 +355,23 @@ class ImportEditDialog(QDialog):
                     vat_percent = float(self.get_widget_value(self.parameter_widgets['tva']) or 0)
                 except Exception:
                     vat_percent = 0
-            
-            # Calculate VAT amount
-            vat_amount = subtotal * (vat_percent / 100)
-            
-            # Calculate total
-            total = subtotal + vat_amount
-            
+
+            # All money math runs through the shared Decimal utility so a
+            # Decimal subtotal is never multiplied by a raw float.
+            totals = calculate_operation_totals(subtotal, 0, vat_percent)
+
             # Update widgets
             from ui.widgets.parameters_widgets import ParameterWidgetFactory
             if hasattr(self, 'subtotal_widget'):
-                ParameterWidgetFactory.set_widget_value(self.subtotal_widget, subtotal)
+                ParameterWidgetFactory.set_widget_value(
+                    self.subtotal_widget, totals['original_subtotal'])
             if hasattr(self, 'vat_widget'):
-                ParameterWidgetFactory.set_widget_value(self.vat_widget, vat_amount)
+                ParameterWidgetFactory.set_widget_value(
+                    self.vat_widget, totals['vat_amount'])
             if hasattr(self, 'total_widget'):
-                ParameterWidgetFactory.set_widget_value(self.total_widget, total)
-                
+                ParameterWidgetFactory.set_widget_value(
+                    self.total_widget, totals['total_ttc'])
+
         except Exception as e:
             print(f"Error updating totals: {e}")
     
@@ -379,7 +411,7 @@ class ImportEditDialog(QDialog):
             return False
         
         try:
-            self.database.cursor.execute("SELECT COUNT(*) FROM Suppliers WHERE username = ?", (username,))
+            self.database.cursor.execute("SELECT COUNT(*) FROM Suppliers WHERE username = %s", (username,))
             result = self.database.cursor.fetchone()
             return result[0] > 0 if result else False
         except Exception as e:

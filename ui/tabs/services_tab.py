@@ -51,6 +51,20 @@ class ServicesTab(BaseTab):
             "Service Name Desc"
         ])
 
+    def _order_by_field(self, order_option):
+        """Map display labels to allowlisted sort columns."""
+        field = super()._order_by_field(order_option)
+        if field and field.startswith('service_name'):
+            return 'name'
+        if field and field.startswith('id') and field != 'id':
+            return 'id'
+        return field
+
+    def _order_direction(self, order_option):
+        if order_option and str(order_option).lower().endswith('desc'):
+            return 'desc'
+        return super()._order_direction(order_option)
+
     def get_searchable_fields(self):
         return ['name', 'description', 'keywords']
 

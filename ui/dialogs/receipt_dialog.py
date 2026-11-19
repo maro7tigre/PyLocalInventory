@@ -1,7 +1,9 @@
 """
 Payment receipt dialog - printable receipt display.
 """
-from PySide6.QtWidgets import QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser
+from PySide6.QtWidgets import (
+    QDialog, QVBoxLayout, QHBoxLayout, QPushButton, QTextBrowser, QMessageBox
+)
 from PySide6.QtGui import QTextDocument
 import os
 
@@ -10,11 +12,12 @@ class ReceiptDialog(QDialog):
     """Printable payment receipt."""
 
     def __init__(self, sale_id, client, order_date, payment_date,
-                 total, amount_this, total_paid, remaining, parent=None):
+                 total, amount_this, total_paid, remaining, parent=None, currency='MAD'):
         super().__init__(parent)
         self.setWindowTitle("Payment Receipt")
         self.setMinimumWidth(500)
         self.setMinimumHeight(480)
+        self.currency = currency
         self._html = self._build_html(
             sale_id, client, order_date, payment_date,
             total, amount_this, total_paid, remaining
@@ -24,7 +27,7 @@ class ReceiptDialog(QDialog):
     def _build_html(self, sale_id, client, order_date, payment_date,
                     total, amount_this, total_paid, remaining):
         rem_color = '#27ae60' if remaining <= 0 else '#e67e22'
-        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} DA REMAINING'
+        status_text = 'FULLY PAID ✓' if remaining <= 0 else f'{remaining:.2f} {self.currency} REMAINING'
 
         template_path = os.path.normpath(os.path.join(
             os.path.dirname(os.path.abspath(__file__)), '..', '..', 'report', 'Receipt_templat.html'
@@ -38,13 +41,14 @@ class ReceiptDialog(QDialog):
                 total=f"{total:.2f}", amount_this=f"{amount_this:.2f}",
                 total_paid=f"{total_paid:.2f}", remaining=f"{remaining:.2f}",
                 status_text=status_text,
+                currency=self.currency,
             )
             return html.replace('REM_COLOR', rem_color)
         except Exception as e:
             print(f"Error loading receipt template: {e}")
             return (f"<html><body><p>Receipt for Sale #{sale_id} — "
-                    f"{amount_this:.2f} DA paid by {client}. "
-                    f"Remaining: {remaining:.2f} DA</p></body></html>")
+                    f"{amount_this:.2f} {self.currency} paid by {client}. "
+                    f"Remaining: {remaining:.2f} {self.currency}</p></body></html>")
 
     def _setup_ui(self):
         layout = QVBoxLayout(self)
@@ -76,8 +80,17 @@ class ReceiptDialog(QDialog):
 
     def _print_receipt(self):
         try:
-            from PySide6.QtPrintSupport import QPrinter, QPrintDialog
+            from PySide6.QtPrintSupport import QPrinter, QPrinterInfo, QPrintDialog
+            if not QPrinterInfo.availablePrinterNames():
+                QMessageBox.warning(
+                    self, "No Printer",
+                    "No printer is installed or available on this computer.",
+                )
+                return
             printer = QPrinter(QPrinter.HighResolution)
+            default_printer = QPrinterInfo.defaultPrinter()
+            if not default_printer.isNull():
+                printer.setPrinterName(default_printer.printerName())
             dlg = QPrintDialog(printer, self)
             if dlg.exec() == QPrintDialog.Accepted:
                 doc = QTextDocument()
@@ -85,3 +98,6 @@ class ReceiptDialog(QDialog):
                 doc.print_(printer)
         except Exception as e:
             print(f"Print error: {e}")
+            QMessageBox.critical(
+                self, "Print Error", f"Could not print this receipt:\n{e}"
+            )

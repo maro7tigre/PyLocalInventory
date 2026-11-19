@@ -3,6 +3,7 @@ Import Class - Updated to handle multiple items per import operation
 """
 from classes.base_class import BaseClass
 from classes.import_item_class import ImportItemClass
+from core.calculations import to_decimal, calculate_operation_totals
 
 
 class ImportClass(BaseClass):
@@ -50,6 +51,32 @@ class ImportClass(BaseClass):
                 "options": [],
                 "type": "date"
             },
+            "bl_number": {
+                "value": "",
+                "display_name": {"en": "Bon de Livraison N°", "fr": "Bon de Livraison N°", "es": "Bon de Livraison N°"},
+                "required": False,
+                "default": "",
+                "options": [],
+                "type": "string",
+                "editable": True,
+                "readonly": False
+            },
+            "is_historical": {
+                "value": False,
+                "display_name": {"en": "Historical Import — Do not affect current stock", "fr": "Importation Historique — N'affecte pas le stock actuel", "es": "Importación Histórica — No afecta el stock actual"},
+                "required": False,
+                "default": False,
+                "options": [],
+                "type": "bool",
+                # Canonical boolean mapping: the value stays Python True/False
+                # end-to-end (checkbox -> payload -> RPC -> PostgreSQL BOOLEAN).
+                # Without this the BaseClass bool conversion falls back to the
+                # integer true_value=1/false_value=0 and the INSERT sends an
+                # integer into the BOOLEAN imports.is_historical column.
+                "true_value": True,
+                "false_value": False,
+                "readonly": False
+            },
             # TVA now a checkbox: unchecked=0%, checked=20%
             "tva": {
                 "value": 20.0,
@@ -67,6 +94,22 @@ class ImportClass(BaseClass):
                 "default": "",
                 "options": [],
                 "type": "string"
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
+            "operation_token": {
+                "value": "", "display_name": {"en": "Operation Token"},
+                "required": False, "default": "", "type": "string"
             },
             "items": {
                 "display_name": {"en": "Items", "fr": "Articles", "es": "Artículos"},
@@ -116,22 +159,31 @@ class ImportClass(BaseClass):
                 "supplier_username": "r",
                 "supplier_name": "r",
                 "date": "r",
+                "bl_number": "r",
                 "total_price": "r",
                 "details": "r"
             },
             "dialog": {
                 "supplier_username": "rw",
                 "date": "rw",
+                "bl_number": "rw",
                 "tva": "rw",
                 "notes": "rw",
+                "is_historical": "rw",
                 "items": "rw"
             },
             "database": {
                 "supplier_username": "rw",
                 "supplier_name": "rw",
                 "date": "rw",
+                "bl_number": "rw",
                 "tva": "rw",
-                "notes": "rw"
+                "notes": "rw",
+                "is_historical": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r",
+                "operation_token": "r"
             },
             "report": {
                 "id": "r",
@@ -149,40 +201,47 @@ class ImportClass(BaseClass):
         """Get all items for this import operation"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return []
+        if hasattr(self, "items"):
+            return self.items
         
         try:
-            # Get all import items for this import operation
-            self.database.cursor.execute("SELECT ID FROM Import_Items WHERE import_id = ?", (self.id,))
-            item_ids = self.database.cursor.fetchall()
-            
             items = []
-            for (item_id,) in item_ids:
-                item = ImportItemClass(item_id, self.database)
-                if item.load_database_data():
-                    items.append(item)
-            
-            return items
+            for row in self.database.get_items_by_operation_id(self.id, "Import_Items"):
+                item = ImportItemClass(row.get("ID", 0), self.database)
+                for key, value in row.items():
+                    parameter = "id" if key == "ID" else key
+                    if parameter in item.parameters and not item.is_parameter_calculated(parameter):
+                        item.set_value(parameter, value)
+                items.append(item)
+            self.items = items
+            return self.items
             
         except Exception as e:
             print(f"Error getting import items for import {self.id}: {e}")
             return []
     
     def calculate_subtotal(self):
-        """Calculate subtotal from all items"""
+        """Calculate subtotal from all items (Decimal, no float mixing)."""
         items = self.get_import_items()
-        return sum(item.get_value('subtotal') or 0 for item in items)
-    
+        return sum(to_decimal(item.get_value('subtotal')) for item in items)
+
     def calculate_total_tva(self):
-        """Calculate total VAT amount"""
-        subtotal = self.calculate_subtotal()
-        tva_percent = self.get_value('tva') or 0
-        return subtotal * (tva_percent / 100)
-    
+        """Calculate total VAT amount (centralized Decimal math)."""
+        totals = calculate_operation_totals(
+            self.calculate_subtotal(),
+            0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['vat_amount'])
+
     def calculate_total_price(self):
-        """Calculate total price including VAT"""
-        subtotal = self.calculate_subtotal()
-        tva_amount = self.calculate_total_tva()
-        return subtotal + tva_amount
+        """Calculate total price including VAT (centralized Decimal math)."""
+        totals = calculate_operation_totals(
+            self.calculate_subtotal(),
+            0,
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
     
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this import operation"""
@@ -237,7 +296,7 @@ class ImportClass(BaseClass):
                 super().set_value('supplier_id', None)
                 super().set_value('supplier_name', '')
                 return
-            self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = ?", (uname,))
+            self.database.cursor.execute("SELECT ID, name FROM Suppliers WHERE username = %s", (uname,))
             res = self.database.cursor.fetchone()
             if res:
                 sid, sname = res
@@ -262,7 +321,7 @@ class ImportClass(BaseClass):
             supplier_username = self.get_value('supplier_username')
             if not supplier_username:
                 return None
-            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE username = ?", (supplier_username,))
+            self.database.cursor.execute("SELECT preview_image FROM Suppliers WHERE username = %s", (supplier_username,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
@@ -274,9 +333,8 @@ class ImportClass(BaseClass):
         # Call parent set_value first
         super().set_value(param_key, value)
         
-        # Handle connected parameters for supplier_username
-        if param_key == 'supplier_username':
-            self._refresh_supplier_snapshot()
+        # Snapshot resolution is deferred to save_to_database() to avoid an
+        # HTTP/database round trip for every row loaded on a network client.
     
     def get_parameter_options(self, param_key):
         """Override to provide dynamic options for supplier_username"""

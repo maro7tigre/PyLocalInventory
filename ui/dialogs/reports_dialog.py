@@ -9,12 +9,110 @@ import subprocess
 import tempfile
 import shutil
 import html
+from pathlib import Path
 from datetime import datetime, timedelta
+import shiboken6
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QHBoxLayout, QLabel,
                                QPushButton, QMessageBox, QApplication)
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 from ui.widgets.themed_widgets import BlueButton, RedButton
+from core.runtime_paths import resource_path, local_reports_dir, safe_windows_component, user_data_root
+from core import diagnostics
 import base64
+from decimal import Decimal, InvalidOperation
+import traceback
+import time
+import logging
+
+logger = logging.getLogger(__name__)
+
+class _PdfRenderWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal(float)
+    status_updated = Signal(str)
+
+    def __init__(self, renderer, report_generator, report_type, sales_db=None):
+        super().__init__()
+        self.renderer = renderer
+        self.report_generator = report_generator
+        self.report_type = report_type
+        self.sales_db = sales_db
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = None
+        worker_db = None
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+
+            # A psycopg2 connection is not thread-safe: the shared
+            # sales_obj.database is owned by the GUI thread and must never be
+            # used from this worker. For local/host databases we open a
+            # dedicated connection on this thread so report queries never
+            # interleave with GUI-thread queries on the same socket.
+            sales_db = self.sales_db
+            if sales_db is not None and sales_db.__class__.__name__ != 'RemoteDatabase':
+                try:
+                    from core.database import Database
+                    worker_db = Database(sales_db.profile_manager)
+                    worker_db.language = getattr(sales_db, 'language', 'en')
+                    worker_db.registered_classes = sales_db.registered_classes
+                    if not worker_db.connect(initialize_schema=False):
+                        worker_db = None
+                except Exception:
+                    worker_db = None
+
+            self.status_updated.emit("Preparing report data...")
+            with diagnostics.operation("pdf_prepare", type=self.report_type):
+                if worker_db is not None:
+                    html_content, output_path = self.report_generator(self.report_type, worker_db)
+                else:
+                    html_content, output_path = self.report_generator(self.report_type)
+            
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
+            self.status_updated.emit("Rendering PDF...")
+            with diagnostics.operation("pdf_render", output=output_path):
+                result = self.renderer(html_content, output_path)
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
+        except Exception as error:
+            logger.exception("PDF generation failed type=%s", self.report_type)
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if worker_db is not None:
+                try:
+                    worker_db.close()
+                except Exception:
+                    pass
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "generate_sales_report completed in %.3f seconds", elapsed,
+            )
+            print(
+                "[PERFORMANCE] generate_sales_report completed in "
+                f"{elapsed:.2f} seconds"
+            )
 
 
 class ReportsDialog(QDialog):
@@ -60,6 +158,10 @@ class ReportsDialog(QDialog):
         buttons_layout.addWidget(self.bdl_btn)
         
         layout.addLayout(buttons_layout)
+
+        self.status_label = QLabel("")
+        self.status_label.setAlignment(Qt.AlignmentFlag.AlignCenter)
+        layout.addWidget(self.status_label)
         
         # Cancel button
         cancel_layout = QHBoxLayout()
@@ -85,50 +187,187 @@ class ReportsDialog(QDialog):
     
     def generate_report(self, report_type):
         """Generate report of specified type"""
+        existing_thread = getattr(self, "_report_thread", None)
+        is_running = False
+
+        if existing_thread is not None:
+
+            try:
+
+                if shiboken6.isValid(existing_thread) and existing_thread.isRunning():
+
+                    is_running = True
+
+            except RuntimeError:
+
+                pass
+
+        if is_running:
+            return False
+            
         try:
             # Disable buttons during generation
             self.devis_btn.setEnabled(False)
             self.bdl_btn.setEnabled(False)
             self.cancel_btn.setEnabled(False)
             
-            # Show progress
-            QApplication.setOverrideCursor(Qt.CursorShape.WaitCursor)
+            self.status_label.setText("Starting report generation...")
+            self._active_report_type = report_type
             
-            # Generate report directly
-            pdf_path = self._generate_report_sync(report_type)
+            thread = QThread()
+            worker = _PdfRenderWorker(
+                self._html_to_pdf,
+                self._prepare_report,
+                report_type,
+                sales_db=getattr(getattr(self, 'sales_obj', None), 'database', None),
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
             
-            # Restore cursor and enable buttons
-            QApplication.restoreOverrideCursor()
-            self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
-            self.cancel_btn.setEnabled(True)
+            # Connect to QObject-bound slots so PySide queues every widget and
+            # QMessageBox operation onto the GUI thread. A lambda here can run
+            # in the worker thread and make the success dialog unresponsive.
+            worker.finished.connect(self._report_rendered_on_ui)
+            worker.failed.connect(self._report_failed_on_ui)
+            worker.status_updated.connect(self.status_label.setText)
             
-            # Handle success - show message but don't close dialog
-            QMessageBox.information(self, "Success", f"Report generated successfully!\n\nSaved to: {pdf_path}")
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
             
-            # Open the generated file
-            try:
-                self.open_pdf(pdf_path)
-            except Exception as e:
-                QMessageBox.warning(self, "Warning", f"Report generated but failed to open:\n{str(e)}")
+            worker.finished.connect(worker.deleteLater)
+            worker.failed.connect(worker.deleteLater)
+            worker.cancelled.connect(worker.deleteLater)
             
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._on_report_thread_finished)
+            
+            self._report_thread = thread
+            self._report_worker = worker
+            diagnostics.worker_started("pdf_render", "reports", report_type)
+            thread.start()
+            return True
         except Exception as e:
-            QApplication.restoreOverrideCursor()
-            self.devis_btn.setEnabled(True)
-            self.bdl_btn.setEnabled(True)
-            self.cancel_btn.setEnabled(True)
-            QMessageBox.critical(self, "Error", f"Failed to generate report:\n{str(e)}")
+            logger.exception("Report preparation failed type=%s", report_type)
+            self._report_failed(report_type, str(e))
+            return False
+
+    @Slot(str)
+    def _report_rendered_on_ui(self, pdf_path):
+        diagnostics.worker_finished("pdf_render", "reports", getattr(self, "_active_report_type", "report"))
+        self._report_rendered(
+            getattr(self, "_active_report_type", "report"), pdf_path
+        )
+
+    @Slot(str)
+    def _report_failed_on_ui(self, error):
+        diagnostics.worker_failed("pdf_render", "reports", getattr(self, "_active_report_type", "report"))
+        self._report_failed(
+            getattr(self, "_active_report_type", "report"), error
+        )
+
+    def _set_report_buttons_enabled(self, enabled):
+        self.devis_btn.setEnabled(enabled)
+        self.bdl_btn.setEnabled(enabled)
+        self.cancel_btn.setEnabled(enabled)
+
+    def _report_rendered(self, report_type, pdf_path):
+        self._set_report_buttons_enabled(True)
+        self.status_label.setText("")
+        self._write_report_log(self._report_context(report_type, pdf_path, None))
+        QMessageBox.information(
+            self, "Success", f"Report generated successfully!\n\nSaved to: {pdf_path}"
+        )
+        try:
+            self.open_pdf(pdf_path)
+        except Exception as error:
+            logger.exception("Generated report could not be opened path=%s", pdf_path)
+            QMessageBox.warning(
+                self, "Warning", f"Report generated but failed to open:\n{error}"
+            )
+
+    def _report_failed(self, report_type, error):
+        self._set_report_buttons_enabled(True)
+        self.status_label.setText("")
+        details = self._report_context(
+            report_type, getattr(self, "_last_output_path", None), error
+        )
+        self._write_report_log(details)
+        QMessageBox.critical(self, "Report Error", details)
+
+    @Slot()
+    def _on_report_thread_finished(self):
+        self._report_thread = None
+        self._report_worker = None
+
+    def _wait_for_report_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_report_thread", None)
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+                self._report_thread = None
+                self._report_worker = None
+                return True
+
+        except RuntimeError:
+            # If it's deleted during the checks, it's already finished.
+            self._report_thread = None
+            self._report_worker = None
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Report generation thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        if getattr(self, "_report_thread", None) is thread:
+            self._report_thread = None
+            self._report_worker = None
+            
+        return True
+
+    def closeEvent(self, event):
+        thread = getattr(self, "_report_thread", None)
+        if thread and thread.isRunning():
+            event.ignore()
+            return
+        super().closeEvent(event)
     
     def _generate_report_sync(self, report_type):
         """Synchronously generate report and return PDF path"""
+        html_content, filepath = self._prepare_report(report_type)
+        try:
+            actual_output_path = self._html_to_pdf(html_content, filepath)
+        except Exception as exc:
+            raise RuntimeError(self._report_context(report_type, filepath, exc)) from exc
+        self._write_report_log(self._report_context(report_type, actual_output_path, None))
+        return actual_output_path
+
+    def _prepare_report(self, report_type, database=None):
+        """Collect database/UI data on the GUI thread before worker rendering.
+        ``database`` is the worker-owned connection when running on the worker
+        thread (local/host mode); ``None`` means the shared sales connection
+        (RemoteDatabase RPC or test doubles)."""
         # Get current profile path
-        if not self.profile_manager.selected_profile:
-            raise Exception("No profile selected")
-        
-        profile_path = os.path.dirname(self.profile_manager.selected_profile.config_path)
-        # Per-machine subfolder so each user on the LAN has their own reports directory
-        machine_name = socket.gethostname()
-        reports_dir = os.path.join(profile_path, "reports", machine_name)
+        if database is None:
+            database = getattr(self.sales_obj, 'database', None)
+        profile = getattr(self.profile_manager, "selected_profile", None)
+        if not profile:
+            profile = getattr(database, "remote_profile", None)
+        if not profile:
+            raise Exception("The host did not provide report profile details")
+        self._active_profile = profile
+        application_username = getattr(database, 'username', None) or 'DefaultUser'
+        reports_dir = local_reports_dir(application_username)
         
         # Create reports directory if it doesn't exist
         os.makedirs(reports_dir, exist_ok=True)
@@ -137,29 +376,51 @@ class ReportsDialog(QDialog):
         self._cleanup_old_reports(reports_dir)
         
         # Generate unique filename
-        date_str = datetime.now().strftime("%d_%m_%Y")
+        report_names = {'devis': 'DEVIS', 'bdl': 'DELIVERY_NOTE', 'facture': 'INVOICE'}
+        report_label = report_names.get(report_type, safe_windows_component(report_type, 'REPORT').upper())
+        sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 0
+        report_id = f"DOC-{int(sales_id):06d}" if report_type == 'devis' else str(sales_id)
+        timestamp = datetime.now().strftime("%Y-%m-%d_%H%M%S")
         counter = 0
         while True:
-            filename = f"{date_str}_{counter}.pdf"
+            suffix = f"_{counter}" if counter else ""
+            filename = f"{report_label}_{report_id}_{timestamp}{suffix}.pdf"
             filepath = os.path.join(reports_dir, filename)
             if not os.path.exists(filepath):
                 break
             counter += 1
+        self._last_output_path = filepath
         
         # Generate HTML content
-        html_content = self._generate_html_content(report_type)
+        html_content = self._generate_html_content(report_type, database)
         
-        # Convert HTML to PDF (or HTML fallback)
-        actual_output_path = self._html_to_pdf(html_content, filepath)
-        
-        return actual_output_path
+        return html_content, filepath
+
+    def _report_context(self, report_type, path, error):
+        database = getattr(self.sales_obj, 'database', None)
+        mode = 'connected client' if database.__class__.__name__ == 'RemoteDatabase' else 'host/local'
+        status = 'success' if error is None else 'failed'
+        message = [
+            f"Report operation: {status}",
+            f"Report type: {report_type}",
+            f"Application username: {getattr(database, 'username', None) or 'DefaultUser'}",
+            f"Computer mode: {mode}",
+            f"Computer name: {socket.gethostname()}",
+            f"Local path: {path or 'not allocated'}",
+        ]
+        if error is not None:
+            message.extend((f"Exception: {error}", traceback.format_exc()))
+        return "\n".join(message)
+
+    @staticmethod
+    def _write_report_log(message):
+        logger.info("Report operation\n%s", message)
     
     def _cleanup_old_reports(self, reports_dir):
         """Delete reports older than 48 hours"""
         cutoff_date = datetime.now() - timedelta(hours=48)
         
-        # Clean up both PDF and HTML reports (fallback reports)
-        for pattern in ["*.pdf", "*.html"]:
+        for pattern in ["*.pdf"]:
             for report_file in glob.glob(os.path.join(reports_dir, pattern)):
                 try:
                     file_mtime = datetime.fromtimestamp(os.path.getmtime(report_file))
@@ -169,29 +430,46 @@ class ReportsDialog(QDialog):
                 except Exception as e:
                     print(f"Error deleting old report {report_file}: {e}")
     
-    def _generate_html_content(self, report_type):
+    def _generate_html_content(self, report_type, database=None):
         """Generate HTML content based on report type"""
         # Get template path - all templates have _templet suffix
-        template_path = os.path.join("report", f"{report_type}_templet.html")
-        
-        if not os.path.exists(template_path):
-            raise Exception(f"Template file not found: {template_path}")
+        template_path = resource_path("report", f"{report_type}_templet.html")
+        self._log_report_resources(report_type, template_path)
+        if not os.path.isfile(template_path):
+            raise FileNotFoundError(f"Required report template is missing: {template_path}")
         
         # Read template
         with open(template_path, 'r', encoding='utf-8') as f:
             template_content = f.read()
         
         # Get sales data
-        sales_data = self._extract_sales_data(report_type)
+        sales_data = self._extract_sales_data(report_type, database)
         
         # Replace placeholders
         html_content = self._replace_placeholders(template_content, sales_data)
         
         return html_content
     
-    def _extract_sales_data(self, report_type: str):
+    def _get_lamidap_logo_block(self):
+        """Return an <img> tag with the Lamidap brand logo embedded as a base64 data URI."""
+        logo_path = resource_path('report', 'lamidap_logo.png')
+        if not os.path.isfile(logo_path):
+            raise FileNotFoundError(f"Required report logo is missing: {logo_path}")
+        with open(logo_path, 'rb') as img_f:
+            b64 = base64.b64encode(img_f.read()).decode('ascii')
+        return (
+            f'<img src="data:image/png;base64,{b64}" '
+            f'class="report-logo" width="120" '
+            f'style="width: 120px; height: auto; max-height: 80px; object-fit: contain; display: block; margin: 0 0 6px 0;" />'
+        )
+
+    def _extract_sales_data(self, report_type: str, database=None):
         """Extract data from sales object"""
         try:
+            # Worker-owned connection when generating on the worker thread
+            # (local/host mode); falls back to the shared sales connection.
+            db = database or getattr(self.sales_obj, 'database', None)
+
             def _fmt_fr(value: float) -> str:
                 try:
                     s = f"{float(value):,.2f}"
@@ -200,64 +478,132 @@ class ReportsDialog(QDialog):
                 except Exception:
                     return str(value)
 
+            def _decimal(value) -> Decimal:
+                try:
+                    from core.calculations import to_decimal
+                    return to_decimal(value)
+                except Exception:
+                    return Decimal("0")
+
+            def _fmt_quantity(value) -> str:
+                number = _decimal(value)
+                return format(number.normalize(), "f") if number != number.to_integral() else str(int(number))
+
             # Get profile data
-            profile = self.profile_manager.selected_profile
+            profile = (
+                getattr(self, "_active_profile", None)
+                or getattr(self.profile_manager, "selected_profile", None)
+                or getattr(
+                    getattr(self.sales_obj, "database", None),
+                    "remote_profile", None,
+                )
+            )
+            if not profile:
+                raise RuntimeError("Report profile details are unavailable")
             company_name = profile.get_value("company name") or "Your Company"
             company_phone = profile.get_value("phone") or ""
             company_address = profile.get_value("address") or ""
             company_email = profile.get_value("email") or ""
             report_footer = profile.get_value("report footer") or ""
 
-            # Build logo block from profile preview if available
-            logo_block = '<div class="logo-placeholder">LOGO</div>'
-            try:
-                preview_path = getattr(profile, 'preview_path', None)
-                if preview_path and os.path.exists(preview_path):
-                    # Read and encode image as base64 data URI (supports png/jpg)
-                    ext = os.path.splitext(preview_path)[1].lower()
-                    mime = 'image/png' if ext in ['.png'] else ('image/jpeg' if ext in ['.jpg', '.jpeg'] else 'image/png')
-                    with open(preview_path, 'rb') as img_f:
-                        b64 = base64.b64encode(img_f.read()).decode('ascii')
-                    # Constrain displayed logo size via inline style to fit header nicely
-                    logo_block = (
-                        f'<img src="data:{mime};base64,{b64}" '
-                        f'style="max-width: 200px; max-height: 80px; object-fit: contain; display: block; margin-bottom: 4px;" />'
-                    )
-            except Exception as _e:
-                # Fallback to placeholder on any issue
-                logo_block = '<div class="logo-placeholder">LOGO</div>'
+            logo_block = self._get_lamidap_logo_block()
 
             # Extract sales data
             client_username = self.sales_obj.get_value('client_username') or ""
             client_name = self.sales_obj.get_value('client_name') or ""
             date = self.sales_obj.get_value('date') or datetime.now().strftime("%d-%m-%Y")
             total_price = self.sales_obj.get_value('total_price') or 0
-            
-            # Generate document reference
+
+            # Look up the client's contact details for the report customer block.
+            client_address = ""
+            client_phone = ""
+            client_email = ""
+            client_ice = ""
+            client_id = self.sales_obj.get_value('client_id')
+            if db is not None:
+                try:
+                    if client_id:
+                        db.cursor.execute(
+                            "SELECT address, phone, email, ice FROM Clients WHERE ID = %s", (client_id,)
+                        )
+                    else:
+                        db.cursor.execute(
+                            "SELECT address, phone, email, ice FROM Clients WHERE username = %s", (client_username,)
+                        )
+                    client_row = db.cursor.fetchone()
+                    if client_row:
+                        client_address = client_row[0] or ""
+                        client_phone = client_row[1] or ""
+                        client_email = client_row[2] or ""
+                        client_ice = client_row[3] or ""
+                except Exception as e:
+                    print(f"DEBUG: Error getting client contact details: {e}")
+
+            sale_notes = self.sales_obj.get_value('notes') or ""
+
+            # Generate document reference. For Devis, use the canonical,
+            # user-editable devis reference when one exists; fall back to a
+            # deterministic DOC-<id> placeholder for legacy rows.
             sales_id = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID') or 1
-            doc_ref = f"DOC-{sales_id:06d}"
+            try:
+                doc_devis = str(self.sales_obj.get_value('devis') or '').strip()
+            except Exception:
+                doc_devis = ''
+            if report_type == 'devis' and doc_devis:
+                doc_ref = html.escape(doc_devis)
+            else:
+                doc_ref = f"DOC-{sales_id:06d}"
             
             # Get sales items - ensure they are loaded from database
             items_html = ""
             total_quantity = 0
+            rendered_rows = 0
+
+            # BDL uses the service catalog to exclude product-only rows.
+            report_services = []
+            if report_type == 'bdl' and db is not None:
+                try:
+                    db.cursor.execute(
+                        "SELECT id, name, description, keywords FROM Services "
+                        "WHERE name IS NOT NULL AND name != '' ORDER BY id"
+                    )
+                    for service_id, service_name, description, keywords in db.cursor.fetchall():
+                        aliases = [service_name]
+                        aliases.extend(
+                            part.strip()
+                            for part in str(keywords or '').replace('\n', ',').replace(';', ',').split(',')
+                            if part.strip()
+                        )
+                        report_services.append({
+                            'id': service_id,
+                            'name': service_name,
+                            'description': description or '',
+                            'aliases': {str(alias).strip().casefold() for alias in aliases if alias},
+                        })
+                except Exception as e:
+                    print(f"DEBUG: Error loading report services: {e}")
             
             # Load sales items if not already loaded
             if not hasattr(self.sales_obj, 'items') or not self.sales_obj.items:
                 print("DEBUG: Loading sales items from database...")
                 sales_id_value = self.sales_obj.get_value('id') or self.sales_obj.get_value('ID')
-                if sales_id_value and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
+                if sales_id_value and db is not None:
                     try:
                         # Load items from database
-                        items_data = self.sales_obj.database.get_items_by_operation_id(sales_id_value, 'Sales_Items')
+                        items_data = db.get_items_by_operation_id(sales_id_value, 'Sales_Items')
                         print(f"DEBUG: Found {len(items_data)} sales items in database")
                         
                         # Create item objects
                         from classes.sales_item_class import SalesItemClass
                         self.sales_obj.items = []
                         for item_data in items_data:
-                            item_obj = SalesItemClass(0, self.sales_obj.database)
+                            item_obj = SalesItemClass(0, db)
+                            if item_data.get("item_type"):
+                                item_obj.set_value("item_type", item_data["item_type"])
                             # Load item data
                             for key, value in item_data.items():
+                                if key == "item_type":
+                                    continue
                                 if key in item_obj.parameters:
                                     try:
                                         item_obj.set_value(key, value)
@@ -267,152 +613,208 @@ class ReportsDialog(QDialog):
                     except Exception as e:
                         print(f"DEBUG: Error loading sales items: {e}")
             
-            devis_rows = []  # rows for devis/facture full-table rendering
             if hasattr(self.sales_obj, 'items') and self.sales_obj.items:
                 print(f"DEBUG: Processing {len(self.sales_obj.items)} sales items")
-                total_ht = 0
+                subtotal_before_discount = Decimal("0")
+                
+                # Bulk prefetch missing product names
+                missing_product_ids = set()
+                for item in self.sales_obj.items:
+                    if not item.get_value('product_name') and item.get_value('product_id'):
+                        missing_product_ids.add(int(item.get_value('product_id')))
+                
+                prefetched_product_names = {}
+                if missing_product_ids and db is not None:
+                    try:
+                        format_strings = ','.join(['%s'] * len(missing_product_ids))
+                        db.cursor.execute(
+                            f"SELECT id, name FROM Products WHERE id IN ({format_strings})", 
+                            tuple(missing_product_ids)
+                        )
+                        for row in db.cursor.fetchall():
+                            prefetched_product_names[row[0]] = row[1]
+                    except Exception as e:
+                        print(f"DEBUG: Error in bulk product name lookup: {e}")
+
                 for item in self.sales_obj.items:
                     product_name = item.get_value('product_name') or ""
                     item_information = item.get_value('information') or ""
+                    product_id = item.get_value('product_id') or ""
+                    service_id = item.get_value('service_id') or ""
+                    item_type = str(item.get_value("item_type") or "").casefold()
+                    is_service = item_type == "service" or (
+                        bool(service_id) and not bool(product_id)
+                    )
                     
-                    # If product_name is empty, try to get it from product_id
-                    if not product_name:
-                        product_id = item.get_value('product_id')
-                        if product_id and hasattr(self.sales_obj, 'database') and self.sales_obj.database:
-                            try:
-                                # Get product name from Products table
-                                product_data = self.sales_obj.database.cursor.execute(
-                                    "SELECT name FROM Products WHERE ID = ?", (product_id,)
-                                ).fetchone()
-                                if product_data:
-                                    product_name = product_data[0]
-                            except Exception as e:
-                                print(f"DEBUG: Error getting product name: {e}")
+                    # If product_name is empty, try to get it from pre-fetched dictionary
+                    if not product_name and product_id:
+                        try:
+                            pid_int = int(product_id)
+                            if pid_int in prefetched_product_names:
+                                product_name = prefetched_product_names[pid_int]
+                        except ValueError:
+                            pass
+
+                    if item_type == "section":
+                        section_title = html.escape(str(product_name).strip())
+                        title_html = (
+                            '<strong class="sale-section-title" '
+                            'style="display:block;text-align:left">'
+                            f'{section_title}</strong>'
+                        )
+                        if report_type == 'devis':
+                            row_html = (
+                                f'<tr class="sale-section-row"><td></td><td>{title_html}</td>'
+                                '<td></td><td></td><td></td></tr>'
+                            )
+                        elif report_type == 'bdl':
+                            row_html = (
+                                f'<tr class="sale-section-row"><td></td><td>{title_html}</td>'
+                                '<td></td></tr>'
+                            )
+                        else:
+                            row_html = (
+                                f'<tr class="sale-section-row"><td>{title_html}</td>'
+                                '<td></td><td></td><td></td></tr>'
+                            )
+                        items_html += row_html + "\n"
+                        rendered_rows += 1
+                        continue
                     
-                    quantity = item.get_value('quantity') or 0
-                    unit_price = item.get_value('unit_price') or 0
+                    quantity = _decimal(item.get_value('quantity'))
+                    unit_price = _decimal(item.get_value('unit_price'))
                     subtotal = item.get_value('subtotal') or (quantity * unit_price)
+                    product_token = str(product_name or '').strip().casefold()
                     
                     print(f"DEBUG: Item - Product: {product_name}, Qty: {quantity}, Price: {unit_price}")
                     
-                    total_quantity += int(quantity) if quantity else 0
-                    total_ht += float(subtotal) if subtotal else 0
+                    total_quantity += quantity
+                    subtotal_before_discount += quantity * unit_price
+                    quantity_text = _fmt_quantity(quantity)
                     
-                    designation_html = html.escape(str(product_name))
-                    if item_information:
-                        designation_html += (
-                            f" <span style=\"font-size: 10px; color: #333;\">"
-                            f"{html.escape(str(item_information))}</span>"
+                    if report_type == 'bdl':
+                        info_tokens = {
+                            part.strip().casefold()
+                            for part in str(item_information or '').replace('\n', ',').replace(';', ',').split(',')
+                            if part.strip()
+                        }
+                        matched_services = [
+                            service for service in report_services
+                            if product_token in service['aliases']
+                            or bool(info_tokens.intersection(service['aliases']))
+                        ]
+
+                        # A delivery note contains services only. Product-only
+                        # sale rows stay stored and remain visible in Devis.
+                        if not matched_services:
+                            continue
+
+                        service_codes = " / ".join(html.escape(str(service['id'])) for service in matched_services)
+                        designation_html = " / ".join(
+                            f'<strong class="item-name">{html.escape(str(service["name"]))}</strong>'
+                            for service in matched_services
+                        )
+                        if item_information:
+                            designation_html += f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
+                        row_html = (
+                            f"<tr><td>{service_codes}</td>"
+                            f"<td>{designation_html}</td>"
+                            f"<td>{quantity_text}</td></tr>"
+                        )
+                    elif report_type == 'devis':
+                        product_code = html.escape(str(product_id)) if product_id else "-"
+                        escaped_name = html.escape(str(product_name))
+                        designation_html = (
+                            f'<strong class="item-name">{escaped_name}</strong>'
+                            if is_service
+                            else f'<span class="product-item-name">{escaped_name}</span>'
+                        )
+                        if item_information:
+                            designation_html += (
+                                f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
+                            )
+                        row_html = (
+                            f"<tr><td>{product_code}</td>"
+                            f"<td>{designation_html}</td>"
+                            f"<td>{quantity_text}</td>"
+                            f"<td>{_fmt_fr(unit_price)}</td>"
+                            f"<td>{_fmt_fr(subtotal)}</td></tr>"
+                        )
+                    else:
+                        escaped_name = html.escape(str(product_name))
+                        designation_html = (
+                            f'<strong class="item-name">{escaped_name}</strong>'
+                            if is_service
+                            else f'<span class="product-item-name">{escaped_name}</span>'
+                        )
+                        if item_information:
+                            designation_html += (
+                                f'<span class="item-detail"> {html.escape(str(item_information))}</span>'
+                            )
+                        # Preserve the existing four-column facture presentation.
+                        row_html = (
+                            f"<tr><td>{designation_html}</td>"
+                            f"<td>{quantity_text}</td>"
+                            f"<td>{_fmt_fr(unit_price)}</td>"
+                            f"<td>{_fmt_fr(subtotal)}</td></tr>"
                         )
 
-                    row_html = (
-                        f"<tr>"
-                        f"<td style=\"text-align: left\">{designation_html}</td>"
-                        f"<td>{quantity}</td>"
-                        f"<td>{_fmt_fr(unit_price)}</td>"
-                        f"<td>{_fmt_fr(subtotal)}</td>"
-                        f"</tr>"
-                    )
-                    # For BDL or legacy simple replacement
                     items_html += row_html + "\n"
-                    # For Devis paginated tables
-                    devis_rows.append(row_html)
-                # Add filler rows to visually fill the table area to the footer
+                    rendered_rows += 1
+                if report_type == 'bdl' and not items_html.strip():
+                    items_html = '<tr class="empty-row"><td colspan="3">Aucun service</td></tr>'
+                # Do not add visual filler rows; they stretch the printable report table.
                 try:
                     current_rows = len(self.sales_obj.items)
-                    # Target rows per page tuned for current CSS; adjust if needed
-                    target_rows = 22
-                    filler_needed = max(0, target_rows - current_rows)
-                    for _ in range(filler_needed):
-                        items_html += """
-                        <tr class=\"filler\">
-                            <td style=\"text-align: left\">&nbsp;</td>
-                            <td>&nbsp;</td>
-                            <td>&nbsp;</td>
-                            <td>&nbsp;</td>
-                        </tr>
-                        """
+                    filler_needed = 0
+                    filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
+                    filler_row = (
+                        '<tr class="filler">'
+                        + '<td style="text-align: left">&nbsp;</td>'
+                        + '<td>&nbsp;</td>' * (filler_cols - 1)
+                        + '</tr>\n'
+                    )
+                    items_html += filler_row * filler_needed
                 except Exception:
                     pass
             else:
                 print("DEBUG: No sales items found")
-                items_html = '<tr><td colspan="4">No items found for this sale</td></tr>'
-                devis_rows = []
-                total_ht = 0
+                filler_cols = 5 if report_type == 'devis' else (3 if report_type == 'bdl' else 4)
+                empty_label = 'Aucun service' if report_type == 'bdl' else 'Aucun article'
+                items_html = f'<tr class="empty-row"><td colspan="{filler_cols}">{empty_label}</td></tr>'
+                subtotal_before_discount = Decimal("0")
             
-            # Calculate financial totals for devis
-            total_remise = 0  # No discount system implemented yet
-            total_regle = 0   # Amount already paid (could be from payments table if exists)
-            net_a_payer = total_ht - total_remise - total_regle
-            
-            # Calculate TVA and Total TTC based on sales record
-            # Get the TVA percentage from the sales object (0 or 20)
+            # New-format sales persist the exact final Remise visible in the
+            # Sale dialog. Do not independently recalculate it for the Devis.
+            total_remise = _decimal(self.sales_obj.get_value('remise') or 0)
+            if not self.sales_obj.get_value('remise_includes_line_discounts'):
+                total_remise += sum(
+                    _decimal(item.get_value('quantity')) * _decimal(item.get_value('unit_price'))
+                    * _decimal(item.get_value('discount_percentage') or 0) / 100
+                    for item in getattr(self.sales_obj, 'items', [])
+                    if str(item.get_value('item_type') or '').casefold() != 'section'
+                )
             tva_percent = self.sales_obj.get_value('tva') or 0
-            tva_rate = tva_percent / 100.0  # Convert percentage to decimal
-            tva_amount = total_ht * tva_rate
-            total_ttc = total_ht + tva_amount
+
+            from classes.sales_class import calculate_sale_totals
+            totals = calculate_sale_totals(
+                subtotal_before_discount, total_remise, tva_percent
+            )
+            logger.info(
+                "[DEVIS REMISE DEBUG] module=%s sale_id=%s stored_sales_remise=%s "
+                "remise_includes_line_discounts=%s final_remise_used_by_report=%s",
+                __file__, sales_id, self.sales_obj.get_value('remise'),
+                self.sales_obj.get_value('remise_includes_line_discounts'), total_remise,
+            )
+            net_ht = totals['total_ht']
+            tva_amount = totals['vat_amount']
+            total_ttc = totals['total_ttc']
+            total_regle = Decimal("0")
+            net_a_payer = total_ttc
             
-            # Build items HTML based on report type
-            if report_type == 'devis':
-                # For devis, use the paginated logic
-                devis_items_html = ""
-                # Row capacities (calibrated):
-                # - single page (header+table+totals) => base-2
-                # - first of multi (header+table)     => base+1
-                # - middle pages (table only)         => base+10
-                # - last page (table+totals)          => base-4
-                BASE = 18
-                rows_one_page = 21                # single page needs more rows
-                rows_first_multi = 25             # first page of multi needs more rows
-                rows_middle = 29                  # middle pages a bit more
-                rows_last = 29                    # last page a lot more rows before totals
-
-                total_rows = len(devis_rows)
-                if total_rows == 0:
-                    # Render a single empty table with one filler row so borders appear
-                    pages = [(0, rows_one_page)]
-                elif total_rows <= rows_one_page:
-                    pages = [(total_rows, rows_one_page)]
-                else:
-                    remaining = total_rows
-                    pages = []
-                    # First page (no bottom yet)
-                    take = min(remaining, rows_first_multi)
-                    pages.append((take, rows_first_multi))
-                    remaining -= take
-                    # Middle pages
-                    while remaining > rows_last:
-                        take = min(remaining, rows_middle)
-                        pages.append((take, rows_middle))
-                        remaining -= take
-                    # Last page
-                    pages.append((remaining, rows_last))
-
-                # Build HTML tables with page breaks
-                cursor = 0
-                for idx, (take, capacity) in enumerate(pages):
-                    page_rows = devis_rows[cursor:cursor + take]
-                    cursor += take
-                    fillers = max(0, capacity - len(page_rows))
-                    block_class = "items-block page-break" if idx < len(pages) - 1 else "items-block"
-                    table_html = [f'<div class="{block_class}">']
-                    table_html.append('<table>')
-                    table_html.append('<thead><tr>'
-                                      '<th>Désignation</th>'
-                                      '<th>Qté</th>'
-                                      '<th>P.U HT</th>'
-                                      '<th>Total HT</th>'
-                                      '</tr></thead>')
-                    table_html.append('<tbody>')
-                    table_html.extend(page_rows)
-                    for _ in range(fillers):
-                        table_html.append('<tr class="filler"><td style="text-align: left">&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td><td>&nbsp;</td></tr>')
-                    table_html.append('</tbody></table></div>')
-                    devis_items_html += "".join(table_html)
-                items_final = devis_items_html
-            else:
-                # For BDL, use simple table format (items_html already includes proper table structure)
-                items_final = items_html
+            # The templates own the table structure so print engines can repeat
+            # its header and paginate rows naturally.
+            items_final = items_html
 
             # No separate BDL logic anymore
             total_qte_commandee = 0
@@ -430,12 +832,18 @@ class ReportsDialog(QDialog):
                 'date': date,
                 'document_ref': doc_ref,
                 'client_name': client_name,
-                'client_address': company_address,  # Use company address as fallback
+                'client_address': client_address,
+                'client_phone': client_phone,
+                'client_email': client_email,
+                'client_ice': html.escape(str(client_ice)),
+                'sale_notes': html.escape(str(sale_notes)).replace('\n', '<br>'),
+                'payment_terms': '',
                 'commercial': "Sales Team",         # Default commercial
                 'items': items_final,
-                # New financial fields for devis
+                'table_frame_class': 'fill-page' if rendered_rows <= 8 else '',
+                # Financial fields for devis / facture
                 'total_remise': _fmt_fr(total_remise),
-                'total_ht': _fmt_fr(total_ht),
+                'total_ht': _fmt_fr(net_ht),
                 'total_regle': _fmt_fr(total_regle),
                 'net_a_payer': _fmt_fr(net_a_payer),
                 # BDL specific pricing fields
@@ -445,30 +853,7 @@ class ReportsDialog(QDialog):
                 'logo_block': logo_block
             }
         except Exception as e:
-            print(f"Error extracting sales data: {e}")
-            # Return default data structure
-            return {
-                'company_name': 'Your Company',
-                'company_phone': '',
-                'report_footer': '',
-                'company_siret': '',
-                'company_tva': '',
-                'date': datetime.now().strftime("%d-%m-%Y"),
-                'document_ref': 'DOC-000001',
-                'client_name': 'Client Name',
-                'client_address': '',
-                'commercial': 'Sales Team',
-                'items': '<tr><td colspan="4">No items found</td></tr>',
-                # Financial fields for devis
-                'total_remise': '0,00',
-                'total_ht': '0,00',
-                'total_regle': '0,00',
-                'net_a_payer': '0,00',
-                # BDL specific pricing fields
-                'tva': '0,00',
-                'total_ttc': '0,00',
-                'logo_block': '<div class="logo-placeholder">LOGO</div>'
-            }
+            raise RuntimeError(f"Could not extract report data: {e}") from e
     
     def _replace_placeholders(self, template_content, data):
         """Replace template placeholders with actual data"""
@@ -479,151 +864,102 @@ class ReportsDialog(QDialog):
         return template_content
     
     def _html_to_pdf(self, html_content, output_path):
-        """Convert HTML to PDF with full CSS support"""
+        """Convert HTML to PDF with the bundled Chromium renderer."""
+        temp_html_path = None
         try:
-            # Create a temporary HTML file
+            base_url = os.path.abspath(resource_path("report"))
             with tempfile.NamedTemporaryFile(mode='w', suffix='.html', delete=False, encoding='utf-8') as temp_html:
                 temp_html.write(html_content)
                 temp_html_path = temp_html.name
-            
-            # Try playwright first (best CSS support)
-            try:
-                from playwright.sync_api import sync_playwright
-                print("DEBUG: Using Playwright for PDF generation")
-                
-                with sync_playwright() as p:
-                    browser = p.chromium.launch(headless=True)
-                    page = browser.new_page()
-                    page.set_content(html_content, wait_until='networkidle')
-                    
-                    # Configure PDF options for A4 size with proper margins and page breaks
-                    pdf_options = {
-                        'path': output_path,
-                        'format': 'A4',
-                        'margin': {
-                            'top': '0.5in',
-                            'bottom': '0.5in', 
-                            'left': '0.5in',
-                            'right': '0.5in'
-                        },
-                        'print_background': True,
-                        'prefer_css_page_size': False,
-                        'width': '8.27in',  # A4 width
-                        'height': '11.69in'  # A4 height
-                    }
-                    
-                    page.pdf(**pdf_options)
-                    browser.close()
-                    
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with Playwright: {output_path}")
-                return output_path
-            except ImportError:
-                print("DEBUG: Playwright not available")
-                pass
-            except Exception as e:
-                print(f"DEBUG: Playwright failed: {e}")
-            
-            # Try xhtml2pdf as fallback (limited CSS support)
-            try:
-                from xhtml2pdf import pisa
-                print("DEBUG: Using xhtml2pdf for PDF generation")
-                
-                with open(output_path, "wb") as result_file:
-                    # Convert HTML to PDF
-                    pisa_status = pisa.CreatePDF(html_content, dest=result_file)
-                    
-                    if not pisa_status.err:
-                        os.unlink(temp_html_path)
-                        print(f"DEBUG: Successfully generated PDF with xhtml2pdf: {output_path}")
-                        return output_path
-                    else:
-                        print(f"DEBUG: xhtml2pdf reported errors: {pisa_status.err}")
-                        
-            except ImportError:
-                print("DEBUG: xhtml2pdf not available")
-                pass
-            except Exception as e:
-                print(f"DEBUG: xhtml2pdf failed: {e}")
-            
-            # Try weasyprint third
-            try:
-                import weasyprint
-                print("DEBUG: Using WeasyPrint for PDF generation")
-                html = weasyprint.HTML(string=html_content)
-                html.write_pdf(output_path)
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with WeasyPrint: {output_path}")
-                return output_path
-            except ImportError:
-                print("DEBUG: WeasyPrint not available")
-                pass
-            except Exception as e:
-                print(f"DEBUG: WeasyPrint failed: {e}")
-            
-            # Try pdfkit as last resort
-            try:
-                import pdfkit
-                print("DEBUG: Using PDFKit for PDF generation")
-                # Configure pdfkit options for better compatibility
-                options = {
-                    'page-size': 'A4',
-                    'margin-top': '0.75in',
-                    'margin-right': '0.75in',
-                    'margin-bottom': '0.75in',
-                    'margin-left': '0.75in',
-                    'encoding': "UTF-8",
-                    'no-outline': None
-                }
-                pdfkit.from_string(html_content, output_path, options=options)
-                os.unlink(temp_html_path)
-                print(f"DEBUG: Successfully generated PDF with PDFKit: {output_path}")
-                return output_path
-            except ImportError:
-                print("DEBUG: PDFKit not available")
-                pass
-            except Exception as e:
-                print(f"DEBUG: PDFKit failed: {e}")
-            
-            # If PDF generation fails, save as HTML with proper extension
-            print("DEBUG: Falling back to HTML generation")
-            html_output_path = output_path.replace('.pdf', '.html')
-            with open(html_output_path, 'w', encoding='utf-8') as f:
-                f.write(f"""
-<!DOCTYPE html>
-<html>
-<head>
-    <title>Sales Report</title>
-    <style>
-        body {{ font-family: Arial, sans-serif; margin: 20px; background: white; color: black; }}
-        .notice {{ background: #fff3cd; border: 1px solid #ffeaa7; padding: 10px; margin: 10px 0; border-radius: 4px; }}
-    </style>
-</head>
-<body>
-    <div class="notice">
-        <strong>Note:</strong> PDF generation failed. This is an HTML version of your report. 
-        For proper PDF generation, ensure weasyprint is properly installed.
-    </div>
-    {html_content}
-</body>
-</html>
-                """)
-            
-            # Clean up temporary file
-            os.unlink(temp_html_path)
-            print(f"DEBUG: Generated HTML fallback: {html_output_path}")
-            return html_output_path
-            
-        except Exception as e:
-            # Clean up temporary file if it exists
-            if 'temp_html_path' in locals() and os.path.exists(temp_html_path):
+            from playwright.sync_api import sync_playwright
+            executable = self._find_installed_chromium()
+            if not executable:
+                raise FileNotFoundError("The bundled Chromium PDF engine is missing.")
+            self._write_report_log(
+                f"PDF engine: Playwright Chromium\nBase path: {base_url}\n"
+                f"Temporary HTML URI: {Path(temp_html_path).as_uri()}\n"
+                f"Chromium: {executable}\nChromium exists: {os.path.isfile(executable)}"
+            )
+            with sync_playwright() as playwright:
+                browser = playwright.chromium.launch(headless=True, executable_path=executable)
                 try:
-                    os.unlink(temp_html_path)
-                except:
-                    pass
-            print(f"DEBUG: HTML to PDF conversion failed: {e}")
-            print(f"DEBUG: Output path: {output_path}")
-            raise Exception(f"Failed to convert HTML to PDF: {str(e)}")
+                    page = browser.new_page()
+                    page.emulate_media(media="print")
+                    page.goto(Path(temp_html_path).as_uri(), wait_until='networkidle')
+                    page.pdf(
+                        path=output_path, format='A4', print_background=True,
+                        prefer_css_page_size=True,
+                        margin={'top': '0', 'bottom': '0', 'left': '0', 'right': '0'},
+                    )
+                finally:
+                    browser.close()
+            if not os.path.isfile(output_path) or os.path.getsize(output_path) == 0:
+                raise RuntimeError("Chromium completed without producing a PDF.")
+            return output_path
+        except Exception as e:
+            raise RuntimeError(f"Chromium PDF generation failed: {e}") from e
+        finally:
+            if temp_html_path and os.path.exists(temp_html_path):
+                os.unlink(temp_html_path)
+
+    def _log_report_resources(self, report_type, template_path):
+        report_dir = resource_path('report')
+        logo_path = resource_path('report', 'lamidap_logo.png')
+        browser_path = self._find_installed_chromium()
+        self._write_report_log("\n".join([
+            f"Frozen runtime: {bool(getattr(sys, 'frozen', False))}",
+            f"sys._MEIPASS: {getattr(sys, '_MEIPASS', 'not set')}",
+            f"Report type: {report_type}",
+            f"Report base path: {report_dir}",
+            f"Report base path exists: {os.path.isdir(report_dir)}",
+            f"Template: {template_path}",
+            f"Template exists: {os.path.isfile(template_path)}",
+            "CSS: inline in template",
+            f"CSS source exists: {os.path.isfile(template_path)}",
+            "Fonts: Arial/Helvetica system fonts (no custom font files referenced)",
+            f"Logo: {logo_path}",
+            f"Logo exists: {os.path.isfile(logo_path)}",
+            f"Chromium: {browser_path or 'not found'}",
+            f"Chromium exists: {bool(browser_path and os.path.isfile(browser_path))}",
+        ]))
+
+    @staticmethod
+    def _find_installed_chromium():
+        """Find a usable Playwright/Chrome executable when revisions differ."""
+        local_appdata = os.getenv('LOCALAPPDATA') or ''
+        program_files = os.getenv('PROGRAMFILES') or ''
+        bundled_candidates = []
+        # The build cache is dot-prefixed in source mode and is copied without
+        # the dot into PyInstaller's read-only resource directory.
+        for bundled_browser_root in (
+            resource_path('playwright-browsers'),
+            resource_path('.playwright-browsers'),
+        ):
+            bundled_candidates.extend(glob.glob(os.path.join(
+                bundled_browser_root, 'chromium_headless_shell-*',
+                'chrome-headless-shell-win64', 'chrome-headless-shell.exe'
+            )))
+            bundled_candidates.extend(glob.glob(os.path.join(
+                bundled_browser_root, 'chromium-*', 'chrome-win64', 'chrome.exe'
+            )))
+        bundled_existing = [path for path in bundled_candidates if os.path.isfile(path)]
+        if bundled_existing:
+            return max(bundled_existing, key=os.path.getmtime)
+
+        candidates = []
+        candidates.extend(glob.glob(os.path.join(
+            local_appdata, 'ms-playwright', 'chromium_headless_shell-*',
+            'chrome-headless-shell-win64', 'chrome-headless-shell.exe'
+        )))
+        candidates.extend(glob.glob(os.path.join(
+            local_appdata, 'ms-playwright', 'chromium-*', 'chrome-win64', 'chrome.exe'
+        )))
+        candidates.extend([
+            os.path.join(local_appdata, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+            os.path.join(program_files, 'Google', 'Chrome', 'Application', 'chrome.exe'),
+        ])
+        existing = [path for path in candidates if path and os.path.isfile(path)]
+        return max(existing, key=os.path.getmtime) if existing else None
     
 
     

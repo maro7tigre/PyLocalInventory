@@ -4,6 +4,27 @@ Example showing new parameter types: date, table
 """
 from classes.base_class import BaseClass
 from classes.sales_item_class import SalesItemClass
+from core.calculations import to_decimal, calculate_operation_totals
+
+
+def calculate_sale_totals(raw_subtotal, remise=0, tva_rate=0):
+    """Centralized monetary calculation for sales.
+
+    Parameters
+    ----------
+    raw_subtotal : Decimal|int|float|str|None
+        Sum of all Sale Item line totals (before any discount).
+    remise : Decimal|int|float|str|None
+        Discount amount.
+    tva_rate : Decimal|int|float|str|None
+        VAT percentage, e.g. 20 for 20 %.
+
+    Returns
+    -------
+    dict with keys: original_subtotal, remise, total_ht, vat_amount, total_ttc
+    All values are Decimal rounded to 2 decimal places.
+    """
+    return calculate_operation_totals(raw_subtotal, remise, tva_rate)
 
 
 class SalesClass(BaseClass):
@@ -22,6 +43,20 @@ class SalesClass(BaseClass):
                 "type": "int"
             },
 
+            # Canonical per-sale Devis reference (e.g. DE-2026-525 or a manual
+            # DE-2026-525-A). Stored verbatim on sales.devis - never silently
+            # renumbered. The host allocates the preview value on save and
+            # enforces uniqueness.
+            "devis": {
+                "value": "",
+                "display_name": {"en": "Devis N°", "fr": "Devis N°", "es": "Devis N°"},
+                "required": False,
+                "default": "",
+                "options": [],
+                "type": "string",
+                "maxlength": 40
+            },
+
             # New: workflow state of the sale
             "state": {
                 "value": "pending",  # default when created
@@ -30,6 +65,47 @@ class SalesClass(BaseClass):
                 "default": "pending",
                 "type": "string",
                 "options": ["on_hold", "pending", "confirmed", "finished"]  # internal values
+            },
+            # Historical sales are recorded for the books/records but never
+            # touch product stock (no deduction, no validation, no movements).
+            "is_historical": {
+                "value": False,
+                "display_name": {
+                    "en": "Historical Sale", "fr": "Vente historique",
+                    "es": "Venta histórica"
+                },
+                "required": False,
+                "default": False,
+                "type": "bool",
+                "true_value": True,
+                "false_value": False,
+                "hint": {
+                    "en": "Record this sale without affecting current stock",
+                    "fr": "Enregistrer cette vente sans affecter le stock actuel",
+                    "es": "Registrar esta venta sin afectar el stock actual"
+                }
+            },
+            # Explicit, user-chosen inventory decision for this Sale. Creating a
+            # sale does NOT touch current stock unless this is checked. Kept
+            # separate from is_historical (books/accounting meaning) and from
+            # state (workflow meaning): a historical sale always forces this
+            # off, and a state change never changes it.
+            "affect_stock": {
+                "value": False,
+                "display_name": {
+                    "en": "Affect current stock", "fr": "Affecter le stock actuel",
+                    "es": "Afectar el stock actual"
+                },
+                "required": False,
+                "default": False,
+                "type": "bool",
+                "true_value": True,
+                "false_value": False,
+                "hint": {
+                    "en": "Deduct product quantities from inventory",
+                    "fr": "Déduire les quantités produits du stock",
+                    "es": "Descontar las cantidades de producto del inventario"
+                }
             },
             "client_username": {
                 "value": "",
@@ -72,6 +148,22 @@ class SalesClass(BaseClass):
                 "true_value": 20.0,
                 "false_value": 0.0
             },
+            "remise": {
+                "value": 0.0,
+                "display_name": {"en": "Remise", "fr": "Remise", "es": "Descuento"},
+                "required": False,
+                "default": 0.0,
+                "type": "float"
+            },
+            "remise_includes_line_discounts": {
+                "value": True,
+                "display_name": {"en": "Final Remise"},
+                "required": False,
+                "default": True,
+                "true_value": True,
+                "false_value": False,
+                "type": "bool"
+            },
             "notes": {
                 "value": "",
                 "display_name": {"en": "Notes", "fr": "Notes", "es": "Notas"},
@@ -79,6 +171,22 @@ class SalesClass(BaseClass):
                 "default": "",
                 "options": [],
                 "type": "string"
+            },
+            "created_by": {
+                "value": None, "display_name": {"en": "Created By"},
+                "required": False, "default": None, "type": "int"
+            },
+            "created_by_username": {
+                "value": "", "display_name": {"en": "Created By"},
+                "required": False, "default": "", "type": "string"
+            },
+            "created_at": {
+                "value": "", "display_name": {"en": "Created At"},
+                "required": False, "default": "", "type": "date"
+            },
+            "operation_token": {
+                "value": "", "display_name": {"en": "Operation Token"},
+                "required": False, "default": "", "type": "string"
             },
             "items": {
                 "display_name": {"en": "Items", "fr": "Articles", "es": "Artículos"},
@@ -106,6 +214,37 @@ class SalesClass(BaseClass):
                 "type": "float",
                 "method": self.calculate_total_tva
             },
+            # Discounted Total HT (Original Subtotal - Remise) shown in the
+            # Sales table "Total HT" column. Values are authoritative from the
+            # summary query when present, otherwise recomputed centrally.
+            "total_ht": {
+                "display_name": {"en": "Total HT", "fr": "Total HT", "es": "Total HT"},
+                "required": False,
+                "type": "float",
+                "method": self.calculate_total_ht
+            },
+            # Final Total TTC (Total HT + VAT on Total HT) shown in the
+            # Sales table "Total TTC" column.
+            "total_ttc": {
+                "display_name": {"en": "Total TTC", "fr": "Total TTC", "es": "Total TTC"},
+                "required": False,
+                "type": "float",
+                "method": self.calculate_total_ttc
+            },
+            "total_quantity": {
+                "value": 0,
+                "display_name": {"en": "Total Quantity", "fr": "Quantité Totale", "es": "Cantidad Total"},
+                "required": False,
+                "default": 0,
+                "type": "int"
+            },
+            "total_production": {
+                "value": 0,
+                "display_name": {"en": "Total Production", "fr": "Production Totale", "es": "Producción Total"},
+                "required": False,
+                "default": 0,
+                "type": "int"
+            },
             "total_price": {
                 "display_name": {"en": "Total Price", "fr": "Prix Total", "es": "Precio Total"},
                 "required": False,
@@ -118,34 +257,55 @@ class SalesClass(BaseClass):
         self.available_parameters = {
             "table": {
                 "id": "r",
+                "devis": "r",
                 "state": "r",
+                # "is_historical": "r",
                 "client_name": "r",
+                "notes": "r",
                 "date": "r",
-                "subtotal": "r",
-                "total_price": "r"
+                "total_ht": "r",
+                "total_ttc": "r"
             },
             "dialog": {
                 "client_username": "rw",
                 "date": "rw",
+                "devis": "rw",
                 "tva": "rw",
                 "notes": "rw",
+                "is_historical": "rw",
+                "affect_stock": "rw",
                 "items": "rw"  # Table parameter is editable in dialog
             },
             "database": {
                 "state": "rw",
                 "client_username": "rw",
+                "client_id": "rw",
                 "client_name": "rw",  # snapshot
                 "date": "rw",
+                "devis": "rw",
                 "tva": "rw",
-                "notes": "rw"
-                # Note: items are stored separately in Sales_Items table
+                "remise": "rw",
+                "remise_includes_line_discounts": "rw",
+                "notes": "rw",
+                "created_by": "r",
+                "created_by_username": "r",
+                "created_at": "r",
+                "operation_token": "r"
+                # Note: items are stored separately in Sales_Items table.
+                # is_historical is intentionally NOT listed here: it is a real
+                # BOOLEAN column managed by Database._ensure_additional_columns
+                # and injected into the header by save_sale_with_items directly.
+                # devis_number is managed by the host-side backfill/allocator,
+                # never sent by the client.
             },
             "report": {
                 "id": "r",
                 "state": "r",
+                "is_historical": "r",
                 "client_id": "r",
                 "date": "r",
                 "tva": "r",
+                "remise": "r",
                 "subtotal": "r",
                 "total_tva": "r",
                 "total_price": "r",
@@ -158,30 +318,64 @@ class SalesClass(BaseClass):
     
     def get_sales_items(self):
         """Get all items for this sales operation"""
+        if hasattr(self, "items"):
+            return self.items
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return []
         
         try:
-            # Get all sales items for this sales operation
-            self.database.cursor.execute("SELECT ID FROM Sales_Items WHERE sales_id = ?", (self.id,))
-            item_ids = self.database.cursor.fetchall()
-            
             items = []
-            for (item_id,) in item_ids:
-                item = SalesItemClass(item_id, self.database)
-                if item.load_database_data():
-                    items.append(item)
-            
-            return items
+            for row in self.database.get_items_by_operation_id(self.id, "Sales_Items"):
+                item = SalesItemClass(row.get("ID", 0), self.database)
+                if row.get("item_type"):
+                    item.set_value("item_type", row["item_type"])
+                for key, value in row.items():
+                    parameter = "id" if key == "ID" else key
+                    if parameter == "item_type":
+                        continue
+                    if parameter in item.parameters and not item.is_parameter_calculated(parameter):
+                        item.set_value(parameter, value)
+                items.append(item)
+            self.items = items
+            return self.items
             
         except Exception as e:
             print(f"Error getting sales items for sales {self.id}: {e}")
             return []
     
-    def calculate_subtotal(self):
-        """Calculate subtotal from all items"""
+    def _raw_subtotal(self):
+        """Internal: sum of all Sale Item line totals before any discount."""
         items = self.get_sales_items()
-        return sum(item.get_value('subtotal') or 0 for item in items)
+        return sum(
+            to_decimal(item.get_value('quantity')) * to_decimal(item.get_value('unit_price'))
+            for item in items
+            if str(item.get_value('item_type') or '').casefold() != 'section'
+        )
+
+    def _final_remise(self):
+        """Use the stored final remise, preserving pre-migration sale meaning."""
+        remise = to_decimal(self.get_value('remise') or 0)
+        if self.get_value('remise_includes_line_discounts'):
+            return remise
+        return remise + sum(
+            to_decimal(item.get_value('quantity')) * to_decimal(item.get_value('unit_price'))
+            * to_decimal(item.get_value('discount_percentage') or 0) / 100
+            for item in self.get_sales_items()
+            if str(item.get_value('item_type') or '').casefold() != 'section'
+        )
+
+    def calculate_subtotal(self):
+        """Discounted Total HT (Original Subtotal - Remise).
+
+        Kept for internal/report compatibility. The visible Sales table column
+        is now "Total HT" via ``total_ht`` (see ``calculate_total_ht``).
+        """
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self._final_remise(),
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ht'])
 
     def get_sale_information(self):
         """Summarize item information values for display in the sales table."""
@@ -197,19 +391,43 @@ class SalesClass(BaseClass):
         except Exception as e:
             print(f"Error getting sale information for sales {self.id}: {e}")
             return ""
-    
+
     def calculate_total_tva(self):
-        """Calculate total VAT amount"""
-        subtotal = self.calculate_subtotal()
-        tva_percent = self.get_value('tva') or 0
-        return subtotal * (tva_percent / 100)
-    
+        """Calculate total VAT amount (centralized)."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self._final_remise(),
+            self.get_value('tva') or 0,
+        )
+        return float(totals['vat_amount'])
+
     def calculate_total_price(self):
-        """Calculate total price including VAT"""
-        subtotal = self.calculate_subtotal()
-        tva_amount = self.calculate_total_tva()
-        return subtotal + tva_amount
+        """Calculate total price including VAT (centralized)."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self._final_remise(),
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
     
+    def calculate_total_ht(self):
+        """Discounted Total HT: Original Subtotal - Remise."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self._final_remise(),
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ht'])
+
+    def calculate_total_ttc(self):
+        """Final Total TTC: Total HT + VAT computed on Total HT."""
+        totals = calculate_sale_totals(
+            self._raw_subtotal(),
+            self._final_remise(),
+            self.get_value('tva') or 0,
+        )
+        return float(totals['total_ttc'])
+
     def add_item(self, product_id, quantity, unit_price):
         """Add an item to this sales operation"""
         if not self.database:
@@ -269,7 +487,7 @@ class SalesClass(BaseClass):
                 super().set_value('client_id', None)
                 super().set_value('client_name', '')
                 return
-            self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = ?", (username,))
+            self.database.cursor.execute("SELECT ID, name FROM Clients WHERE username = %s", (username,))
             res = self.database.cursor.fetchone()
             if res:
                 cid, cname = res
@@ -292,10 +510,8 @@ class SalesClass(BaseClass):
         # Call parent set_value first
         super().set_value(param_key, value)
         
-        # Handle connected parameters for client_username
-        if param_key == 'client_username':
-            # Update snapshot fields
-            self._refresh_client_snapshot()
+        # Snapshot resolution is intentionally deferred to save_to_database().
+        # Running it here creates one remote query per sale while loading tabs.
 
     
     def get_parameter_options(self, param_key):

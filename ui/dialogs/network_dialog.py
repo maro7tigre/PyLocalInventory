@@ -3,44 +3,264 @@ Network Dialog - Lets the super-admin host the current profile's database on
 the LAN and manage the user accounts / per-section role permission matrix
 that control what connecting clients can read, insert or delete.
 """
+from datetime import datetime
+import logging
+import os
+
 from PySide6.QtWidgets import (
     QDialog, QVBoxLayout, QHBoxLayout, QWidget, QLabel, QLineEdit, QPushButton,
     QTabWidget, QTableWidget, QTableWidgetItem, QHeaderView, QComboBox,
-    QCheckBox, QMessageBox, QInputDialog
+    QCheckBox, QMessageBox, QInputDialog, QFileDialog
 )
-from PySide6.QtCore import Qt
+from PySide6.QtCore import Qt, QTimer
 
-from core.network.server import DatabaseServer
+from core.network.server import DatabaseServer, port_in_use
+from core.network.client import RemoteCursor, RemoteDatabase
 from core.network.protocol import DEFAULT_PORT
+from core.build_info import APP_BUILD_ID
 from core.user_manager import UserManager, MATRIX_SECTIONS
+from core import pg_config
+from ui.widgets.password_widget import CircularCheckBox
+
+
+logger = logging.getLogger(__name__)
+
+
+class PermissionCheckBox(CircularCheckBox):
+    """Permission toggle that responds immediately inside a table cell."""
+
+    def mousePressEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.setChecked(not self.isChecked())
+            self.pressed.emit()
+            event.accept()
+            return
+        super().mousePressEvent(event)
+
+    def mouseReleaseEvent(self, event):
+        if event.button() == Qt.LeftButton and self.isEnabled():
+            self.released.emit()
+            self.clicked.emit()
+            event.accept()
+            return
+        super().mouseReleaseEvent(event)
+
+
+class _RemoteAdminSession:
+    """Database stand-in giving UserManager its own cursor on a network login.
+
+    RemoteDatabase.cursor is one shared object that tab refresh workers also
+    use, so reading rows from it here could return another thread's result.
+    """
+
+    def __init__(self, remote_database):
+        self.cursor = RemoteCursor(remote_database)
+        self.conn = remote_database.conn
 
 
 class NetworkDialog(QDialog):
-    """Only meaningful once a profile is unlocked - main_window.database is a
-    real, connected Database (not a RemoteDatabase) at this point."""
+    """Database settings are always editable; hosting, users and roles are only
+    available after a profile has been unlocked and the local database is
+    connected.
 
-    def __init__(self, main_window):
+    A super admin signed in over the network gets the Users and Roles tabs
+    only: the host runs those statements, while database settings and hosting
+    belong to the computer that owns PostgreSQL."""
+
+    def __init__(self, main_window, focus_tab=0):
         super().__init__(main_window)
         self.main_window = main_window
         self.database = main_window.database
-        self.user_manager = UserManager(self.database)
-        self.setWindowTitle("Network & Users")
+        self.can_manage_network = bool(
+            getattr(main_window.profile_manager, 'selected_profile', None)
+            and getattr(self.database, 'conn', None)
+            and not isinstance(self.database, RemoteDatabase)
+        )
+        self.remote_admin = bool(
+            isinstance(self.database, RemoteDatabase)
+            and getattr(self.database, 'is_superadmin', False)
+        )
+        self.can_manage_users = self.can_manage_network or self.remote_admin
+        if self.remote_admin:
+            self.user_manager = UserManager(_RemoteAdminSession(self.database))
+        else:
+            self.user_manager = UserManager(self.database) if self.can_manage_network else None
+        self.setWindowTitle("Users & Roles" if self.remote_admin else "Network & Users")
         self.setMinimumSize(640, 520)
 
         layout = QVBoxLayout(self)
-        tabs = QTabWidget()
-        tabs.addTab(self._build_hosting_tab(), "Hosting")
-        tabs.addTab(self._build_users_tab(), "Users")
-        tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
-        layout.addWidget(tabs)
+        self.tabs = QTabWidget()
+        if not self.remote_admin:
+            self.tabs.addTab(self._build_db_server_tab(), "Database Server")
+            self.tabs.addTab(self._build_hosting_tab(), "Hosting")
+        self.tabs.addTab(self._build_users_tab(), "Users")
+        self.tabs.addTab(self._build_roles_tab(), "Roles && Permissions")
+        layout.addWidget(self.tabs)
 
         close_btn = QPushButton("Close")
         close_btn.clicked.connect(self.accept)
         layout.addWidget(close_btn)
 
-        self._refresh_hosting_status()
-        self._refresh_users_table()
-        self._refresh_roles_combo()
+        if not self.remote_admin:
+            self._refresh_db_server_fields()
+            self._apply_access_state()
+
+        if self.can_manage_users:
+            self._refresh_users_table()
+            self._refresh_roles_combo()
+        if self.can_manage_network:
+            self._refresh_hosting_status()
+            self._hosting_status_timer = QTimer(self)
+            self._hosting_status_timer.setInterval(2000)
+            self._hosting_status_timer.timeout.connect(self._refresh_hosting_status)
+            self._hosting_status_timer.start()
+
+        self.tabs.setCurrentIndex(min(focus_tab, self.tabs.count() - 1))
+
+    def done(self, result):
+        timer = getattr(self, '_hosting_status_timer', None)
+        if timer is not None:
+            timer.stop()
+        super().done(result)
+
+    def _apply_access_state(self):
+        """Disable the management tabs until a profile has been unlocked."""
+        for index in range(1, self.tabs.count()):
+            self.tabs.setTabEnabled(index, self.can_manage_network)
+
+        if not self.can_manage_network:
+            self.tabs.setTabToolTip(
+                1,
+                "Unlock a profile before starting or stopping hosting."
+            )
+            self.tabs.setTabToolTip(
+                2,
+                "Unlock a profile before managing users."
+            )
+            self.tabs.setTabToolTip(
+                3,
+                "Unlock a profile before editing roles and permissions."
+            )
+
+    # ---------------- Database Server tab ----------------
+
+    def _build_db_server_tab(self):
+        widget = QWidget()
+        form = QVBoxLayout(widget)
+
+        note = QLabel(
+            "Connection settings for the central PostgreSQL server that stores every "
+            "profile's data. These are shared across all profiles on this machine."
+        )
+        note.setWordWrap(True)
+        form.addWidget(note)
+
+        host_row = QHBoxLayout()
+        host_row.addWidget(QLabel("Host:"))
+        self.db_host_input = QLineEdit()
+        host_row.addWidget(self.db_host_input)
+        form.addLayout(host_row)
+
+        port_row = QHBoxLayout()
+        port_row.addWidget(QLabel("Port:"))
+        self.db_port_input = QLineEdit()
+        port_row.addWidget(self.db_port_input)
+        form.addLayout(port_row)
+
+        dbname_row = QHBoxLayout()
+        dbname_row.addWidget(QLabel("Maintenance Database:"))
+        self.db_name_input = QLineEdit()
+        dbname_row.addWidget(self.db_name_input)
+        form.addLayout(dbname_row)
+
+        user_row = QHBoxLayout()
+        user_row.addWidget(QLabel("User:"))
+        self.db_user_input = QLineEdit()
+        user_row.addWidget(self.db_user_input)
+        form.addLayout(user_row)
+
+        password_row = QHBoxLayout()
+        password_row.addWidget(QLabel("Password:"))
+        self.db_password_input = QLineEdit()
+        self.db_password_input.setEchoMode(QLineEdit.Password)
+        password_row.addWidget(self.db_password_input)
+        form.addLayout(password_row)
+
+        bin_row = QHBoxLayout()
+        bin_row.addWidget(QLabel("PostgreSQL Bin Directory:"))
+        self.db_bin_input = QLineEdit()
+        self.db_bin_input.setPlaceholderText(
+            r"Optional, for example C:\Program Files\PostgreSQL\18\bin"
+        )
+        bin_row.addWidget(self.db_bin_input)
+        browse_bin_btn = QPushButton("Browse...")
+        browse_bin_btn.clicked.connect(self._browse_postgres_bin)
+        bin_row.addWidget(browse_bin_btn)
+        form.addLayout(bin_row)
+
+        self.db_status_label = QLabel()
+        form.addWidget(self.db_status_label)
+
+        btn_row = QHBoxLayout()
+        test_btn = QPushButton("Test Connection")
+        test_btn.clicked.connect(self._test_db_server_connection)
+        btn_row.addWidget(test_btn)
+        save_btn = QPushButton("Save")
+        save_btn.clicked.connect(self._save_db_server_config)
+        btn_row.addWidget(save_btn)
+        form.addLayout(btn_row)
+
+        form.addStretch()
+        return widget
+
+    def _refresh_db_server_fields(self):
+        config = pg_config.load_server_config()
+        self.db_host_input.setText(str(config.get("host", "")))
+        self.db_port_input.setText(str(config.get("port", "")))
+        self.db_name_input.setText(str(config.get("maintenance_database", config.get("database", "postgres"))))
+        self.db_user_input.setText(str(config.get("user", "")))
+        self.db_password_input.setText(str(config.get("password", "")))
+        self.db_bin_input.setText(str(config.get("postgres_bin_dir", "")))
+
+    def _browse_postgres_bin(self):
+        directory = QFileDialog.getExistingDirectory(
+            self,
+            "Select PostgreSQL Bin Directory",
+            self.db_bin_input.text().strip(),
+        )
+        if directory:
+            self.db_bin_input.setText(directory)
+
+    def _collect_db_server_config(self):
+        try:
+            port = int(self.db_port_input.text().strip())
+        except ValueError:
+            QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
+            return None
+        return {
+            "host": self.db_host_input.text().strip(),
+            "port": port,
+            "maintenance_database": self.db_name_input.text().strip(),
+            "user": self.db_user_input.text().strip(),
+            "password": self.db_password_input.text(),
+            "postgres_bin_dir": self.db_bin_input.text().strip(),
+        }
+
+    def _test_db_server_connection(self):
+        config = self._collect_db_server_config()
+        if config is None:
+            return
+        ok, message = pg_config.test_connection(config)
+        self.db_status_label.setText(f"{'✓' if ok else '✗'} {message}")
+
+    def _save_db_server_config(self):
+        config = self._collect_db_server_config()
+        if config is None:
+            return
+        current = pg_config.load_server_config()
+        current.update(config)
+        pg_config.save_server_config(current)
+        QMessageBox.information(self, "Saved", "Database server settings saved.")
 
     # ---------------- Hosting tab ----------------
 
@@ -48,8 +268,22 @@ class NetworkDialog(QDialog):
         widget = QWidget()
         form = QVBoxLayout(widget)
 
+        if not self.can_manage_network:
+            note = QLabel(
+                "Unlock a profile first to start hosting this database on the LAN."
+            )
+            note.setWordWrap(True)
+            form.addWidget(note)
+            form.addStretch()
+            return widget
+
         self.status_label = QLabel()
         form.addWidget(self.status_label)
+
+        self.status_detail_label = QLabel()
+        self.status_detail_label.setWordWrap(True)
+        self.status_detail_label.setStyleSheet("color: palette(mid);")
+        form.addWidget(self.status_detail_label)
 
         port_row = QHBoxLayout()
         port_row.addWidget(QLabel("Port:"))
@@ -77,17 +311,174 @@ class NetworkDialog(QDialog):
     def _refresh_hosting_status(self):
         server = getattr(self.main_window, 'network_server', None)
         running = bool(server and server.is_running)
-        self.status_label.setText("Status: Hosting" if running else "Status: Not hosting")
+        status_text = (
+            "Status: Hosting" if running else
+            "Status: Server unavailable" if server else "Status: Not hosting"
+        )
+        snapshot = self._snapshot_of(server) if server is not None else None
+        self.status_label.setText(status_text)
         self.toggle_btn.setText("Stop Hosting" if running else "Start Hosting")
         self.ip_label.setText(f"Your LAN IP: {DatabaseServer.local_ip()}" if running else "")
         self.port_input.setEnabled(not running)
+        detail_label = getattr(self, 'status_detail_label', None)
+        if detail_label is not None:
+            detail_label.setText(self._hosting_detail(server, running, snapshot))
+        self._log_host_status_change(status_text, server, snapshot)
+
+    def _log_host_status_change(self, status_text, server, snapshot):
+        previous = getattr(self, '_last_reported_host_status', None)
+        if previous == status_text:
+            return
+        self._last_reported_host_status = status_text
+        state = snapshot or getattr(self.main_window, 'host_last_snapshot', None) or {}
+        if not isinstance(state, dict):
+            state = {}
+        log = (
+            logger.warning
+            if previous == "Status: Hosting" and status_text != "Status: Hosting"
+            else logger.info
+        )
+        log(
+            'host_ui_status previous=%s status=%s server_present=%s state=%s '
+            'reason=%s thread_alive=%s listener=%s active_requests=%s '
+            'checked_out=%s sessions=%s build_id=%s pid=%s',
+            previous or 'none', status_text, server is not None,
+            state.get('state', 'none'), state.get('reason', 'none'),
+            state.get('thread_alive', 'unknown'),
+            state.get('listener_available', 'unknown'),
+            state.get('active_requests', 'unknown'),
+            state.get('checked_out', 'unknown'), state.get('sessions', 'unknown'),
+            state.get('build_id') or APP_BUILD_ID, state.get('pid') or os.getpid(),
+        )
+
+    @staticmethod
+    def _snapshot_of(server):
+        try:
+            snapshot = server.snapshot()
+        except Exception:
+            return None
+        return snapshot if isinstance(snapshot, dict) else None
+
+    @staticmethod
+    def _host_identity(snapshot=None):
+        snapshot = snapshot or {}
+        return (
+            f"Build: {snapshot.get('build_id') or APP_BUILD_ID}; "
+            f"PID: {snapshot.get('pid') or os.getpid()}."
+        )
+
+    def _hosting_detail(self, server, running, snapshot=None):
+        """Explain the exact observed Host state without changing its meaning."""
+        if running:
+            if snapshot is None:
+                return (
+                    "Hosting checks pass, but detailed Host state is unavailable. "
+                    f"Check app.log for the last host_state record. "
+                    f"{self._host_identity()}"
+                )
+            healthy = (snapshot.get('thread_alive')
+                       and snapshot.get('listener_available'))
+            health_text = (
+                "Serving thread alive; listener accepting connections."
+                if healthy else
+                "Serving thread/listener health is degraded; stop and start hosting."
+            )
+            return (
+                f"{health_text} Active requests: {snapshot.get('active_requests', 0)}. "
+                f"DB connections in use: {snapshot.get('checked_out', 0)}. "
+                f"Sessions: {snapshot.get('sessions', 0)}. "
+                f"State: {snapshot.get('state', 'unknown')} since "
+                f"{snapshot.get('state_since', 'unknown')}. "
+                f"{self._host_identity(snapshot)}"
+            )
+        if server is not None:
+            if snapshot is None:
+                return (
+                    "The Host object still exists but its serving thread and listener "
+                    "are not healthy. Press Start Hosting to stop it and try again. "
+                    f"{self._host_identity()}"
+                )
+            category = snapshot.get('last_error_category')
+            return (
+                f"Host state: {snapshot.get('state', 'unknown')} since "
+                f"{snapshot.get('state_since', 'unknown')} "
+                f"(reason: {snapshot.get('reason', 'unknown')}; "
+                f"last error: {category or 'none'}). "
+                "Serving thread and listener are not both available. "
+                "Press Start Hosting to stop the stale Host and start it again. "
+                f"{self._host_identity(snapshot)}"
+            )
+
+        last = getattr(self.main_window, 'host_last_snapshot', None)
+        if isinstance(last, dict):
+            state = last.get('state', 'unknown')
+            reason = last.get('reason', 'unknown')
+            category = last.get('last_error_category') or 'none'
+            since = last.get('state_since', 'unknown')
+            identity = self._host_identity(last)
+            if state in ('stopped', 'not_started'):
+                history = ''
+                unhealthy_state = last.get('last_unhealthy_state')
+                if unhealthy_state:
+                    history = (
+                        f" Last unhealthy state: {unhealthy_state} "
+                        f"({last.get('last_unhealthy_reason', 'unknown')} at "
+                        f"{last.get('last_unhealthy_at', 'unknown')})."
+                    )
+                else:
+                    previous = last.get('previous_state')
+                    if previous in ('thread_exited', 'listener_lost', 'failed'):
+                        history = (
+                            f" Previous state: {previous} "
+                            f"({last.get('previous_reason', 'unknown')})."
+                        )
+                if category != 'none':
+                    history += (
+                        f" Last error: {category} at "
+                        f"{last.get('last_error_at', 'unknown')}."
+                    )
+                return (
+                    f"Last Host state: {state} at {since} (reason: {reason})."
+                    f"{history} Hosting does not resume automatically; "
+                    f"press Start Hosting to host again. {identity}"
+                )
+            return (
+                f"Last Host state: {state} at {since} (reason: {reason}; "
+                f"last error: {category}). Press Start Hosting to try again. "
+                f"{identity}"
+            )
+        return (
+            "Hosting has not been started since this application opened. "
+            "Hosting does not resume automatically after an application restart; "
+            f"press Start Hosting to host this profile. {self._host_identity()}"
+        )
+
+    def _remember_host_state(self, server):
+        snapshot = self._snapshot_of(server) if server is not None else None
+        if snapshot is not None:
+            self.main_window.host_last_snapshot = snapshot
 
     def _toggle_hosting(self):
         server = getattr(self.main_window, 'network_server', None)
+        logger.info(
+            'host_toggle_requested server_present=%s running=%s build_id=%s pid=%d',
+            server is not None, bool(server and server.is_running),
+            APP_BUILD_ID, os.getpid(),
+        )
         if server and server.is_running:
-            server.stop()
+            server.stop(reason='operator_stop')
+            self._remember_host_state(server)
+            logger.info('host_reference_cleared reason=operator_stop pid=%d', os.getpid())
+            self.main_window.network_server = None
             self._refresh_hosting_status()
             return
+        if server:
+            # A dead serving thread still owns its pool until stop() cleans it.
+            server.stop(reason='stale_server_cleanup')
+            self._remember_host_state(server)
+            logger.info('host_reference_cleared reason=stale_server_cleanup pid=%d',
+                        os.getpid())
+            self.main_window.network_server = None
 
         if not self.user_manager.has_any_superadmin():
             username, ok = QInputDialog.getText(self, "Create Super Admin", "Choose a super-admin username:")
@@ -111,14 +502,42 @@ class NetworkDialog(QDialog):
             QMessageBox.warning(self, "Invalid Port", "Port must be a number.")
             return
 
-        server = DatabaseServer(self.database, port=port)
+        if port_in_use(port):
+            QMessageBox.warning(
+                self, "Port In Use",
+                f"Something is already answering on port {port}. If the background "
+                "server (PyLocalInventoryServer) is running, this profile is already "
+                "hosted and there is nothing to start here. Otherwise choose another port."
+            )
+            return
+
         try:
+            server = None
+            logger.info('host_start_requested port=%d pid=%d build_id=%s',
+                        port, os.getpid(), APP_BUILD_ID)
+            server = DatabaseServer(self.database, port=port)
             server.start()
-        except OSError as e:
+        except Exception as e:
+            logger.error('host_start_failed_from_ui port=%d category=%s pid=%d',
+                         port, type(e).__name__, os.getpid())
+            if server is not None:
+                self._remember_host_state(server)
+            else:
+                self.main_window.host_last_snapshot = {
+                    'state': 'failed',
+                    'state_since': datetime.now().astimezone().isoformat(timespec='seconds'),
+                    'reason': 'create_failed',
+                    'last_error_category': type(e).__name__,
+                    'port': port,
+                }
+            self._refresh_hosting_status()
             QMessageBox.critical(self, "Could not start hosting", str(e))
             return
         self.main_window.network_server = server
         self.main_window.network_port = port
+        self.main_window.host_last_snapshot = None
+        logger.info('host_reference_installed port=%d pid=%d build_id=%s',
+                    port, os.getpid(), APP_BUILD_ID)
         self._refresh_hosting_status()
 
     # ---------------- Users tab ----------------
@@ -126,6 +545,15 @@ class NetworkDialog(QDialog):
     def _build_users_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        if not self.can_manage_users:
+            note = QLabel(
+                "Users can only be created after a profile is unlocked and the local database is connected."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch()
+            return widget
 
         self.users_table = QTableWidget(0, 3)
         self.users_table.setHorizontalHeaderLabels(["Username", "Role", "Super Admin"])
@@ -138,10 +566,13 @@ class NetworkDialog(QDialog):
         add_btn.clicked.connect(self._add_user)
         change_role_btn = QPushButton("Change Role")
         change_role_btn.clicked.connect(self._change_user_role)
+        change_password_btn = QPushButton("Change Password")
+        change_password_btn.clicked.connect(self._change_user_password)
         remove_btn = QPushButton("Remove Selected")
         remove_btn.clicked.connect(self._remove_user)
         btn_row.addWidget(add_btn)
         btn_row.addWidget(change_role_btn)
+        btn_row.addWidget(change_password_btn)
         btn_row.addWidget(remove_btn)
         layout.addLayout(btn_row)
 
@@ -215,6 +646,20 @@ class NetworkDialog(QDialog):
         self.user_manager.set_user_role(user['id'], role_id)
         self._refresh_users_table()
 
+    def _change_user_password(self):
+        row = self.users_table.currentRow()
+        if row < 0:
+            QMessageBox.information(self, "No Selection", "Select a user first.")
+            return
+        user = self._users_cache[row]
+        password, ok = QInputDialog.getText(
+            self, "Change Password", f"New password for '{user['username']}':", QLineEdit.Password
+        )
+        if not ok or not password:
+            return
+        self.user_manager.change_password(user['id'], password)
+        QMessageBox.information(self, "Password Changed", f"Password updated for '{user['username']}'.")
+
     def _remove_user(self):
         row = self.users_table.currentRow()
         if row < 0:
@@ -232,6 +677,15 @@ class NetworkDialog(QDialog):
     def _build_roles_tab(self):
         widget = QWidget()
         layout = QVBoxLayout(widget)
+
+        if not self.can_manage_users:
+            note = QLabel(
+                "Roles and permissions can only be edited after a profile is unlocked and the local database is connected."
+            )
+            note.setWordWrap(True)
+            layout.addWidget(note)
+            layout.addStretch()
+            return widget
 
         role_row = QHBoxLayout()
         role_row.addWidget(QLabel("Role:"))
@@ -286,7 +740,7 @@ class NetworkDialog(QDialog):
         for row, section in enumerate(MATRIX_SECTIONS):
             perm = perms[section]
             for col, key in enumerate(('read', 'write', 'delete')):
-                checkbox = QCheckBox()
+                checkbox = PermissionCheckBox()
                 checkbox.setChecked(perm[key])
                 cell = QWidget()
                 cell_layout = QHBoxLayout(cell)

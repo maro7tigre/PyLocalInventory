@@ -3,9 +3,11 @@ Sales Item Class - Represents individual items within a sales operation
 Updated example showing button parameter for delete actions
 """
 from classes.base_class import BaseClass
+import time
 
 
 class SalesItemClass(BaseClass):
+    _catalog_cache = {}
     def __init__(self, id, database, sales_id=0, product_id=0):
         super().__init__(id, database)
         self.section = "Sales_Items"
@@ -34,6 +36,29 @@ class SalesItemClass(BaseClass):
                 "required": False,  # allow NULL when product not yet created (Ignore path)
                 "default": 0,
                 "options": [],
+                "type": "int"
+            },
+            "service_id": {
+                "value": None,
+                "display_name": {"en": "Service ID", "fr": "ID Service", "es": "ID Servicio"},
+                "required": False,
+                "default": None,
+                "options": [],
+                "type": "int"
+            },
+            "item_type": {
+                "value": "product",
+                "display_name": {"en": "Type", "fr": "Type", "es": "Tipo"},
+                "required": True,
+                "default": "product",
+                "options": ["product", "service", "manual", "section"],
+                "type": "string"
+            },
+            "sort_order": {
+                "value": None,
+                "display_name": {"en": "Sort Order", "fr": "Ordre", "es": "Orden"},
+                "required": False,
+                "default": None,
                 "type": "int"
             },
             "product_name": {
@@ -65,6 +90,9 @@ class SalesItemClass(BaseClass):
                 "default": "",
                 "type": "string",
                 "autocomplete": True,
+                "allow_free_text": True,
+                "multi_value": True,
+                "auto_expand": True,
                 "options": self.get_service_keyword_options
             },
             "quantity": {
@@ -73,8 +101,9 @@ class SalesItemClass(BaseClass):
                 "required": True,
                 "default": 1,
                 "options": [],
-                "type": "int",
-                "min": 1
+                "type": "decimal",
+                "min": 0.001,
+                "precision": 3
             },
             "production": {
                 "value": 0,
@@ -93,6 +122,17 @@ class SalesItemClass(BaseClass):
                 "options": [],
                 "type": "float",
                 "min": 0.0
+            },
+            "discount_percentage": {
+                "value": 0.0,
+                "display_name": {"en": "Remise %", "fr": "Remise %", "es": "Descuento %"},
+                "required": False,
+                "default": 0.0,
+                "options": [],
+                "type": "float",
+                "min": 0.0,
+                "max": 100.0,
+                "precision": 2,
             },
             "subtotal": {
                 "display_name": {"en": "Subtotal", "fr": "Sous-total", "es": "Subtotal"},
@@ -114,12 +154,13 @@ class SalesItemClass(BaseClass):
         # Define where parameters can be used and their permissions
         self.available_parameters = {
             "table": {
-                "product_preview": "r",
+                "item_type": "rw",
                 "product_name": "rw",
                 "product_description": "rw",
                 "information": "rw",
                 "quantity": "rw", 
                 "unit_price": "rw",
+                "discount_percentage": "rw",
                 "subtotal": "r",
                 "delete_action": "r"  # Delete button visible in table
             },
@@ -134,10 +175,14 @@ class SalesItemClass(BaseClass):
             "database": {
                 "sales_id": "rw",
                 "product_id": "rw",
+                "service_id": "rw",
+                "item_type": "rw",
+                "sort_order": "rw",
                 "product_name": "rw",  # snapshot of name at time of operation
                 "information": "rw",
                 "quantity": "rw",
                 "unit_price": "rw",
+                "discount_percentage": "rw",
                 "production": "rw"
             },
             "report": {
@@ -145,6 +190,7 @@ class SalesItemClass(BaseClass):
                 "information": "r",
                 "quantity": "r",
                 "unit_price": "r",
+                "discount_percentage": "r",
                 "subtotal": "r"
                 # No delete button in reports
             }
@@ -154,6 +200,39 @@ class SalesItemClass(BaseClass):
         """Return product and service keywords for autocomplete (non-empty)."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            options = []
+            seen = set()
+            service_keywords = []
+            for record in remote_catalog.get("products", []):
+                value = str(record.get("name") or "").strip()
+                if value and value.casefold() not in seen:
+                    seen.add(value.casefold())
+                    options.append(value)
+            for record in remote_catalog.get("services", []):
+                values = [
+                    record.get("name"),
+                    *self._split_keywords(record.get("keywords") or ""),
+                ]
+                service_keywords.extend(self._split_keywords(
+                    record.get("keywords") or ""
+                ))
+                for value in values:
+                    value = str(value or "").strip()
+                    if value and value.casefold() not in seen:
+                        seen.add(value.casefold())
+                        options.append(value)
+            self._catalog_cache[id(self.database)] = {
+                "loaded_at": time.monotonic(),
+                "products": list(options),
+                "service_keywords": list(dict.fromkeys(service_keywords)),
+            }
+            return options
+        cache_key = id(self.database)
+        cached = self._catalog_cache.get(cache_key)
+        if cached and time.monotonic() - cached['loaded_at'] < 60:
+            return list(cached['products'])
         try:
             options = []
             seen = set()
@@ -177,6 +256,19 @@ class SalesItemClass(BaseClass):
             except Exception:
                 pass
 
+            service_keywords = []
+            try:
+                self.database.cursor.execute(
+                    "SELECT keywords FROM Services WHERE keywords IS NOT NULL AND keywords != ''"
+                )
+                for (keywords,) in self.database.cursor.fetchall():
+                    service_keywords.extend(self._split_keywords(keywords or ""))
+            except Exception:
+                pass
+            self._catalog_cache[cache_key] = {
+                'loaded_at': time.monotonic(), 'products': list(options),
+                'service_keywords': list(dict.fromkeys(service_keywords)),
+            }
             return options
         except Exception:
             return []
@@ -185,7 +277,23 @@ class SalesItemClass(BaseClass):
         """Return service keywords for the line-item information autocomplete."""
         if not (self.database and getattr(self.database, 'cursor', None)):
             return []
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            return list(dict.fromkeys(
+                keyword
+                for record in remote_catalog.get("services", [])
+                for keyword in self._split_keywords(record.get("keywords") or "")
+            ))
 
+        cache_key = id(self.database)
+        cached = self._catalog_cache.get(cache_key)
+        if cached and time.monotonic() - cached['loaded_at'] < 60:
+            return list(cached['service_keywords'])
+        # Populate both lists in one shared catalog load.
+        self.get_product_options()
+        cached = self._catalog_cache.get(cache_key)
+        if cached:
+            return list(cached['service_keywords'])
         try:
             options = []
             seen = set()
@@ -218,7 +326,7 @@ class SalesItemClass(BaseClass):
         if not (self.database and hasattr(self.database, 'cursor') and self.database.cursor):
             return snapshot or f"Product {product_id}"
         try:
-            self.database.cursor.execute("SELECT name FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT name FROM Products WHERE ID = %s", (product_id,))
             row = self.database.cursor.fetchone()
             if row and row[0]:
                 # If DB name differs from snapshot (product renamed), update snapshot silently
@@ -242,7 +350,7 @@ class SalesItemClass(BaseClass):
             product_id = self.get_value('product_id')
             if not product_id:
                 return None
-            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = ?", (product_id,))
+            self.database.cursor.execute("SELECT preview_image FROM Products WHERE ID = %s", (product_id,))
             result = self.database.cursor.fetchone()
             return result[0] if result and result[0] else None
         except Exception as e:
@@ -250,10 +358,16 @@ class SalesItemClass(BaseClass):
             return None
     
     def calculate_subtotal(self):
-        """Calculate subtotal (quantity * unit_price)"""
-        quantity = self.get_value('quantity') or 0
-        unit_price = self.get_value('unit_price') or 0.0
-        return quantity * unit_price
+        """Calculate subtotal (quantity * unit_price) with Decimal precision."""
+        if str(self.get_value("item_type") or "").casefold() == "section":
+            from decimal import Decimal
+            return Decimal("0")
+        from core.calculations import calculate_line_subtotal
+        return calculate_line_subtotal(
+            self.get_value('quantity'),
+            self.get_value('unit_price'),
+            self.get_value('discount_percentage') or 0,
+        )
     
     def delete_self(self):
         """Delete this item from database - called by delete button"""
@@ -273,9 +387,34 @@ class SalesItemClass(BaseClass):
     
     def set_value(self, param_key, value):
         """Override set_value to handle product selection updates and connected parameters"""
+        if param_key == "item_type":
+            normalized = str(value or "").casefold()
+            super().set_value("item_type", normalized)
+            if normalized == "product":
+                self.parameters["service_id"]["value"] = None
+            elif normalized == "service":
+                self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
+            elif normalized == "manual":
+                # Snapshot-only line: keep the typed name, no catalog link.
+                self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
+            elif normalized == "section":
+                # Structural Sale/Devis heading: never link it to the catalog
+                # and keep financial fields genuinely non-applicable.
+                self.parameters["product_id"]["value"] = None
+                self.parameters["service_id"]["value"] = None
+                self.parameters["information"]["value"] = ""
+                self.parameters["quantity"]["value"] = None
+                self.parameters["unit_price"]["value"] = None
+                self.parameters["production"]["value"] = None
+            return
         # For product_name, we need to find the product and set connected parameters
         if param_key == 'product_name' and value:
             name_clean = value.strip()
+            if str(self.get_value("item_type") or "").casefold() == "section":
+                BaseClass.set_value(self, "product_name", name_clean)
+                return
             product_data = self.get_product_data_by_name(name_clean)
             if not product_data:
                 service_name = self.get_service_name_by_keyword(name_clean)
@@ -325,7 +464,7 @@ class SalesItemClass(BaseClass):
         super().set_value(param_key, value)
         
         # Handle quantity or unit_price changes to update subtotal
-        if param_key in ['quantity', 'unit_price']:
+        if param_key in ['quantity', 'unit_price', 'discount_percentage']:
             # Subtotal will be recalculated automatically via the method
             pass
     
@@ -341,10 +480,21 @@ class SalesItemClass(BaseClass):
         """Get product data by name including ID and sale price"""
         if not self.database or not hasattr(self.database, 'cursor') or not self.database.cursor:
             return None
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            target = " ".join(str(product_name or "").split()).casefold()
+            for record in remote_catalog.get("products", []):
+                if " ".join(str(record.get("name") or "").split()).casefold() == target:
+                    return {
+                        "id": int(record["id"]),
+                        "sale_price": record.get("price") or 0,
+                        "preview_image": record.get("preview_image"),
+                    }
+            return None
         
         try:
             self.database.cursor.execute(
-                "SELECT ID, sale_price, preview_image FROM Products WHERE name = ? LIMIT 1", 
+                "SELECT ID, sale_price, preview_image FROM Products WHERE name = %s LIMIT 1",
                 (product_name,)
             )
             result = self.database.cursor.fetchone()
@@ -366,6 +516,20 @@ class SalesItemClass(BaseClass):
 
         value_clean = (value or '').strip()
         if not value_clean:
+            return None
+        remote_catalog = getattr(self.database, "sale_catalog", None)
+        if isinstance(remote_catalog, dict):
+            target = value_clean.casefold()
+            for record in remote_catalog.get("services", []):
+                candidates = [
+                    record.get("name"),
+                    *self._split_keywords(record.get("keywords") or ""),
+                ]
+                if any(
+                    target == str(candidate or "").strip().casefold()
+                    for candidate in candidates
+                ):
+                    return record.get("name")
             return None
 
         try:

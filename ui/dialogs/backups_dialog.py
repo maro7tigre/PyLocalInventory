@@ -1,16 +1,127 @@
 """
 Backup management dialog - create and restore database backups
 """
+import shiboken6
 from PySide6.QtWidgets import (QDialog, QVBoxLayout, QLabel, QHBoxLayout, 
-                               QMessageBox, QInputDialog, QLineEdit)
-from PySide6.QtCore import Qt
+                               QMessageBox, QInputDialog, QLineEdit, QFileDialog)
+from PySide6.QtCore import Qt, QObject, QThread, Signal, Slot
 import os
+import re
 import shutil
 import time
+import logging
 from datetime import datetime
 
 from ui.widgets.themed_widgets import RedButton, GreenButton, BlueButton
 from ui.widgets.cards_list import GridCardsList
+from core import pg_backup
+from core.attachments import attachment_backup_root
+from core import diagnostics
+
+logger = logging.getLogger(__name__)
+
+class _BackupCreateWorker(QObject):
+    finished = Signal(bool)
+    failed = Signal(str)
+    cancelled = Signal(float)
+
+    def __init__(self, callback, operation="backup_operation"):
+        super().__init__()
+        self.callback = callback
+        self.operation = operation
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = False
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
+            with diagnostics.operation(self.operation):
+                result = bool(self.callback())
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
+        except Exception as error:
+            logger.exception("Backup worker failed operation=%s", self.operation)
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "%s completed in %.3f seconds", self.operation, elapsed,
+            )
+            print(
+                f"[PERFORMANCE] {self.operation} completed in "
+                f"{elapsed:.2f} seconds"
+            )
+
+
+class _BackupDownloadWorker(QObject):
+    finished = Signal(str)
+    failed = Signal(str)
+    cancelled = Signal(float)
+
+    def __init__(self, database, destination):
+        super().__init__()
+        self.database = database
+        self.destination = destination
+
+    @Slot()
+    def run(self):
+        started = time.perf_counter()
+        is_success = False
+        is_cancelled = False
+        error_msg = ""
+        result = None
+        try:
+            if QThread.currentThread().isInterruptionRequested():
+                is_cancelled = True
+                return
+                
+            with diagnostics.operation("network_backup_download"):
+                result = self.database.download_backup(self.destination)
+                
+                if QThread.currentThread().isInterruptionRequested():
+                    is_cancelled = True
+                    return
+                    
+                is_success = True
+        except Exception as error:
+            logger.exception(
+                "Network backup download failed destination=%s", self.destination
+            )
+            error_msg = str(error) or "Unknown error"
+        finally:
+            if is_cancelled:
+                self.cancelled.emit(started)
+            elif is_success:
+                self.finished.emit(result)
+            else:
+                self.failed.emit(error_msg)
+            elapsed = time.perf_counter() - started
+            logger.log(
+                logging.WARNING if elapsed >= 0.5 else logging.INFO,
+                "network_backup_download completed in %.3f seconds", elapsed,
+            )
+            print(
+                "[PERFORMANCE] network_backup_download completed in "
+                f"{elapsed:.2f} seconds"
+            )
 
 class BackupsDialog(QDialog):
     def __init__(self, parent=None):
@@ -24,6 +135,8 @@ class BackupsDialog(QDialog):
         self.profile_dir = None
         self.backups_dir = None
         self.selected_backup = None
+        self._backup_running = False
+        self.remote_mode = False
         
         # Load configuration - if this fails, dialog will close
         if not self.load_config(parent):
@@ -53,6 +166,9 @@ class BackupsDialog(QDialog):
             }
         """)
         
+        if self.remote_mode:
+            return self._setup_remote_ui()
+
         # Main vertical layout
         layout = QVBoxLayout()
 
@@ -60,6 +176,9 @@ class BackupsDialog(QDialog):
         header_label = QLabel("Database Backups")
         header_label.setStyleSheet("color: #ffffff; font-size: 18px; font-weight: bold;")
         layout.addWidget(header_label)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #9ecbff;")
+        layout.addWidget(self.status_label)
 
         # Cards list for backups
         self.cards_list = GridCardsList(category="backups", parent=self)
@@ -91,6 +210,10 @@ class BackupsDialog(QDialog):
     
     def load_config(self, parent):
         """Load configuration from parent"""
+        database = getattr(parent, "database", None)
+        if database and hasattr(database, "download_backup"):
+            self.remote_mode = True
+            return True
         if hasattr(parent, 'profile_manager') and parent.profile_manager.selected_profile:
             self.current_profile = parent.profile_manager.selected_profile
             self.profile_dir = os.path.dirname(self.current_profile.config_path)
@@ -103,6 +226,110 @@ class BackupsDialog(QDialog):
             QMessageBox.warning(self, "Error", "No profile selected. Please select a profile first.")
             self.reject()
             return False
+
+    def _setup_remote_ui(self):
+        """Client-PC backup UI; the host creates the dump, this PC stores it."""
+        self.setMinimumSize(460, 220)
+        layout = QVBoxLayout(self)
+        header = QLabel("Download Shared Database Backup")
+        header.setStyleSheet("font-size: 18px; font-weight: bold;")
+        layout.addWidget(header)
+        detail = QLabel(
+            "The host will create a consistent database backup and send it "
+            "to a folder you choose on this computer."
+        )
+        detail.setWordWrap(True)
+        layout.addWidget(detail)
+        self.status_label = QLabel("")
+        self.status_label.setStyleSheet("color: #9ecbff;")
+        layout.addWidget(self.status_label)
+        layout.addStretch()
+        buttons = QHBoxLayout()
+        buttons.addStretch()
+        self.download_btn = GreenButton("Choose Destination")
+        self.download_btn.clicked.connect(self._choose_remote_destination)
+        buttons.addWidget(self.download_btn)
+        self.close_btn = RedButton("Close")
+        self.close_btn.clicked.connect(self.close)
+        buttons.addWidget(self.close_btn)
+        layout.addLayout(buttons)
+
+    def _choose_remote_destination(self):
+        if self._backup_running:
+            return
+        default_name = f"PyLocalInventory_{datetime.now():%Y-%m-%d_%H-%M-%S}.zip"
+        default_path = os.path.join(
+            os.path.expanduser("~/Documents"), default_name
+        )
+        destination, _ = QFileDialog.getSaveFileName(
+            self, "Save Shared Database Backup", default_path,
+            "ZIP backup (*.zip)",
+        )
+        if not destination:
+            return
+        if not destination.lower().endswith(".zip"):
+            destination += ".zip"
+        self._backup_running = True
+        self.download_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.status_label.setText("Creating backup on host and downloading…")
+        
+        thread = QThread()
+        worker = _BackupDownloadWorker(
+            getattr(self.parent(), "database"), destination
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        
+        worker.finished.connect(self._remote_backup_finished)
+        worker.failed.connect(self._remote_backup_failed)
+        
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_backup_thread_finished)
+        
+        self._backup_thread = thread
+        self._backup_worker = worker
+        diagnostics.worker_started("backup_download", "backups", destination)
+        thread.start()
+
+    @Slot(str)
+    def _remote_backup_finished(self, destination):
+        diagnostics.worker_finished("backup_download", "backups", destination)
+        self._backup_running = False
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.information(
+            self, "Backup Created",
+            f"The shared database backup was validated and saved to:\n{destination}",
+        )
+
+    @Slot(str)
+    def _remote_backup_failed(self, error):
+        diagnostics.worker_failed("backup_download", "backups", "network")
+        self._backup_running = False
+        self.download_btn.setEnabled(True)
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        QMessageBox.critical(self, "Backup Failed", error)
+
+    def closeEvent(self, event):
+        if self._backup_running:
+            QMessageBox.information(
+                self, "Backup in Progress",
+                "Wait for the current backup operation to finish before closing.",
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
     
     def refresh_backups_list(self):
         """Reload backups from filesystem and update cards list"""
@@ -120,7 +347,20 @@ class BackupsDialog(QDialog):
             if os.path.isdir(backup_path):
                 # Check if it's a valid backup (has config.json and database)
                 config_path = os.path.join(backup_path, "config.json")
-                if os.path.exists(config_path):
+                dump_files = [
+                    name for name in os.listdir(backup_path)
+                    if name in ("database.dump", "schema.dump")
+                    or name.lower().endswith(".backup")
+                ]
+                has_valid_dump = any(
+                    os.path.isfile(os.path.join(backup_path, name))
+                    and os.path.getsize(os.path.join(backup_path, name)) > 0
+                    for name in dump_files
+                )
+                has_legacy_schema = os.path.isfile(
+                    os.path.join(backup_path, "manifest.json")
+                )
+                if os.path.exists(config_path) and (has_valid_dump or has_legacy_schema):
                     backups[item] = {
                         'name': item,
                         'path': backup_path,
@@ -129,63 +369,94 @@ class BackupsDialog(QDialog):
         
         return backups
     
-    def create_backup(self, backup_name):
+    def create_backup(self, backup_name, show_errors=True):
         """Create a new backup with given name"""
+        backup_path = None
         try:
+            backup_name = backup_name.strip()
+            if (
+                not backup_name
+                or backup_name in (".", "..")
+                or re.search(r'[<>:"/\\|?*]', backup_name)
+                or backup_name.endswith((" ", "."))
+            ):
+                message = (
+                    "Use a Windows-safe name without < > : \" / \\ | ? * and "
+                    "do not end it with a space or period."
+                )
+                if show_errors:
+                    QMessageBox.warning(self, "Invalid Backup Name", message)
+                    return False
+                raise ValueError(message)
             backup_path = os.path.join(self.backups_dir, backup_name)
             
-            if os.path.exists(backup_path):
-                QMessageBox.warning(self, "Error", f"Backup '{backup_name}' already exists.")
-                return False
+            if backup_path and os.path.exists(backup_path):
+                message = f"Backup '{backup_name}' already exists."
+                if show_errors:
+                    QMessageBox.warning(self, "Error", message)
+                    return False
+                raise ValueError(message)
             
             # Create backup directory
             os.makedirs(backup_path)
-            
-            # Copy profile contents except backups directory
+
+            # Attachments are copied separately from their canonical storage
+            # root below. In portable builds that root may live inside the
+            # profile directory, so copying it here as well would make the
+            # dedicated copy fail on Windows with error 183 (destination
+            # already exists).
             for item in os.listdir(self.profile_dir):
-                if item == "backups":
+                if item in ("backups", "attachments"):
                     continue
-                    
+
                 source_path = os.path.join(self.profile_dir, item)
                 dest_path = os.path.join(backup_path, item)
-                
+
                 try:
                     if os.path.isfile(source_path):
-                        # For database files, use a retry mechanism
-                        if source_path.endswith('.db'):
-                            max_retries = 3
-                            for attempt in range(max_retries):
-                                try:
-                                    shutil.copy2(source_path, dest_path)
-                                    break
-                                except OSError as e:
-                                    if attempt < max_retries - 1:
-                                        time.sleep(0.1)  # Wait before retry
-                                        continue
-                                    else:
-                                        raise e
-                        else:
-                            shutil.copy2(source_path, dest_path)
+                        shutil.copy2(source_path, dest_path)
                     elif os.path.isdir(source_path):
                         shutil.copytree(source_path, dest_path)
                 except OSError as e:
                     print(f"Warning: Could not backup {source_path}: {e}")
                     # Continue with other files - partial backup is better than no backup
-            
+
+            # Dump the profile's actual data out of Postgres into the backup folder
+            if getattr(self.current_profile, 'database_name', None):
+                pg_backup.backup_database(self.current_profile.database_name, backup_path)
+            else:
+                pg_backup.backup_schema(self.current_profile.schema_name, backup_path)
+
+            # Files are centrally stored beside the host application's data,
+            # not in PostgreSQL or a workstation profile directory.
+            db = getattr(self.parent(), 'database', None)
+            if db:
+                source = attachment_backup_root(db)
+                if source.exists():
+                    shutil.copytree(
+                        source,
+                        os.path.join(backup_path, "attachments"),
+                        dirs_exist_ok=True,
+                    )
+
             return True
             
         except Exception as e:
             # Clean up partial backup on failure
-            if os.path.exists(backup_path):
+            if backup_path and os.path.exists(backup_path):
                 try:
                     shutil.rmtree(backup_path)
                 except:
                     pass
-            QMessageBox.critical(self, "Error", f"Failed to create backup: {str(e)}")
-            return False
+            if show_errors:
+                QMessageBox.critical(self, "Error", f"Failed to create backup: {str(e)}")
+                return False
+            raise
     
     def restore_backup(self):
         """Restore selected backup"""
+        if self._backup_running:
+            return
         if not self.selected_backup:
             QMessageBox.warning(self, "Warning", "Please select a backup to restore.")
             return
@@ -201,66 +472,118 @@ class BackupsDialog(QDialog):
         if reply != QMessageBox.Yes:
             return
         
+        backup_path = os.path.join(self.backups_dir, self.selected_backup)
+        database = getattr(self.parent(), "database", None)
+        if database:
+            print("Closing database connection for backup restore...")
+            database.close()
+
+        self._backup_running = True
+        self.restore_btn.setEnabled(False)
+        self.close_btn.setEnabled(False)
+        self.status_label.setText("Restoring backup…")
+        
+        thread = QThread()
+        worker = _BackupCreateWorker(
+            lambda: self._restore_backup_data(backup_path, database),
+            "restore_backup",
+        )
+        worker.moveToThread(thread)
+        thread.started.connect(worker.run)
+        
+        worker.finished.connect(self._restore_completed)
+        worker.failed.connect(self._restore_failed)
+        
+        worker.finished.connect(thread.quit)
+        worker.failed.connect(thread.quit)
+        worker.cancelled.connect(thread.quit)
+        
+        worker.finished.connect(worker.deleteLater)
+        worker.failed.connect(worker.deleteLater)
+        worker.cancelled.connect(worker.deleteLater)
+        
+        thread.finished.connect(thread.deleteLater)
+        thread.finished.connect(self._on_backup_thread_finished)
+        
+        self._backup_thread = thread
+        self._backup_worker = worker
+        diagnostics.worker_started("restore_backup", "backups", backup_path)
+        thread.start()
+
+    def _restore_backup_data(self, backup_path, database):
+        """Worker-thread portion of restore; never touches Qt widgets."""
+        for item in os.listdir(self.profile_dir):
+            if item == "backups":
+                continue
+            item_path = os.path.join(self.profile_dir, item)
+            if os.path.isfile(item_path):
+                os.remove(item_path)
+            elif os.path.isdir(item_path):
+                shutil.rmtree(item_path)
+
+        skip_names = {"manifest.json", "schema.dump", "database.dump", "attachments"}
+        for item in os.listdir(backup_path):
+            if item in skip_names or item.endswith(".csv") or item.lower().endswith(".backup"):
+                continue
+            source_path = os.path.join(backup_path, item)
+            dest_path = os.path.join(self.profile_dir, item)
+            if os.path.isfile(source_path):
+                shutil.copy2(source_path, dest_path)
+            elif os.path.isdir(source_path):
+                shutil.copytree(source_path, dest_path)
+
+        if getattr(self.current_profile, "database_name", None):
+            pg_backup.restore_database(self.current_profile.database_name, backup_path)
+        else:
+            pg_backup.restore_schema(self.current_profile.schema_name, backup_path)
+
+        stored = os.path.join(backup_path, "attachments")
+        if database and os.path.isdir(stored):
+            target = attachment_backup_root(database)
+            if target.exists():
+                shutil.rmtree(target)
+            shutil.copytree(stored, target)
+        return True
+
+    def _reconnect_after_restore(self):
+        database = getattr(self.parent(), "database", None)
+        if database:
+            print("Reconnecting database after backup restore...")
+            return bool(database.connect())
+        return True
+
+    def _restore_completed(self, success):
+        diagnostics.worker_finished("restore_backup", "backups", "restore")
+        self._backup_running = False
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        if not success or not self._reconnect_after_restore():
+            self.restore_btn.setEnabled(bool(self.selected_backup))
+            QMessageBox.critical(self, "Error", "The backup finished but the database could not reconnect.")
+            return
+        if hasattr(self.parent(), "refresh_all_tabs"):
+            self.parent().refresh_all_tabs()
+        QMessageBox.information(
+            self, "Success",
+            "Backup restored successfully.\nThe application has been refreshed with the restored data.",
+        )
+        self.accept()
+
+    def _restore_failed(self, error):
+        diagnostics.worker_failed("restore_backup", "backups", "restore")
+        self._backup_running = False
+        self.close_btn.setEnabled(True)
+        self.restore_btn.setEnabled(bool(self.selected_backup))
+        self.status_label.setText("")
+        reconnect_error = ""
         try:
-            backup_path = os.path.join(self.backups_dir, self.selected_backup)
-            
-            # Close database connection to release file locks
-            if hasattr(self.parent(), 'database') and self.parent().database:
-                print("Closing database connection for backup restore...")
-                self.parent().database.close()
-            
-            # Small delay to ensure file handles are fully released
-            time.sleep(0.2)
-            
-            # Remove current profile contents (except backups)
-            for item in os.listdir(self.profile_dir):
-                if item == "backups":
-                    continue
-                    
-                item_path = os.path.join(self.profile_dir, item)
-                try:
-                    if os.path.isfile(item_path):
-                        os.remove(item_path)
-                    elif os.path.isdir(item_path):
-                        shutil.rmtree(item_path)
-                except OSError as e:
-                    print(f"Warning: Could not remove {item_path}: {e}")
-                    # Continue with other files
-            
-            # Copy backup contents back to profile
-            for item in os.listdir(backup_path):
-                source_path = os.path.join(backup_path, item)
-                dest_path = os.path.join(self.profile_dir, item)
-                
-                try:
-                    if os.path.isfile(source_path):
-                        shutil.copy2(source_path, dest_path)
-                    elif os.path.isdir(source_path):
-                        shutil.copytree(source_path, dest_path)
-                except OSError as e:
-                    print(f"Warning: Could not copy {source_path}: {e}")
-                    # Continue with other files
-            
-            # Reconnect database with restored files
-            if hasattr(self.parent(), 'database') and self.parent().database:
-                print("Reconnecting database after backup restore...")
-                self.parent().database.connect()
-                
-                # Refresh all tabs if they exist
-                if hasattr(self.parent(), 'refresh_all_tabs'):
-                    self.parent().refresh_all_tabs()
-            
-            QMessageBox.information(self, "Success", "Backup restored successfully.\nThe application has been refreshed with the restored data.")
-            self.accept()  # Close dialog after successful restore
-            
-        except Exception as e:
-            # Try to reconnect database even if restore failed
-            if hasattr(self.parent(), 'database') and self.parent().database:
-                try:
-                    self.parent().database.connect()
-                except:
-                    pass
-            QMessageBox.critical(self, "Error", f"Failed to restore backup: {str(e)}")
+            if not self._reconnect_after_restore():
+                reconnect_error = "\nThe database could not reconnect."
+        except Exception as exc:
+            reconnect_error = f"\nReconnect failed: {exc}"
+        QMessageBox.critical(
+            self, "Error", f"Failed to restore backup: {error}{reconnect_error}"
+        )
     
     def delete_backup(self, backup_name):
         """Delete a backup"""
@@ -344,6 +667,8 @@ class BackupsDialog(QDialog):
     # Cards List Events
     def on_add_card_pressed(self):
         """Handle add backup button press"""
+        if self._backup_running:
+            return
         # Generate default timestamp name
         timestamp = datetime.now().strftime("%Y-%m-%d_%H-%M-%S")
         
@@ -356,9 +681,55 @@ class BackupsDialog(QDialog):
         
         if ok and backup_name.strip():
             backup_name = backup_name.strip()
-            if self.create_backup(backup_name):
-                self.cards_list.load_cards()  # Refresh list
-                QMessageBox.information(self, "Success", "Backup created successfully.")
+            self._backup_running = True
+            self.restore_btn.setEnabled(False)
+            self.close_btn.setEnabled(False)
+            self.status_label.setText("Creating backup…")
+            
+            thread = QThread()
+            worker = _BackupCreateWorker(
+                lambda: self.create_backup(backup_name, show_errors=False),
+                "create_backup",
+            )
+            worker.moveToThread(thread)
+            thread.started.connect(worker.run)
+            
+            worker.finished.connect(self._backup_created)
+            worker.failed.connect(self._backup_failed)
+            
+            worker.finished.connect(thread.quit)
+            worker.failed.connect(thread.quit)
+            worker.cancelled.connect(thread.quit)
+            
+            worker.finished.connect(worker.deleteLater)
+            worker.failed.connect(worker.deleteLater)
+            worker.cancelled.connect(worker.deleteLater)
+            
+            thread.finished.connect(thread.deleteLater)
+            thread.finished.connect(self._on_backup_thread_finished)
+            
+            self._backup_thread = thread
+            self._backup_worker = worker
+            diagnostics.worker_started("create_backup", "backups", backup_name)
+            thread.start()
+
+    def _backup_created(self, success):
+        diagnostics.worker_finished("create_backup", "backups", "create")
+        self._backup_running = False
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        self.cards_list.load_cards()
+        self.restore_btn.setEnabled(bool(self.selected_backup))
+        if success:
+            QMessageBox.information(self, "Success", "Backup created successfully.")
+
+    def _backup_failed(self, error):
+        diagnostics.worker_failed("create_backup", "backups", "create")
+        self._backup_running = False
+        self.close_btn.setEnabled(True)
+        self.status_label.setText("")
+        self.restore_btn.setEnabled(bool(self.selected_backup))
+        QMessageBox.critical(self, "Error", f"Failed to create backup: {error}")
     
     def on_card_pressed(self, card_id):
         """Handle backup card selection"""
@@ -390,3 +761,54 @@ class BackupsDialog(QDialog):
                     self.restore_btn.setEnabled(False)
                 self.cards_list.load_cards()  # Refresh list
                 QMessageBox.information(self, "Success", "Backup deleted successfully.")
+
+    @Slot()
+    def _on_backup_thread_finished(self):
+        self._backup_thread = None
+        self._backup_worker = None
+
+    def _wait_for_backup_thread(self, timeout_ms=5000):
+        thread = getattr(self, "_backup_thread", None)
+        if thread is None:
+
+            return True
+
+        try:
+
+            if not shiboken6.isValid(thread) or not thread.isRunning():
+                self._backup_thread = None
+                self._backup_worker = None
+                return True
+
+        except RuntimeError:
+            # If it's deleted during the checks, it's already finished.
+            self._backup_thread = None
+            self._backup_worker = None
+            return True
+            
+        if thread == QThread.currentThread():
+            return False
+            
+        thread.requestInterruption()
+        thread.quit()
+        
+        if not thread.wait(timeout_ms):
+            logger.error("Backup thread did not stop timeout=%sms", timeout_ms)
+            return False
+            
+        if getattr(self, "_backup_thread", None) is thread:
+            self._backup_thread = None
+            self._backup_worker = None
+            
+        return True
+
+    def closeEvent(self, event):
+        thread = getattr(self, "_backup_thread", None)
+        if thread and thread.isRunning():
+            QMessageBox.information(
+                self, "Backup in Progress",
+                "Wait for the current backup operation to finish before closing."
+            )
+            event.ignore()
+            return
+        super().closeEvent(event)
